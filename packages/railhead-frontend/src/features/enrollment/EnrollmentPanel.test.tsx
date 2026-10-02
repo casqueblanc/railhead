@@ -16,7 +16,7 @@ import {
   withLostEvents,
 } from "../../../../../fixtures/board/syntheticLog";
 import { enrol } from "../../../../../fixtures/board/uploadSteps";
-import type { OwnerPort } from "../board/boardPorts";
+import type { EnrollmentPort, OwnerPort } from "../board/boardPorts";
 import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
 import type { BoardFeed } from "../claims/boardFeed";
 import { EnrollmentPanel } from "./EnrollmentPanel";
@@ -120,6 +120,38 @@ const click = async (target: HTMLButtonElement) => {
   await act(async () => target.click());
 };
 
+/** An enrollment port that records each token and completed challenge. */
+const enrollmentPort = (
+  completed: () => Promise<BoardResult<{ ownerId: string }>> = async () => ({
+    ok: true,
+    value: { ownerId: "usr_synthowner" },
+  }),
+) => {
+  const tokens: string[] = [];
+  const completions: string[] = [];
+  const port: EnrollmentPort = {
+    kind: "available",
+    onPrepareEnrollment: async (token) => {
+      tokens.push(token);
+      return {
+        ok: true,
+        value: {
+          challengeId: "enr_1",
+          challenge: "AAECAw",
+          rpId: "railhead.dev",
+          userHandle: "BAUG",
+          expiresAt: Date.now() + 60_000,
+        },
+      };
+    },
+    onCompleteEnrollment: (challengeId) => {
+      completions.push(challengeId);
+      return completed();
+    },
+  };
+  return { port, tokens, completions };
+};
+
 describe("EnrollmentPanel", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -135,9 +167,21 @@ describe("EnrollmentPanel", () => {
     container.remove();
   });
 
-  const render = async (feed: BoardFeed, owner: OwnerPort, authenticator: Authenticator | null) => {
+  const render = async (
+    feed: BoardFeed,
+    owner: OwnerPort,
+    authenticator: Authenticator | null,
+    enrollment: EnrollmentPort = { kind: "unavailable", reason: "module_unavailable" },
+  ) => {
     await act(async () =>
-      root.render(<EnrollmentPanel feed={feed} owner={owner} authenticator={authenticator} />),
+      root.render(
+        <EnrollmentPanel
+          feed={feed}
+          owner={owner}
+          enrollment={enrollment}
+          authenticator={authenticator}
+        />,
+      ),
     );
   };
 
@@ -320,5 +364,73 @@ describe("EnrollmentPanel", () => {
     const { owner } = recordingOwner(echo);
     await render(live(fold([])), owner, fakeAuthenticator().authenticator);
     expect(text()).toContain("No agents yet");
+  });
+
+  describe("owner passkey", () => {
+    it("enrolls with the bootstrap token and closes the form", async () => {
+      const { owner } = recordingOwner(echo);
+      const { port, tokens, completions } = enrollmentPort();
+      await render(live(fold([])), owner, fakeAuthenticator().authenticator, port);
+
+      await type(input("Bootstrap token"), " deploy-token ");
+      await click(button("Enroll owner passkey"));
+
+      expect(tokens).toEqual(["deploy-token"]);
+      expect(completions).toEqual(["enr_1"]);
+      expect(text()).toContain("Owner passkey enrolled. Enrollment is now closed.");
+      expect(container.querySelector("input[name=bootstrap-token]")).toBeNull();
+    });
+
+    it("enrolls nothing when the owner cancels the passkey prompt", async () => {
+      const { owner } = recordingOwner(echo);
+      const { port, completions } = enrollmentPort();
+      await render(live(fold([])), owner, fakeAuthenticator(() => "dismiss").authenticator, port);
+
+      await type(input("Bootstrap token"), "deploy-token");
+      await click(button("Enroll owner passkey"));
+
+      expect(completions).toEqual([]);
+      expect(text()).toContain("Cancelled. No passkey was enrolled.");
+    });
+
+    it("asks for a token before contacting the backend", async () => {
+      const { owner } = recordingOwner(echo);
+      const { port, tokens } = enrollmentPort();
+      await render(live(fold([])), owner, fakeAuthenticator().authenticator, port);
+
+      await type(input("Bootstrap token"), "   ");
+      await click(button("Enroll owner passkey"));
+
+      expect(tokens).toEqual([]);
+      expect(text()).toContain("Enter the bootstrap token from the deploy.");
+    });
+
+    it("reports a closed enrollment or wrong token", async () => {
+      const { owner } = recordingOwner(echo);
+      const { port } = enrollmentPort(async () => ({
+        ok: false,
+        code: "bootstrap_closed",
+        message: "closed",
+      }));
+      await render(live(fold([])), owner, fakeAuthenticator().authenticator, port);
+
+      await type(input("Bootstrap token"), "wrong");
+      await click(button("Enroll owner passkey"));
+
+      expect(text()).toContain(
+        "The owner passkey is already enrolled, or the bootstrap token is wrong.",
+      );
+    });
+
+    it("says why enrollment is unavailable, even while the board is loading", async () => {
+      const { owner } = recordingOwner(echo);
+      await render({ kind: "loading" }, owner, fakeAuthenticator().authenticator, {
+        kind: "unavailable",
+        reason: "offline",
+      });
+
+      expect(button("Enroll owner passkey").disabled).toBe(true);
+      expect(text()).toContain("Blocked while the board is offline.");
+    });
   });
 });

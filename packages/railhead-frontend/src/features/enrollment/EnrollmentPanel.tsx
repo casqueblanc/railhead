@@ -1,13 +1,14 @@
 import { Badge, Empty, LayerCard, SkeletonLine, Text } from "@cloudflare/kumo";
 import { RobotIcon, WarningCircleIcon } from "@phosphor-icons/react";
 import { useId, type ReactNode } from "react";
-import type { OwnerPort } from "../board/boardPorts";
+import type { EnrollmentPort, OwnerPort } from "../board/boardPorts";
 import type { BoardState, StreamStatus } from "../board/boardState";
 import { feedView, type BoardFeed } from "../claims/boardFeed";
 import { AwaitingAgent } from "./AwaitingAgent";
 import { BlockedNote } from "./BlockedNote";
 import { ConfirmedAgent } from "./ConfirmedAgent";
 import { InviteForm } from "./InviteForm";
+import { OwnerPasskeySetup } from "./OwnerPasskeySetup";
 import { unreachable } from "./ownerActions";
 import { roster } from "./roster";
 import type { ActionAccess } from "./useOwnerAction";
@@ -16,6 +17,7 @@ import type { Authenticator } from "./webauthn";
 interface EnrollmentPanelProps {
   feed: BoardFeed;
   owner: OwnerPort;
+  enrollment: EnrollmentPort;
   /** The browser's authenticator, or `null` when this page cannot use passkeys. */
   authenticator: Authenticator | null;
 }
@@ -46,8 +48,16 @@ export const actionAccess = (
   return { kind: "ready", owner, authenticator };
 };
 
-/** Invites agents, confirms each one against the code its terminal shows, and revokes them. */
-export const EnrollmentPanel = ({ feed, owner, authenticator }: EnrollmentPanelProps) => {
+/**
+ * Invites agents, confirms each one against the code its terminal shows, and revokes them; on a new
+ * instance, enrolls the owner's passkey those actions need.
+ */
+export const EnrollmentPanel = ({
+  feed,
+  owner,
+  enrollment,
+  authenticator,
+}: EnrollmentPanelProps) => {
   const headingId = useId();
   const view = feedView(feed);
 
@@ -81,6 +91,7 @@ export const EnrollmentPanel = ({ feed, owner, authenticator }: EnrollmentPanelP
               access={actionAccess(owner, authenticator, view.board.stream)}
             />
           )}
+          <OwnerPasskeySetup enrollment={enrollment} authenticator={authenticator} />
         </LayerCard.Primary>
       </LayerCard>
     </section>
@@ -93,7 +104,7 @@ const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) 
     rows.invites.length + rows.awaiting.length + rows.confirmed.length + rows.revoked.length === 0;
   return (
     <>
-      <div className="grid gap-3 border-b border-kumo-line px-4 py-3">
+      <div className="grid gap-3 px-4 py-3">
         {access.kind === "blocked" && (
           <div aria-live="polite">
             <BlockedNote block={access.block} />
@@ -162,7 +173,7 @@ const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) 
 const Group = ({ title, children }: { title: string; children: ReactNode }) => {
   const id = useId();
   return (
-    <div className="border-b border-kumo-line last:border-b-0">
+    <div className="border-t border-kumo-line">
       <Text as="h3" variant="secondary" DANGEROUS_className="px-4 pt-3">
         <span id={id}>{title}</span>
       </Text>
