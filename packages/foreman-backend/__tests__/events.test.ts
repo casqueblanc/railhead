@@ -256,6 +256,10 @@ describe("validateEvent", () => {
       expect(() => validateEvent(event("claim.opened", other))).toThrow(/only for itself/);
     });
 
+    it.each([HUMAN, SYSTEM])("refuses an acknowledgement recorded by %o", (actor) => {
+      expect(() => validateEvent(event("inbox.acked", actor))).toThrow(/by the agent itself/);
+    });
+
     it("lets a person open a claim on an agent's behalf", () => {
       expect(() => validateEvent(event("claim.opened", HUMAN))).not.toThrow();
     });
