@@ -12,6 +12,7 @@ const ports = (overrides: Partial<BoardPorts> = {}): BoardPorts => ({
   board: { kind: "available", feed: { kind: "loading" } },
   decisions: { kind: "available", onRecordDecision: never },
   owner: { kind: "available", onPrepareAction: never, onPerformAction: never },
+  enrollment: { kind: "available", onPrepareEnrollment: never, onCompleteEnrollment: never },
   ...overrides,
 });
 
@@ -34,6 +35,7 @@ describe("gateOnConnection", () => {
 
     expect(gated.decisions).toEqual({ kind: "unavailable", reason: "offline" });
     expect(gated.owner).toEqual({ kind: "unavailable", reason: "offline" });
+    expect(gated.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
     expect(gated.board).toEqual({ kind: "available", feed: { kind: "loading" } });
   });
 
@@ -44,6 +46,7 @@ describe("gateOnConnection", () => {
 
     expect(gated.decisions).toEqual({ kind: "unavailable", reason: "offline" });
     expect(gated.owner).toEqual({ kind: "unavailable", reason: "offline" });
+    expect(gated.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
   });
 
   it("keeps a missing module's reason when the session is also lost", () => {
@@ -52,10 +55,12 @@ describe("gateOnConnection", () => {
         connection: "lost",
         decisions: { kind: "unavailable", reason: "no_passkey" },
         owner: { kind: "unavailable", reason: "module_unavailable" },
+        enrollment: { kind: "unavailable", reason: "module_unavailable" },
       }),
     );
 
     expect(gated.decisions).toEqual({ kind: "unavailable", reason: "no_passkey" });
     expect(gated.owner).toEqual({ kind: "unavailable", reason: "module_unavailable" });
+    expect(gated.enrollment).toEqual({ kind: "unavailable", reason: "module_unavailable" });
   });
 });

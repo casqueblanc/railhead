@@ -52,6 +52,11 @@ const ports = (overrides: Partial<BoardPorts> = {}): BoardPorts => ({
     onPrepareAction: () => Promise.reject(new Error("no owner action in this test")),
     onPerformAction: () => Promise.reject(new Error("no owner action in this test")),
   },
+  enrollment: {
+    kind: "available",
+    onPrepareEnrollment: () => Promise.reject(new Error("no enrollment in this test")),
+    onCompleteEnrollment: () => Promise.reject(new Error("no enrollment in this test")),
+  },
   ...overrides,
 });
 
@@ -128,8 +133,49 @@ describe("HomePage", () => {
     expect(text()).toContain("Enrollment installed");
     expect(text().match(/Not available\./g)).toHaveLength(4);
     const last = received.at(-1);
-    expect(last && Object.keys(last).toSorted()).toEqual(["feed", "owner"]);
+    expect(last && Object.keys(last).toSorted()).toEqual(["enrollment", "feed", "owner"]);
     expect(last?.owner).toEqual({ kind: "unavailable", reason: "offline" });
+    expect(last?.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
+  });
+
+  it("hands the enrollment slot the binding's enrollment callbacks while connected", async () => {
+    const received: OwnerSlotProps[] = [];
+    slot.enrollment = {
+      kind: "available",
+      Component: (props) => {
+        received.push(props);
+        return <p>Enrollment installed</p>;
+      },
+    };
+    const value = ports();
+    await render(value);
+
+    expect(received.at(-1)?.enrollment).toBe(value.enrollment);
+  });
+
+  it("passes an unavailable enrollment through with its reason", async () => {
+    const received: OwnerSlotProps[] = [];
+    slot.enrollment = {
+      kind: "available",
+      Component: (props) => {
+        received.push(props);
+        return <p>Enrollment installed</p>;
+      },
+    };
+    await render(ports({ enrollment: { kind: "unavailable", reason: "module_unavailable" } }));
+
+    expect(received.at(-1)?.enrollment).toEqual({
+      kind: "unavailable",
+      reason: "module_unavailable",
+    });
+  });
+
+  it("says enrollment is unavailable when neither the feature nor the backend serves it", async () => {
+    await render(ports({ enrollment: { kind: "unavailable", reason: "module_unavailable" } }));
+
+    expect(text()).toContain(
+      "Not available. This board cannot invite, confirm or revoke agents yet.",
+    );
   });
 
   it("blocks answering while the board's feed is lost and records nothing", async () => {

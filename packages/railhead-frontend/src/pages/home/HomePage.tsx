@@ -42,7 +42,7 @@ const Anchor = ({ id, children }: { id: SectionId; children: ReactNode }) => (
  * slot. The page gets its data and actions only through `ports`.
  */
 export const HomePage = ({ ports }: HomePageProps) => {
-  const { board, decisions, owner, connection, onReconnect } = gateOnConnection(ports);
+  const { board, decisions, owner, enrollment, connection, onReconnect } = gateOnConnection(ports);
 
   if (board.kind === "unavailable") {
     return (
@@ -82,7 +82,7 @@ export const HomePage = ({ ports }: HomePageProps) => {
           <Anchor id="agents">
             <FeatureSlot
               entry={enrollmentEntry}
-              props={{ feed, owner }}
+              props={{ feed, owner, enrollment }}
               title="Agents"
               unavailable="This board cannot invite, confirm or revoke agents yet."
             />
@@ -90,7 +90,7 @@ export const HomePage = ({ ports }: HomePageProps) => {
           <Anchor id="issues">
             <FeatureSlot
               entry={issuesEntry}
-              props={{ feed, owner }}
+              props={{ feed, owner, enrollment }}
               title="Issues"
               unavailable="This board cannot file issues for agents yet."
             />

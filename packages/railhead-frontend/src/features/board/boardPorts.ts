@@ -9,10 +9,13 @@ import type { ComponentType } from "react";
 import type {
   ActionChallenge,
   BoardResult,
+  EnrollmentChallenge,
   OwnerAction,
   OwnerActionResult,
   PasskeyAssertion,
+  PasskeyRegistration,
 } from "@railhead/shared/board-api";
+import type { UserId } from "@railhead/shared/events";
 import type { ConnectionStatus } from "../../rpc/useApiConnection";
 import type { BoardFeed } from "../claims/boardFeed";
 import type { DecisionActions } from "../decisions/decisionActions";
@@ -47,6 +50,23 @@ export type OwnerPort =
     }
   | { kind: "unavailable"; reason: OwnerUnavailableReason };
 
+/**
+ * The instance owner's passkey enrollment as plain callbacks, after `OwnerEnrollmentApi`. The
+ * backend keeps it open only until the first enrollment succeeds.
+ */
+export type EnrollmentPort =
+  | {
+      kind: "available";
+      /** Asks for a registration challenge with the operator's one-time bootstrap token. */
+      onPrepareEnrollment: (bootstrapToken: string) => Promise<BoardResult<EnrollmentChallenge>>;
+      /** Enrolls the authenticator's registration for the challenge, and closes enrollment. */
+      onCompleteEnrollment: (
+        challengeId: string,
+        registration: PasskeyRegistration,
+      ) => Promise<BoardResult<{ ownerId: UserId }>>;
+    }
+  | { kind: "unavailable"; reason: OwnerUnavailableReason };
+
 /** Everything the board page is composed from. */
 export interface BoardPorts {
   /** Whether the one backend session answers. */
@@ -56,6 +76,7 @@ export interface BoardPorts {
   board: BoardRead;
   decisions: DecisionActions;
   owner: OwnerPort;
+  enrollment: EnrollmentPort;
 }
 
 /** What every leaf slot receives: the board it renders from. */
@@ -66,6 +87,7 @@ export interface BoardSlotProps {
 /** What a slot that performs owner actions receives. */
 export interface OwnerSlotProps extends BoardSlotProps {
   owner: OwnerPort;
+  enrollment: EnrollmentPort;
 }
 
 /**
@@ -95,5 +117,9 @@ export const gateOnConnection = (ports: BoardPorts): BoardPorts => {
         : ports.decisions,
     owner:
       ports.owner.kind === "available" ? { kind: "unavailable", reason: "offline" } : ports.owner,
+    enrollment:
+      ports.enrollment.kind === "available"
+        ? { kind: "unavailable", reason: "offline" }
+        : ports.enrollment,
   };
 };

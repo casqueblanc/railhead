@@ -65,6 +65,7 @@ describe("useLiveBoardPorts", () => {
     expect(ports.board).toEqual({ kind: "unavailable" });
     expect(ports.decisions).toEqual({ kind: "unavailable", reason: "module_unavailable" });
     expect(ports.owner).toEqual({ kind: "unavailable", reason: "module_unavailable" });
+    expect(ports.enrollment).toEqual({ kind: "unavailable", reason: "module_unavailable" });
   });
 
   it("reports the actions offline when the backend does not answer", async () => {
@@ -73,6 +74,7 @@ describe("useLiveBoardPorts", () => {
     expect(ports.connection).toBe("lost");
     expect(ports.decisions).toEqual({ kind: "unavailable", reason: "offline" });
     expect(ports.owner).toEqual({ kind: "unavailable", reason: "offline" });
+    expect(ports.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
   });
 
   it("opens one session across renders and disposes it on unmount", async () => {
