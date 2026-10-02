@@ -1,6 +1,6 @@
 packages:
   - packages/*
-  # The shared build tooling as `@foreman/scripts`, so packages reach it by name rather than by a
+  # The shared build tooling as `@railhead/scripts`, so packages reach it by name rather than by a
   # relative path.
   - scripts
 

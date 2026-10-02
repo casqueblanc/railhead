@@ -39,6 +39,6 @@ export interface WranglerExtras {
 }
 
 /** `defineConfig` for one Worker, with the repo-wide compatibility date filled in. */
-export function defineForemanWorker(worker: Omit<WorkerConfig, "compatibilityDate">) {
+export function defineRailheadWorker(worker: Omit<WorkerConfig, "compatibilityDate">) {
   return defineConfig({ worker: { compatibilityDate: COMPATIBILITY_DATE, ...worker } });
 }

@@ -9,7 +9,7 @@ import { skillNames, validatePolicy } from "../scripts/policy.mjs";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
 async function fixture(t) {
-  const root = await mkdtemp(resolve(tmpdir(), "foreman-policy-"));
+  const root = await mkdtemp(resolve(tmpdir(), "railhead-policy-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   for (const path of [
     "engineering",
@@ -45,8 +45,8 @@ test("a fresh checkout loads its local baseline from any working directory and a
   const snapshot = JSON.parse(result.stdout.split("\n")[0]);
   assert.equal(snapshot.path, resolve(root, "engineering"));
   assert.deepEqual(snapshot.skills, skillNames);
-  assert.match(result.stdout, /# Foreman working rules/);
-  assert.match(result.stdout, /# Foreman writing/);
+  assert.match(result.stdout, /# Railhead working rules/);
+  assert.match(result.stdout, /# Railhead writing/);
   assert.equal(start(root, [snapshot.fingerprint]).status, 0);
 });
 
@@ -54,7 +54,7 @@ test("invalid fingerprints and changed worker policy stop startup", async (t) =>
   const root = await fixture(t);
   assert.equal(start(root, ["invalid"]).status, 1);
   const before = await validatePolicy(root);
-  const policy = resolve(root, "engineering/skills/foreman-working/SKILL.md");
+  const policy = resolve(root, "engineering/skills/railhead-working/SKILL.md");
   await writeFile(policy, `${await readFile(policy, "utf8")}\nNew constraint.\n`);
   const result = start(root, [before.fingerprint]);
   assert.equal(result.status, 1);
@@ -64,7 +64,7 @@ test("invalid fingerprints and changed worker policy stop startup", async (t) =>
 
 test("missing baseline and broken reference fail rather than loading partial guidance", async (t) => {
   const root = await fixture(t);
-  const path = resolve(root, "engineering/skills/foreman-working/SKILL.md");
+  const path = resolve(root, "engineering/skills/railhead-working/SKILL.md");
   const original = await readFile(path, "utf8");
   await unlink(path);
   assert.equal(start(root).status, 1);
@@ -74,9 +74,9 @@ test("missing baseline and broken reference fail rather than loading partial gui
 
 test("discovery links cannot redirect skills to another source", async (t) => {
   const root = await fixture(t);
-  const alias = resolve(root, ".agents/skills/foreman-working");
+  const alias = resolve(root, ".agents/skills/railhead-working");
   await unlink(alias);
-  await symlink(resolve(root, "engineering/skills/foreman-writing"), alias);
+  await symlink(resolve(root, "engineering/skills/railhead-writing"), alias);
   const result = start(root);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /local canonical directory/);
@@ -93,7 +93,7 @@ test("a missing native startup hook fails verification", async (t) => {
 
 test("excluded approval tooling cannot return through a skill edit", async (t) => {
   const root = await fixture(t);
-  const path = resolve(root, "engineering/skills/foreman-orca/SKILL.md");
+  const path = resolve(root, "engineering/skills/railhead-orca/SKILL.md");
   await writeFile(path, `${await readFile(path, "utf8")}\nRun roger list.\n`);
   assert.equal(start(root).status, 1);
 });

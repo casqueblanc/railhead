@@ -17,7 +17,7 @@ try {
   }
   process.stdout.write(`${JSON.stringify(snapshot)}\n\n`);
   for (const name of ["working", "writing"]) {
-    const path = resolve(snapshot.path, "skills", `foreman-${name}`, "SKILL.md");
+    const path = resolve(snapshot.path, "skills", `railhead-${name}`, "SKILL.md");
     process.stdout.write(`${await readFile(path, "utf8")}\n`);
   }
 } catch (error) {

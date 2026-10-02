@@ -1,6 +1,6 @@
 /**
  * Shared Vite+ type-check task, used by each package's `vite.config.ts` and reached as
- * `@foreman/scripts/typecheck-task`.
+ * `@railhead/scripts/typecheck-task`.
  *
  * Never cached. Vite+ fingerprints a cached task by the files it observes the command reading, and
  * it does not observe the reads of the native TypeScript 7 compiler: measured on macOS with

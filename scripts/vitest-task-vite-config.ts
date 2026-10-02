@@ -4,7 +4,7 @@
  * resolvable `vite-plus` import of their own. The task types below are structural copies of
  * Vite+'s rather than imports of them, which is what keeps that true.
  *
- * Reached as `@foreman/scripts/vitest-task`, an `exports` subpath of this directory's package. This
+ * Reached as `@railhead/scripts/vitest-task`, an `exports` subpath of this directory's package. This
  * module is loaded by `node` as well as by vite -- vp resolves it through the `exports` map when it
  * loads a consumer's task graph -- so intra-directory imports must name the file on disk.
  *

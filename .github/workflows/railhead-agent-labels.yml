@@ -1,0 +1,37 @@
+# Clears agent work-state labels when an issue closes, including through a PR's
+# closing keyword. Label meanings: engineering/skills/railhead-orca/references/unattended-run.md
+name: railhead-agent-labels
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  clear:
+    if: >-
+      contains(github.event.issue.labels.*.name, 'agent-ready') ||
+      contains(github.event.issue.labels.*.name, 'agent-working') ||
+      contains(github.event.issue.labels.*.name, 'needs-spec')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        # Read the issue now rather than the event: a rerun after a partial
+        # failure skips labels already removed, and an issue reopened since
+        # keeps whatever it was relabelled with.
+        run: |
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE")
+          if [[ "$(jq -r '.state' <<< "$issue")" != "closed" ]]; then
+            exit 0
+          fi
+          current=$(jq -r '.labels[].name' <<< "$issue")
+          for label in agent-ready agent-working needs-spec; do
+            if grep -qxF "$label" <<< "$current"; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$ISSUE/labels/$label" > /dev/null
+            fi
+          done

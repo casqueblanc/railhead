@@ -57,7 +57,7 @@ export default defineConfig({
     ],
     overrides: [
       {
-        files: ["packages/foreman-frontend/**/*.{ts,tsx}"],
+        files: ["packages/railhead-frontend/**/*.{ts,tsx}"],
         plugins: ["typescript", "unicorn", "oxc", "import", "react", "jsx-a11y"],
         env: {
           browser: true,
@@ -66,7 +66,7 @@ export default defineConfig({
       },
       {
         // Cloudflare Workers code: worker global scope.
-        files: ["packages/foreman-backend/**/*.ts", "packages/foreman-shared/**/*.ts"],
+        files: ["packages/railhead-backend/**/*.ts", "packages/railhead-shared/**/*.ts"],
         env: {
           serviceworker: true,
           es2024: true,
@@ -84,7 +84,7 @@ export default defineConfig({
         // Hook tests capture the hook's return value from a throwaway probe component into a `let`
         // in the enclosing `describe`. Reassigning an outer variable during render is the point
         // there, not the production side effect `react/globals` guards against.
-        files: ["packages/foreman-frontend/**/*.test.tsx"],
+        files: ["packages/railhead-frontend/**/*.test.tsx"],
         plugins: ["typescript", "unicorn", "oxc", "import", "react", "jsx-a11y", "vitest"],
         rules: {
           "react/globals": "off",

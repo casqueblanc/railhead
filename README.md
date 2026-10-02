@@ -1,8 +1,8 @@
-# Foreman
+# Railhead
 
-Foreman is a Git platform for many concurrent coding agents, built on Cloudflare Workers, Durable Objects and Artifacts. It is an entry for Cloudflare's "Build the Next GitHub" challenge.
+Railhead is a Git platform for many concurrent coding agents, built on Cloudflare Workers, Durable Objects and Artifacts. It is an entry for Cloudflare's "Build the Next GitHub" challenge.
 
-The design is in [issue #1](https://github.com/casqueblanc/foreman/issues/1), including two reviews and the revised direction that follow the original brief.
+The design is in [issue #1](https://github.com/casqueblanc/railhead/issues/1), including two reviews and the revised direction that follow the original brief.
 
 ## Status
 
@@ -37,13 +37,13 @@ This runs the engineering guidance checks, formatting and linting, the type chec
 
 ## Layout
 
-| Path                        | Contents                                                            |
-| --------------------------- | ------------------------------------------------------------------- |
-| `packages/foreman-shared`   | The RPC interface shared by the board and the Worker                |
-| `packages/foreman-backend`  | The Worker: the API and the built board's static assets             |
-| `packages/foreman-frontend` | The board: React, TanStack Router, Tailwind and Kumo                |
-| `scripts/`                  | Build tooling: Worker config generation and shared task definitions |
-| `engineering/`              | Engineering guidance and skills for people and coding agents        |
+| Path                         | Contents                                                            |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `packages/railhead-shared`   | The RPC interface shared by the board and the Worker                |
+| `packages/railhead-backend`  | The Worker: the API and the built board's static assets             |
+| `packages/railhead-frontend` | The board: React, TanStack Router, Tailwind and Kumo                |
+| `scripts/`                   | Build tooling: Worker config generation and shared task definitions |
+| `engineering/`               | Engineering guidance and skills for people and coding agents        |
 
 The structure, tooling and UI conventions follow [Cloudflare OS](https://github.com/cloudflare/cloudflare-os/tree/1045d2e1ceac7be29e1a6f056c936fb31aa00851). [AGENTS.md](AGENTS.md) holds the rules for working in this repository and lists the deliberate differences.
 

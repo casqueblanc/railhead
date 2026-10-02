@@ -1,5 +1,5 @@
 /**
- * Vite+ settings for `@foreman/scripts`. Only a `test` task: this package holds the shared task
+ * Vite+ settings for `@railhead/scripts`. Only a `test` task: this package holds the shared task
  * definitions other packages import, and has no build of its own (see `tsconfig.json`).
  *
  * `node --test`, not vitest: these suites assert on build tooling, and pulling vitest in would mean
