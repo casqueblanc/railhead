@@ -71,6 +71,16 @@ pub enum LocalCode {
     CommandUnavailable,
     /// Output could not be written.
     Output,
+    /// The agent has no session token.
+    NoSession,
+    /// The command must run inside a claim's clone.
+    NoClone,
+    /// A Git step failed.
+    Git,
+    /// The clone's remote is not the Railhead repository it should be.
+    UntrustedRemote,
+    /// The working tree holds changes the command would overwrite.
+    WorkspaceConflict,
 }
 
 /// A failure as `rh` reports it.

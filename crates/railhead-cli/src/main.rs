@@ -152,6 +152,19 @@ pub enum Error {
     /// Output could not be written.
     #[error("writing output: {0}")]
     Output(#[source] io::Error),
+    /// A command failed on this machine, before or after its requests: no session, no clone, a Git
+    /// step, an untrusted remote or a conflicting workspace. `message` is `rh`'s own words.
+    #[error("{message}")]
+    Local {
+        /// What went wrong.
+        code: LocalCode,
+        /// One sentence for the agent; any untrusted part must already be inert.
+        message: String,
+        /// Whether repeating the command may succeed.
+        retryable: bool,
+        /// The command to run next.
+        next: Option<railhead_protocol::NextCommand>,
+    },
 }
 
 /// Result of a command.
@@ -209,6 +222,12 @@ impl Error {
             Self::WorkingDirectory(_) | Self::Runtime(_) => {
                 local(LocalCode::InvalidInput, false, None)
             }
+            Self::Local {
+                code,
+                retryable,
+                next,
+                ..
+            } => local(*code, *retryable, *next),
         }
     }
 }
@@ -483,6 +502,92 @@ mod tests {
         assert_eq!(
             unavailable.message,
             "rh work is not available in this build yet"
+        );
+        Ok(())
+    }
+
+    fn print(mode: Mode, error: &Error) -> anyhow::Result<(String, String)> {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        Output::new(mode, &mut stdout, &mut stderr).failure(&error.failure())?;
+        Ok((String::from_utf8(stdout)?, String::from_utf8(stderr)?))
+    }
+
+    #[test]
+    fn local_failures_render_their_code_retry_advice_and_next_command() -> anyhow::Result<()> {
+        let cases = [
+            (
+                LocalCode::NoSession,
+                "no_session",
+                false,
+                Some(NextCommand::Join),
+            ),
+            (
+                LocalCode::NoClone,
+                "no_clone",
+                false,
+                Some(NextCommand::Claim),
+            ),
+            (LocalCode::Git, "git", true, None),
+            (LocalCode::UntrustedRemote, "untrusted_remote", false, None),
+            (
+                LocalCode::WorkspaceConflict,
+                "workspace_conflict",
+                false,
+                Some(NextCommand::Status),
+            ),
+        ];
+        for (code, wire, retryable, next) in cases {
+            let error = Error::Local {
+                code,
+                message: format!("{wire} happened."),
+                retryable,
+                next,
+            };
+            let failure = error.failure();
+            assert_eq!(
+                (failure.code, failure.retryable, failure.next),
+                (Code::Local(code), retryable, next)
+            );
+
+            let (stdout, stderr) = print(Mode::Json, &error)?;
+            let envelope: serde_json::Value = serde_json::from_str(&stdout)?;
+            assert_eq!(
+                envelope,
+                serde_json::json!({"ok": false, "error": {"code": wire,
+                    "message": format!("{wire} happened."), "retryable": retryable,
+                    "next": next.map(output::command_line)}})
+            );
+            assert_eq!(stderr, "");
+
+            let hint = next.map_or(String::new(), |next| {
+                format!("next: {}\n", output::command_line(next))
+            });
+            let (stdout, stderr) = print(Mode::Text, &error)?;
+            assert_eq!(stdout, "");
+            assert_eq!(stderr, format!("rh: {wire} happened.\n{hint}"));
+
+            let (stdout, stderr) = print(Mode::Credential, &error)?;
+            assert_eq!(stdout, "", "credential mode wrote a {wire} failure to Git");
+            assert_eq!(stderr, format!("rh: {wire} happened.\n{hint}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_message_is_rendered_inert_in_text_and_kept_whole_in_json() -> anyhow::Result<()> {
+        let error = Error::Local {
+            code: LocalCode::Git,
+            message: "git fetch failed: \u{1b}[2J".to_owned(),
+            retryable: false,
+            next: None,
+        };
+        let (_, stderr) = print(Mode::Text, &error)?;
+        assert_eq!(stderr, "rh: git fetch failed: \u{fffd}[2J\n");
+        let (stdout, _) = print(Mode::Json, &error)?;
+        let envelope: serde_json::Value = serde_json::from_str(&stdout)?;
+        assert_eq!(
+            envelope.pointer("/error/message"),
+            Some(&serde_json::json!("git fetch failed: \u{1b}[2J"))
         );
         Ok(())
     }
