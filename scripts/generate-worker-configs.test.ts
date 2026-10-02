@@ -44,6 +44,24 @@ test("rejects an assets directory when the Worker binds no assets", async () => 
   );
 });
 
+test("binds the Worker's own Durable Object class without naming the Worker as another script", async () => {
+  const text = await renderWorkerConfig(fixture("durable-objects"));
+
+  const json: unknown = JSON.parse(text.split("\n").slice(2).join("\n"));
+  assert.deepEqual(json, {
+    name: "fixture",
+    main: "src/index.ts",
+    compatibility_date: COMPATIBILITY_DATE,
+    durable_objects: {
+      bindings: [
+        { name: "OWN", class_name: "Own" },
+        { name: "OTHER", class_name: "Theirs", script_name: "other-worker" },
+      ],
+    },
+    exports: { Own: { type: "durable-object", storage: "sqlite" } },
+  });
+});
+
 test("every Worker package commits the config its source generates", async () => {
   const dirs = workerConfigDirs();
   assert.ok(dirs.length > 0, "no Worker config found under packages/");

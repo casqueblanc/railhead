@@ -79,6 +79,21 @@ export async function renderWorkerConfig(dir: string): Promise<string> {
     config.assets = { ...config.assets, directory: extras.assetsDirectory };
   }
 
+  // @cloudflare/config makes a Durable Object binding name its Worker and always writes it as
+  // `script_name`, but Wrangler and workerd read any `script_name` as another Worker. A binding to a
+  // class this Worker exports itself therefore loses it.
+  if (config.durable_objects) {
+    config.durable_objects = {
+      ...config.durable_objects,
+      bindings: config.durable_objects.bindings.map(
+        ({ script_name, ...binding }: { script_name?: string; [key: string]: unknown }) =>
+          script_name === undefined || script_name === config.name
+            ? binding
+            : { ...binding, script_name },
+      ),
+    };
+  }
+
   // An undefined `build` drops out of the JSON.
   return HEADER + JSON.stringify({ ...config, build: extras.build }, null, 2) + "\n";
 }

@@ -31,7 +31,7 @@ function issue(n: number, body = ""): EventPayload {
 }
 
 function freshStub(): DurableObjectStub {
-  return env.STORAGE_TEST.get(env.STORAGE_TEST.idFromName(crypto.randomUUID()));
+  return env.REPO.getByName(crypto.randomUUID());
 }
 
 /** Runs `body` against the storage of `stub`, or of a Durable Object no other test touches. */

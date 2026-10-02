@@ -1,0 +1,242 @@
+// One repository's Durable Object: its storage, its event log and its composed modules.
+//
+// It is reached only through this Worker's `REPO` binding, by the fixed adapters in `gateway/`;
+// nothing outside the Worker can call its methods. The adapters validate input and authenticate
+// nothing themselves: who is calling is decided inside, by the sessions and owner modules, against
+// current state. No method takes an actor or appends an arbitrary event.
+//
+// A repository exists once `initialize` has recorded it. Until then the object reads, but never
+// writes, its storage, so a request for a name nobody created leaves nothing behind. All state is
+// rebuilt from storage when the object starts, so eviction or hibernation loses nothing but live
+// subscriptions.
+
+import { DurableObject } from "cloudflare:workers";
+import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
+import type {
+  ActionChallenge,
+  EventPage,
+  OwnerAction,
+  OwnerActionResult,
+  PasskeyAssertion,
+  PendingJoin,
+} from "@railhead/shared/board-api";
+import { MAX_EVENT_PAGE } from "@railhead/shared/board-api";
+import type { RepoId } from "@railhead/shared/events";
+import { fail, ok, type PortResult } from "../contracts/result";
+import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
+import type { GitTarget } from "../modules/git/entry";
+import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
+import { composeRepo, type RepoPorts } from "./composeRepo";
+import { EventLog, EventLogError } from "./eventLog";
+import { migrate } from "./storage";
+
+/** A repository as it was recorded. */
+export interface RepoSummary {
+  /** The repository's identifier. */
+  repoId: RepoId;
+  /** Its organisation segment. */
+  org: RepoSegment;
+  /** Its repository segment. */
+  name: RepoSegment;
+}
+
+/** The migration owner name of the Repo's own table. */
+const REPO_OWNER = "repo";
+
+/** Released schema steps of the Repo's own table. Append a step to change it; never edit one. */
+const MIGRATIONS: readonly string[] = [
+  `CREATE TABLE repo (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    repo_id TEXT NOT NULL,
+    org TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  ) STRICT`,
+];
+
+/** The Durable Object name of the repository `org/name`. */
+export function repoObjectName(org: RepoSegment, name: RepoSegment): string {
+  return `${org}/${name}`;
+}
+
+interface Installed {
+  summary: RepoSummary;
+  log: EventLog;
+  ports: RepoPorts;
+}
+
+/** One repository. */
+export class Repo extends DurableObject<Env> {
+  #installed: Installed | null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    const summary = this.#readSummary();
+    this.#installed = summary === null ? null : this.#install(summary);
+  }
+
+  /** The repository, or `null` when it was never initialized. */
+  describe(): RepoSummary | null {
+    return this.#installed?.summary ?? null;
+  }
+
+  /**
+   * Records this object as the repository `org/name` and installs its modules. A repeat with the
+   * same name returns the same repository; any other name is refused with `invalid_request` and
+   * writes nothing.
+   */
+  initialize(org: RepoSegment, name: RepoSegment): PortResult<RepoSummary> {
+    if (!isRepoSegment(org) || !isRepoSegment(name)) {
+      return fail("invalid_request", "The organisation and name must be repository segments.");
+    }
+    const expected = repoObjectName(org, name);
+    if (this.ctx.id.name !== undefined && this.ctx.id.name !== expected) {
+      return fail("invalid_request", "This object is not named for that repository.");
+    }
+    if (this.#installed !== null) {
+      const { summary } = this.#installed;
+      if (summary.org !== org || summary.name !== name) {
+        return fail("invalid_request", "This object already holds another repository.");
+      }
+      return ok(summary);
+    }
+    migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
+    const summary: RepoSummary = { repoId: `rep_${this.ctx.id.toString()}`, org, name };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO repo (id, repo_id, org, name, created_at) VALUES (1, ?, ?, ?, ?)",
+      summary.repoId,
+      org,
+      name,
+      Date.now(),
+    );
+    this.#installed = this.#install(summary);
+    return ok(summary);
+  }
+
+  /** Reads up to `limit` events after `cursor`. */
+  readEvents(cursor: number, limit: number): PortResult<EventPage> {
+    const installed = this.#installed;
+    if (installed === null) return missing();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_PAGE) {
+      return fail(
+        "invalid_request",
+        `The limit must be a whole number from 1 to ${MAX_EVENT_PAGE}.`,
+      );
+    }
+    try {
+      const page = installed.log.replay(cursor, limit);
+      return ok({
+        repo: installed.summary.repoId,
+        events: page.events,
+        cursor: page.events.at(-1)?.seq ?? cursor,
+        head: page.head,
+      });
+    } catch (error) {
+      if (!(error instanceof EventLogError)) throw error;
+      switch (error.code) {
+        case "invalid_request":
+        case "replay_too_large":
+          return fail("invalid_request", "The cursor must be a whole number from 0.");
+        case "cursor_ahead":
+          return fail("cursor_ahead", "The cursor is ahead of this repository's log.");
+        case "invalid_repo":
+        case "invalid_event":
+        case "invalid_transaction":
+        case "corrupt_log":
+          // An unreadable log is a backend fault, not the caller's: let the Worker report it.
+          throw error;
+        default:
+          return unreachable(error.code);
+      }
+    }
+  }
+
+  /** Subscribes `listener` to events after `cursor`, through the stream module. */
+  async subscribe(
+    cursor: number,
+    listener: StreamListener,
+  ): Promise<PortResult<StreamSubscription>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.stream.subscribe(cursor, listener);
+  }
+
+  /** The joins waiting for the owner, through the identity module. */
+  async pendingJoins(): Promise<PortResult<PendingJoin[]>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.identity.pendingJoins();
+  }
+
+  /** Prepares an owner action, through the owner module. */
+  async prepareOwnerAction(action: OwnerAction): Promise<PortResult<ActionChallenge>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.owner.prepare(action);
+  }
+
+  /** Performs a prepared owner action, through the owner module. */
+  async performOwnerAction(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+  ): Promise<PortResult<OwnerActionResult>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.owner.perform(challengeId, assertion);
+  }
+
+  /** Answers one validated agent request. */
+  async agent(call: AgentCall): Promise<AgentReply> {
+    const installed = this.#installed;
+    if (installed === null) return dispatchAgent(null, call);
+    return dispatchAgent({ repoId: installed.summary.repoId, ports: installed.ports }, call);
+  }
+
+  /** Answers one Git smart-HTTP request, through the Git module. */
+  async git(request: Request, target: GitTarget, path: string): Promise<Response> {
+    const ports = this.#ports();
+    if (ports === null) return new Response("Repository not found.\n", { status: 404 });
+    return ports.git.serve(request, target, path);
+  }
+
+  #ports(): RepoPorts | null {
+    return this.#installed?.ports ?? null;
+  }
+
+  // Reads only, so that a name nobody initialized leaves no storage behind.
+  #readSummary(): RepoSummary | null {
+    const sql = this.ctx.storage.sql;
+    const table = sql
+      .exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo'")
+      .toArray();
+    if (table.length === 0) return null;
+    const row = sql
+      .exec<{ repo_id: string; org: string; name: string }>(
+        "SELECT repo_id, org, name FROM repo WHERE id = 1",
+      )
+      .toArray()[0];
+    if (row === undefined) return null;
+    return { repoId: row.repo_id, org: row.org, name: row.name };
+  }
+
+  #install(summary: RepoSummary): Installed {
+    migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
+    const log = EventLog.open(this.ctx.storage, summary.repoId);
+    const ports = composeRepo({
+      repoId: summary.repoId,
+      storage: this.ctx.storage,
+      log,
+      clock: Date.now,
+      env: this.env,
+    });
+    return { summary, log, ports };
+  }
+}
+
+function missing(): PortResult<never> {
+  return fail("not_found", "No such repository.");
+}
+
+function unreachable(value: never): never {
+  throw new Error(`unhandled event log error: ${String(value)}`);
+}
