@@ -7,9 +7,10 @@
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
 // again rather than inheriting any part of its result.
 //
-// Nothing schedules the train from a timer: each `enqueue` and `recordCheck` drives it as far as
-// it can go, bounded by `MAX_STEPS`, and one that is blocked on an unavailable port waits for the
-// next call.
+// Nothing schedules the train from a timer: each `enqueue` and `recordCheck` drives it until it
+// waits for a check report or a port, or the queue is empty. A train blocked on an unavailable port
+// moves again on the next call. A thrown drive error does not undo the call's committed write:
+// the call still returns its result, and the next call drives again.
 
 import {
   isCommitSha,
@@ -66,8 +67,14 @@ export const MAX_BATCH = 8;
 /** How many batches may fail for reasons outside a pin before the pin is dropped. */
 export const MAX_RETRIES = 3;
 
-/** Most state transitions one call drives before it returns. */
-export const MAX_STEPS = 16;
+/**
+ * Most state transitions one call drives. Every transition that does not stop the drive settles or
+ * consumes queue state: a batch costs at most four (form, compose, start or land, and a drop of
+ * stale pins), and a pin joins at most `MAX_RETRIES + 3` batches (its retries, one shared failure,
+ * one isolated run and its last one). The budget covers a full queue, so a drive never stops with
+ * pins it could still move; `yielded` marks a broken bound rather than a normal pause.
+ */
+export const MAX_STEPS = 4 * MAX_QUEUE * (MAX_RETRIES + 3);
 
 /** Most rows a diagnostic read returns. */
 export const MAX_DIAGNOSTIC_ROWS = 64;
@@ -116,7 +123,7 @@ export type DriveOutcome =
   | { kind: "checking"; batchId: number; attemptId: string }
   /** The train cannot move until a port answers; the next call tries again. */
   | { kind: "blocked"; batchId: number | null; reason: BlockReason; code: PortErrorCode | null }
-  /** The drive used its step budget; the next call continues. */
+  /** The drive used its step budget, which a correct queue never reaches; the next call continues. */
   | { kind: "yielded" };
 
 /** The train port, with the scheduler's own reads. */
@@ -454,6 +461,22 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
     });
   }
 
+  /**
+   * Drives after a call committed its write, so a port that rejects or a broken invariant cannot
+   * turn that committed result into a thrown error. The error is logged by name only, never with
+   * its message, which may carry a port's text.
+   */
+  async function driveAfterCommit(): Promise<void> {
+    try {
+      await drive();
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "unknown";
+      console.error(
+        JSON.stringify({ event: "train.drive_failed", repo: context.repoId, error: name }),
+      );
+    }
+  }
+
   async function enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>> {
     if (!validPin(pin)) {
       return fail("invalid_request", "The pin needs a claim, a positive generation and a commit.");
@@ -477,7 +500,7 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
       return ok({ queued: true });
     });
     if (!result.ok) return result;
-    await drive();
+    await driveAfterCommit();
     return result;
   }
 
@@ -518,7 +541,7 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
     });
     const { value } = result;
     if (!value.ok) return value;
-    await drive();
+    await driveAfterCommit();
     return value;
   }
 

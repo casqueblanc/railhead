@@ -609,6 +609,39 @@ describe("train failures", () => {
 });
 
 describe("train boundaries", () => {
+  it("settles every pin of a full batch that cannot compose in one call", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Not yet.");
+    fakes.compose = () => ok({ kind: "error", reason: "unsupported" });
+    await withTrain(async ({ train }) => {
+      const pins = Array.from({ length: 8 }, (_, n) => pin(n + 1));
+      fakes.ready(...pins);
+      for (const p of pins) await train.enqueue(p);
+      fakes.head = () => ok(fakes.main);
+
+      expect(await train.drive()).toEqual({ kind: "idle" });
+      expect(fakes.composeCalls.map((c) => c.pins.length)).toEqual([8, 1, 1, 1, 1, 1, 1, 1, 1]);
+      expect(train.entries(64).map((e) => [e.state, e.reason])).toEqual(
+        pins.map(() => ["dropped", "compose_failed"]),
+      );
+    }, fakes);
+  });
+
+  it("returns a committed enqueue when a port rejects during the drive", async () => {
+    const fakes = new Fakes();
+    fakes.compose = () => {
+      throw new Error("sandbox RPC failed");
+    };
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(train.batches(1)[0]).toMatchObject({ state: "composing" });
+
+      fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
+      expect(await train.drive()).toMatchObject({ kind: "checking" });
+      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+    }, fakes);
+  });
   it("starts nothing unless main holds exactly one valid trusted definition", async () => {
     const fakes = new Fakes();
     await withTrain(async ({ train }) => {
