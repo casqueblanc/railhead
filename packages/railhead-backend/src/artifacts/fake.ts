@@ -65,7 +65,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
   #nextId = 1;
   #forkFaults: ForkFault[] = [];
   #revokeFails = 0;
-  #mintGate: Promise<void> | null = null;
+  #mintGate: { held: Promise<void>; reach: () => void } | null = null;
 
   constructor(now = 1_000_000) {
     this.#now = now;
@@ -97,15 +97,22 @@ export class FakeArtifacts implements ArtifactsNamespace {
   }
 
   /**
-   * Holds the next `createToken` call after it mints, until the returned function is called, so a
-   * test can act while a mint is in flight.
+   * Holds the next `createToken` call after it mints, until `release` is called, so a test can act
+   * while a mint is in flight. `reached` resolves once the call is held.
    */
-  pauseNextMint(): () => void {
+  pauseNextMint(): { reached: Promise<void>; release: () => void } {
     let release: (() => void) | undefined;
-    this.#mintGate = new Promise<void>((resolve) => {
-      release = resolve;
+    let reach: (() => void) | undefined;
+    const reached = new Promise<void>((resolve) => {
+      reach = resolve;
     });
-    return () => release?.();
+    this.#mintGate = {
+      held: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      reach: () => reach?.(),
+    };
+    return { reached, release: () => release?.() };
   }
 
   /** Whether `plaintext` would be accepted by the fake's Git endpoint now. */
@@ -185,7 +192,10 @@ export class FakeArtifacts implements ArtifactsNamespace {
         const token = this.#mint(repo, scope, ttl);
         const gate = this.#mintGate;
         this.#mintGate = null;
-        if (gate !== null) await gate;
+        if (gate !== null) {
+          gate.reach();
+          await gate.held;
+        }
         return {
           id: token.id,
           plaintext: token.plaintext,

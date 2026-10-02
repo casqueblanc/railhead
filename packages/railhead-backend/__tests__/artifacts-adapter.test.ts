@@ -345,11 +345,30 @@ describe("revokeTokens", () => {
       if (!forked.ok) throw new Error("fork failed");
       const repo = forked.value.repo;
 
-      const release = fake.pauseNextMint();
+      const paused = fake.pauseNextMint();
       const minting = port.token(repo, "write", 10 * MINUTE);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await paused.reached;
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: true });
-      release();
+      paused.release();
+
+      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("sweeps the fork when the token minted during revocation cannot be revoked by id", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const forked = await port.forkForClaim(CLAIM, HEAD);
+      if (!forked.ok) throw new Error("fork failed");
+      const repo = forked.value.repo;
+
+      const paused = fake.pauseNextMint();
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: true });
+      fake.failRevocations(1);
+      paused.release();
 
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
       expect(fake.liveTokens(repo)).toEqual([]);

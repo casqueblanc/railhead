@@ -188,8 +188,16 @@ class ArtifactsAdapter implements ArtifactsPort {
       const created = await this.#bounded(handle.createToken(scope, Math.ceil(ttlMs / 1000)));
       const expiresAt = Date.parse(created.expiresAt);
       if (this.#epoch(repo) !== epoch || Number.isNaN(expiresAt)) {
-        // Revoked while minting, or unusable: this token must not stay live.
-        await this.#bounded(handle.revokeToken(created.id));
+        // Revoked while minting, or unusable: this token must not stay live. A fork's tokens may all
+        // be swept if revoking this one fails; main's may not, as that would revoke the train's.
+        const revoked = await this.#bounded(handle.revokeToken(created.id)).catch(() => false);
+        if (!revoked) {
+          if (target.kind === "main") {
+            return fail("internal", "A minted token could not be revoked.");
+          }
+          const swept = await this.#revokeActive(handle);
+          if (!swept.ok) return swept;
+        }
         return this.#epoch(repo) !== epoch
           ? fail("busy", "The repository's tokens were revoked while one was minted.")
           : fail("internal", "Artifacts returned a token without a valid expiry.");
