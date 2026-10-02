@@ -30,6 +30,13 @@ const MIGRATIONS: readonly string[] = [
     seq INTEGER PRIMARY KEY CHECK (seq > 0),
     body TEXT NOT NULL
   ) STRICT`,
+  // The head is kept apart from the events, so losing the last event is a detectable gap rather
+  // than a shorter log.
+  `CREATE TABLE event_head (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    seq INTEGER NOT NULL CHECK (seq >= 0)
+  ) STRICT`,
+  "INSERT INTO event_head (id, seq) VALUES (1, 0)",
 ];
 
 /** Most events one replay page may request. */
@@ -123,12 +130,14 @@ export class EventLog {
     return new EventLog(storage, repo, clock);
   }
 
-  /** The sequence number of the last event, or 0 when the log is empty. */
+  /** The sequence number of the last committed event, or 0 when the log is empty. */
   head(): number {
     const rows = this.#storage.sql
-      .exec<{ head: number }>("SELECT COALESCE(MAX(seq), 0) AS head FROM events")
+      .exec<{ seq: number }>("SELECT seq FROM event_head WHERE id = 1")
       .toArray();
-    return rows[0]?.head ?? 0;
+    const row = rows[0];
+    if (row === undefined) throw new EventLogError("corrupt_log", "the log has lost its head");
+    return row.seq;
   }
 
   /**
@@ -195,24 +204,31 @@ export class EventLog {
       }
       const rows = this.#storage.sql
         .exec<{ seq: number; body: string }>(
-          "SELECT seq, body FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+          "SELECT seq, body FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?",
           after,
+          head,
           limit,
         )
         .toArray();
       const events: RailheadEvent[] = [];
       let length = 0;
+      let full = rows.length === limit;
       for (const row of rows) {
         const expected = after + events.length + 1;
         if (row.seq !== expected) {
           throw new EventLogError("corrupt_log", `the log has a gap before sequence ${expected}`);
         }
         length += row.body.length;
-        if (events.length > 0 && length > MAX_REPLAY_JSON_LENGTH) break;
+        if (events.length > 0 && length > MAX_REPLAY_JSON_LENGTH) {
+          full = true;
+          break;
+        }
         events.push(readStoredEvent(row.seq, row.body));
       }
-      if (events.length === 0 && after < head) {
-        throw new EventLogError("corrupt_log", `the log has a gap before sequence ${after + 1}`);
+      // A page that is neither at its limit nor its budget must reach the head.
+      const reached = after + events.length;
+      if (!full && reached < head) {
+        throw new EventLogError("corrupt_log", `the log has a gap before sequence ${reached + 1}`);
       }
       return { events, head };
     });
@@ -240,6 +256,7 @@ export class EventLog {
       seq,
       JSON.stringify(event),
     );
+    this.#storage.sql.exec("UPDATE event_head SET seq = ? WHERE id = 1", seq);
     return event;
   }
 }

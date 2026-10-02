@@ -357,6 +357,42 @@ describe("EventLog replay", () => {
     });
   });
 
+  it("refuses to serve a log whose last event is missing", async () => {
+    await withStorage((storage) => {
+      const log = openLog(storage);
+      log.transaction((tx) => [1, 2, 3].map((n) => tx.append(HUMAN, issue(n))));
+      storage.sql.exec("DELETE FROM events WHERE seq = 3");
+
+      expect(log.head()).toBe(3);
+      expect(seqs(log.replay(0, 2))).toEqual([1, 2]);
+      expect(() => log.replay(0, 10)).toThrow(refusal("corrupt_log"));
+      expect(() => log.replay(2, 10)).toThrow(refusal("corrupt_log"));
+    });
+  });
+
+  it("does not serve a stored row past the committed head", async () => {
+    await withStorage((storage) => {
+      const log = openLog(storage);
+      log.transaction((tx) => tx.append(HUMAN, issue(1)));
+      storage.sql.exec("UPDATE event_head SET seq = 0 WHERE id = 1");
+
+      expect(log.replay(0, 10)).toEqual({ events: [], head: 0 });
+    });
+  });
+
+  it("refuses to read a log that has lost its head", async () => {
+    await withStorage((storage) => {
+      const log = openLog(storage);
+      storage.sql.exec("DELETE FROM event_head");
+
+      expect(() => log.head()).toThrow(refusal("corrupt_log"));
+      expect(() => log.transaction((tx) => tx.append(HUMAN, issue(1)))).toThrow(
+        refusal("corrupt_log"),
+      );
+      expect(rowCount(storage, "events")).toBe(0);
+    });
+  });
+
   it("refuses to serve an event with an unsupported schema version", async () => {
     await withStorage((storage) => {
       const log = openLog(storage);
