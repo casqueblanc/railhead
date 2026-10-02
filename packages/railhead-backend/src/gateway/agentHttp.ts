@@ -117,18 +117,15 @@ async function readBody(request: Request, route: AgentRouteName): Promise<BodyRe
   if (declared !== null && Number(declared) > MAX_AGENT_REQUEST_BYTES) {
     return tooLarge();
   }
+  const mediaType = request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase();
+  const json = mediaType === AGENT_REQUEST_CONTENT_TYPE;
+  // A declared non-empty body of another type is refused unread.
+  if (declared !== null && Number(declared) > 0 && !json) return wrongMediaType();
   const bytes = await readBounded(request.body);
   if (bytes === null) return tooLarge();
   // A route without a body (`work`) accepts an empty one.
   if (bytes.length === 0) return { ok: true, value: null };
-  const mediaType = request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase();
-  if (mediaType !== AGENT_REQUEST_CONTENT_TYPE) {
-    return {
-      ok: false,
-      code: "unsupported_media_type",
-      message: `The body must be ${AGENT_REQUEST_CONTENT_TYPE}.`,
-    };
-  }
+  if (!json) return wrongMediaType();
   try {
     const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
     const value: unknown = JSON.parse(text);
@@ -136,6 +133,14 @@ async function readBody(request: Request, route: AgentRouteName): Promise<BodyRe
   } catch {
     return { ok: false, code: "invalid_request", message: "The body is not valid JSON." };
   }
+}
+
+function wrongMediaType(): BodyResult {
+  return {
+    ok: false,
+    code: "unsupported_media_type",
+    message: `The body must be ${AGENT_REQUEST_CONTENT_TYPE}.`,
+  };
 }
 
 function tooLarge(): BodyResult {

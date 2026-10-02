@@ -445,6 +445,15 @@ describe("agent HTTP routes", () => {
         415,
         "unsupported_media_type",
       ],
+      // A streamed body declares no length, so its type is checked once it has been read.
+      [
+        agentRequest(name, "/join", {
+          body: new Blob([VALID_JOIN]).stream(),
+          headers: { "Content-Type": "text/plain" },
+        }),
+        415,
+        "unsupported_media_type",
+      ],
       [agentRequest(name, "/join", { body: "{", headers: JSON_HEADERS }), 400, "invalid_request"],
       [
         agentRequest(name, "/join", {

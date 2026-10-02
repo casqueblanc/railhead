@@ -216,9 +216,16 @@ class SubscriptionImpl extends RpcTarget implements BoardSubscription {
     }
   }
 
-  // Disposing the board's stub ends the subscription: with the listener released, the stream
-  // module's next delivery fails and it stops.
+  // Disposing the board's stub ends the subscription: the Repo side is cancelled now rather than
+  // at its next delivery, and the listener is released.
   [Symbol.dispose](): void {
+    this.#subscription.cancel().catch((error: unknown) => {
+      // Only the error's name: its message may carry data from the Repo.
+      console.error(
+        "stream subscription cancel failed",
+        error instanceof Error ? error.name : "unknown",
+      );
+    });
     this.#bridge.release();
   }
 }
