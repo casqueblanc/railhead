@@ -75,7 +75,7 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
   },
   "claim.refused": {
     actor: SYSTEM,
-    data: { claimId: "clm_42abcd", reason: "after_ready" },
+    data: { claimId: "clm_42abcd", generation: 1, reason: "after_ready" },
   },
   "claim.expired": {
     actor: SYSTEM,
@@ -245,6 +245,22 @@ describe("validateEvent", () => {
     );
   });
 
+  describe("agent self-reference", () => {
+    it("refuses an agent acknowledging another agent's inbox item", () => {
+      const other: Actor = { kind: "agent", id: "agt_ember01" };
+      expect(() => validateEvent(event("inbox.acked", other))).toThrow(/its own inbox items/);
+    });
+
+    it("refuses an agent opening a claim for another agent", () => {
+      const other: Actor = { kind: "agent", id: "agt_ember01" };
+      expect(() => validateEvent(event("claim.opened", other))).toThrow(/only for itself/);
+    });
+
+    it("lets a person open a claim on an agent's behalf", () => {
+      expect(() => validateEvent(event("claim.opened", HUMAN))).not.toThrow();
+    });
+  });
+
   describe("payload invariants", () => {
     it("rejects a commit id that is not 40 lowercase hex characters", () => {
       expect(() =>
@@ -328,6 +344,11 @@ describe("validateEvent", () => {
       expect(() => validateEvent(withData("train.intent", (d) => ({ ...d, claims: [] })))).toThrow(
         /claims/,
       );
+    });
+
+    it("rejects a refusal without a valid generation", () => {
+      const bad = withData("claim.refused", (d) => ({ ...d, generation: 0 }));
+      expect(() => validateEvent(bad)).toThrow(/generation/);
     });
 
     it("rejects a push to something that is not a Git ref", () => {

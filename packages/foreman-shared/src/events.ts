@@ -209,7 +209,10 @@ export type EventPayload =
       type: "claim.ready";
       data: { claimId: ClaimId; generation: number; commit: CommitSha; decisions: DecisionRef[] };
     }
-  | { type: "claim.refused"; data: { claimId: ClaimId; reason: RefusalReason } }
+  | {
+      type: "claim.refused";
+      data: { claimId: ClaimId; generation: number; reason: RefusalReason };
+    }
   | { type: "claim.expired"; data: { claimId: ClaimId; generation: number } }
   | {
       type: "claim.reassigned";
@@ -383,6 +386,21 @@ function validateActor(event: ForemanEvent): void {
   if (SYSTEM_ONLY_EVENTS.includes(type) && actor.kind !== "system") {
     throw new Error(`${type} must be recorded by the system, not by ${actor.kind} ${actor.id}`);
   }
+  requireActorIsSubject(event);
+}
+
+/**
+ * An agent acting for itself must name itself: it can open a claim only for itself, and can
+ * acknowledge only its own inbox items. People and the system may act for an agent.
+ */
+function requireActorIsSubject(event: ForemanEvent): void {
+  if (event.actor.kind !== "agent") return;
+  if (event.type === "claim.opened" && event.data.agentId !== event.actor.id) {
+    throw new Error("an agent can open a claim only for itself");
+  }
+  if (event.type === "inbox.acked" && event.data.agentId !== event.actor.id) {
+    throw new Error("an agent can acknowledge only its own inbox items");
+  }
 }
 
 function validatePayload(event: EventPayload): void {
@@ -430,6 +448,7 @@ function validatePayload(event: EventPayload): void {
       return;
     case "claim.refused":
       requireId("claim", event.data.claimId, "claimId");
+      requirePositiveInteger(event.data.generation, "generation");
       return;
     case "claim.expired":
       requireId("claim", event.data.claimId, "claimId");
