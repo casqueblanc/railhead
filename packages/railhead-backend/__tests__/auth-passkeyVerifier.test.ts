@@ -341,6 +341,18 @@ describe("verifyActionAssertion", () => {
     expect(await verify(verifiedOnly)).toEqual(refused("user-not-present"));
   });
 
+  it("refuses a backed-up credential that is not backup eligible", async () => {
+    const assertion = await assert(auth, party, challenge, { flags: 0x15 });
+    expect(await verify(assertion)).toEqual(refused("backup-state-invalid"));
+  });
+
+  it("accepts every valid backup eligibility and backup state combination", async () => {
+    for (const flags of [0x05, 0x0d, 0x1d]) {
+      const assertion = await assert(auth, party, challenge, { flags });
+      expect(await verify(assertion)).toEqual({ ok: true, signCount: 1 });
+    }
+  });
+
   it("refuses at and after expiry, and accepts one millisecond before", async () => {
     const assertion = await assert(auth, party, challenge);
     expect(await verify(assertion, { now: binding.expiresAt - 1 })).toEqual({
@@ -449,6 +461,7 @@ describe("boardErrorFor", () => {
     expect(boardErrorFor("expired")).toBe("proof_expired");
     expect(boardErrorFor("bad-signature")).toBe("proof_invalid");
     expect(boardErrorFor("origin-mismatch")).toBe("proof_invalid");
+    expect(boardErrorFor("backup-state-invalid")).toBe("proof_invalid");
     expect(boardErrorFor("invalid-binding")).toBe("internal");
   });
 });

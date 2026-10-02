@@ -39,6 +39,8 @@ export const MAX_COSE_KEY_BYTES = 256;
 
 const FLAG_USER_PRESENT = 0x01;
 const FLAG_USER_VERIFIED = 0x04;
+const FLAG_BACKUP_ELIGIBLE = 0x08;
+const FLAG_BACKED_UP = 0x10;
 const AUTH_DATA_MIN = 37;
 const COSE_ALG_ES256 = -7;
 const COSE_KTY_EC2 = 2;
@@ -108,6 +110,8 @@ export type PasskeyFailure =
   | "user-not-present"
   /** The authenticator did not report user verification (biometric or device unlock). */
   | "user-not-verified"
+  /** The authenticator reported a backed-up credential that is not backup eligible. */
+  | "backup-state-invalid"
   /** The user handle differs from the one registered with the credential. */
   | "user-mismatch"
   /** The signature counter did not advance past the stored one: a possible cloned authenticator. */
@@ -151,6 +155,7 @@ export function boardErrorFor(reason: PasskeyFailure): BoardErrorCode {
     case "rp-mismatch":
     case "user-not-present":
     case "user-not-verified":
+    case "backup-state-invalid":
     case "user-mismatch":
     case "counter-regressed":
     case "bad-signature":
@@ -263,6 +268,10 @@ export async function verifyActionAssertion(input: ActionAssertionInput): Promis
   const flags = authData[32] ?? 0;
   if ((flags & FLAG_USER_PRESENT) === 0) return fail("user-not-present");
   if ((flags & FLAG_USER_VERIFIED) === 0) return fail("user-not-verified");
+  // WebAuthn L3 7.2 step 18: backup state without backup eligibility is invalid.
+  if ((flags & FLAG_BACKED_UP) !== 0 && (flags & FLAG_BACKUP_ELIGIBLE) === 0) {
+    return fail("backup-state-invalid");
+  }
 
   if (assertion.userHandle !== null && assertion.userHandle !== credential.userHandle) {
     return fail("user-mismatch");
