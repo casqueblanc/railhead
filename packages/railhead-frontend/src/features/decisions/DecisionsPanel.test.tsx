@@ -109,8 +109,13 @@ describe("DecisionsPanel", () => {
   });
 
   it("sends one request when the form is submitted twice before it re-renders", async () => {
-    let settle: (outcome: RecordDecisionOutcome) => void = () => {};
-    const { requests, actions } = recorder(() => new Promise((resolve) => (settle = resolve)));
+    const settled: { resolve: (outcome: RecordDecisionOutcome) => void } = { resolve: () => {} };
+    const { requests, actions } = recorder(
+      () =>
+        new Promise((resolve) => {
+          settled.resolve = resolve;
+        }),
+    );
     await render(asked(), actions);
     await choose("Reject them");
     const form = container.querySelector("form");
@@ -121,7 +126,7 @@ describe("DecisionsPanel", () => {
     });
     expect(requests).toHaveLength(1);
 
-    await act(async () => settle({ ok: true, version: 1 }));
+    await act(async () => settled.resolve({ ok: true, version: 1 }));
     expect(text()).toContain("Recorded as version 1.");
   });
 
