@@ -312,6 +312,12 @@ export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
   "decision.recorded",
 ];
 
+/**
+ * The event types only the agent named in the event may record. An acknowledgement is what the
+ * `ready` gate relies on, so nobody can acknowledge on an agent's behalf (#17).
+ */
+export const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked"];
+
 /** The event types only the system records: facts no caller can assert about itself. */
 export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "agent.joined",
@@ -386,12 +392,17 @@ function validateActor(event: ForemanEvent): void {
   if (SYSTEM_ONLY_EVENTS.includes(type) && actor.kind !== "system") {
     throw new Error(`${type} must be recorded by the system, not by ${actor.kind} ${actor.id}`);
   }
+  if (AGENT_ONLY_EVENTS.includes(type) && actor.kind !== "agent") {
+    throw new Error(
+      `${type} must be recorded by the agent itself, not by ${actor.kind} ${actor.id}`,
+    );
+  }
   requireActorIsSubject(event);
 }
 
 /**
  * An agent acting for itself must name itself: it can open a claim only for itself, and can
- * acknowledge only its own inbox items. People and the system may act for an agent.
+ * acknowledge only its own inbox items. A person may still open a claim for an agent.
  */
 function requireActorIsSubject(event: ForemanEvent): void {
   if (event.actor.kind !== "agent") return;
