@@ -125,7 +125,8 @@ impl fmt::Display for CommandName {
 }
 
 /// Every way a command fails. No variant carries a token, a key or response text other than the
-/// backend's own error message, which is rendered inert.
+/// backend's own error message: text mode renders it inert, and JSON mode carries it escaped and
+/// whole, bounded by the response limit, for the agent to treat as untrusted.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The context could not be resolved.

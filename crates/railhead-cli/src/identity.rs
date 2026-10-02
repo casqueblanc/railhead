@@ -500,24 +500,49 @@ fn create_private_file(path: &Path) -> Result<File> {
 }
 
 /// Reads a store file, refusing a link, an oversized file and one other users can read.
+///
+/// The path is checked without following a link, then every check is repeated on the opened
+/// handle, so a path swapped for a link between the two is refused rather than followed.
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(path) {
+    let checked = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(io_error("reading", path, source)),
     };
-    if !metadata.is_file() || metadata.len() > MAX_STORED_BYTES {
+    if !checked.is_file() {
+        return Err(Error::Damaged(path.to_owned()));
+    }
+    let file = File::open(path).map_err(|source| io_error("reading", path, source))?;
+    check_opened(path, &checked, &file)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STORED_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("reading", path, source))?;
+    Ok(Some(bytes))
+}
+
+/// Checks the file a handle actually opened: the one checked at `path`, regular, small and private.
+fn check_opened(path: &Path, checked: &fs::Metadata, file: &File) -> Result<()> {
+    let opened = file
+        .metadata()
+        .map_err(|source| io_error("reading", path, source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (opened.dev(), opened.ino()) != (checked.dev(), checked.ino()) {
+            return Err(Error::Damaged(path.to_owned()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = checked;
+    if !opened.is_file() || opened.len() > MAX_STORED_BYTES {
         return Err(Error::Damaged(path.to_owned()));
     }
     #[cfg(unix)]
-    if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+    if std::os::unix::fs::PermissionsExt::mode(&opened.permissions()) & 0o077 != 0 {
         return Err(Error::InsecurePermissions(path.to_owned()));
     }
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_STORED_BYTES).read_to_end(&mut bytes))
-        .map_err(|source| io_error("reading", path, source))?;
-    Ok(Some(bytes))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -691,6 +716,29 @@ mod tests {
         std::os::unix::fs::symlink(home.path().join("agents/atlas/session"), &path)?;
         let error = store.read(&atlas, SecretKind::SigningKey).err();
         assert!(matches!(error, Some(Error::Damaged(_))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_swapped_for_a_link_after_the_check_is_refused() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let key = Secret::new("key".to_owned());
+        store.create(&atlas, SecretKind::SigningKey, &key)?;
+        store.replace(&atlas, SecretKind::SessionToken, &key)?;
+        let path = home.path().join("agents/atlas/key");
+        let checked = fs::symlink_metadata(&path)?;
+        fs::remove_file(&path)?;
+        std::os::unix::fs::symlink(home.path().join("agents/atlas/session"), &path)?;
+        let opened = File::open(&path)?;
+        let error = check_opened(&path, &checked, &opened).err();
+        assert!(matches!(error, Some(Error::Damaged(_))));
+
+        let unchanged = home.path().join("agents/atlas/session");
+        let checked = fs::symlink_metadata(&unchanged)?;
+        check_opened(&unchanged, &checked, &File::open(&unchanged)?)?;
         Ok(())
     }
 
