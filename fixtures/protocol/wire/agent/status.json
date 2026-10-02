@@ -1,0 +1,143 @@
+{
+  "route": "status",
+  "method": "GET",
+  "path": "/agent/v1/casqueblanc/demo/status",
+  "exchanges": [
+    {
+      "name": "shows the agent, its claim and its inbox first",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "working",
+              "readyCommit": null,
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            }
+          },
+          "inbox": {
+            "items": [
+              {
+                "item": 17,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999996000,
+                "entry": {
+                  "kind": "rework",
+                  "decision": {
+                    "decisionId": "dec_upload1",
+                    "version": 2
+                  }
+                },
+                "decision": {
+                  "decisionId": "dec_upload1",
+                  "version": 2,
+                  "supersedes": 1,
+                  "questionId": "qst_upload1",
+                  "question": "Should uploads above 10 MB be rejected or chunked?",
+                  "option": {
+                    "key": "chunk",
+                    "label": "Upload them in chunks"
+                  },
+                  "previous": {
+                    "key": "reject",
+                    "label": "Reject them"
+                  },
+                  "scope": ["src/upload.ts"],
+                  "decidedBy": "usr_lemarier",
+                  "decidedAt": 1789999995000
+                }
+              }
+            ],
+            "pending": 1
+          },
+          "next": "sync"
+        }
+      }
+    },
+    {
+      "name": "an agent without a claim",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": null
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "refuses a revoked agent at its next call",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 403,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "identity_revoked",
+            "message": "This agent was revoked by its owner.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "a body on a route without one",
+      "body": {
+        "agentId": "agt_atlas01"
+      },
+      "stage": "shape"
+    }
+  ]
+}

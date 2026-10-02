@@ -1,0 +1,227 @@
+{
+  "route": "ask",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/claims/clm_42abcd/questions",
+  "exchanges": [
+    {
+      "name": "asks the owner and returns at once",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "requestId": "req_upload0000000001",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "questionId": "qst_upload1",
+            "decisionId": "dec_upload1",
+            "state": "open",
+            "decision": null
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "refuses a reused request id with a different question",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "requestId": "req_upload0000000001",
+          "text": "Another question?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "idempotency_mismatch",
+            "message": "This request id was used for another question.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses a stale generation",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "requestId": "req_upload0000000001",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "stale_generation",
+            "message": "This claim moved to generation 2.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "a single option",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          }
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "duplicate option keys",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "reject",
+            "label": "Reject them"
+          }
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "option key with capitals",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "Reject",
+            "label": "Reject"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "blank text",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "bad request id",
+      "body": {
+        "generation": 1,
+        "requestId": "upload",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "options missing",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?"
+      },
+      "stage": "shape"
+    }
+  ]
+}

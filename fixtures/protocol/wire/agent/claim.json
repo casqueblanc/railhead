@@ -1,0 +1,114 @@
+{
+  "route": "claim",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/claims",
+  "exchanges": [
+    {
+      "name": "claims the named issue",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "issueId": "iss_upload1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "working",
+              "readyCommit": null,
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "resumed": false
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "refuses a second claim while one is active",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "issueId": "iss_other01"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "claim_exists",
+            "message": "This agent already holds claim clm_42abcd.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses an issue that is claimed or closed",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "issueId": "iss_other01"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "issue_unavailable",
+            "message": "This issue is not open for a claim.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "work"
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "claim id as issue id",
+      "body": {
+        "issueId": "clm_42abcd"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "issue id missing",
+      "body": {},
+      "stage": "shape"
+    }
+  ]
+}

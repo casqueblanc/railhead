@@ -1,0 +1,71 @@
+{
+  "route": "challenge",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/session/challenge",
+  "exchanges": [
+    {
+      "name": "issues a single-use challenge and the exact message to sign",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "query": {},
+        "body": {
+          "agentId": "agt_atlas01"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "challengeId": "chl_3q27HkVb0nZ8pXa1",
+            "expiresAt": 1790000060000,
+            "message": "railhead-login-v1\norigin=https://railhead.dev\nrepo=casqueblanc/demo\nagent=agt_atlas01\nchallenge=chl_3q27HkVb0nZ8pXa1\nexpires=1790000060000\n"
+          },
+          "inbox": null,
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "limits the rate of challenges",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "query": {},
+        "body": {
+          "agentId": "agt_atlas01"
+        }
+      },
+      "response": {
+        "status": 429,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "rate_limited",
+            "message": "Too many login attempts. Wait and try again.",
+            "retryable": true,
+            "retryAfterMs": 10000,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "person id as agent id",
+      "body": {
+        "agentId": "usr_lemarier"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "agent id missing",
+      "body": {},
+      "stage": "shape"
+    }
+  ]
+}
