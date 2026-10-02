@@ -38,7 +38,7 @@ const refused = async (): Promise<RecordDecisionOutcome> => ({
 
 const broken = (): Promise<RecordDecisionOutcome> => Promise.reject(new Error("socket closed"));
 
-/** Records every request and answers each with the next queued outcome. */
+/** Records every request and answers each one by calling `outcome`. */
 const recorder = (outcome: () => Promise<RecordDecisionOutcome>) => {
   const requests: RecordDecisionRequest[] = [];
   const actions: DecisionActions = {
