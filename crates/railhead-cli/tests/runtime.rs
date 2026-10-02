@@ -19,7 +19,7 @@ const KEY: &str =
 /// Every command that acts as an agent, with arguments Git or a person would pass.
 const AGENT_COMMANDS: [&[&str]; 8] = [
     &["work"],
-    &["claim"],
+    &["claim", "iss_upload1"],
     &["ready"],
     &["status"],
     &["sync"],
