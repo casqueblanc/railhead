@@ -340,12 +340,14 @@ describe("agent dispatch", () => {
   };
 
   it("runs the command for an agent of this repository and piggybacks its inbox", async () => {
+    // The port's URLs are replaced by ones on the origin the agent called.
+    const foreign = { ...claim.claim, originUrl: "https://evil.invalid/x.git", upstreamUrl: "" };
     await withFakePorts(
-      { work: ok(claim), digest: ok({ items: [], pending: 3 }) },
+      { work: ok({ ...claim, claim: foreign }), digest: ok({ items: [], pending: 3 }) },
       async (ports, calls) => {
         const reply = await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: work, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: work, token: TOKEN, origin: ORIGIN },
         );
 
         expect(reply).toEqual({
@@ -362,8 +364,8 @@ describe("agent dispatch", () => {
   it("refuses a session bound to another repository before running anything", async () => {
     await withFakePorts({ work: ok(claim) }, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: "rep_mine0001", ports },
-        { command: work, token: TOKEN },
+        { repoId: "rep_mine0001", org: "acme", name: "widgets", ports },
+        { command: work, token: TOKEN, origin: ORIGIN },
       );
 
       expect(reply).toMatchObject({ ok: false, error: { code: "unauthenticated" } });
@@ -374,8 +376,8 @@ describe("agent dispatch", () => {
   it("refuses a missing token without authenticating", async () => {
     await withFakePorts({}, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: AGENT.repoId, ports },
-        { command: work, token: null },
+        { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+        { command: work, token: null, origin: ORIGIN },
       );
 
       expect(reply).toMatchObject({
@@ -389,8 +391,8 @@ describe("agent dispatch", () => {
   it("answers status with the identity's view and the active claim", async () => {
     await withFakePorts({ activeClaim: ok(claim.claim) }, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: AGENT.repoId, ports },
-        { command: { route: "status" }, token: TOKEN },
+        { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+        { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
       );
 
       expect(reply).toEqual({
@@ -428,7 +430,10 @@ describe("agent dispatch", () => {
       { work: ok(claim), digest: fail("unavailable", "Inbox is down.") },
       async (ports) => {
         expect(
-          await dispatchAgent({ repoId: AGENT.repoId, ports }, { command: work, token: TOKEN }),
+          await dispatchAgent(
+            { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+            { command: work, token: TOKEN, origin: ORIGIN },
+          ),
         ).toMatchObject({ ok: false, error: { code: "unavailable" } });
       },
     );
@@ -437,7 +442,10 @@ describe("agent dispatch", () => {
   it("reports a code outside the agent wire as internal, without its message", async () => {
     await withFakePorts({ work: fail("check_mismatch", "Internal detail.") }, async (ports) => {
       expect(
-        await dispatchAgent({ repoId: AGENT.repoId, ports }, { command: work, token: TOKEN }),
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: work, token: TOKEN, origin: ORIGIN },
+        ),
       ).toEqual({
         ok: false,
         error: {
