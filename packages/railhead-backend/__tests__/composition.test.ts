@@ -1,6 +1,6 @@
 import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { newWebSocketRpcSession, RpcTarget } from "capnweb";
+import { newWebSocketRpcSession, type RpcTarget } from "capnweb";
 import { describe, expect, it } from "vitest";
 import {
   MAX_AGENT_REQUEST_BYTES,
@@ -9,7 +9,7 @@ import {
   type InboxDigest,
 } from "@railhead/shared/agent-api";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
-import type { BoardListener, BoardResult } from "@railhead/shared/board-api";
+import type { BoardResult } from "@railhead/shared/board-api";
 import type { Actor, EventPayload, RailheadEvent } from "@railhead/shared/events";
 import type { AgentPrincipal } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
@@ -236,7 +236,6 @@ describe("unavailable modules", () => {
           signature: "a",
           userHandle: null,
         }),
-        ports.stream.subscribe(0, { events: async () => {}, ended: async () => {} }),
       ]);
     });
 
@@ -603,14 +602,6 @@ describe("board RPC lifecycle", () => {
     using api = newWebSocketRpcSession<RailheadApi>(await openSession());
     using board = value(await api.openBoard("acme", name));
 
-    class Listener extends RpcTarget implements BoardListener {
-      async events(): Promise<void> {}
-      async ended(): Promise<void> {}
-    }
-    expect(await board.subscribe(0, new Listener())).toMatchObject({
-      ok: false,
-      code: "unavailable",
-    });
     expect(await board.pendingJoins()).toMatchObject({ ok: false, code: "unavailable" });
     using owner = await board.owner();
     expect(await owner.prepare({ kind: "agent.revoke", agentId: "agt_atlas01" })).toMatchObject({

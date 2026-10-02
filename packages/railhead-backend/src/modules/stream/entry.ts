@@ -1,12 +1,26 @@
 // Stream: live delivery of a repository's events to board subscribers. A subscription is a
 // convenience over the durable log, never delivery the board relies on: the board's persisted
-// cursor and `readEvents` are what survive a restart or hibernation. Until its task installs the
-// module, every subscription is refused with `unavailable` and the board reads by paging.
+// cursor and `readEvents` are what survive a restart or hibernation.
+//
+// A subscription holds only its cursor and its listener; it buffers no events. Each delivery reads
+// the next page after the cursor from storage, so an event appended while a page is in flight, or
+// before the subscription caught up, is read on the next pass rather than lost, and the memory a
+// subscriber costs does not grow with how far behind it is. The event log's commit observer is the
+// only wake-up; nothing polls, so an idle repository with subscribers stays idle.
+//
+// Nothing here survives the Repo being evicted: subscriptions live in memory, and a board that
+// loses one pages from its own cursor and subscribes again.
 
-import type { SubscriptionEnd } from "@railhead/shared/board-api";
+import { RpcTarget } from "cloudflare:workers";
+import {
+  MAX_PUSH_BATCH,
+  MAX_UNACKNOWLEDGED_EVENTS,
+  type SubscriptionEnd,
+} from "@railhead/shared/board-api";
 import type { RailheadEvent } from "@railhead/shared/events";
-import { fail, type PortResult } from "../../contracts/result";
+import { fail, ok, type PortResult } from "../../contracts/result";
 import type { ModuleFactory } from "../../repo/composeRepo";
+import type { EventLog } from "../../repo/eventLog";
 
 /** The subscriber's side, as the Repo receives it across the Worker's RPC boundary. */
 export interface StreamListener {
@@ -28,7 +42,213 @@ export interface StreamPort {
   subscribe(cursor: number, listener: StreamListener): Promise<PortResult<StreamSubscription>>;
 }
 
+/** Most live subscriptions one repository holds; past it `subscribe` fails with `quota_exceeded`. */
+export const MAX_SUBSCRIPTIONS = 256;
+
+/**
+ * How long a listener may take to settle one delivery, in milliseconds, before the subscription
+ * ends with `slow`.
+ */
+export const DELIVERY_TIMEOUT_MS = 30_000;
+
+/** Tuning a test may shorten. Production uses the defaults. */
+export interface StreamOptions {
+  /** See `DELIVERY_TIMEOUT_MS`. */
+  deliveryTimeoutMs?: number;
+}
+
 /** Builds the stream module of one repository. */
-export const stream: ModuleFactory<StreamPort> = () => ({
-  subscribe: async () => fail("unavailable", "The stream module is not available."),
-});
+export const stream: ModuleFactory<StreamPort> = (context) => streamPort(context.log);
+
+/** The stream port over `log`. */
+export function streamPort(log: EventLog, options: StreamOptions = {}): StreamPort {
+  const hub = new Hub(log, options.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS);
+  return { subscribe: async (cursor, listener) => hub.subscribe(cursor, listener) };
+}
+
+class Hub {
+  readonly #log: EventLog;
+  readonly #timeoutMs: number;
+  readonly #live = new Set<Subscription>();
+  #stopObserving: (() => void) | null = null;
+
+  constructor(log: EventLog, timeoutMs: number) {
+    this.#log = log;
+    this.#timeoutMs = timeoutMs;
+  }
+
+  subscribe(cursor: number, listener: StreamListener): PortResult<StreamSubscription> {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      return fail("invalid_request", "The cursor must be a whole number from 0.");
+    }
+    if (cursor > this.#log.head()) {
+      return fail("cursor_ahead", "The cursor is ahead of this repository's log.");
+    }
+    if (this.#live.size >= MAX_SUBSCRIPTIONS) {
+      return fail("quota_exceeded", "This repository has too many live subscriptions.");
+    }
+    // A stub received as an argument is released when the call returns, so the subscription keeps
+    // its own duplicate and releases it when it ends.
+    const held = retain(listener);
+    const subscription = new Subscription(this.#log, cursor, held, this.#timeoutMs, () =>
+      this.#remove(subscription),
+    );
+    this.#live.add(subscription);
+    // Observe only while someone listens, so an unwatched repository does no work on commit.
+    this.#stopObserving ??= this.#log.observe((head) => {
+      for (const live of this.#live) live.wake(head);
+    });
+    subscription.wake(this.#log.head());
+    return ok(new SubscriptionHandle(subscription));
+  }
+
+  #remove(subscription: Subscription): void {
+    this.#live.delete(subscription);
+    if (this.#live.size === 0 && this.#stopObserving !== null) {
+      this.#stopObserving();
+      this.#stopObserving = null;
+    }
+  }
+}
+
+/** One subscriber's cursor and delivery loop. */
+class Subscription {
+  readonly #log: EventLog;
+  readonly #listener: StreamListener;
+  readonly #timeoutMs: number;
+  readonly #onEnd: () => void;
+  // The `seq` of the last event the listener acknowledged.
+  #cursor: number;
+  #head: number;
+  #sending = false;
+  // The head when the delivery in flight was sent.
+  #sentAtHead = 0;
+  #ended = false;
+
+  constructor(
+    log: EventLog,
+    cursor: number,
+    listener: StreamListener,
+    timeoutMs: number,
+    onEnd: () => void,
+  ) {
+    this.#log = log;
+    this.#cursor = cursor;
+    this.#head = cursor;
+    this.#listener = listener;
+    this.#timeoutMs = timeoutMs;
+    this.#onEnd = onEnd;
+  }
+
+  /** Learns that the log reached `head`, and delivers if the listener is behind. */
+  wake(head: number): void {
+    if (this.#ended) return;
+    this.#head = Math.max(this.#head, head);
+    // Catching up from an old cursor is not slow; falling further behind while a delivery stays
+    // unsettled is.
+    if (this.#sending && this.#head - this.#sentAtHead > MAX_UNACKNOWLEDGED_EVENTS) {
+      this.end("slow");
+      return;
+    }
+    if (!this.#sending && this.#cursor < this.#head) void this.#pump();
+  }
+
+  /** Ends the subscription; `reason` is sent to the listener, `null` sends nothing. */
+  end(reason: SubscriptionEnd | null): void {
+    if (this.#ended) return;
+    this.#ended = true;
+    this.#onEnd();
+    if (reason === null) {
+      this.#release();
+      return;
+    }
+    void withTimeout(this.#listener.ended(reason), this.#timeoutMs)
+      .then((outcome) => {
+        if (outcome === "timeout") reportFailure("stream listener ended timed out", null);
+      })
+      .catch((error: unknown) => reportFailure("stream listener ended failed", error))
+      .finally(() => this.#release());
+  }
+
+  async #pump(): Promise<void> {
+    this.#sending = true;
+    try {
+      while (!this.#ended && this.#cursor < this.#head) {
+        const page = this.#log.replay(this.#cursor, MAX_PUSH_BATCH);
+        this.#head = Math.max(this.#head, page.head);
+        const last = page.events.at(-1);
+        if (last === undefined) return;
+        this.#sentAtHead = this.#head;
+        const delivered = await this.#deliver(page.events);
+        if (!delivered || this.#ended) return;
+        this.#cursor = last.seq;
+      }
+    } catch (error) {
+      // The log could not be read. The board pages from its cursor and meets the same fault there.
+      reportFailure("stream delivery failed", error);
+      this.end("restart");
+    } finally {
+      this.#sending = false;
+    }
+  }
+
+  // Resolves `true` once the listener settles the batch, `false` if the subscription ended first.
+  async #deliver(events: RailheadEvent[]): Promise<boolean> {
+    try {
+      const outcome = await withTimeout(this.#listener.events(events), this.#timeoutMs);
+      if (outcome === "timeout") {
+        this.end("slow");
+        return false;
+      }
+      return true;
+    } catch (error) {
+      // The listener is gone, most often because its socket closed: nobody is left to tell.
+      reportFailure("stream listener failed", error);
+      this.end(null);
+      return false;
+    }
+  }
+
+  // Releases the listener's duplicate, when the transport gave a stub.
+  #release(): void {
+    const dispose: unknown = Reflect.get(this.#listener, Symbol.dispose);
+    if (typeof dispose === "function") dispose.call(this.#listener);
+  }
+}
+
+/** The subscription as the Worker holds it, across the Repo's RPC boundary. */
+class SubscriptionHandle extends RpcTarget implements StreamSubscription {
+  readonly #subscription: Subscription;
+
+  constructor(subscription: Subscription) {
+    super();
+    this.#subscription = subscription;
+  }
+
+  async cancel(): Promise<void> {
+    this.#subscription.end(null);
+  }
+}
+
+// A duplicate of `listener` when it is an RPC stub, or `listener` itself.
+function retain(listener: StreamListener & { dup?: () => StreamListener }): StreamListener {
+  return listener.dup?.() ?? listener;
+}
+
+// Settles with `promise`'s outcome, or with "timeout" after `ms`.
+async function withTimeout(promise: Promise<void>, ms: number): Promise<"done" | "timeout"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), ms);
+  });
+  try {
+    return await Promise.race([promise.then((): "done" => "done"), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Only the error's name: a message may carry data from the listener's side.
+function reportFailure(what: string, error: unknown): void {
+  console.error(what, error instanceof Error ? error.name : "unknown");
+}
