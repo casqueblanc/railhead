@@ -1,8 +1,8 @@
 // The repository event log: the wire types of every fact Foreman records about one repository.
 //
 // Each repository has one append-only log, written only by its `Repo` Durable Object. The board,
-// the agents' inboxes and the demo replay all read this one log, and every view the board shows is
-// a fold over it: lane state, the decision ripple and the "adapted" state are derived from events,
+// the agents' inboxes and the demo replay all read this one log. Every view on the board must be a
+// fold over it: lane state, the decision ripple and the "adapted" state are derived from events,
 // never stored beside them, so a replay renders exactly what was shown live. Events record facts
 // that happened, never requests: a refused push is an event, an attempted push is not.
 //
@@ -10,21 +10,21 @@
 // validation all live here. The types are plain JSON so the same log travels over Cap'n Web to the
 // board, over HTTP to the Rust CLI, and into a captured replay file.
 //
-// Trust boundary: the shape of an event is established before `validateEvent` runs -- by the
-// compiler for the backend, which is the only producer, and by capnweb-validate's generated
-// validator at the RPC edge for anything received. So `validateEvent` does not re-check that a
-// value is an object or a string; it checks what a TypeScript type cannot state: identifier and
-// commit formats, size caps, integer and range rules, and which kind of actor may record which
-// fact. The backend validates every event before appending it, so the log holds no event that
-// fails here.
+// Trust boundary: the shape of an event is established before `validateEvent` runs, by the
+// compiler for the backend (the only producer) and by capnweb-validate's generated validator at
+// the RPC edge for anything received. So `validateEvent` does not re-check that a value is an
+// object or a string. It checks what a TypeScript type cannot state: identifier and commit
+// formats, size caps, integer and range rules, and which kind of actor may record which fact. The
+// backend must validate every event before appending it, so the log never holds one that fails
+// here.
 //
 // Identifiers are plain strings with a per-kind prefix (`clm_` for a claim, `dec_` for a decision,
 // and so on) rather than branded types, because capnweb-validate validates only plain wire types.
-// The prefix check in `validateEvent` is what stops one kind of identifier standing in for another.
+// The prefix check in `validateEvent` stops one kind of identifier standing in for another.
 //
-// Text that came from an agent or a person -- issue titles, questions, option labels,
-// acknowledgement plans -- is untrusted. It is carried as data, bounded in length, and must be
-// rendered as inert text. No event ever carries a token, key or other secret.
+// Text from an agent or a person, such as issue titles, questions, option labels and
+// acknowledgement plans, is untrusted. Events carry it as bounded data, and every reader must
+// render it as inert text. No event ever carries a token, key or other secret.
 //
 // Evolution: capnweb-validate refuses a union member it does not know, so adding an event type is
 // a breaking change for older readers. `v` names the schema version; a reader that meets a newer
@@ -151,7 +151,7 @@ export type InboxEntry =
 /** The outcome of one check run. `error` means the check could not run, not that the change failed. */
 export type CheckResult = "pass" | "fail" | "error";
 
-/** Clef's classification of a conflict, and what the train did with it. */
+/** Clef's classification of a conflict. */
 export type ConflictClass = "compatible" | "contradictory";
 
 /** Where the train sent a conflict. */
