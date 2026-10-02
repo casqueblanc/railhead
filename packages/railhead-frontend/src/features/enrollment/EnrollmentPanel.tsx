@@ -1,0 +1,174 @@
+import { Badge, Empty, LayerCard, SkeletonLine, Text } from "@cloudflare/kumo";
+import { RobotIcon, WarningCircleIcon } from "@phosphor-icons/react";
+import { useId, type ReactNode } from "react";
+import type { OwnerPort } from "../board/boardPorts";
+import type { BoardState, StreamStatus } from "../board/boardState";
+import { feedView, type BoardFeed } from "../claims/boardFeed";
+import { AwaitingAgent } from "./AwaitingAgent";
+import { BlockedNote } from "./BlockedNote";
+import { ConfirmedAgent } from "./ConfirmedAgent";
+import { InviteForm } from "./InviteForm";
+import { unreachable } from "./ownerActions";
+import { roster } from "./roster";
+import type { ActionAccess } from "./useOwnerAction";
+import type { Authenticator } from "./webauthn";
+
+interface EnrollmentPanelProps {
+  feed: BoardFeed;
+  owner: OwnerPort;
+  /** The browser's authenticator, or `null` when this page cannot use passkeys. */
+  authenticator: Authenticator | null;
+}
+
+/**
+ * Resolves whether owner actions can be asked for. A board that is behind or halted may not show
+ * who is enrolled, so it blocks them even when the port is available.
+ */
+export const actionAccess = (
+  owner: OwnerPort,
+  authenticator: Authenticator | null,
+  stream: StreamStatus,
+): ActionAccess => {
+  switch (stream.kind) {
+    case "halted":
+      return { kind: "blocked", block: { kind: "halted" } };
+    case "gap":
+      return { kind: "blocked", block: { kind: "behind" } };
+    case "consistent":
+      break;
+    default:
+      return unreachable(stream);
+  }
+  if (owner.kind === "unavailable") {
+    return { kind: "blocked", block: { kind: "unavailable", reason: owner.reason } };
+  }
+  if (authenticator === null) return { kind: "blocked", block: { kind: "no_authenticator" } };
+  return { kind: "ready", owner, authenticator };
+};
+
+/** Invites agents, confirms each one against the code its terminal shows, and revokes them. */
+export const EnrollmentPanel = ({ feed, owner, authenticator }: EnrollmentPanelProps) => {
+  const headingId = useId();
+  const view = feedView(feed);
+
+  return (
+    <section aria-labelledby={headingId} aria-busy={view.kind === "loading"}>
+      <LayerCard>
+        <LayerCard.Secondary>
+          <Text as="h2" variant="heading" DANGEROUS_className="text-balance">
+            <span id={headingId}>Agents</span>
+          </Text>
+        </LayerCard.Secondary>
+        <LayerCard.Primary className="grid gap-0 p-0">
+          {view.kind === "loading" && (
+            <div className="grid gap-2 px-4 py-3">
+              <span className="sr-only">Loading agents…</span>
+              <SkeletonLine />
+              <SkeletonLine />
+            </div>
+          )}
+          {view.kind === "failed" && (
+            <Empty
+              size="sm"
+              icon={<WarningCircleIcon size={32} aria-hidden="true" />}
+              title="Agents did not load"
+              description="The board could not be read from the backend, so no agent can be invited or confirmed."
+            />
+          )}
+          {"board" in view && (
+            <Roster
+              board={view.board}
+              access={actionAccess(owner, authenticator, view.board.stream)}
+            />
+          )}
+        </LayerCard.Primary>
+      </LayerCard>
+    </section>
+  );
+};
+
+const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) => {
+  const rows = roster(board);
+  const empty =
+    rows.invites.length + rows.awaiting.length + rows.confirmed.length + rows.revoked.length === 0;
+  return (
+    <>
+      <div className="grid gap-3 border-b border-kumo-line px-4 py-3">
+        {access.kind === "blocked" && (
+          <div aria-live="polite">
+            <BlockedNote block={access.block} />
+          </div>
+        )}
+        <InviteForm access={access} />
+      </div>
+      {empty && (
+        <Empty
+          size="sm"
+          icon={<RobotIcon size={32} aria-hidden="true" />}
+          title="No agents yet"
+          description="An agent appears here when it joins with an invite. Confirm it once its code matches."
+        />
+      )}
+      {rows.invites.length > 0 && (
+        <Group title="Invited">
+          {rows.invites.map((invite) => (
+            <li
+              key={invite.inviteId}
+              className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 py-3"
+            >
+              <Text bold DANGEROUS_className="min-w-0 break-words">
+                {invite.name}
+              </Text>
+              <Text as="span" variant="secondary">
+                Waiting for the agent to join.
+              </Text>
+            </li>
+          ))}
+        </Group>
+      )}
+      {rows.awaiting.length > 0 && (
+        <Group title="Waiting for you">
+          {rows.awaiting.map((agent) => (
+            <AwaitingAgent key={agent.agentId} agent={agent} access={access} />
+          ))}
+        </Group>
+      )}
+      {rows.confirmed.length > 0 && (
+        <Group title="Confirmed">
+          {rows.confirmed.map((agent) => (
+            <ConfirmedAgent key={agent.agentId} agent={agent} access={access} />
+          ))}
+        </Group>
+      )}
+      {rows.revoked.length > 0 && (
+        <Group title="Revoked">
+          {rows.revoked.map((agent) => (
+            <li
+              key={agent.agentId}
+              className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 py-3"
+            >
+              <Text variant="secondary" DANGEROUS_className="min-w-0 break-words">
+                {agent.name}
+              </Text>
+              <Badge variant="neutral">Revoked</Badge>
+            </li>
+          ))}
+        </Group>
+      )}
+    </>
+  );
+};
+
+const Group = ({ title, children }: { title: string; children: ReactNode }) => {
+  const id = useId();
+  return (
+    <div className="border-b border-kumo-line last:border-b-0">
+      <Text as="h3" variant="secondary" DANGEROUS_className="px-4 pt-3">
+        <span id={id}>{title}</span>
+      </Text>
+      <ul aria-labelledby={id} className="grid divide-y divide-kumo-line">
+        {children}
+      </ul>
+    </div>
+  );
+};

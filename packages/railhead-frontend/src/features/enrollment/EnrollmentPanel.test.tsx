@@ -1,0 +1,324 @@
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type {
+  ActionChallenge,
+  BoardResult,
+  OwnerAction,
+  OwnerActionResult,
+} from "@railhead/shared/board-api";
+import type { RailheadEvent } from "@railhead/shared/events";
+import {
+  SYNTH_GATEWAY,
+  SYNTH_OWNER,
+  SYNTH_REPO,
+  syntheticLog,
+  withLostEvents,
+} from "../../../../../fixtures/board/syntheticLog";
+import { enrol } from "../../../../../fixtures/board/uploadSteps";
+import type { OwnerPort } from "../board/boardPorts";
+import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
+import type { BoardFeed } from "../claims/boardFeed";
+import { EnrollmentPanel } from "./EnrollmentPanel";
+import { fakeAuthenticator } from "./fakeAuthenticator";
+import type { Authenticator } from "./webauthn";
+
+// React flushes effects and state updates inside act() only when the environment opts in.
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const fold = (events: readonly RailheadEvent[]): BoardState =>
+  foldEvents(emptyBoardState(SYNTH_REPO), events);
+
+/** Atlas confirmed; dune joined and waits for the owner. */
+const joinedSteps = () => [
+  ...enrol("agt_synthatlas", "atlas", "inv_synthatlas"),
+  {
+    type: "agent.invited",
+    actor: SYNTH_OWNER,
+    data: { inviteId: "inv_synthdune", name: "dune" },
+  } as const,
+  {
+    type: "agent.joined",
+    actor: SYNTH_GATEWAY,
+    data: {
+      agentId: "agt_synthdune",
+      inviteId: "inv_synthdune",
+      name: "dune",
+      keyFingerprint: `SHA256:${"D".repeat(43)}`,
+    },
+  } as const,
+];
+
+const joined = () => fold(syntheticLog("Synthetic join", joinedSteps()).events);
+
+const live = (board: BoardState): BoardFeed => ({
+  kind: "board",
+  board,
+  connection: "live",
+  recovered: false,
+});
+
+const challenge = (): ActionChallenge => ({
+  challengeId: "chl_1",
+  challenge: "AAECAw",
+  rpId: "railhead.dev",
+  allowCredentials: ["AQID"],
+  expiresAt: Date.now() + 60_000,
+});
+
+/** An owner port that records each prepared action and performed challenge. */
+const recordingOwner = (performed: (action: OwnerAction) => BoardResult<OwnerActionResult>) => {
+  const prepares: OwnerAction[] = [];
+  const performs: string[] = [];
+  const owner: OwnerPort = {
+    kind: "available",
+    onPrepareAction: async (action) => {
+      prepares.push(action);
+      return { ok: true, value: challenge() };
+    },
+    onPerformAction: async (challengeId) => {
+      performs.push(challengeId);
+      const action = prepares.at(-1);
+      if (action === undefined) throw new Error("perform before prepare");
+      return performed(action);
+    },
+  };
+  return { owner, prepares, performs };
+};
+
+/** Answers every action with its own result. */
+const echo = (action: OwnerAction): BoardResult<OwnerActionResult> => {
+  switch (action.kind) {
+    case "invite.create":
+      return {
+        ok: true,
+        value: {
+          kind: "invite.create",
+          inviteId: "inv_synthnew",
+          inviteUrl: "https://railhead.dev/join/synth-secret",
+          expiresAt: Date.UTC(2026, 9, 2, 12, 15),
+        },
+      };
+    case "agent.confirm":
+    case "agent.revoke":
+      return { ok: true, value: { kind: action.kind, agentId: action.agentId } };
+    case "issue.file":
+    case "decision.record":
+      throw new Error(`unexpected ${action.kind}`);
+  }
+};
+
+const type = async (field: HTMLInputElement, value: string) => {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(field, value);
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+};
+
+const click = async (target: HTMLButtonElement) => {
+  await act(async () => target.click());
+};
+
+describe("EnrollmentPanel", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  const render = async (feed: BoardFeed, owner: OwnerPort, authenticator: Authenticator | null) => {
+    await act(async () =>
+      root.render(<EnrollmentPanel feed={feed} owner={owner} authenticator={authenticator} />),
+    );
+  };
+
+  const button = (name: string): HTMLButtonElement => {
+    const found = [...container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent?.trim() === name,
+    );
+    if (found === undefined) throw new Error(`no button named ${name}`);
+    return found;
+  };
+
+  const input = (label: string): HTMLInputElement => {
+    const found = [...container.querySelectorAll("label")].find(
+      (candidate) => candidate.textContent?.trim() === label,
+    );
+    const control = found?.htmlFor ? document.getElementById(found.htmlFor) : null;
+    if (!(control instanceof HTMLInputElement)) throw new Error(`no input labelled ${label}`);
+    return control;
+  };
+
+  const confirmDune = async (code: string) => {
+    await type(input("Code shown by dune"), code);
+    await click(button("Confirm agent"));
+  };
+
+  const text = () => container.textContent ?? "";
+
+  it("confirms a joined agent with the code its terminal shows and one passkey assertion", async () => {
+    const { owner, prepares, performs } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await confirmDune("482913");
+
+    expect(prepares).toEqual([{ kind: "agent.confirm", agentId: "agt_synthdune", code: "482913" }]);
+    expect(performs).toEqual(["chl_1"]);
+    expect(text()).toContain("Confirmed. dune shows as confirmed once the log records it.");
+    // The log has not recorded the confirmation, so dune still waits.
+    expect(text()).toContain("Awaiting confirmation");
+  });
+
+  it("leaves the agent unconfirmed when the owner cancels the passkey prompt", async () => {
+    const { owner, performs } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator(() => "dismiss").authenticator);
+
+    await confirmDune("482913");
+
+    expect(performs).toEqual([]);
+    expect(text()).toContain("Cancelled. dune stays unconfirmed and cannot work.");
+    expect(text()).toContain("Awaiting confirmation");
+  });
+
+  it("refuses a malformed code before asking for a challenge", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await confirmDune("48291");
+
+    expect(prepares).toEqual([]);
+    expect(text()).toContain("Enter the six digits the agent's terminal shows.");
+  });
+
+  it("shows the backend's refusal of a wrong-action assertion and keeps the agent waiting", async () => {
+    const { owner } = recordingOwner(() => ({
+      ok: false,
+      code: "proof_invalid",
+      message: "assertion bound to another action",
+    }));
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await confirmDune("482913");
+
+    expect(text()).toContain("The passkey did not verify for this action. Nothing changed.");
+    expect(text()).toContain("Awaiting confirmation");
+  });
+
+  it("offers no way to confirm without a passkey on this page", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, null);
+
+    expect(button("Confirm agent").disabled).toBe(true);
+    expect(button("Create invite").disabled).toBe(true);
+    expect(text()).toContain("Blocked: this browser cannot use a passkey on this page.");
+    await act(async () => {
+      container
+        .querySelector("form:has(input[name=confirmation-code])")
+        ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(prepares).toEqual([]);
+  });
+
+  it.each([
+    [{ kind: "unavailable", reason: "offline" } as const, "Blocked while the board is offline."],
+    [
+      { kind: "unavailable", reason: "module_unavailable" } as const,
+      "Unavailable: this Railhead has no owner actions installed.",
+    ],
+  ])("blocks every action while the owner port is %o", async (owner, message) => {
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    expect(text()).toContain(message);
+    expect(button("Confirm agent").disabled).toBe(true);
+    expect(button("Create invite").disabled).toBe(true);
+    expect(container.textContent).not.toContain("Revoke…");
+  });
+
+  it("blocks actions while the board is missing events", async () => {
+    const log = syntheticLog("Synthetic gap", [
+      ...joinedSteps(),
+      { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthatlas" } },
+      { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthdune" } },
+    ]);
+    const board = fold(withLostEvents(log, [log.events.length - 1]));
+    expect(board.stream.kind).toBe("gap");
+    const { owner } = recordingOwner(echo);
+    await render(live(board), owner, fakeAuthenticator().authenticator);
+
+    expect(text()).toContain("Blocked while the board catches up with missing events.");
+    expect(button("Create invite").disabled).toBe(true);
+  });
+
+  it("creates an invite and shows its URL until hidden", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await type(input("Agent name"), "cedar");
+    await click(button("Create invite"));
+
+    expect(prepares).toEqual([{ kind: "invite.create", name: "cedar" }]);
+    expect(text()).toContain("https://railhead.dev/join/synth-secret");
+    expect(input("Agent name").value).toBe("");
+
+    await click(button("Hide invite"));
+    expect(text()).not.toContain("synth-secret");
+  });
+
+  it("refuses an invalid agent name before asking for a challenge", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await type(input("Agent name"), "Cedar");
+    await click(button("Create invite"));
+
+    expect(prepares).toEqual([]);
+    expect(text()).toContain("Start with a lowercase letter");
+  });
+
+  it("revokes a confirmed agent only after a second step", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await click(button("Revoke…"));
+    expect(prepares).toEqual([]);
+    await click(button("Revoke atlas"));
+
+    expect(prepares).toEqual([{ kind: "agent.revoke", agentId: "agt_synthatlas" }]);
+    expect(text()).toContain("Revoked. atlas shows as revoked once the log records it.");
+  });
+
+  it("keeps the agent when the owner backs out of revoking", async () => {
+    const { owner, prepares } = recordingOwner(echo);
+    await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+    await click(button("Revoke…"));
+    await click(button("Keep"));
+
+    expect(prepares).toEqual([]);
+    expect(button("Revoke…")).toBeDefined();
+  });
+
+  it("says when the board is loading or failed to load", async () => {
+    const { owner } = recordingOwner(echo);
+    await render({ kind: "loading" }, owner, null);
+    expect(text()).toContain("Loading agents…");
+
+    await render({ kind: "failed" }, owner, null);
+    expect(text()).toContain("Agents did not load");
+  });
+
+  it("explains an empty roster", async () => {
+    const { owner } = recordingOwner(echo);
+    await render(live(fold([])), owner, fakeAuthenticator().authenticator);
+    expect(text()).toContain("No agents yet");
+  });
+});
