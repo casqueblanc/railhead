@@ -1,0 +1,17 @@
+// The demo app's own Worker config. It is deployed from the app's Artifacts repository, not from
+// Railhead, so it is written by hand rather than generated from a cloudflare.config.ts.
+{
+  "name": "railhead-demo-upload",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-30",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "invocation_logs": false },
+    "traces": { "enabled": true }
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "UPLOADS", "class_name": "UploadStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UploadStore"] }]
+}

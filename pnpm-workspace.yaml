@@ -1,5 +1,7 @@
 packages:
   - packages/*
+  # Demo apps Railhead's agents work on. Each is seeded into its own Artifacts repository.
+  - demo/*
   # The shared build tooling as `@railhead/scripts`, so packages reach it by name rather than by a
   # relative path.
   - scripts
