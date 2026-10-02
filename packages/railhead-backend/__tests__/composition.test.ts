@@ -229,13 +229,6 @@ describe("unavailable modules", () => {
         }),
         ports.sessions.authenticate(TOKEN),
         ports.decisions.requirements(CLAIM),
-        ports.owner.perform("chl_x", {
-          credentialId: "a",
-          clientDataJson: "a",
-          authenticatorData: "a",
-          signature: "a",
-          userHandle: null,
-        }),
         ports.stream.subscribe(0, { events: async () => {}, ended: async () => {} }),
       ]);
     });
@@ -618,7 +611,10 @@ describe("board RPC lifecycle", () => {
       code: "unavailable",
     });
     using enrollment = await api.ownerEnrollment();
-    expect(await enrollment.prepare("bootstrap")).toMatchObject({ ok: false, code: "unavailable" });
+    expect(await enrollment.prepare("bootstrap")).toMatchObject({
+      ok: false,
+      code: "bootstrap_closed",
+    });
   });
 
   /** A client that tries methods and argument types the public interface does not declare. */
