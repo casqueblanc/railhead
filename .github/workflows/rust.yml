@@ -1,0 +1,37 @@
+name: Rust
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The same gate `pnpm check` runs locally. It needs Node only to run the script, so it skips the
+  # pnpm install the other jobs pay for.
+  check:
+    name: Cargo check, test and Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # With no argument, rustup installs the toolchain and components rust-toolchain.toml names.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Run the Rust gate
+        run: node scripts/rust-check.mjs

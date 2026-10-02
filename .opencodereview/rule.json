@@ -1,3 +1,9 @@
 {
-  "exclude": ["**/worker-configuration.d.ts", "**/wrangler.jsonc", "**/*.gen.ts", "pnpm-lock.yaml"]
+  "exclude": [
+    "**/worker-configuration.d.ts",
+    "**/wrangler.jsonc",
+    "**/*.gen.ts",
+    "pnpm-lock.yaml",
+    "Cargo.lock"
+  ]
 }
