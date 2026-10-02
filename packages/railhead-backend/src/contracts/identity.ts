@@ -1,7 +1,9 @@
 // Identity and sessions: who an agent is, and how it proves it on each call.
 
 import type {
+  AgentView,
   ChallengeRequest,
+  EnrollmentState,
   ChallengeResult,
   JoinRequest,
   JoinResult,
@@ -9,7 +11,7 @@ import type {
   SessionResult,
 } from "@railhead/shared/agent-api";
 import type { PendingJoin } from "@railhead/shared/board-api";
-import type { AgentId, InviteId } from "@railhead/shared/events";
+import type { AgentId, InviteId, UserId } from "@railhead/shared/events";
 import type { AgentPrincipal, GrantFor } from "./principals";
 import type { PortResult } from "./result";
 
@@ -17,7 +19,9 @@ import type { PortResult } from "./result";
 export interface IdentityPort {
   /**
    * Registers the request's key with its invite, or resumes the enrollment that key already holds.
-   * A consumed invite never enrolls a second key. Every refusal is `join_refused` and stores nothing.
+   * A consumed invite never enrolls a second key. Every refusal stores nothing: a bad invite,
+   * secret, key or proof is `join_refused`, too many of those in a short time are `rate_limited`,
+   * and the key of a revoked agent is `identity_revoked`.
    */
   join(request: JoinRequest): Promise<PortResult<JoinResult>>;
   /** Creates a single-use invite. The returned URL carries the secret; only its hash is stored. */
@@ -30,6 +34,31 @@ export interface IdentityPort {
   revoke(grant: GrantFor<"agent.revoke">): Promise<PortResult<{ agentId: AgentId }>>;
   /** The joins waiting for the owner, oldest first. */
   pendingJoins(): Promise<PortResult<PendingJoin[]>>;
+  /**
+   * The authenticated agent as it sees itself. Fails with `identity_revoked` once it is revoked,
+   * and with `unauthenticated` when the principal names no agent of this repository.
+   */
+  view(agent: AgentPrincipal): Promise<PortResult<AgentView>>;
+  /**
+   * The key and standing of `agentId`, read now, for the sessions module to verify a login and to
+   * check a session at the time of use. `null` when no such agent joined this repository.
+   */
+  credential(agentId: AgentId): Promise<PortResult<AgentCredential | null>>;
+}
+
+/** Where an agent stands, including revocation, which the agent's own view never shows. */
+export type AgentStanding = EnrollmentState | "revoked";
+
+/** What the sessions module needs to authenticate an agent. */
+export interface AgentCredential {
+  /** The agent. */
+  agentId: AgentId;
+  /** Its OpenSSH public key line, `ssh-ed25519 <base64 blob>`. */
+  publicKey: string;
+  /** The person who owns it. */
+  ownerId: UserId;
+  /** Only a `confirmed` agent may log in or keep a session. */
+  standing: AgentStanding;
 }
 
 /** Login challenges and session tokens. */
