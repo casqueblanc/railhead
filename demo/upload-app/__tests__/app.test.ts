@@ -2,6 +2,7 @@ import { SELF, env, listDurableObjectIds, runInDurableObject } from "cloudflare:
 import { describe, expect, it } from "vitest";
 import { firstDifference, generateBody } from "../acceptance/bodies";
 import type { UploadStore } from "../src/store";
+import { receiveUpload } from "../src/uploads";
 
 const ORIGIN = "https://upload.invalid";
 const LIMIT = 10_000_000;
@@ -81,6 +82,25 @@ describe("POST /api/uploads", () => {
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual({ error: "Files above 10 MB are not accepted" });
     expect(await orphanedRows()).toBe(0);
+  });
+
+  it("deletes the rows it wrote when the body fails partway", async () => {
+    let sent = 0;
+    const failing = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= 3 * 1024 * 1024) {
+          controller.error(new Error("client went away"));
+          return;
+        }
+        controller.enqueue(generateBody(700_000, 7));
+        sent += 700_000;
+      },
+    });
+    // Called directly: through SELF the client-side error arrives as a clean end of body.
+    const request = new Request(`${ORIGIN}/api/uploads`, { method: "POST", body: failing });
+    await expect(receiveUpload(request, env)).rejects.toThrow("client went away");
+    expect(await orphanedRows()).toBe(0);
+    expect((await listDurableObjectIds(env.UPLOADS)).length).toBeGreaterThan(0);
   });
 
   it("stores a streamed body of exactly 10 MB", async () => {

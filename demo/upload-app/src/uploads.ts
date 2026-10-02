@@ -44,14 +44,28 @@ export async function receiveUpload(request: Request, env: Env): Promise<Respons
     buffer = new Uint8Array(PART_BYTES);
     buffered = 0;
   };
+  // Set when reading the body fails. An errored body needs no cancel, and cancelling it would only
+  // reject again with the same error.
+  let bodyFailed = false;
+  const read = async () => {
+    try {
+      return await reader.read();
+    } catch (error) {
+      bodyFailed = true;
+      throw error;
+    }
+  };
   const abandon = async () => {
-    await reader.cancel();
-    if (parts > 0) await store.discard();
+    try {
+      if (!bodyFailed) await reader.cancel();
+    } finally {
+      if (parts > 0) await store.discard();
+    }
   };
 
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await read();
       if (done) break;
       total += value.byteLength;
       if (total > MAX_UPLOAD_BYTES) {
