@@ -1,0 +1,229 @@
+diff --git a/src/artifacts/events.ts b/src/artifacts/events.ts
+index 23c97f11727bc453533a1fa12798545a95ce34e6..c36e5f6dda0b8121449bd658e625648e1ff923f5 100644
+--- a/src/artifacts/events.ts
++++ b/src/artifacts/events.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { z } from 'zod';
+ import type {
+diff --git a/src/artifacts/source-control.ts b/src/artifacts/source-control.ts
+index 481724b271c3cd141b71d5bee1928932fdfafa00..37c54d671816e8d788752046e2b4677d7cf2466f 100644
+--- a/src/artifacts/source-control.ts
++++ b/src/artifacts/source-control.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type { CloudflareArtifacts } from '../pipeline';
+ import type { SourceControlRepositoryFilter } from '../source-control-adapter';
+diff --git a/src/ci/cache.ts b/src/ci/cache.ts
+index 433f19c0e750f2957e1c08e9c41600f90b234296..05cc96f7b7dbb3cc017685fad0d450b17b16cc14 100644
+--- a/src/ci/cache.ts
++++ b/src/ci/cache.ts
+@@ -173,7 +173,8 @@ export async function lookupSnapshotCache(
+   }
+   return {
+     status: 'hit',
+-    snapshot: { id: pointer.backupId, dir: pointer.dir },
++    // Railhead patch: every backup is written through the R2 binding.
++    snapshot: { id: pointer.backupId, dir: pointer.dir, localBucket: true },
+     cachePointer: { key: input.key, ...metadata },
+   };
+ }
+diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..dbdd0a4249a6f8b3ab0583ea4edafe8ed5206da6 100644
+--- a/src/ci/capabilities.ts
++++ b/src/ci/capabilities.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { z } from 'zod';
+ import type {
+diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..ddf822fa77730cf8a00a517e55c35af444a52c1a 100644
+--- a/src/ci/runners/sandbox.ts
++++ b/src/ci/runners/sandbox.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
+ import { posix } from 'node:path';
+@@ -47,11 +48,18 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+ 
+     let cleanupTransferredToStreams = false;
+     try {
+-      // Containers without FUSE must restore through the local R2 binding and
+-      // unsquashfs. RPC streams those archives instead of base64-encoding them
+-      // into a single request, which can exceed the local dev request limit.
+-      const localBucket =
+-        (await sandbox.exec('test -c /dev/fuse')).exitCode !== 0;
++      // Railhead patch: select the outbound handler before the first command,
++      // so the checkout's Git requests reach it.
++      if (input.source.kind === 'git' && input.source.outbound) {
++        await sandbox.setOutboundHandler(
++          input.source.outbound.handler,
++          input.source.outbound.params
++        );
++      }
++      // Railhead patch: always back up and restore through the R2 binding. The
++      // container has no route to R2 presigned URLs, and RPC streams those
++      // archives instead of base64-encoding them into a single request.
++      const localBucket = true;
+       if (input.restore) {
+         await sandbox.restoreBackup(input.restore);
+         // Overlay (no rm) so cached node_modules survive while tracked source
+@@ -59,20 +67,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         // different commit's source (e.g. a reused install cache), so this is
+         // what keeps it correct. Files deleted since then linger; the next
+         // install/build regenerates derived output.
+-        await sandbox.exec(
+-          checkoutSourceScript(input.source, WORKSPACE_DIR, true),
+-          {
+-            cwd: '/',
+-            timeout: SOURCE_TIMEOUT_MS,
+-            env: checkoutSourceEnv(input.source),
+-          }
++        assertCheckedOut(
++          await sandbox.exec(
++            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
++            {
++              cwd: '/',
++              timeout: SOURCE_TIMEOUT_MS,
++              env: checkoutSourceEnv(input.source),
++            }
++          )
+         );
+       } else {
+-        await sandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+-          cwd: '/',
+-          timeout: SOURCE_TIMEOUT_MS,
+-          env: checkoutSourceEnv(input.source),
+-        });
++        assertCheckedOut(
++          await sandbox.exec(
++            checkoutSourceScript(input.source, WORKSPACE_DIR),
++            {
++              cwd: '/',
++              timeout: SOURCE_TIMEOUT_MS,
++              env: checkoutSourceEnv(input.source),
++            }
++          )
++        );
+       }
+ 
+       const proc = await sandbox.startProcess(
+@@ -142,6 +157,14 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+   }
+ }
+ 
++// Railhead patch: a failed checkout ends the run before the command starts, so
++// a missing commit or a refused fetch is never reported as the command's exit.
++function assertCheckedOut({ exitCode }: { exitCode: number }) {
++  if (exitCode !== 0) {
++    throw new Error(`source checkout exited with status ${exitCode}`);
++  }
++}
++
+ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+   const listing = await sandbox.listFiles('/tmp');
+   const sizes = new Map(
+diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
+index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..8f5c2a658ca865f16a4b856bb82a18d2adc0a71d 100644
+--- a/src/ci/step-notification.ts
++++ b/src/ci/step-notification.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type {
+   CacheSnapshotPointer,
+diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
+index a0ac164d44c2caace0a209652d181b013a2138e9..62634b64af5f164442df2462374b827b48c87c3c 100644
+--- a/src/pipeline/ci-workflow.ts
++++ b/src/pipeline/ci-workflow.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import {
+   WorkflowEntrypoint,
+diff --git a/src/pipeline/failures.ts b/src/pipeline/failures.ts
+index 0de55443ec8666eab4e24d0095c70d4b5878179c..e68af6643f119c1340cba3adff708dbfb6526f79 100644
+--- a/src/pipeline/failures.ts
++++ b/src/pipeline/failures.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type { DirectoryBackup, RunnerOptions } from './types';
+ 
+diff --git a/src/pipeline/runner-group.ts b/src/pipeline/runner-group.ts
+index 5246f0c3af3b1b2eca5ad58f50e2b7807cb7201b..b572f5d1f59522575b5f25fd03fc14f3047b4265 100644
+--- a/src/pipeline/runner-group.ts
++++ b/src/pipeline/runner-group.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { CiRunnerFailure } from './failures';
+ import type { CiRunnerResult, DirectoryBackup, RunnerOptions } from './types';
+diff --git a/src/shared/source-checkout.ts b/src/shared/source-checkout.ts
+index f83770cfc430aacd3c257dc90e46ae8b2fa8be51..5defe23bfdbb4cfc3ae358b0cc9a1603a3751b13 100644
+--- a/src/shared/source-checkout.ts
++++ b/src/shared/source-checkout.ts
+@@ -28,14 +28,15 @@ export function checkoutSourceScript(
+     `rm -rf ${shellQuote(CLONE_DIR)}`,
+     `git init -q ${shellQuote(CLONE_DIR)}`,
+     `git -C ${shellQuote(CLONE_DIR)} remote add origin ${shellQuote(source.remote)}`,
+-    `git -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN" -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`,
++    // Railhead patch: send the header only when the checkout carries a token.
++    `git${source.token === undefined ? '' : ' -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN"'} -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`,
+     `git -C ${shellQuote(CLONE_DIR)} checkout --detach FETCH_HEAD`,
+     `tar --exclude=.git -C ${shellQuote(CLONE_DIR)} -cf - . | tar -C ${shellQuote(workspace)} -xf -`,
+   ].join(' && ');
+ }
+ 
+ export function checkoutSourceEnv(source: SourceControlCheckout) {
+-  return source.kind === 'git'
++  return source.kind === 'git' && source.token !== undefined
+     ? { SOURCE_CONTROL_TOKEN: source.token }
+     : undefined;
+ }
+diff --git a/src/source-control.ts b/src/source-control.ts
+index 83946a318ec5493d258581f33babf8ed43a9e909..0d1b18421bde8845c2076ca6f5cfbe6a89856477 100644
+--- a/src/source-control.ts
++++ b/src/source-control.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type {
+   CiParams,
+@@ -114,8 +115,13 @@ export type SourceControlCheckout =
+   | {
+       kind: 'git';
+       remote: string;
+-      token: string;
++      // Railhead patch: omitted when `outbound` adds credentials outside the
++      // Sandbox, so no token is ever placed inside it.
++      token?: string;
+       sha: string;
++      // Railhead patch: the Sandbox outbound handler, and its params, that
++      // serves this checkout's Git requests.
++      outbound?: { handler: string; params: unknown };
+     };
+ 
+ export type SourceControlEvent<

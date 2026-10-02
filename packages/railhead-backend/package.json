@@ -12,6 +12,7 @@
     "clean": "rm -rf .wrangler"
   },
   "dependencies": {
+    "@cloudflare/ci": "catalog:",
     "@cloudflare/sandbox": "catalog:",
     "@railhead/shared": "workspace:*",
     "capnweb": "catalog:",
