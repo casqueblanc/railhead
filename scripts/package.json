@@ -1,0 +1,33 @@
+{
+  "name": "@foreman/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./assert-workerd": {
+      "types": "./assert-workerd.ts",
+      "import": "./assert-workerd.ts"
+    },
+    "./typecheck-task": {
+      "types": "./typecheck-task-vite-config.ts",
+      "import": "./typecheck-task-vite-config.ts"
+    },
+    "./vitest-task": {
+      "types": "./vitest-task-vite-config.ts",
+      "import": "./vitest-task-vite-config.ts"
+    },
+    "./worker-config": {
+      "types": "./worker-config.ts",
+      "import": "./worker-config.ts"
+    }
+  },
+  "dependencies": {
+    "@cloudflare/config": "0.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

@@ -1,0 +1,16 @@
+Foreman
+
+Portions of this repository are adapted from other open-source projects.
+
+Cloudflare OS (https://github.com/cloudflare/cloudflare-os), revision
+1045d2e1ceac7be29e1a6f056c936fb31aa00851, licensed under Apache-2.0. Adapted with
+changes: the build tooling in scripts/ (worker-config.ts,
+generate-worker-configs.ts, generate-worker-types.ts, assert-workerd.ts,
+vitest-task-vite-config.ts and their configuration), the lint configuration in
+vite.config.ts, the workspace and TypeScript configuration, the CI and
+Dependabot workflows, packages/foreman-frontend/AGENTS.md, and the
+foreman-frontend-conventions skill.
+
+The engineering guidance under engineering/ is adapted from several projects,
+each under its own license. engineering/UPSTREAM.md and the NOTICE.md and
+LICENSE files beside each skill record their provenance and terms.

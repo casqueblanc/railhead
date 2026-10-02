@@ -1,0 +1,37 @@
+{
+  "name": "foreman",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "run-start": "node engineering/scripts/run-start.mjs",
+    "engineering:check": "node engineering/scripts/check.mjs && node --test \"engineering/test/*.test.mjs\"",
+    "build": "vp run --filter=!foreman --cache build",
+    "test": "vp run --filter=!foreman --cache test",
+    "clean": "vp run --filter=!foreman clean",
+    "check": "pnpm run engineering:check && pnpm run lint && pnpm run test",
+    "dev-client": "pnpm --filter @foreman/frontend run dev",
+    "dev-server": "pnpm run configs:generate && vp run --cache @foreman/frontend#build && pnpm --filter @foreman/backend run dev",
+    "lint:check": "vp check",
+    "lint:fix": "vp check --fix",
+    "types:check": "pnpm run build",
+    "types:scripts": "tsc -p scripts/tsconfig.json",
+    "lint": "pnpm run lint:check && pnpm run types:scripts && pnpm run configs:check && pnpm run types:check",
+    "configs:generate": "node scripts/generate-worker-configs.ts",
+    "configs:check": "node scripts/generate-worker-configs.ts --check && node scripts/generate-worker-types.ts --check",
+    "types:generate": "node scripts/generate-worker-configs.ts && node scripts/generate-worker-types.ts"
+  },
+  "devDependencies": {
+    "@foreman/scripts": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "wrangler": "catalog:"
+  },
+  "volta": {
+    "node": "24.21.0"
+  },
+  "packageManager": "pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45"
+}

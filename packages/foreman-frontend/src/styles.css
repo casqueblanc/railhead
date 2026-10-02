@@ -1,0 +1,8 @@
+/* Kumo's tokens must be registered before Tailwind. Tailwind does not scan node_modules, so the
+   first line is what lets it find the utility classes Kumo's components use. */
+@source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+@import "@cloudflare/kumo/styles";
+@import "tailwindcss";
+
+/* Application-level theming lives here and nowhere else: override Kumo's semantic tokens in one
+   `@theme` block rather than restyling a component per screen. None are overridden yet. */

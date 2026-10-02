@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Cloudflare Workers
+.wrangler
+
+# Local secrets (never commit). Matches root and per-package files.
+.env
+.dev.vars
+.dev.vars.*
+**/.dev.vars
+**/.dev.vars.*
+
+# macOS
+.DS_Store

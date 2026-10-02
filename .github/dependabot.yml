@@ -1,0 +1,90 @@
+# Dependency updates arrive weekly, grouped so each pull request is one thing to reason about.
+#
+# Routine bumps travel by family, scoped to minor + patch. Majors arrive alone: no family group
+# accepts `major`, so a major bump matches no group and Dependabot opens it as its own pull request.
+# Group order matters -- a dependency joins the first group it matches -- so the catch-all is last.
+version: 2
+
+updates:
+  # One entry at "/": the workspace has a single root lockfile, and Dependabot discovers every
+  # package manifest plus the pnpm-workspace.yaml catalog from there.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    # Keep this above `minimumReleaseAge` in pnpm-workspace.yaml (1440 minutes). pnpm refuses to
+    # resolve a version younger than that gate, and Dependabot's update then fails outright.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    ignore:
+      # Pinned to 7.x: Vite 8's Oxc does not lower the Stage-3 decorators `@validateRpc()` relies
+      # on. See the catalog entry in pnpm-workspace.yaml.
+      - dependency-name: vite
+        update-types: ["version-update:semver-major"]
+      # The Workers test pool pins the Vitest major it supports; the major moves with the pool.
+      - dependency-name: vitest
+        update-types: ["version-update:semver-major"]
+      # Requires Vite 8 from 6.0.
+      - dependency-name: "@vitejs/plugin-react"
+        update-types: ["version-update:semver-major"]
+      # capnweb-validate is pinned in lockstep with capnweb, so neither moves without the other.
+      - dependency-name: capnweb
+      - dependency-name: capnweb-validate
+      # Types follow the Node runtime pinned in .node-version. Bump with the runtime.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # Wrangler, the test pool, Miniflare and workerd are released as one matched set.
+      cloudflare-toolchain:
+        update-types: [minor, patch]
+        patterns:
+          - wrangler
+          - "@cloudflare/*"
+          - workerd
+          - miniflare
+        exclude-patterns:
+          - "@cloudflare/kumo" # a UI library, not part of the Workers toolchain
+      build-toolchain:
+        update-types: [minor, patch]
+        patterns:
+          - typescript
+          - vite
+          - vite-plus
+          - vitest
+          - jsdom
+      react-and-ui:
+        update-types: [minor, patch]
+        patterns:
+          - react
+          - react-dom
+          - "@types/react"
+          - "@types/react-dom"
+          - "@vitejs/plugin-react"
+          - "@cloudflare/kumo"
+          - "@phosphor-icons/*"
+          - "@tanstack/*"
+          - tailwindcss
+          - "@tailwindcss/*"
+      remaining-npm:
+        update-types: [minor, patch]
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # "/" covers .github/workflows. SHA pins and their trailing version comments are both updated.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
