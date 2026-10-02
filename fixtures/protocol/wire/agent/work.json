@@ -1,0 +1,138 @@
+{
+  "route": "work",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/work",
+  "exchanges": [
+    {
+      "name": "claims the next ready issue",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "working",
+              "readyCommit": null,
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "resumed": false
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a repeat returns the claim the agent already holds",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "working",
+              "readyCommit": null,
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "resumed": true
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "no issue is ready",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "no_work",
+            "message": "No issue is ready. Try again later.",
+            "retryable": true,
+            "retryAfterMs": 30000,
+            "next": "work"
+          }
+        }
+      }
+    },
+    {
+      "name": "the fork is still being created",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 503,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "busy",
+            "message": "The claim's fork is being created. Repeat the request.",
+            "retryable": true,
+            "retryAfterMs": 2000,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "a body on a route without one",
+      "body": {
+        "issueId": "iss_upload1"
+      },
+      "stage": "shape"
+    }
+  ]
+}

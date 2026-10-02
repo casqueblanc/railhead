@@ -4,9 +4,17 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./agent-api": {
+      "types": "./src/agent-api.ts",
+      "import": "./src/agent-api.ts"
+    },
     "./api": {
       "types": "./src/api.ts",
       "import": "./src/api.ts"
+    },
+    "./board-api": {
+      "types": "./src/board-api.ts",
+      "import": "./src/board-api.ts"
     },
     "./events": {
       "types": "./src/events.ts",

@@ -1,0 +1,167 @@
+{
+  "route": "inbox",
+  "method": "GET",
+  "path": "/agent/v1/casqueblanc/demo/inbox",
+  "exchanges": [
+    {
+      "name": "returns unacknowledged items oldest first",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {
+          "limit": "16"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "items": [
+              {
+                "item": 17,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999996000,
+                "entry": {
+                  "kind": "rework",
+                  "decision": {
+                    "decisionId": "dec_upload1",
+                    "version": 2
+                  }
+                },
+                "decision": {
+                  "decisionId": "dec_upload1",
+                  "version": 2,
+                  "supersedes": 1,
+                  "questionId": "qst_upload1",
+                  "question": "Should uploads above 10 MB be rejected or chunked?",
+                  "option": {
+                    "key": "chunk",
+                    "label": "Upload them in chunks"
+                  },
+                  "previous": {
+                    "key": "reject",
+                    "label": "Reject them"
+                  },
+                  "scope": ["src/upload.ts"],
+                  "decidedBy": "usr_lemarier",
+                  "decidedAt": 1789999995000
+                }
+              },
+              {
+                "item": 18,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999997000,
+                "entry": {
+                  "kind": "conflict",
+                  "otherClaimId": "clm_43abcd",
+                  "path": "src/upload.ts"
+                },
+                "decision": null
+              }
+            ],
+            "pending": 2
+          },
+          "inbox": {
+            "items": [
+              {
+                "item": 17,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999996000,
+                "entry": {
+                  "kind": "rework",
+                  "decision": {
+                    "decisionId": "dec_upload1",
+                    "version": 2
+                  }
+                },
+                "decision": {
+                  "decisionId": "dec_upload1",
+                  "version": 2,
+                  "supersedes": 1,
+                  "questionId": "qst_upload1",
+                  "question": "Should uploads above 10 MB be rejected or chunked?",
+                  "option": {
+                    "key": "chunk",
+                    "label": "Upload them in chunks"
+                  },
+                  "previous": {
+                    "key": "reject",
+                    "label": "Reject them"
+                  },
+                  "scope": ["src/upload.ts"],
+                  "decidedBy": "usr_lemarier",
+                  "decidedAt": 1789999995000
+                }
+              },
+              {
+                "item": 18,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999997000,
+                "entry": {
+                  "kind": "conflict",
+                  "otherClaimId": "clm_43abcd",
+                  "path": "src/upload.ts"
+                },
+                "decision": null
+              }
+            ],
+            "pending": 2
+          },
+          "next": "ack"
+        }
+      }
+    },
+    {
+      "name": "an empty inbox",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "items": [],
+            "pending": 0
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "refuses an expired session",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 401,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "unauthenticated",
+            "message": "The session expired. Log in again.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": []
+}

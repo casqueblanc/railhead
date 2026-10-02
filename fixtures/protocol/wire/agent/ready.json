@@ -1,0 +1,240 @@
+{
+  "route": "ready",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/claims/clm_42abcd/ready",
+  "exchanges": [
+    {
+      "name": "pins the commit",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "ready",
+              "readyCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "repeated": false
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a repeat after a lost response returns the same pin",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "ready",
+              "readyCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "repeated": true
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "refuses while a decision is unacknowledged",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "unacked_decision",
+            "message": "Item 17 is not acknowledged. Run rh sync, then rh ack.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "sync"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses a stale generation",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "stale_generation",
+            "message": "This claim moved to generation 2.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses another commit after ready",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "after_ready",
+            "message": "This claim is already ready at another commit.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses a commit the fork does not have",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1,
+          "commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "commit_not_found",
+            "message": "The fork has no such commit. Push it first.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "uppercase commit",
+      "body": {
+        "generation": 1,
+        "commit": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "generation 0",
+      "body": {
+        "generation": 0,
+        "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "generation beyond the safe integer range",
+      "body": {
+        "generation": 9007199254740992,
+        "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "generation as a string",
+      "body": {
+        "generation": "1",
+        "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "stage": "shape"
+    },
+    {
+      "name": "commit missing",
+      "body": {
+        "generation": 1
+      },
+      "stage": "shape"
+    }
+  ]
+}

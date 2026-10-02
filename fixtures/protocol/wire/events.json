@@ -1,0 +1,663 @@
+{
+  "valid": [
+    {
+      "v": 1,
+      "seq": 1,
+      "at": 1790000000001,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "agent.invited",
+      "data": {
+        "inviteId": "inv_abc123",
+        "name": "atlas"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 2,
+      "at": 1790000000002,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "agent.joined",
+      "data": {
+        "agentId": "agt_atlas01",
+        "inviteId": "inv_abc123",
+        "name": "atlas",
+        "keyFingerprint": "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 3,
+      "at": 1790000000003,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "agent.confirmed",
+      "data": {
+        "agentId": "agt_atlas01"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 4,
+      "at": 1790000000004,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "issue.filed",
+      "data": {
+        "issueId": "iss_upload1",
+        "title": "Handle large uploads",
+        "body": ""
+      }
+    },
+    {
+      "v": 1,
+      "seq": 5,
+      "at": 1790000000005,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "claim.opened",
+      "data": {
+        "claimId": "clm_42abcd",
+        "issueId": "iss_upload1",
+        "agentId": "agt_atlas01",
+        "generation": 1,
+        "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 6,
+      "at": 1790000000006,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "claim.pushed",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1,
+        "ref": "refs/heads/main",
+        "from": null,
+        "to": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 7,
+      "at": 1790000000007,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "question.asked",
+      "data": {
+        "questionId": "qst_upload1",
+        "claimId": "clm_42abcd",
+        "decisionId": "dec_upload1",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ]
+      }
+    },
+    {
+      "v": 1,
+      "seq": 8,
+      "at": 1790000000008,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "decision.recorded",
+      "data": {
+        "decisionId": "dec_upload1",
+        "version": 1,
+        "questionId": "qst_upload1",
+        "option": "reject",
+        "supersedes": null,
+        "scope": ["src/upload.ts"]
+      }
+    },
+    {
+      "v": 1,
+      "seq": 9,
+      "at": 1790000000009,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "inbox.queued",
+      "data": {
+        "agentId": "agt_atlas01",
+        "claimId": "clm_42abcd",
+        "item": 16,
+        "entry": {
+          "kind": "decision",
+          "decision": {
+            "decisionId": "dec_upload1",
+            "version": 1
+          }
+        }
+      }
+    },
+    {
+      "v": 1,
+      "seq": 10,
+      "at": 1790000000010,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "inbox.delivered",
+      "data": {
+        "agentId": "agt_atlas01",
+        "claimId": "clm_42abcd",
+        "item": 16
+      }
+    },
+    {
+      "v": 1,
+      "seq": 11,
+      "at": 1790000000011,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "inbox.acked",
+      "data": {
+        "agentId": "agt_atlas01",
+        "claimId": "clm_42abcd",
+        "item": 16,
+        "plan": "Reject above 10 MB"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 12,
+      "at": 1790000000012,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "claim.ready",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1,
+        "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "decisions": [
+          {
+            "decisionId": "dec_upload1",
+            "version": 1
+          }
+        ]
+      }
+    },
+    {
+      "v": 1,
+      "seq": 13,
+      "at": 1790000000013,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.check",
+      "data": {
+        "checkRunId": "chk_run0001",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "check": "acceptance:reject",
+        "result": "pass",
+        "acceptance": {
+          "decision": {
+            "decisionId": "dec_upload1",
+            "version": 1
+          },
+          "option": "reject"
+        }
+      }
+    },
+    {
+      "v": 1,
+      "seq": 14,
+      "at": 1790000000014,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.intent",
+      "data": {
+        "intentId": "int_merge01",
+        "expectedMain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "claims": ["clm_42abcd"],
+        "decisions": [
+          {
+            "decisionId": "dec_upload1",
+            "version": 1
+          }
+        ],
+        "checkRunId": "chk_run0001"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 15,
+      "at": 1790000000015,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.main",
+      "data": {
+        "intentId": "int_merge01",
+        "outcome": "updated",
+        "main": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 16,
+      "at": 1790000000016,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.conflict",
+      "data": {
+        "claims": ["clm_42abcd", "clm_43abcd"],
+        "path": "src/upload.ts",
+        "class": "contradictory",
+        "probability": 0.97,
+        "route": "question"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 17,
+      "at": 1790000000017,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.refused",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1,
+        "reason": "unacked_decision"
+      }
+    },
+    {
+      "v": 1,
+      "seq": 18,
+      "at": 1790000000018,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.expired",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1
+      }
+    },
+    {
+      "v": 1,
+      "seq": 19,
+      "at": 1790000000019,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.reassigned",
+      "data": {
+        "claimId": "clm_42abcd",
+        "from": "agt_atlas01",
+        "to": "agt_ember01",
+        "generation": 2
+      }
+    },
+    {
+      "v": 1,
+      "seq": 20,
+      "at": 1790000000020,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "agent.revoked",
+      "data": {
+        "agentId": "agt_atlas01"
+      }
+    }
+  ],
+  "largestSafeSeq": {
+    "v": 1,
+    "seq": 9007199254740991,
+    "at": 1790000000005,
+    "repo": "rep_demo0001",
+    "actor": {
+      "kind": "agent",
+      "id": "agt_atlas01"
+    },
+    "type": "claim.opened",
+    "data": {
+      "claimId": "clm_42abcd",
+      "issueId": "iss_upload1",
+      "agentId": "agt_atlas01",
+      "generation": 1,
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "rejectedShape": [
+    {
+      "name": "unknown event type",
+      "value": {
+        "v": 1,
+        "seq": 5,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.deleted",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "data missing",
+      "value": {
+        "v": 1,
+        "seq": 5,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened"
+      }
+    },
+    {
+      "name": "null written as an omitted field",
+      "value": {
+        "v": 1,
+        "seq": 6,
+        "at": 1790000000006,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.pushed",
+        "data": {
+          "claimId": "clm_42abcd",
+          "generation": 1,
+          "ref": "refs/heads/main",
+          "to": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    },
+    {
+      "name": "seq as a string",
+      "value": {
+        "v": 1,
+        "seq": "5",
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "unknown actor kind",
+      "value": {
+        "v": 1,
+        "seq": 5,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "robot",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    {
+      "name": "tag and data of different types",
+      "value": {
+        "v": 1,
+        "seq": 5,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.expired",
+        "data": {
+          "claimId": "clm_42abcd"
+        }
+      }
+    }
+  ],
+  "rejectedInvariant": [
+    {
+      "name": "unsupported schema version",
+      "value": {
+        "v": 2,
+        "seq": 5,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "error": "schema version"
+    },
+    {
+      "name": "seq beyond the safe integer range",
+      "value": {
+        "v": 1,
+        "seq": 9007199254740992,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "error": "seq"
+    },
+    {
+      "name": "seq of zero",
+      "value": {
+        "v": 1,
+        "seq": 0,
+        "at": 1790000000005,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.opened",
+        "data": {
+          "claimId": "clm_42abcd",
+          "issueId": "iss_upload1",
+          "agentId": "agt_atlas01",
+          "generation": 1,
+          "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "error": "seq"
+    },
+    {
+      "name": "claim id used as a decision id",
+      "value": {
+        "v": 1,
+        "seq": 12,
+        "at": 1790000000012,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.ready",
+        "data": {
+          "claimId": "clm_42abcd",
+          "generation": 1,
+          "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "decisions": [
+            {
+              "decisionId": "clm_42abcd",
+              "version": 1
+            }
+          ]
+        }
+      },
+      "error": "decisionId"
+    },
+    {
+      "name": "acknowledgement recorded by the system",
+      "value": {
+        "v": 1,
+        "seq": 11,
+        "at": 1790000000011,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "inbox.acked",
+        "data": {
+          "agentId": "agt_atlas01",
+          "claimId": "clm_42abcd",
+          "item": 16,
+          "plan": "Reject above 10 MB"
+        }
+      },
+      "error": "by the agent itself"
+    },
+    {
+      "name": "agent acknowledging another agent's item",
+      "value": {
+        "v": 1,
+        "seq": 11,
+        "at": 1790000000011,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_ember01"
+        },
+        "type": "inbox.acked",
+        "data": {
+          "agentId": "agt_atlas01",
+          "claimId": "clm_42abcd",
+          "item": 16,
+          "plan": "Reject above 10 MB"
+        }
+      },
+      "error": "its own inbox items"
+    },
+    {
+      "name": "decision recorded by an agent",
+      "value": {
+        "v": 1,
+        "seq": 8,
+        "at": 1790000000008,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "decision.recorded",
+        "data": {
+          "decisionId": "dec_upload1",
+          "version": 1,
+          "questionId": "qst_upload1",
+          "option": "reject",
+          "supersedes": null,
+          "scope": ["src/upload.ts"]
+        }
+      },
+      "error": "by a person"
+    }
+  ]
+}

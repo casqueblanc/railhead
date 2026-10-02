@@ -1,0 +1,172 @@
+{
+  "route": "join",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/join",
+  "exchanges": [
+    {
+      "name": "registers the key and returns the code to match",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "query": {},
+        "body": {
+          "inviteId": "inv_abc123",
+          "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+          "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+          "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "pending"
+            },
+            "code": "915893",
+            "pollAfterMs": 2000
+          },
+          "inbox": null,
+          "next": "join"
+        }
+      }
+    },
+    {
+      "name": "a repeat with the same key resumes the confirmed enrollment",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "query": {},
+        "body": {
+          "inviteId": "inv_abc123",
+          "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+          "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+          "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "code": "915893",
+            "pollAfterMs": 2000
+          },
+          "inbox": null,
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "refuses an invite used by another key, saying nothing more",
+      "request": {
+        "headers": {
+          "content-type": "application/json"
+        },
+        "query": {},
+        "body": {
+          "inviteId": "inv_abc123",
+          "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+          "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID1AF8PoQ4lakrcKp00bfrycmCzPLsSWjMDNVfEq9GYM",
+          "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+        }
+      },
+      "response": {
+        "status": 403,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "join_refused",
+            "message": "This invite cannot be used. Ask the owner for a new one.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "signature missing",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+      },
+      "stage": "shape"
+    },
+    {
+      "name": "public key is a number",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": 42,
+        "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+      },
+      "stage": "shape"
+    },
+    {
+      "name": "RSA key",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ",
+        "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "public key with a comment",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea atlas@laptop",
+        "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "short invite secret",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "abc",
+        "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "claim id as invite id",
+      "body": {
+        "inviteId": "clm_42abcd",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "signature": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg11qYAYKxCrfVS/7TyWQHOg7hcv\nPapiMlrwIaaPcHURoAAAANcmFpbGhlYWQtYXV0aAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAEAnF1O4ya00fnkt/WOWNZrXMaq+hhRHZkELhYCDIaRaQRGDxJ4PYk\ntD4i2fuAbwz46/t+VT8YYbWzYdQodGp8IB\n-----END SSH SIGNATURE-----\n"
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "signature not armored",
+      "body": {
+        "inviteId": "inv_abc123",
+        "inviteSecret": "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE",
+        "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "signature": "c2lnbmF0dXJl"
+      },
+      "stage": "invariant"
+    }
+  ]
+}

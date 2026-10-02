@@ -1,0 +1,126 @@
+{
+  "route": "question",
+  "method": "GET",
+  "path": "/agent/v1/casqueblanc/demo/questions/qst_upload1",
+  "exchanges": [
+    {
+      "name": "a long poll that times out is still open",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {
+          "waitMs": "25000"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "questionId": "qst_upload1",
+            "decisionId": "dec_upload1",
+            "state": "open",
+            "decision": null
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "an answered question carries the decision",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {
+          "waitMs": "25000"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "questionId": "qst_upload1",
+            "decisionId": "dec_upload1",
+            "state": "answered",
+            "decision": {
+              "decisionId": "dec_upload1",
+              "version": 1,
+              "supersedes": null,
+              "questionId": "qst_upload1",
+              "question": "Should uploads above 10 MB be rejected or chunked?",
+              "option": {
+                "key": "reject",
+                "label": "Reject them"
+              },
+              "previous": null,
+              "scope": ["src/upload.ts"],
+              "decidedBy": "usr_lemarier",
+              "decidedAt": 1789999995000
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "sync"
+        }
+      }
+    },
+    {
+      "name": "refuses a question the agent did not ask",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "not_found",
+            "message": "This agent has no question qst_upload1.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "the decisions module is not installed",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 503,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "unavailable",
+            "message": "The decisions module is not available.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": []
+}

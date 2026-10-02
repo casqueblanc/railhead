@@ -1,0 +1,173 @@
+// The train: merging exact pins, checking the exact candidate, authorizing a merge intent and
+// moving main against an expected commit.
+//
+// The public `train.intent` and `train.main` events tell the board what happened. They are not the
+// storage the safety argument rests on: `MergeIntentRecord` is, and it is written in the Repo
+// transaction that authorizes the merge, before any write to main is attempted.
+
+import type {
+  CheckResult,
+  CheckRunId,
+  CommitSha,
+  DecisionRef,
+  IntentId,
+} from "@railhead/shared/events";
+import type { ClaimPin } from "./claims";
+import type { PortResult } from "./result";
+
+/**
+ * A check definition as read from main, never from the change being checked. A candidate that
+ * edits its own definition is held for a person, not checked with the edited definition.
+ */
+export interface CheckDefinition {
+  /** The check's name. */
+  name: string;
+  /** The main commit the definition was read from. */
+  source: CommitSha;
+  /** SHA-256 of the definition's bytes, 64 lowercase hexadecimal characters. */
+  digest: string;
+  /** For an acceptance check, the decision version and option it proves; otherwise `null`. */
+  acceptance: { decision: DecisionRef; option: string } | null;
+}
+
+/**
+ * One persisted attempt to check one candidate. A runner's report counts only if it names this
+ * attempt and this candidate; nothing transfers a result to another composition.
+ */
+export interface CheckAttempt {
+  /** The attempt. */
+  attemptId: CheckRunId;
+  /** The main commit the candidate was composed on. */
+  expectedMain: CommitSha;
+  /** The exact composed commit being checked. */
+  candidate: CommitSha;
+  /** The pins composed into it, each at its generation. */
+  pins: ClaimPin[];
+  /** The trusted definition the run uses. */
+  definition: CheckDefinition;
+  /** The decision versions required when the attempt was scheduled. */
+  decisions: DecisionRef[];
+  /** When it was recorded. */
+  createdAt: number;
+}
+
+/** What a runner reports, from outside the sandbox. */
+export interface CheckReport {
+  /** The attempt it reports on. */
+  attemptId: CheckRunId;
+  /** The candidate it ran on. */
+  candidate: CommitSha;
+  /** The outcome. `error` means the check could not run; it is never a pass. */
+  result: CheckResult;
+  /** SHA-256 of the stored log, or `null` when there is none. */
+  logDigest: string | null;
+  /** When the run finished. */
+  finishedAt: number;
+}
+
+/** The result of composing pins on main. */
+export type MergeOutcome =
+  /** Git merged every pin; `candidate` is the composed commit, published only for checking. */
+  | { kind: "clean"; candidate: CommitSha }
+  /** Two pins conflict on these paths. */
+  | { kind: "conflict"; pins: [ClaimPin, ClaimPin]; paths: string[] }
+  /** The merge could not run, such as a missing commit or a timeout. Not the agents' failure. */
+  | { kind: "error"; reason: "missing_commit" | "timeout" | "unsupported" | "infrastructure" };
+
+/** Where a merge intent stands. The settled states are the `MainOutcome` of its `train.main` event. */
+export type MergeIntentStatus =
+  /** Recorded and authorized; main has not been confirmed moved. A writer must reconcile first. */
+  | "authorized"
+  /** Main moved from `expectedMain` to `candidate`. */
+  | "updated"
+  /** Main was not at `expectedMain`; nothing changed. */
+  | "rejected"
+  /** An uncertain write was settled by reading main back; `main` says what was found. */
+  | "reconciled";
+
+/** The durable record a merge is authorized by. */
+export interface MergeIntentRecord {
+  /** The intent. */
+  intentId: IntentId;
+  /** The main commit the update is conditional on. */
+  expectedMain: CommitSha;
+  /** The commit main moves to. */
+  candidate: CommitSha;
+  /** The pins merged, each at the generation that was current when authorized. */
+  pins: ClaimPin[];
+  /** The decision versions that were current when authorized. */
+  decisions: DecisionRef[];
+  /** The passing check attempt on exactly `candidate`. */
+  checkAttemptId: CheckRunId;
+  /** Where it stands. */
+  status: MergeIntentStatus;
+  /** Write attempts made so far. */
+  attempts: number;
+  /** Main as last observed by the writer, or `null` before the first attempt. */
+  main: CommitSha | null;
+  /** When it was authorized. */
+  authorizedAt: number;
+  /** When it last changed. */
+  updatedAt: number;
+}
+
+/** Composes pins into a candidate in a sandbox. It never writes main. */
+export interface MergePort {
+  /** Merges `pins`, in order, onto `expectedMain`. */
+  compose(expectedMain: CommitSha, pins: ClaimPin[]): Promise<PortResult<MergeOutcome>>;
+}
+
+/** Starts trusted check runs. Results arrive later through `TrainPort.recordCheck`. */
+export interface CheckPort {
+  /** Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. */
+  start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
+}
+
+/** The train's queue and its check bookkeeping. */
+export interface TrainPort {
+  /** Queues a ready pin. A repeat for the same claim and generation is a no-op. */
+  enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
+  /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
+  recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>>;
+}
+
+/**
+ * Authorizes a merge. Inside one Repo transaction it checks that the attempt passed on exactly its
+ * candidate, that every pin's generation and every required decision version is still current,
+ * and records the `MergeIntentRecord`. A repeat for the same attempt returns the same record.
+ */
+export interface AuthorizationPort {
+  /** Authorizes the merge of a passed attempt. */
+  authorize(attemptId: CheckRunId): Promise<PortResult<MergeIntentRecord>>;
+  /** Reads an intent. */
+  intent(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
+}
+
+/** The result of one conditional update of main. */
+export type MainUpdate =
+  /** Main moved to the new commit. */
+  | { kind: "updated" }
+  /** Main was at `actual`, not the expected commit; nothing changed. */
+  | { kind: "rejected"; actual: CommitSha }
+  /** The outcome is unknown; read main back before anything else. */
+  | { kind: "uncertain" };
+
+/**
+ * Main's ref. Only the main-writer module receives this port; no other port can mint a token that
+ * writes main.
+ */
+export interface MainRefPort {
+  /** Reads main's current commit. */
+  read(): Promise<PortResult<CommitSha>>;
+  /** Moves main from `expected` to `next`, only if it is still at `expected`. Never forces. */
+  update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>>;
+}
+
+/** Publishes authorized intents to main. */
+export interface MainWriterPort {
+  /**
+   * Moves main for an authorized intent and records the outcome. An intent left `authorized` by an
+   * earlier attempt is reconciled by reading main before any new write.
+   */
+  publish(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
+}
