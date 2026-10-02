@@ -1,6 +1,6 @@
 import { Button, Radio, Text } from "@cloudflare/kumo";
 import { LockSimpleIcon } from "@phosphor-icons/react";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import type { DecisionId, QuestionOption } from "@railhead/shared/events";
 import { blockMessage, type DecisionCardAction } from "./decisionActions";
 
@@ -28,6 +28,8 @@ export const DecisionAnswerForm = ({
   const [option, setOption] = useState<string | null>(null);
   const [invalid, setInvalid] = useState<string | null>(null);
   const [submission, setSubmission] = useState<Submission>({ kind: "idle" });
+  // `pending` is captured at render, so two submits in one tick would both pass it.
+  const inFlight = useRef(false);
 
   const verb = current === null ? "Record answer" : "Replace answer";
   const blocked = action.kind === "blocked";
@@ -35,7 +37,7 @@ export const DecisionAnswerForm = ({
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (action.kind !== "available" || pending) return;
+    if (action.kind !== "available" || inFlight.current) return;
     if (option === null) {
       setInvalid("Choose an option.");
       return;
@@ -45,6 +47,7 @@ export const DecisionAnswerForm = ({
       return;
     }
     setInvalid(null);
+    inFlight.current = true;
     setSubmission({ kind: "pending" });
     try {
       const outcome = await action.onRecordDecision({
@@ -62,6 +65,8 @@ export const DecisionAnswerForm = ({
         kind: "failed",
         message: "The answer was not confirmed as recorded. Check the history, then try again.",
       });
+    } finally {
+      inFlight.current = false;
     }
   };
 

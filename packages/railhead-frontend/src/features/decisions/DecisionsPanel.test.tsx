@@ -108,6 +108,23 @@ describe("DecisionsPanel", () => {
     expect(text()).toContain("Recorded as version 1.");
   });
 
+  it("sends one request when the form is submitted twice before it re-renders", async () => {
+    let settle: (outcome: RecordDecisionOutcome) => void = () => {};
+    const { requests, actions } = recorder(() => new Promise((resolve) => (settle = resolve)));
+    await render(asked(), actions);
+    await choose("Reject them");
+    const form = container.querySelector("form");
+    if (form === null) throw new Error("no answer form");
+    await act(async () => {
+      form.requestSubmit();
+      form.requestSubmit();
+    });
+    expect(requests).toHaveLength(1);
+
+    await act(async () => settle({ ok: true, version: 1 }));
+    expect(text()).toContain("Recorded as version 1.");
+  });
+
   it("refuses to submit without an option, and a replacement that repeats the answer", async () => {
     const { requests, actions } = recorder(async () => ({ ok: true, version: 2 }));
     await render(asked(), actions);
