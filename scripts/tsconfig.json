@@ -1,6 +1,6 @@
 // Type-checks `scripts/` -- the repo's build and dev tooling, which no package tsconfig includes.
 // Nothing here is compiled: every module runs directly under `node`, which strips the types.
-// `erasableSyntaxOnly` is what keeps that a guarantee, and why the `@foreman/scripts` `exports` map
+// `erasableSyntaxOnly` is what keeps that a guarantee, and why the `@railhead/scripts` `exports` map
 // points straight at the `.ts` sources.
 //
 // Checked by `pnpm types:scripts` in CI's lint job, not by `pnpm build`.

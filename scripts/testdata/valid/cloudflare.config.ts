@@ -1,6 +1,6 @@
-import { bindings, defineForemanWorker, type WranglerExtras } from "../../worker-config.ts";
+import { bindings, defineRailheadWorker, type WranglerExtras } from "../../worker-config.ts";
 
-export default defineForemanWorker({
+export default defineRailheadWorker({
   name: "fixture",
   entrypoint: "src/index.ts",
   env: { ASSETS: bindings.assets() },

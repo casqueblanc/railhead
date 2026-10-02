@@ -1,5 +1,5 @@
 {
-  "name": "foreman",
+  "name": "railhead",
   "version": "0.0.0",
   "private": true,
   "license": "Apache-2.0",
@@ -7,12 +7,12 @@
   "scripts": {
     "run-start": "node engineering/scripts/run-start.mjs",
     "engineering:check": "node engineering/scripts/check.mjs && node --test \"engineering/test/*.test.mjs\"",
-    "build": "vp run --filter=!foreman --cache build",
-    "test": "vp run --filter=!foreman --cache test",
-    "clean": "vp run --filter=!foreman clean",
+    "build": "vp run --filter=!railhead --cache build",
+    "test": "vp run --filter=!railhead --cache test",
+    "clean": "vp run --filter=!railhead clean",
     "check": "pnpm run engineering:check && pnpm run lint && pnpm run test",
-    "dev-client": "pnpm --filter @foreman/frontend run dev",
-    "dev-server": "pnpm run configs:generate && vp run --cache @foreman/frontend#build && pnpm --filter @foreman/backend run dev",
+    "dev-client": "pnpm --filter @railhead/frontend run dev",
+    "dev-server": "pnpm run configs:generate && vp run --cache @railhead/frontend#build && pnpm --filter @railhead/backend run dev",
     "lint:check": "vp check",
     "lint:fix": "vp check --fix",
     "types:check": "pnpm run build",
@@ -23,7 +23,7 @@
     "types:generate": "node scripts/generate-worker-configs.ts && node scripts/generate-worker-types.ts"
   },
   "devDependencies": {
-    "@foreman/scripts": "workspace:*",
+    "@railhead/scripts": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",

@@ -1,14 +1,14 @@
-# Foreman review and coding instructions
+# Railhead review and coding instructions
 
 Read root [AGENTS.md](../AGENTS.md), including Code Review Rules. Coding tasks
 start with `pnpm run-start` and read
-`engineering/skills/foreman-working/SKILL.md` and
-`engineering/skills/foreman-writing/SKILL.md`. Hosted reviews read the tracked
+`engineering/skills/railhead-working/SKILL.md` and
+`engineering/skills/railhead-writing/SKILL.md`. Hosted reviews read the tracked
 skills directly and keep review-only scope; no startup or network refresh is needed.
-Use [review](../engineering/skills/foreman-review/SKILL.md),
-[TypeScript](../engineering/skills/foreman-typescript/SKILL.md),
-[testing](../engineering/skills/foreman-testing/SKILL.md) and, for React code,
-[frontend conventions](../engineering/skills/foreman-frontend-conventions/SKILL.md)
+Use [review](../engineering/skills/railhead-review/SKILL.md),
+[TypeScript](../engineering/skills/railhead-typescript/SKILL.md),
+[testing](../engineering/skills/railhead-testing/SKILL.md) and, for React code,
+[frontend conventions](../engineering/skills/railhead-frontend-conventions/SKILL.md)
 for the changed behavior.
 
 Trace who may perform an action, capability scope and disposal, whether current

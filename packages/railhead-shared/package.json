@@ -1,0 +1,23 @@
+{
+  "name": "@railhead/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./api": {
+      "types": "./src/api.ts",
+      "import": "./src/api.ts"
+    },
+    "./events": {
+      "types": "./src/events.ts",
+      "import": "./src/events.ts"
+    }
+  },
+  "dependencies": {
+    "capnweb": "catalog:"
+  },
+  "devDependencies": {
+    "@railhead/scripts": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

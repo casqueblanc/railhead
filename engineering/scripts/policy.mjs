@@ -16,7 +16,7 @@ export const skillNames = [
   "ui-checklist",
   "working",
   "writing",
-].map((name) => `foreman-${name}`);
+].map((name) => `railhead-${name}`);
 
 async function filesIn(directory) {
   const files = [];
@@ -81,9 +81,9 @@ export async function validatePolicy(root) {
     const content = entryContents.get(entry);
     for (const required of [
       "pnpm run-start",
-      "engineering/skills/foreman-working/SKILL.md",
-      "engineering/skills/foreman-writing/SKILL.md",
-      "engineering/skills/foreman-review/SKILL.md",
+      "engineering/skills/railhead-working/SKILL.md",
+      "engineering/skills/railhead-writing/SKILL.md",
+      "engineering/skills/railhead-review/SKILL.md",
     ]) {
       if (!content.includes(required)) throw new Error(`${entry} is missing ${required}`);
     }
