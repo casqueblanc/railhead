@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/railhead-cli", "crates/railhead-protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The pinned toolchain in rust-toolchain.toml; no older compiler is tested.
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/casqueblanc/railhead"
+
+# Every crate the CLI lane will need, pinned once here so later tasks never edit a manifest.
+# Versions are exact; `Cargo.lock` is committed.
+[workspace.dependencies]
+railhead-protocol = { path = "crates/railhead-protocol", version = "=0.1.0" }
+
+anyhow = "=1.0.104"
+clap = { version = "=4.6.7", features = ["derive"] }
+# The per-user config directory that holds the agent key store.
+dirs = "=7.0.0"
+# rustls with the platform verifier: no OpenSSL to link, and the OS trust store is honoured.
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# Not 0.11: ssh-key 0.6 is built on the 0.10 digest traits, and the confirmation code hashes
+# alongside it. Move both together when ssh-key 0.7 is stable.
+sha2 = "=0.10.9"
+# 0.7 is still a release candidate.
+ssh-key = { version = "=0.6.7", features = ["ed25519", "getrandom", "std"] }
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
+url = "=2.5.8"
+
+tempfile = "=3.27.0"
+wiremock = "=0.6.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+as_conversions = "deny"
