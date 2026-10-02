@@ -35,10 +35,13 @@ export async function receiveUpload(request: Request, env: Env): Promise<Respons
   let buffer = new Uint8Array(PART_BYTES);
   let buffered = 0;
   let parts = 0;
+  // Set before the first write: a rejected call may still have stored its row.
+  let written = false;
   let total = 0;
 
   const flush = async () => {
     if (buffered === 0) return;
+    written = true;
     await store.putPart(parts, buffer.subarray(0, buffered));
     parts += 1;
     buffer = new Uint8Array(PART_BYTES);
@@ -59,7 +62,7 @@ export async function receiveUpload(request: Request, env: Env): Promise<Respons
     try {
       if (!bodyFailed) await reader.cancel();
     } finally {
-      if (parts > 0) await store.discard();
+      if (written) await store.discard();
     }
   };
 
