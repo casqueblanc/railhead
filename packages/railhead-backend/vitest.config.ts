@@ -8,10 +8,17 @@ export default defineConfig({
   plugins: [
     capnwebValidate(),
     cloudflareTest({
-      // The source entry, not the config's `.wrangler/validate` tree: the plugin above applies the
-      // same `@validateRpc()` transform in memory.
-      main: "./src/server.ts",
+      // The test harness re-exports the source entry, not the config's `.wrangler/validate` tree:
+      // the plugin above applies the same `@validateRpc()` transform in memory. It adds a
+      // test-only SQLite Durable Object for the storage tests, bound below until the `Repo`
+      // Durable Object's binding replaces it.
+      main: "./__tests__/repo-harness.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        durableObjects: {
+          STORAGE_TEST: { className: "StorageTestObject", useSQLite: true },
+        },
+      },
     }),
   ],
   test: {
