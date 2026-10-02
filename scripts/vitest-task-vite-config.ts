@@ -46,7 +46,7 @@ export type VitestTask = {
  * When a test task stops caching, `vp run --last-details` names the path it read and wrote -- add
  * it here if it is shared, or at the call site if it is one package's own.
  */
-const SCRATCH_EXCLUSIONS: GlobWithBase[] = [
+export const SCRATCH_EXCLUSIONS: GlobWithBase[] = [
   { pattern: "!**/node_modules/.vite/**", base: "workspace" },
   { pattern: "!**/node_modules/.vite-temp/**", base: "workspace" },
   { pattern: "!**/.wrangler/**", base: "workspace" },

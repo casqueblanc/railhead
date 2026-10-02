@@ -1,3 +1,5 @@
+import { SCRATCH_EXCLUSIONS } from "./vitest-task-vite-config.ts";
+
 /**
  * Vite+ settings for `@railhead/scripts`. Only a `test` task: this package holds the shared task
  * definitions other packages import, and has no build of its own (see `tsconfig.json`).
@@ -18,12 +20,7 @@ export default {
           // Workspace-wide, matching `cwd`: the suites read across `packages/` and the root
           // manifests, and a guard that stopped seeing a file it asserts about would cache-hit its
           // way to a stale pass. A suite here must therefore never write inside the workspace.
-          input: [
-            { auto: true },
-            { pattern: "!**/node_modules/.vite/**", base: "workspace" },
-            { pattern: "!**/node_modules/.vite-temp/**", base: "workspace" },
-            { pattern: "!**/.wrangler/**", base: "workspace" },
-          ],
+          input: [{ auto: true }, ...SCRATCH_EXCLUSIONS],
           output: [],
         },
       },
