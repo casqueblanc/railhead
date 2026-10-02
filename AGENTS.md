@@ -2,7 +2,7 @@
 
 Railhead is a Git platform for many concurrent coding agents, built on Cloudflare Workers, Durable Objects and Artifacts for the "Build the Next GitHub" challenge (submissions close 2026-10-14). The design is casqueblanc/railhead#1. Its later comments supersede parts of the original brief, so read the issue through to its last comment before deciding what to build; where two comments disagree, the later one wins, and an unresolved design question goes to the user rather than being settled in code.
 
-The repository is a walking skeleton: the toolchain, one RPC method (`ping`) and a board page that reports the backend connection. No claim, evidence, train, decision or Artifacts code exists yet.
+Issue #2 tracks what is built and what remains.
 
 ## Every run
 
@@ -45,6 +45,10 @@ Issue #1 sets [Cloudflare OS](https://github.com/cloudflare/cloudflare-os/tree/1
 - `packages/railhead-shared` (`@railhead/shared`): the RPC interfaces shared by client and server. Types and constants only.
 - `packages/railhead-backend` (`@railhead/backend`): the Worker. It serves the Cap'n Web session at `/api` and the built board as static assets.
 - `packages/railhead-frontend` (`@railhead/frontend`): the board, a client-side React app (Vite, TanStack Router, Tailwind, Kumo, Phosphor icons). `packages/railhead-frontend/AGENTS.md` adds its directory rules.
+- `crates/railhead-cli` (published as `railhead`): `rh`, the command line for coding agents.
+- `crates/railhead-protocol`: wire types shared by the CLI and server.
+- `demo/upload-app`: a demo app Railhead's agents work on, seeded into its own Artifacts repository.
+- `fixtures/`: test inputs shared across packages: SSH signatures (`auth`), synthetic board scenarios (`board`) and wire messages (`protocol`).
 - `scripts/` (`@railhead/scripts`): build tooling that runs directly under `node`: the Worker config factory and generators, and the shared Vite+ task definitions.
 - `engineering/`: the skills and startup checks described above.
 
@@ -54,7 +58,7 @@ Add a package only with its first real code. A shared `packages/ui` waits for a 
 
 Root `package.json` scripts are the commands; run them from the repository root.
 
-- `pnpm check`: everything required before handing off. It runs `pnpm engineering:check`, `pnpm lint` and `pnpm test`. CI runs the same checks as separate jobs.
+- `pnpm check`: everything required before handing off. It runs `pnpm engineering:check`, `pnpm lint`, `pnpm rust:check` and `pnpm test`. CI runs the same checks as separate jobs.
 - `pnpm lint`: format and lint (`vp check`), the `scripts/` type check, the generated-config check and `pnpm build`. `pnpm lint:fix` applies format and lint fixes.
 - `pnpm build`: every package's type check, then the board bundle. Nothing else is compiled: Wrangler and Vite bundle from source.
 - `pnpm test`: every package's `test` task through the Vite+ cache. While iterating on one package, `pnpm --filter <package> test:run` goes straight to vitest.

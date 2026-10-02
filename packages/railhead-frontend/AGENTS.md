@@ -17,7 +17,7 @@ src/
   utils/        Feature-independent utilities
 ```
 
-Create a directory when its first file needs it; `features/`, `components/`, `hooks/` and `utils/` do not exist yet.
+Create a directory when its first file needs it; `components/`, `hooks/` and `utils/` do not exist yet.
 
 - A feature directory owns product behavior: its components, hooks, tests and utilities. Start it flat. Do not add `components/`, `hooks/`, `helpers/` or `tests/` subdirectories merely to classify files; introduce a subdirectory named after its responsibility when a coherent subsystem has several files.
 - Files under `src/routes/` define routes and stay focused on route concerns: parameters, search validation, loaders, navigation and composing the route's page. A small page may remain in its route file. A substantial one moves to `src/pages/<page>/`, named with a `Page.tsx` suffix, which also keeps its support code out of the router's file scanning.
