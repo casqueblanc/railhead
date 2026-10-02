@@ -761,11 +761,12 @@ describe("human-only actions through the Worker", () => {
     if (!challenge.ok) throw new Error(challenge.code);
     expect(challenge.value.rpId).toBe(HOST);
     const proof = await auth.assert(challenge.value.challenge, userHandle);
-    // The identity module is not installed yet, so the consumed proof reaches an unavailable port.
-    expect(await owner.perform(challenge.value.challengeId, proof)).toMatchObject({
-      ok: false,
-      code: "unavailable",
-    });
+    // The proof is consumed even though the action does not complete: without the identity module
+    // the port is unavailable, and with it the revocation of an unregistered agent is stale.
+    const first = await owner.perform(challenge.value.challengeId, proof);
+    expect(first.ok).toBe(false);
+    if (first.ok) throw new Error("the action should not complete");
+    expect(["unavailable", "action_stale"]).toContain(first.code);
     expect(await owner.perform(challenge.value.challengeId, proof)).toMatchObject({
       ok: false,
       code: "proof_expired",
