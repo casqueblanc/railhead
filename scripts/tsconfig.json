@@ -1,0 +1,21 @@
+// Type-checks `scripts/` -- the repo's build and dev tooling, which no package tsconfig includes.
+// Nothing here is compiled: every module runs directly under `node`, which strips the types.
+// `erasableSyntaxOnly` is what keeps that a guarantee, and why the `@foreman/scripts` `exports` map
+// points straight at the `.ts` sources.
+//
+// Checked by `pnpm types:scripts` in CI's lint job, not by `pnpm build`.
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // Node resolves these specifiers for real, unlike the packages' "bundler" mode, so imports
+    // name the file on disk (`./worker-config.ts`) and need the extension allowed.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true
+  },
+  // The Worker configs are included because generate-worker-configs.ts imports them under `node`.
+  "include": ["**/*.ts", "../packages/*/cloudflare.config.ts"]
+}

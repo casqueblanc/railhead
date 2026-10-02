@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ESNext"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    // tsgo's parallel checkers each keep separate type caches, so every checker re-derives
+    // capnweb's recursive type graphs; Cloudflare OS measured single-threaded as both faster and
+    // smaller for a capnweb codebase.
+    "singleThreaded": true
+  },
+  "include": [],
+  "exclude": ["node_modules", "dist"]
+}

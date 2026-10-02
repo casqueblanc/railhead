@@ -1,0 +1,48 @@
+packages:
+  - packages/*
+  # The shared build tooling as `@foreman/scripts`, so packages reach it by name rather than by a
+  # relative path.
+  - scripts
+
+# The toolchain versions every package shares, declared once so a bump is one edit. Every entry is
+# exact: the lockfile and Dependabot move versions, a range never does.
+catalog:
+  # The Workers test pool, under its current package name (formerly `@cloudflare/vitest-pool-workers`).
+  # Released in step with Wrangler: 1.3.4 depends on exactly the `wrangler` pinned below, so the
+  # pool, Wrangler, Miniflare and workerd are one matched set without overrides.
+  "@cloudflare/vitest-plugin": 1.3.4
+  # Types follow the Node runtime pinned in .node-version, not the newest Node.
+  "@types/node": 24.19.0
+  capnweb: 0.12.0
+  # Pinned in lockstep with capnweb (declared as a >=0.7.0 peer).
+  capnweb-validate: 0.3.0
+  # TypeScript 7 (tsgo): type checking runs on the native compiler. capnweb-validate ships its own
+  # JS-based compiler for the `@validateRpc()` transform.
+  typescript: 7.0.2
+  # Not 8.x: the test transform has to stay on esbuild. Vite 8's Oxc does not lower the Stage-3
+  # decorators capnweb-validate's `@validateRpc()` rewrites to (oxc-project/oxc#9170), so the raw
+  # `@` reaches workerd and a suite importing a decorated class fails to load. Recorded by
+  # Cloudflare OS at 1045d2e; re-verify before lifting the pin.
+  vite: 7.3.6
+  vite-plus: 1.0.0
+  # The 4.x line the Workers test pool supports (peer `^4.1.0`); the major moves with the pool.
+  vitest: 4.1.11
+  wrangler: 4.145.0
+
+overrides:
+  # Vitest peers can resolve vite@latest, so the version is pinned through the catalog. Selected by
+  # range, not bare `vite`: vite-plus depends on `vite` as an alias for
+  # `npm:@voidzero-dev/vite-plus-core`, which a semver selector does not match, so `vp` keeps the
+  # core it was built against.
+  vite@*: "catalog:"
+  # Arrives as an optional vite/vitest peer resolved to `latest`, which minimumReleaseAge does not
+  # gate.
+  "@types/node": "catalog:"
+
+# Reject dependency versions published within this many minutes (24h), so a local install cannot
+# commit a too-fresh lockfile. Keep Dependabot's cooldown above it.
+minimumReleaseAge: 1440
+
+allowBuilds:
+  esbuild: true
+  workerd: true

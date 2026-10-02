@@ -1,0 +1,19 @@
+{
+  "name": "@foreman/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./api": {
+      "types": "./src/api.ts",
+      "import": "./src/api.ts"
+    }
+  },
+  "dependencies": {
+    "capnweb": "catalog:"
+  },
+  "devDependencies": {
+    "@foreman/scripts": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

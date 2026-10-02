@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Parallel to `test` so lint and test failures surface on the same run. Package type checking
+  # lives in Build; `scripts/` is checked here instead.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Vite+ downloads its own pnpm for `vp install` and exposes no shim, so this is what puts
+      # `pnpm` on PATH for the steps below.
+      - name: Enable Corepack
+        run: corepack enable
+
+      # Vite+ resolves its own version from the `vite-plus` catalog entry, and installs the pnpm
+      # named in `packageManager` (integrity hash checked as Corepack does), so setup-node is not
+      # needed.
+      #
+      # No `cache` here, unlike `test`: this job is fast anyway, and both caching means they race
+      # to reserve the same lockfile-keyed entry.
+      - name: Set up Vite+, Node.js and dependencies
+        uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
+        with:
+          node-version-file: .node-version
+          cache: false
+          run-install: true
+
+      - name: Check engineering guidance
+        run: pnpm engineering:check
+
+      - name: Format and lint
+        run: pnpm lint:check
+
+      - name: Type-check scripts/
+        run: pnpm types:scripts
+
+      - name: Check generated worker configs and types
+        run: pnpm configs:check
+
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    # Without an explicit cap a wedged workerd test process burns the 6-hour default instead of
+    # failing.
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set up Vite+, Node.js and dependencies
+        uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
+        with:
+          node-version-file: .node-version
+          cache: true
+          run-install: true
+
+      # Every package's type check and the board bundle (`types:check` aliases this).
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test

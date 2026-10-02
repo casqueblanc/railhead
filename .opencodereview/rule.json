@@ -1,0 +1,3 @@
+{
+  "exclude": ["**/worker-configuration.d.ts", "**/wrangler.jsonc", "**/*.gen.ts", "pnpm-lock.yaml"]
+}

@@ -1,0 +1,2 @@
+// A config written by hand, with no cloudflare.config.ts beside it. The generator must refuse it.
+{ "name": "fixture" }

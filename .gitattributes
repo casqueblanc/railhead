@@ -1,0 +1,4 @@
+# Every checkout gets LF, on every platform. A CRLF working copy breaks anything comparing file
+# bytes: `pnpm configs:check` diffs each committed wrangler.jsonc and worker-configuration.d.ts
+# against freshly generated output.
+* text=auto eol=lf
