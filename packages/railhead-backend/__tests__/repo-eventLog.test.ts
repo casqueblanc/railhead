@@ -8,13 +8,14 @@ import {
   type EventPayload,
 } from "@railhead/shared/events";
 import {
+  EVENT_LOG_OWNER,
   EventLog,
   EventLogError,
   MAX_REPLAY_EVENTS,
   MAX_REPLAY_JSON_LENGTH,
   type EventLogErrorCode,
 } from "../src/repo/eventLog";
-import type { RepoStorage } from "../src/repo/storage";
+import { migrate, type RepoStorage } from "../src/repo/storage";
 
 const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
@@ -223,6 +224,30 @@ describe("EventLog transactions", () => {
 
       expect(() => leaked.tx.append(HUMAN, issue(1))).toThrow(refusal("invalid_transaction"));
       expect(log.head()).toBe(0);
+    });
+  });
+
+  it("takes the head from events stored before the head row existed", async () => {
+    await withStorage((storage) => {
+      // The first schema step alone, as a log written before the head row was added.
+      migrate(storage, EVENT_LOG_OWNER, [
+        "CREATE TABLE events (seq INTEGER PRIMARY KEY CHECK (seq > 0), body TEXT NOT NULL) STRICT",
+      ]);
+      const stored = {
+        v: EVENT_SCHEMA_VERSION,
+        seq: 1,
+        at: NOW,
+        repo: REPO,
+        actor: HUMAN,
+        ...issue(1),
+      };
+      storage.sql.exec("INSERT INTO events (seq, body) VALUES (1, ?)", JSON.stringify(stored));
+
+      const log = openLog(storage);
+
+      expect(log.head()).toBe(1);
+      expect(log.transaction((tx) => tx.append(HUMAN, issue(2))).value.seq).toBe(2);
+      expect(log.replay(0, 10)).toMatchObject({ events: [stored, { seq: 2 }], head: 2 });
     });
   });
 

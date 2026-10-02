@@ -36,7 +36,7 @@ const MIGRATIONS: readonly string[] = [
     id INTEGER PRIMARY KEY CHECK (id = 1),
     seq INTEGER NOT NULL CHECK (seq >= 0)
   ) STRICT`,
-  "INSERT INTO event_head (id, seq) VALUES (1, 0)",
+  "INSERT INTO event_head (id, seq) SELECT 1, COALESCE(MAX(seq), 0) FROM events",
 ];
 
 /** Most events one replay page may request. */
