@@ -1,11 +1,12 @@
-// The implementation of each port while its module is not installed. Every method refuses with
-// `unavailable` and does nothing else: it holds no state and receives no storage, so it cannot
-// record an effect. In particular the ready gate is never `clear` and no check ever passes by
-// default; a missing security module blocks the action it guards.
+// The implementation of each port while its module is not installed. Every asynchronous method
+// refuses with `unavailable`, and each synchronous fence reader returns `null`; neither does
+// anything else. Each port holds no state and receives no storage, so it cannot record an effect.
+// In particular the ready gate is never `clear` and no check ever passes by default; a missing
+// security module blocks the action it guards.
 //
-// The synchronous fence readers cannot return a `PortFailure`, so each returns `null`, which its
-// contract defines as unknown: no attempt, no current generation and no decision list, never an
-// empty one. A caller treats `null` as a refusal.
+// The fence readers cannot return a `PortFailure`, so their `null` is what each contract defines
+// as unknown: no attempt, no current generation and no decision list, never an empty one. A
+// caller treats `null` as a refusal.
 
 import type { ArtifactsPort } from "./artifacts";
 import type { ClaimsPort } from "./claims";
