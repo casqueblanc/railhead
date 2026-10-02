@@ -1,15 +1,17 @@
-import { RpcTarget, newWebSocketRpcSession } from "capnweb";
-import { validateRpc } from "capnweb-validate";
-import { API_PATH, type PublicApi } from "@railhead/shared/api";
+import { newWebSocketRpcSession } from "capnweb";
+import { AGENT_PATH_PREFIX } from "@railhead/shared/agent-api";
+import { API_PATH } from "@railhead/shared/api";
+import { serveAgent } from "./gateway/agentHttp";
+import { GIT_PATH_PREFIX, serveGit } from "./gateway/gitHttp";
+import { RailheadApiImpl } from "./gateway/rpc";
 
-@validateRpc<PublicApi>()
-class PublicApiImpl extends RpcTarget implements PublicApi {
-  async ping(): Promise<void> {}
-}
+export { Repo } from "./repo/RepoObject";
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
+    if (pathname.startsWith(`${AGENT_PATH_PREFIX}/`)) return serveAgent(request, env);
+    if (pathname.startsWith(GIT_PATH_PREFIX)) return serveGit(request, env);
     if (pathname !== API_PATH) return new Response("Not found", { status: 404 });
 
     // WebSocket sessions only. capnweb's HTTP batch handler throws on a body that is not valid
@@ -25,7 +27,7 @@ export default {
     // in band: a method that takes credentials and returns the authorized capability.
     const { 0: client, 1: server } = new WebSocketPair();
     server.accept();
-    newWebSocketRpcSession(server, new PublicApiImpl());
+    newWebSocketRpcSession(server, new RailheadApiImpl(env));
     return new Response(null, { status: 101, webSocket: client });
   },
 } satisfies ExportedHandler<Env>;

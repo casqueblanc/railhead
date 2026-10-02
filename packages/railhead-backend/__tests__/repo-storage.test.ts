@@ -5,7 +5,7 @@ import { StorageError, atomically, migrate, type RepoStorage } from "../src/repo
 
 /** Runs `body` against the storage of a Durable Object no other test touches. */
 function withStorage<R>(body: (storage: RepoStorage) => R): Promise<R> {
-  const stub = env.STORAGE_TEST.get(env.STORAGE_TEST.idFromName(crypto.randomUUID()));
+  const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, (_instance, state) => body(state.storage));
 }
 

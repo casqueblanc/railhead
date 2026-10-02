@@ -11,14 +11,30 @@
       "invocation_logs": false
     }
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REPO",
+        "class_name": "Repo"
+      }
+    ]
+  },
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": [
       "/api",
-      "/api/*"
+      "/api/*",
+      "/agent/*",
+      "/git/*"
     ],
     "directory": "../railhead-frontend/dist"
+  },
+  "exports": {
+    "Repo": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
   },
   "build": {
     "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
