@@ -87,9 +87,21 @@ const MIGRATIONS: readonly string[] = [
 /** Builds the owner module of one repository against the instance's `Owner` object. */
 export const owner: ModuleFactory<OwnerPort> = (context, ports) =>
   createOwner(context, ports, {
-    instance: context.env.OWNER.getByName(OWNER_OBJECT_NAME),
+    instance: instanceOwner(context.env),
     relyingParty: relyingParty(context.env.RELYING_PARTY_HOST),
   });
+
+/**
+ * The instance's `Owner` object as a port. Each call takes a fresh stub: a stub that saw an
+ * exception may stay broken, and this port outlives any one request.
+ */
+function instanceOwner(env: Env): InstanceOwnerPort {
+  const stub = () => env.OWNER.getByName(OWNER_OBJECT_NAME);
+  return {
+    credential: () => stub().credential(),
+    recordSignCount: (credentialId, signCount) => stub().recordSignCount(credentialId, signCount),
+  };
+}
 
 /** Where an owner module finds the instance owner and its relying party. */
 export interface OwnerDependencies {
@@ -263,10 +275,11 @@ async function act(ports: RepoPorts, grant: HumanGrant): Promise<PortResult<Owne
 
 /** Builds the instance owner's enrollment, through the instance's `Owner` object. */
 export function ownerEnrollment(env: Env): OwnerEnrollmentPort {
-  const instance = env.OWNER.getByName(OWNER_OBJECT_NAME);
+  // A fresh stub per call, as in `instanceOwner`.
+  const stub = () => env.OWNER.getByName(OWNER_OBJECT_NAME);
   return {
-    prepare: (bootstrapToken) => instance.prepareEnrollment(bootstrapToken),
-    complete: (challengeId, registration) => instance.completeEnrollment(challengeId, registration),
+    prepare: (bootstrapToken) => stub().prepareEnrollment(bootstrapToken),
+    complete: (challengeId, registration) => stub().completeEnrollment(challengeId, registration),
   };
 }
 
