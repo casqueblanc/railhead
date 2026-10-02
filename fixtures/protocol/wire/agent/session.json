@@ -56,7 +56,7 @@
           "error": {
             "code": "challenge_invalid",
             "message": "The challenge expired or was used. Request a new one.",
-            "retryable": true,
+            "retryable": false,
             "retryAfterMs": null,
             "next": null
           }

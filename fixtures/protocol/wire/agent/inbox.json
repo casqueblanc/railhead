@@ -155,7 +155,7 @@
           "error": {
             "code": "unauthenticated",
             "message": "The session expired. Log in again.",
-            "retryable": true,
+            "retryable": false,
             "retryAfterMs": null,
             "next": null
           }

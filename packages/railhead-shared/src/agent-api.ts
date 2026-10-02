@@ -433,8 +433,12 @@ export interface AgentErrorSpec {
  * `join_refused` answers every join failure, whether the invite is unknown, expired, used by
  * another key or the proof is wrong, so a failed join reveals nothing. `unavailable` means a
  * backend module is not installed: the request had no effect, and retrying will not help until the
- * backend changes. `internal` and `busy` are retryable because every state-changing route is
- * idempotent: the retry reconciles with whatever the first attempt recorded.
+ * backend changes. `internal` and `busy` are retryable because every state-changing route except
+ * `session` is idempotent: the retry reconciles with whatever the first attempt recorded. A
+ * `session` redemption may have consumed its challenge before failing, so after `internal` there
+ * the CLI requests a new challenge instead of repeating the request. `challenge_invalid` and
+ * `unauthenticated` are not retryable as sent: the CLI recovers by logging in again with a new
+ * challenge, which changes the request.
  */
 export const AGENT_ERRORS = {
   invalid_request: { status: 400, retryable: false, next: null },
@@ -443,8 +447,8 @@ export const AGENT_ERRORS = {
   not_found: { status: 404, retryable: false, next: "status" },
   rate_limited: { status: 429, retryable: true, next: null },
   join_refused: { status: 403, retryable: false, next: null },
-  challenge_invalid: { status: 401, retryable: true, next: null },
-  unauthenticated: { status: 401, retryable: true, next: null },
+  challenge_invalid: { status: 401, retryable: false, next: null },
+  unauthenticated: { status: 401, retryable: false, next: null },
   identity_pending: { status: 403, retryable: true, next: "join" },
   identity_revoked: { status: 403, retryable: false, next: null },
   quota_exceeded: { status: 429, retryable: false, next: "status" },
