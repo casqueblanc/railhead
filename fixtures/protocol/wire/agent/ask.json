@@ -24,7 +24,8 @@
               "key": "chunk",
               "label": "Upload them in chunks"
             }
-          ]
+          ],
+          "scope": ["src/upload.ts"]
         }
       },
       "response": {
@@ -66,7 +67,8 @@
               "key": "chunk",
               "label": "Upload them in chunks"
             }
-          ]
+          ],
+          "scope": ["src/upload.ts"]
         }
       },
       "response": {
@@ -104,7 +106,8 @@
               "key": "chunk",
               "label": "Upload them in chunks"
             }
-          ]
+          ],
+          "scope": ["src/upload.ts"]
         }
       },
       "response": {
@@ -134,7 +137,8 @@
             "key": "reject",
             "label": "Reject them"
           }
-        ]
+        ],
+        "scope": ["src/upload.ts"]
       },
       "stage": "invariant"
     },
@@ -153,7 +157,8 @@
             "key": "reject",
             "label": "Reject them"
           }
-        ]
+        ],
+        "scope": ["src/upload.ts"]
       },
       "stage": "invariant"
     },
@@ -172,7 +177,8 @@
             "key": "chunk",
             "label": "Upload them in chunks"
           }
-        ]
+        ],
+        "scope": ["src/upload.ts"]
       },
       "stage": "invariant"
     },
@@ -191,7 +197,8 @@
             "key": "chunk",
             "label": "Upload them in chunks"
           }
-        ]
+        ],
+        "scope": ["src/upload.ts"]
       },
       "stage": "invariant"
     },
@@ -210,7 +217,8 @@
             "key": "chunk",
             "label": "Upload them in chunks"
           }
-        ]
+        ],
+        "scope": ["src/upload.ts"]
       },
       "stage": "invariant"
     },
@@ -219,7 +227,173 @@
       "body": {
         "generation": 1,
         "requestId": "req_upload0000000001",
-        "text": "Should uploads above 10 MB be rejected or chunked?"
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "scope": ["src/upload.ts"]
+      },
+      "stage": "shape"
+    },
+    {
+      "name": "empty scope",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ],
+        "scope": []
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "scope over the limit",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ],
+        "scope": [
+          "src/file0.ts",
+          "src/file1.ts",
+          "src/file2.ts",
+          "src/file3.ts",
+          "src/file4.ts",
+          "src/file5.ts",
+          "src/file6.ts",
+          "src/file7.ts",
+          "src/file8.ts",
+          "src/file9.ts",
+          "src/file10.ts",
+          "src/file11.ts",
+          "src/file12.ts",
+          "src/file13.ts",
+          "src/file14.ts",
+          "src/file15.ts",
+          "src/file16.ts",
+          "src/file17.ts",
+          "src/file18.ts",
+          "src/file19.ts",
+          "src/file20.ts",
+          "src/file21.ts",
+          "src/file22.ts",
+          "src/file23.ts",
+          "src/file24.ts",
+          "src/file25.ts",
+          "src/file26.ts",
+          "src/file27.ts",
+          "src/file28.ts",
+          "src/file29.ts",
+          "src/file30.ts",
+          "src/file31.ts",
+          "src/file32.ts",
+          "src/file33.ts",
+          "src/file34.ts",
+          "src/file35.ts",
+          "src/file36.ts",
+          "src/file37.ts",
+          "src/file38.ts",
+          "src/file39.ts",
+          "src/file40.ts",
+          "src/file41.ts",
+          "src/file42.ts",
+          "src/file43.ts",
+          "src/file44.ts",
+          "src/file45.ts",
+          "src/file46.ts",
+          "src/file47.ts",
+          "src/file48.ts",
+          "src/file49.ts",
+          "src/file50.ts",
+          "src/file51.ts",
+          "src/file52.ts",
+          "src/file53.ts",
+          "src/file54.ts",
+          "src/file55.ts",
+          "src/file56.ts",
+          "src/file57.ts",
+          "src/file58.ts",
+          "src/file59.ts",
+          "src/file60.ts",
+          "src/file61.ts",
+          "src/file62.ts",
+          "src/file63.ts",
+          "src/file64.ts"
+        ]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "absolute scope path",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ],
+        "scope": ["/src/upload.ts"]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "scope path with a dot-dot segment",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ],
+        "scope": ["src/../upload.ts"]
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "scope missing",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ]
       },
       "stage": "shape"
     }

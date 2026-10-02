@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::error::Result;
 use crate::events::{InboxEntry, QuestionOption};
 use crate::integer::{SafeInteger, nullable};
-use crate::payloads::require_options;
+use crate::payloads::{require_options, require_scope};
 use crate::rules::{
     IdKind, MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, is_armored_signature, is_challenge_id,
     is_commit_sha, is_ed25519_public_key, is_invite_secret, is_request_id, require, require_id,
@@ -842,6 +842,8 @@ pub struct AskRequest {
     pub text: String,
     /// The answers offered.
     pub options: Vec<QuestionOption>,
+    /// The repository paths the answer applies to, the recorded decision's scope.
+    pub scope: Vec<String>,
 }
 
 impl AskRequest {
@@ -863,7 +865,8 @@ impl AskRequest {
             "text",
             "a question of 1 to 2000 characters",
         )?;
-        require_options(&self.options)
+        require_options(&self.options)?;
+        require_scope(&self.scope)
     }
 }
 

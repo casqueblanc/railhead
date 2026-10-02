@@ -28,8 +28,10 @@
 // another secret, apart from the session token the session route exists to return.
 
 import {
+  MAX_LIST_LENGTH,
   MAX_OPTION_LABEL_LENGTH,
   MAX_OPTIONS,
+  MAX_PATH_LENGTH,
   MAX_PLAN_LENGTH,
   MAX_QUESTION_LENGTH,
   MIN_OPTIONS,
@@ -750,6 +752,11 @@ export interface AskRequest {
   text: string;
   /** The answers offered, between `MIN_OPTIONS` and `MAX_OPTIONS`, with unique keys. */
   options: QuestionOption[];
+  /**
+   * The repository paths the answer applies to: 1 to `MAX_LIST_LENGTH` relative paths, none empty
+   * or with a `.` or `..` segment. The decision the answer records carries them as its scope.
+   */
+  scope: string[];
 }
 
 /** Where a question stands. */
@@ -864,6 +871,7 @@ export function validateAgentRequest(request: AgentRequestPair): void {
       }
       requireText(request.body.text, MAX_QUESTION_LENGTH, "text");
       requireOptions(request.body.options);
+      requireScope(request.body.scope);
       return;
     case "work":
     case "status":
@@ -942,6 +950,21 @@ function requireOptions(options: QuestionOption[]): void {
     }
     requireText(option.label, MAX_OPTION_LABEL_LENGTH, `options[${index}].label`);
   });
+}
+
+function requireScope(scope: string[]): void {
+  if (scope.length === 0 || scope.length > MAX_LIST_LENGTH) {
+    throw new Error(`scope must have between 1 and ${MAX_LIST_LENGTH} entries`);
+  }
+  scope.forEach((path, index) => {
+    if (!isRepositoryPath(path)) throw new Error(`scope[${index}] is not a repository path`);
+  });
+}
+
+/** True when `path` is a relative repository path with no empty, `.` or `..` segment. */
+export function isRepositoryPath(path: string): boolean {
+  if (path === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
+  return path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
 function requireId(kind: IdKind, value: string, field: string): void {

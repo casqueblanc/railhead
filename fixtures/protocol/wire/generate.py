@@ -281,6 +281,7 @@ ASK_BODY = {
     "requestId": "req_upload0000000001",
     "text": "Should uploads above 10 MB be rejected or chunked?",
     "options": [{"key": "reject", "label": "Reject them"}, {"key": "chunk", "label": "Upload them in chunks"}],
+    "scope": ["src/upload.ts"],
 }
 QUESTION_OPEN = {"questionId": "qst_upload1", "decisionId": "dec_upload1", "state": "open", "decision": None}
 
@@ -555,6 +556,11 @@ def agent_fixtures() -> dict:
                 rejected("blank text", {**ASK_BODY, "text": ""}, "invariant"),
                 rejected("bad request id", {**ASK_BODY, "requestId": "upload"}, "invariant"),
                 rejected("options missing", {k: v for k, v in ASK_BODY.items() if k != "options"}, "shape"),
+                rejected("empty scope", {**ASK_BODY, "scope": []}, "invariant"),
+                rejected("scope over the limit", {**ASK_BODY, "scope": [f"src/file{i}.ts" for i in range(65)]}, "invariant"),
+                rejected("absolute scope path", {**ASK_BODY, "scope": ["/src/upload.ts"]}, "invariant"),
+                rejected("scope path with a dot-dot segment", {**ASK_BODY, "scope": ["src/../upload.ts"]}, "invariant"),
+                rejected("scope missing", {k: v for k, v in ASK_BODY.items() if k != "scope"}, "shape"),
             ],
         },
         "question": {

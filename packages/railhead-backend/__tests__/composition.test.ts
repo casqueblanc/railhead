@@ -227,7 +227,21 @@ describe("unavailable modules", () => {
           operation: "fetch",
         }),
         ports.sessions.authenticate(TOKEN),
-        ports.decisions.requirements(CLAIM),
+        // Decisions is installed, but asking needs the claims module to confirm the claim.
+        ports.decisions.ask(
+          { kind: "agent", agentId: "agt_atlas01", ownerId: "usr_lemarier", repoId },
+          CLAIM,
+          {
+            generation: 1,
+            requestId: "req_upload0000000001",
+            text: "Reject or chunk?",
+            options: [
+              { key: "reject", label: "Reject" },
+              { key: "chunk", label: "Chunk" },
+            ],
+            scope: ["src/upload.ts"],
+          },
+        ),
         ports.owner.perform("chl_x", {
           credentialId: "a",
           clientDataJson: "a",
