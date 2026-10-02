@@ -1,0 +1,21 @@
+{
+  "name": "@railhead/demo-upload-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test:run": "vitest run",
+    "types:generate": "wrangler types",
+    "clean": "rm -rf .wrangler"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "catalog:",
+    "@railhead/scripts": "workspace:*",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

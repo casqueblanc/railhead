@@ -1,0 +1,8 @@
+{
+  "decision": "upload-size-limit",
+  "current": { "option": "A", "version": 1 },
+  "suites": [
+    { "option": "A", "version": 1, "file": "acceptance/option-a.test.ts" },
+    { "option": "B", "version": 2, "file": "acceptance/option-b.test.ts" }
+  ]
+}
