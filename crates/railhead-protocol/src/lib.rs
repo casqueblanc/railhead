@@ -4,8 +4,8 @@
 //! same JSON. It currently decodes the envelope every event shares and leaves each payload as raw
 //! JSON. Decoding the payload variants is the next step of the protocol work.
 //!
-//! Event JSON comes from the network and is untrusted: every field is checked here, and a value
-//! the TypeScript side could not have produced is refused rather than adjusted.
+//! Event JSON comes from the network and is untrusted: every envelope field is checked here, and a
+//! value the TypeScript side could not have produced is refused rather than adjusted.
 
 use serde::Deserialize;
 
@@ -34,6 +34,15 @@ pub enum DecodeError {
         field: &'static str,
         /// The value received.
         value: u64,
+    },
+    /// An identifier lacks its kind's prefix or has a malformed body. The value is not echoed,
+    /// since it is untrusted text.
+    #[error("{field} is not a valid {prefix} identifier")]
+    InvalidId {
+        /// The envelope field that held the identifier.
+        field: &'static str,
+        /// The prefix its kind requires, such as `rep_`.
+        prefix: &'static str,
     },
 }
 
@@ -79,14 +88,15 @@ pub struct EventEnvelope {
     pub data: serde_json::Value,
 }
 
-/// Decodes one event's envelope from JSON and checks its version and integer ranges.
+/// Decodes one event's envelope from JSON and checks its version, integer ranges and identifiers.
 ///
 /// # Errors
 ///
 /// Returns [`DecodeError::Json`] for malformed JSON, a missing or unknown field, or an integer
 /// that is negative or fractional; [`DecodeError::UnsupportedVersion`] for any version other than
-/// [`EVENT_SCHEMA_VERSION`]; and [`DecodeError::IntegerOutOfRange`] for a zero or unsafe `seq` or
-/// `at`.
+/// [`EVENT_SCHEMA_VERSION`]; [`DecodeError::IntegerOutOfRange`] for a zero or unsafe `seq` or
+/// `at`; and [`DecodeError::InvalidId`] for a `repo` or `actor.id` that is not an identifier of its
+/// kind, by the same rules as `isId` in `@railhead/shared/events`.
 ///
 /// ```
 /// let json = r#"{"v":1,"seq":1,"at":1700000000000,"repo":"rep_abc123",
@@ -103,7 +113,38 @@ pub fn decode_event(json: &str) -> Result<EventEnvelope, DecodeError> {
     }
     require_safe_positive("seq", event.seq)?;
     require_safe_positive("at", event.at)?;
+    require_id("repo", "rep_", &event.repo, is_id_body)?;
+    match &event.actor {
+        Actor::Human { id } => require_id("actor.id", "usr_", id, is_id_body)?,
+        Actor::Agent { id } => require_id("actor.id", "agt_", id, is_id_body)?,
+        Actor::System { id } => require_id("actor.id", "sys_", id, is_system_id_body)?,
+    }
     Ok(event)
+}
+
+fn require_id(
+    field: &'static str,
+    prefix: &'static str,
+    value: &str,
+    body_is_valid: fn(&str) -> bool,
+) -> Result<(), DecodeError> {
+    match value.strip_prefix(prefix) {
+        Some(body) if body_is_valid(body) => Ok(()),
+        _ => Err(DecodeError::InvalidId { field, prefix }),
+    }
+}
+
+/// `[A-Za-z0-9]{6,64}`, the body of every identifier kind except a system's.
+fn is_id_body(body: &str) -> bool {
+    (6..=64).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// `[a-z][a-z0-9_]{1,63}`, the body of a system identifier such as `sys_train`.
+fn is_system_id_body(body: &str) -> bool {
+    let mut bytes = body.bytes();
+    (2..=64).contains(&body.len())
+        && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn require_safe_positive(field: &'static str, value: u64) -> Result<(), DecodeError> {
@@ -205,6 +246,75 @@ mod tests {
             decode_event(&extra_field),
             Err(DecodeError::Json(_))
         ));
+    }
+
+    fn with_ids(repo: &str, kind: &str, id: &str) -> String {
+        event_json("1", "1", "1")
+            .replace("\"repo\":\"rep_abc123\"", &format!("\"repo\":\"{repo}\""))
+            .replace(
+                r#"{"kind":"agent","id":"agt_abc123"}"#,
+                &format!(r#"{{"kind":"{kind}","id":"{id}"}}"#),
+            )
+    }
+
+    #[test]
+    fn accepts_identifiers_at_their_length_bounds() -> Result<(), DecodeError> {
+        let longest = format!("rep_{}", "A1".repeat(32));
+        let event = decode_event(&with_ids(&longest, "human", "usr_a1B2c3"))?;
+        assert_eq!(event.repo, longest);
+        let event = decode_event(&with_ids("rep_abc123", "system", "sys_a1"))?;
+        assert_eq!(
+            event.actor,
+            Actor::System {
+                id: "sys_a1".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_malformed_repository_identifier() {
+        let too_long = format!("rep_{}", "a".repeat(65));
+        for repo in [
+            "",
+            "rep_",
+            "rep_abc12",
+            "agt_abc123",
+            "rep_abc-123",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    decode_event(&with_ids(repo, "agent", "agt_abc123")),
+                    Err(DecodeError::InvalidId {
+                        field: "repo",
+                        prefix: "rep_"
+                    })
+                ),
+                "accepted repo {repo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_actor_identifier_of_another_kind() {
+        let cases = [
+            ("human", "agt_abc123", "usr_"),
+            ("agent", "usr_abc123", "agt_"),
+            ("system", "sys_Train", "sys_"),
+            ("system", "sys_1train", "sys_"),
+            ("system", "sys_t", "sys_"),
+        ];
+        for (kind, id, prefix) in cases {
+            let result = decode_event(&with_ids("rep_abc123", kind, id));
+            assert!(
+                matches!(
+                    result,
+                    Err(DecodeError::InvalidId { field: "actor.id", prefix: p }) if p == prefix
+                ),
+                "accepted {kind} actor {id:?}"
+            );
+        }
     }
 
     #[test]
