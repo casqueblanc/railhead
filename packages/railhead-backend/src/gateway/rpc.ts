@@ -201,6 +201,8 @@ class ListenerBridge extends WorkersRpcTarget implements StreamListener {
 class SubscriptionImpl extends RpcTarget implements BoardSubscription {
   readonly #subscription: StreamSubscription;
   readonly #bridge: ListenerBridge;
+  // Cancels the Repo side once, then releases its stub, however many times cancel or dispose run.
+  #cancelling: Promise<void> | null = null;
 
   constructor(subscription: StreamSubscription, bridge: ListenerBridge) {
     super();
@@ -210,27 +212,29 @@ class SubscriptionImpl extends RpcTarget implements BoardSubscription {
 
   async cancel(): Promise<void> {
     try {
-      await this.#subscription.cancel();
+      await this.#cancelOnce();
     } finally {
       this.#bridge.release();
-      dispose(this.#subscription);
     }
   }
 
   // Disposing the board's stub ends the subscription: the Repo side is cancelled now rather than
   // at its next delivery, and the listener is released.
   [Symbol.dispose](): void {
-    this.#subscription
-      .cancel()
-      .catch((error: unknown) => {
-        // Only the error's name: its message may carry data from the Repo.
-        console.error(
-          "stream subscription cancel failed",
-          error instanceof Error ? error.name : "unknown",
-        );
-      })
-      .finally(() => dispose(this.#subscription));
     this.#bridge.release();
+    if (this.#cancelling !== null) return;
+    this.#cancelOnce().catch((error: unknown) => {
+      // Only the error's name: its message may carry data from the Repo.
+      console.error(
+        "stream subscription cancel failed",
+        error instanceof Error ? error.name : "unknown",
+      );
+    });
+  }
+
+  #cancelOnce(): Promise<void> {
+    this.#cancelling ??= this.#subscription.cancel().finally(() => dispose(this.#subscription));
+    return this.#cancelling;
   }
 }
 
