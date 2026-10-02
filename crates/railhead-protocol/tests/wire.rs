@@ -2,8 +2,9 @@
 
 use railhead_protocol::Error;
 use railhead_protocol::{
-    Actor, AgentErrorCode, AgentResponse, AskRequest, EventPayload, InboxResult, MAX_SAFE_INTEGER,
-    QuestionOption, ReadyRequest, SafeInteger, StatusResult, decode_event,
+    Actor, AgentErrorCode, AgentResponse, AskRequest, EventPayload, InboxResult, JoinRequest,
+    MAX_SAFE_INTEGER, QuestionOption, ReadyRequest, SafeInteger, StatusResult, decode_event,
+    decode_response,
 };
 use serde_json::{Value, json};
 
@@ -41,8 +42,11 @@ fn refuses_another_version_before_reading_the_rest() {
     assert!(matches!(decode(&newer), Err(Error::UnsupportedVersion(2))));
     let older = json!({"v": 0});
     assert!(matches!(decode(&older), Err(Error::UnsupportedVersion(0))));
-    assert!(matches!(decode(&json!({"v": "1"})), Err(Error::Json(_))));
-    assert!(matches!(decode(&json!({})), Err(Error::Json(_))));
+    assert!(matches!(
+        decode(&json!({"v": "1"})),
+        Err(Error::Json { .. })
+    ));
+    assert!(matches!(decode(&json!({})), Err(Error::Json { .. })));
 }
 
 #[test]
@@ -53,7 +57,10 @@ fn refuses_unknown_tags_and_enum_values() -> TestResult {
     ] {
         let mut event = opened();
         set(&mut event, pointer, value)?;
-        assert!(matches!(decode(&event), Err(Error::Json(_))), "{pointer}");
+        assert!(
+            matches!(decode(&event), Err(Error::Json { .. })),
+            "{pointer}"
+        );
     }
     let refused = json!({
         "v": 1, "seq": 1, "at": 1, "repo": "rep_demo0001",
@@ -61,7 +68,7 @@ fn refuses_unknown_tags_and_enum_values() -> TestResult {
         "type": "claim.refused",
         "data": {"claimId": "clm_42abcd", "generation": 1, "reason": "too_slow"},
     });
-    assert!(matches!(decode(&refused), Err(Error::Json(_))));
+    assert!(matches!(decode(&refused), Err(Error::Json { .. })));
     Ok(())
 }
 
@@ -75,7 +82,10 @@ fn accepts_the_largest_safe_integer_and_refuses_the_next() -> TestResult {
     for pointer in ["/seq", "/at", "/data/generation"] {
         let mut event = opened();
         set(&mut event, pointer, json!(MAX_SAFE_INTEGER + 1))?;
-        assert!(matches!(decode(&event), Err(Error::Json(_))), "{pointer}");
+        assert!(
+            matches!(decode(&event), Err(Error::Json { .. })),
+            "{pointer}"
+        );
     }
     Ok(())
 }
@@ -97,7 +107,7 @@ fn refuses_zero_negative_and_fractional_integers() -> TestResult {
     for bad in [json!(-1), json!(1.5), json!(1.0)] {
         let mut event = opened();
         set(&mut event, "/seq", bad)?;
-        assert!(matches!(decode(&event), Err(Error::Json(_))));
+        assert!(matches!(decode(&event), Err(Error::Json { .. })));
     }
     Ok(())
 }
@@ -130,12 +140,12 @@ fn requires_null_and_refuses_an_omitted_nullable_field() -> TestResult {
         .and_then(Value::as_object_mut)
         .and_then(|data| data.remove("from"))
         .ok_or("no from")?;
-    assert!(matches!(decode(&omitted), Err(Error::Json(_))));
+    assert!(matches!(decode(&omitted), Err(Error::Json { .. })));
 
     // `null` where the type allows none is refused too.
     let mut null_to = pushed;
     set(&mut null_to, "/data/to", Value::Null)?;
-    assert!(matches!(decode(&null_to), Err(Error::Json(_))));
+    assert!(matches!(decode(&null_to), Err(Error::Json { .. })));
     Ok(())
 }
 
@@ -308,7 +318,7 @@ fn checks_decision_versions_and_conflict_bounds() {
     ));
     assert!(matches!(
         decode(&conflict(json!(["clm_42abcd"]), json!(0.5))),
-        Err(Error::Json(_))
+        Err(Error::Json { .. })
     ));
 }
 
@@ -465,5 +475,42 @@ fn validates_requests_before_they_are_sent() -> TestResult {
     ] {
         assert!(request.validate().is_err(), "accepted {request:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn never_echoes_wire_text_or_secrets() -> TestResult {
+    let marker = "\u{1b}[31mFORGED";
+    let mut event = opened();
+    set(&mut event, "/type", json!(marker))?;
+    let error = decode(&event).err().ok_or("accepted")?;
+    assert!(matches!(error, Error::Json { line: 1, .. }));
+    assert!(!error.to_string().contains("FORGED"), "{error}");
+
+    let body = json!({"ok": false, "error": {"code": marker, "message": "m",
+        "retryable": false, "retryAfterMs": null, "next": null}});
+    let error = decode_response::<StatusResult>(&body.to_string())
+        .err()
+        .ok_or("accepted")?;
+    assert!(!error.to_string().contains("FORGED"), "{error}");
+    let response = decode_response::<StatusResult>(&status_response().to_string())?;
+    assert!(matches!(response, AgentResponse::Success(_)));
+
+    let secret = "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE";
+    let join = JoinRequest {
+        invite_id: "inv_abc123".to_owned(),
+        invite_secret: secret.to_owned(),
+        public_key: "ssh-ed25519 AAAA".to_owned(),
+        signature: String::new(),
+    };
+    let debug = format!("{join:?}");
+    assert!(
+        !debug.contains(secret) && debug.contains("inv_abc123"),
+        "{debug}"
+    );
+    assert!(
+        serde_json::to_string(&join)?.contains(secret),
+        "the wire body still carries it"
+    );
     Ok(())
 }

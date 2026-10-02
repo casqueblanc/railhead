@@ -12,8 +12,15 @@ pub enum Error {
     /// The input is not JSON of the expected shape: malformed, a required field missing, a field
     /// of the wrong type, an unknown tag, or an integer that is negative, fractional or above
     /// [`MAX_SAFE_INTEGER`].
-    #[error("value is not valid JSON of the expected shape: {0}")]
-    Json(#[from] serde_json::Error),
+    ///
+    /// Only the position is kept: `serde_json`'s message can quote the untrusted input.
+    #[error("value is not valid JSON of the expected shape (line {line}, column {column})")]
+    Json {
+        /// The 1-based line of the error, or 0 when the input was already parsed.
+        line: usize,
+        /// The 1-based column of the error, or 0 when the input was already parsed.
+        column: usize,
+    },
     /// The event names a schema version this crate does not read.
     #[error("event schema version is not supported: {0}")]
     UnsupportedVersion(u64),
@@ -53,6 +60,15 @@ pub enum Error {
         /// The event type, such as `inbox.acked`.
         event_type: &'static str,
     },
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json {
+            line: error.line(),
+            column: error.column(),
+        }
+    }
 }
 
 /// The result type of this crate.

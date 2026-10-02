@@ -128,7 +128,7 @@ fn refuses_every_event_typescript_refuses_by_shape() -> TestResult {
     for case in list(&fixture, "rejectedShape")? {
         let result = decode_event(&field(case, "value")?.to_string());
         assert!(
-            matches!(result, Err(Error::Json(_))),
+            matches!(result, Err(Error::Json { .. })),
             "{}: {result:?}",
             text(case, "name")?
         );
@@ -145,10 +145,13 @@ fn refuses_every_event_typescript_refuses_by_invariant() -> TestResult {
         let result = decode_event(&value.to_string());
         // An unsafe integer is a shape error here: no Rust integer type may hold it.
         if holds_unsafe_integer(value) {
-            assert!(matches!(result, Err(Error::Json(_))), "{name}: {result:?}");
+            assert!(
+                matches!(result, Err(Error::Json { .. })),
+                "{name}: {result:?}"
+            );
         } else {
             assert!(
-                matches!(&result, Err(error) if !matches!(error, Error::Json(_))),
+                matches!(&result, Err(error) if !matches!(error, Error::Json { .. })),
                 "{name}: {result:?}"
             );
         }

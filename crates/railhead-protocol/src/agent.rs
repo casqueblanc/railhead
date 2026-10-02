@@ -398,6 +398,18 @@ struct FailureBody {
     error: AgentError,
 }
 
+/// Decodes one agent response body as `AgentResponse<T>`.
+///
+/// Prefer this to `serde_json::from_str`: the returned error keeps only the position, never text
+/// from the untrusted body.
+///
+/// # Errors
+///
+/// [`crate::Error::Json`] when the body is not a response of this shape.
+pub fn decode_response<T: DeserializeOwned>(json: &str) -> Result<AgentResponse<T>> {
+    Ok(serde_json::from_str(json)?)
+}
+
 impl<'de, T: DeserializeOwned> Deserialize<'de> for AgentResponse<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         // The `ok` flag picks the shape, so the body is read once into a value and decoded from it.
@@ -559,8 +571,9 @@ pub struct InboxItem {
 // =======================================================================================
 // Requests and results, route by route
 
-/// `join`: register a key with an invite, or resume that registration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `join`: register a key with an invite, or resume that registration. Its `invite_secret` is a
+/// secret: `Debug` redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinRequest {
     /// The `inv_` invite.
@@ -571,6 +584,17 @@ pub struct JoinRequest {
     pub public_key: String,
     /// An armored SSHSIG over the join message.
     pub signature: String,
+}
+
+impl fmt::Debug for JoinRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinRequest")
+            .field("invite_id", &self.invite_id)
+            .field("invite_secret", &"<redacted>")
+            .field("public_key", &self.public_key)
+            .field("signature", &self.signature)
+            .finish()
+    }
 }
 
 impl JoinRequest {
