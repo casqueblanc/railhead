@@ -28,6 +28,9 @@ const AGENT_COMMANDS: [&[&str]; 8] = [
     &["credential", "get"],
 ];
 
+/// Agent commands whose entry points are stubs. A command leaves this list when it is built.
+const STUBBED_AGENT_COMMANDS: [&str; 3] = ["sync", "ack", "ask"];
+
 struct World {
     home: tempfile::TempDir,
     clone: tempfile::TempDir,
@@ -265,21 +268,17 @@ async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result
     let server = MockServer::start().await;
     let world = world(&server.uri())?;
     for agent in [None, Some("atlas"), Some("agt_atlas01")] {
-        for args in AGENT_COMMANDS
-            .iter()
-            .filter(|args| args.first() != Some(&"credential"))
-        {
-            let mut argv = vec!["--json"];
-            argv.extend_from_slice(args);
+        for command in STUBBED_AGENT_COMMANDS {
+            let argv = ["--json", command];
             let run = rh(&world, world.clone.path(), agent, &argv, "")?;
             assert_eq!(run.code, Some(1));
             let envelope = run.json()?;
             assert_eq!(
                 envelope.pointer("/error/code"),
                 Some(&json!("command_unavailable")),
-                "{args:?}"
+                "{command}"
             );
-            let message = format!("rh {} is not available in this build yet", args.join(" "));
+            let message = format!("rh {command} is not available in this build yet");
             assert_eq!(envelope.pointer("/error/message"), Some(&json!(message)));
         }
     }
@@ -288,7 +287,7 @@ async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result
         &world,
         world.outside.path(),
         Some("boreas"),
-        &["--json", "work"],
+        &["--json", "sync"],
         "",
     )?;
     assert_eq!(
