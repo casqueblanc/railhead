@@ -44,7 +44,10 @@ export type InboxDelivery = "queued" | "delivered" | "acknowledged";
 /** Where an enrolled agent stands. */
 export type AgentStatus = "awaiting_confirmation" | "confirmed" | "revoked";
 
-/** Where a claim stands. A claim that landed returns to `working` when its agent pushes again. */
+/**
+ * Where a claim stands. A ready or landed claim returns to `working` when its agent pushes again,
+ * as the losing side of a `redo` conflict or a rework does; only an expired claim takes no push.
+ */
 export type ClaimPhase = "working" | "ready" | "landed" | "expired";
 
 /** An invite, and the agent that joined with it once one has. */
@@ -369,7 +372,6 @@ export const decisionRipple = (state: BoardState, decisionId: DecisionId): Rippl
   return [...rows.values()].map(({ firstSeq: _, ...row }) => row);
 };
 
-// =======================================================================================
 // Internals
 
 const DELIVERY_RANK: Record<InboxDelivery, number> = { queued: 0, delivered: 1, acknowledged: 2 };
@@ -560,10 +562,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       const { claimId, generation, ref, from, to } = event.data;
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
-      check(
-        claim.phase === "working" || claim.phase === "landed",
-        `claim ${claimId} cannot take a push while ${claim.phase}`,
-      );
+      check(claim.phase !== "expired", `claim ${claimId} cannot take a push while expired`);
       const pushes = [...claim.pushes, { seq, ref, from, to }].slice(-MAX_LANE_PUSHES);
       return {
         ...state,

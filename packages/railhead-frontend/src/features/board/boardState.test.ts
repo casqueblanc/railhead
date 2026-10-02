@@ -11,6 +11,7 @@ import {
   seqWhere,
   synthAgent,
   synthCommit,
+  syntheticLog,
   withLostEvents,
   withReplayOverlap,
   type SyntheticLog,
@@ -19,9 +20,12 @@ import {
 import {
   UPLOAD,
   checkResult,
+  inbox,
   moveMain,
   push,
+  ready,
   sizeDecision,
+  uploadPrelude,
 } from "../../../../../fixtures/board/uploadSteps";
 import {
   MAX_LANE_PUSHES,
@@ -70,6 +74,8 @@ const last = (log: SyntheticLog): number => log.events.length;
 const atlasItem = (state: BoardState, item: number) => state.inbox[inboxKey(UPLOAD.atlas, item)];
 
 const ripple = (state: BoardState) => decisionRipple(state, UPLOAD.decision);
+
+const birch = (state: BoardState) => state.claims[UPLOAD.birchClaim];
 
 describe("foldEvents over a delivered stream", () => {
   it("applies a complete log in order", () => {
@@ -265,6 +271,87 @@ describe("foldEvent on events it must not apply", () => {
     const halted = append(pending, moveMain("int_synth01", "updated", synthCommit(9)));
     expect(halted.stream.kind).toBe("halted");
     expect(atlasAdapted(halted)).toBe(false);
+  });
+});
+
+describe("a ready claim that loses a redo conflict", () => {
+  const conflicted = syntheticLog("Synthetic redo conflict between two ready claims", [
+    ...uploadPrelude(),
+    ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), []),
+    push(UPLOAD.birch, UPLOAD.birchClaim, null, synthCommit(2)),
+    ready(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(2), []),
+    {
+      type: "train.conflict",
+      actor: SYNTH_TRAIN,
+      data: {
+        claims: [UPLOAD.atlasClaim, UPLOAD.birchClaim],
+        path: "src/uploads/limits.ts",
+        class: "compatible",
+        probability: 0.8,
+        route: "redo",
+      },
+    },
+    ...inbox(
+      UPLOAD.birch,
+      UPLOAD.birchClaim,
+      1,
+      { kind: "conflict", otherClaimId: UPLOAD.atlasClaim, path: "src/uploads/limits.ts" },
+      "acknowledged",
+    ),
+  ]);
+  const before = fold(conflicted.events);
+
+  it("takes the redo push, then becomes ready again at the new head", () => {
+    expect(birch(before)?.phase).toBe("ready");
+    const pushed = append(
+      before,
+      push(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(2), synthCommit(3)),
+    );
+    expect(pushed.stream).toEqual({ kind: "consistent" });
+    expect(birch(pushed)).toMatchObject({ phase: "working", head: synthCommit(3), ready: null });
+
+    const readyAgain = append(pushed, ready(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(3), []));
+    expect(readyAgain.stream).toEqual({ kind: "consistent" });
+    expect(readyAgain.cursor).toBe(before.cursor + 2);
+    expect(birch(readyAgain)).toMatchObject({
+      phase: "ready",
+      head: synthCommit(3),
+      ready: { commit: synthCommit(3), decisions: [] },
+    });
+    expect(readyAgain.claims[UPLOAD.atlasClaim]?.phase).toBe("ready");
+  });
+
+  it("halts on a second ready without a push in between", () => {
+    const halted = append(before, ready(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(3), []));
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: before.cursor + 1,
+        message: `claim ${UPLOAD.birchClaim} cannot become ready while ready`,
+      },
+    });
+  });
+
+  it("halts on a push once the claim has expired", () => {
+    const expired = append(before, {
+      type: "claim.expired",
+      actor: SYNTH_TRAIN,
+      data: { claimId: UPLOAD.birchClaim, generation: 1 },
+    });
+    const halted = append(
+      expired,
+      push(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(2), synthCommit(3)),
+    );
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: expired.cursor + 1,
+        message: `claim ${UPLOAD.birchClaim} cannot take a push while expired`,
+      },
+    });
+    expect(birch(halted)?.head).toBe(synthCommit(2));
   });
 });
 
