@@ -6,6 +6,7 @@ import { GIT_PATH_PREFIX, serveGit } from "./gateway/gitHttp";
 import { RailheadApiImpl } from "./gateway/rpc";
 
 export { Repo } from "./repo/RepoObject";
+export { ContainerProxy, RailheadSandbox } from "./sandbox/sandboxObject";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

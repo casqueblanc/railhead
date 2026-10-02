@@ -12,6 +12,9 @@ export default defineConfig({
       // same `@validateRpc()` transform in memory. The `Repo` binding is the generated config's.
       main: "./src/server.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
+      // Tests never reach a live resource: the Artifacts binding is always remote, so without this
+      // the pool opens a remote session for it. Tests that need Artifacts stub it.
+      remoteBindings: false,
     }),
   ],
   test: {
