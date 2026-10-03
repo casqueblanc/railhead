@@ -376,6 +376,15 @@ function signal(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve: () => settle?.() };
 }
 
+function leaseOf(sql: SqlStorage, claimId: string): number | null {
+  return sql
+    .exec<{ lease_until: number | null }>(
+      "SELECT lease_until FROM claims_claims WHERE claim_id = ?",
+      claimId,
+    )
+    .one().lease_until;
+}
+
 function claimState(sql: SqlStorage, claimId: string): string {
   return sql
     .exec<{ state: string }>("SELECT state FROM claims_claims WHERE claim_id = ?", claimId)
@@ -395,10 +404,11 @@ describe("ready hands its pin to the train", () => {
 
       expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
       expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
-      // The pin asks for the alarm, and ready confirms that wake once the pin commits. Nothing
-      // drives before the alarm does.
+      // The pin asks for the alarm, and ready confirms that wake once the pin commits. Before it,
+      // ready's transaction asks for the renewed lease and the owed revocation, due now as well.
+      // Nothing drives before the alarm does.
       const due = readWake(setup.sql)?.dueAt;
-      expect(setup.wakes.slice(before)).toEqual([due, due]);
+      expect(setup.wakes.slice(before)).toEqual([leaseOf(setup.sql, claim.claimId), due, due, due]);
       expect(setup.composed).toEqual([]);
 
       await setup.train.resume();
@@ -467,13 +477,13 @@ describe("ready hands its pin to the train", () => {
 
   it("revokes the fork's tokens when ready's alarm write fails, and a repeat arms the wake", async () => {
     // The clock runs an hour ahead, so the runtime never fires a stored alarm on its own. The first
-    // three alarm writes reject: the one ready's transaction asks for, ready's own after revoking,
-    // and the repeat's.
+    // five alarm writes reject: the claim's lease when it opens, the renewed lease and the owed
+    // revocation ready's transaction asks for, ready's own after revoking, and the repeat's.
     const options: HandoffOptions = {
       stub: env.REPO.getByName(crypto.randomUUID()),
       fake: new FakeArtifacts(Date.now() + 60 * 60_000),
       realAlarm: true,
-      failedAlarmWrites: 3,
+      failedAlarmWrites: 5,
     };
     await withHandoff(
       async (setup) => {
@@ -1129,10 +1139,16 @@ describe("a re-ready while the train's retries have run out", () => {
       });
       expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
 
-      // The re-ready restarts the exhausted wake and asks for the alarm; main is back.
+      // The re-ready restarts the exhausted wake and asks for the alarm, after the renewed lease and
+      // the owed revocation; main is back.
       const restarted = readWake(setup.sql);
       expect(restarted).toMatchObject({ failures: 0 });
-      expect(setup.wakes.slice(asked)).toEqual([restarted?.dueAt, restarted?.dueAt]);
+      expect(setup.wakes.slice(asked)).toEqual([
+        leaseOf(setup.sql, claim.claimId),
+        restarted?.dueAt,
+        restarted?.dueAt,
+        restarted?.dueAt,
+      ]);
       setup.mainUp = true;
       await setup.train.resume();
       expect(setup.composed).toEqual([[{ claimId: claim.claimId, generation: 1, commit: LATER }]]);

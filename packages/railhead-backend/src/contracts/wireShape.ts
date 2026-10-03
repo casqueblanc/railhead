@@ -26,6 +26,7 @@ import type {
   InboxResult,
   JoinRequest,
   JoinResult,
+  PinResult,
   QuestionResult,
   ReadyRequest,
   ReadyResult,
@@ -52,6 +53,7 @@ interface WireShapes {
   statusResponse(value: AgentResponse<StatusResult>): AgentResponse<StatusResult>;
   claimResponse(value: AgentResponse<ClaimResult>): AgentResponse<ClaimResult>;
   readyResponse(value: AgentResponse<ReadyResult>): AgentResponse<ReadyResult>;
+  pinResponse(value: AgentResponse<PinResult>): AgentResponse<PinResult>;
   inboxResponse(value: AgentResponse<InboxResult>): AgentResponse<InboxResult>;
   ackResponse(value: AgentResponse<AckResult>): AgentResponse<AckResult>;
   questionResponse(value: AgentResponse<QuestionResult>): AgentResponse<QuestionResult>;
@@ -104,6 +106,9 @@ class WireShapeCheck extends RpcTarget implements WireShapes {
   readyResponse(value: AgentResponse<ReadyResult>): AgentResponse<ReadyResult> {
     return value;
   }
+  pinResponse(value: AgentResponse<PinResult>): AgentResponse<PinResult> {
+    return value;
+  }
   inboxResponse(value: AgentResponse<InboxResult>): AgentResponse<InboxResult> {
     return value;
   }
@@ -150,6 +155,7 @@ export function parseAgentRequest(route: AgentRouteName, body: unknown): AgentRe
       return { route, body: shapes.askRequest(body) };
     case "status":
     case "work":
+    case "pin":
     case "inbox":
     case "question":
       return { route, body: shapes.emptyBody(body) };
@@ -166,6 +172,7 @@ export type AgentResponsePair =
   | { route: "status"; response: AgentResponse<StatusResult> }
   | { route: "work" | "claim"; response: AgentResponse<ClaimResult> }
   | { route: "ready"; response: AgentResponse<ReadyResult> }
+  | { route: "pin"; response: AgentResponse<PinResult> }
   | { route: "inbox"; response: AgentResponse<InboxResult> }
   | { route: "ack"; response: AgentResponse<AckResult> }
   | { route: "ask" | "question"; response: AgentResponse<QuestionResult> };
@@ -186,6 +193,8 @@ export function parseAgentResponse(route: AgentRouteName, body: unknown): AgentR
       return { route, response: shapes.claimResponse(body) };
     case "ready":
       return { route, response: shapes.readyResponse(body) };
+    case "pin":
+      return { route, response: shapes.pinResponse(body) };
     case "inbox":
       return { route, response: shapes.inboxResponse(body) };
     case "ack":

@@ -154,6 +154,7 @@ import {
   type PendingWake,
   type QueueEntry,
 } from "./store";
+import { readPinView } from "./pinView";
 
 /** Most pins waiting or batched at once. `queue` refuses with `busy` beyond it. */
 export const MAX_QUEUE = 256;
@@ -1345,6 +1346,7 @@ export function createTrain(
     recordCheck,
     attemptOutcome,
     holdsLiveEntry,
+    pinView: async (claimId, generation) => readPinView(sql, claimId, generation),
     armWake,
     startup: () => startupWake,
     resume,

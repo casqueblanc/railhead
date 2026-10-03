@@ -5,6 +5,7 @@
 // storage the safety argument rests on: `MergeIntentRecord` is, and it is written in the Repo
 // transaction that authorizes the merge, before any write to main is attempted.
 
+import type { PinView } from "@railhead/shared/agent-api";
 import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
@@ -237,6 +238,13 @@ export interface TrainPort {
    * longer holds.
    */
   holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
+  /**
+   * Where the queue entry of `claimId` at exactly `generation` stands, with the state of the batch
+   * holding it, or `null` when the queue holds none. An entry of another generation, which may be
+   * another agent's pin, is never returned. It only reads. The caller authorizes the read: the agent
+   * routes pass only the caller's own active claim at its current generation.
+   */
+  pinView(claimId: ClaimId, generation: number): Promise<PortResult<PinView | null>>;
   /**
    * Asks the Repo's alarm again for the wake the train owes, and resolves whether storage holds it:
    * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is

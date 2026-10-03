@@ -1,0 +1,365 @@
+{
+  "route": "pin",
+  "method": "GET",
+  "path": "/agent/v1/casqueblanc/demo/pin",
+  "exchanges": [
+    {
+      "name": "a pin waiting second in the queue",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "queued",
+                "position": 2
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a pin in a batch being formed, before any check run",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "batched",
+                "batchId": 7,
+                "batch": "forming",
+                "checkRunId": null
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a pin in a batch being checked",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "batched",
+                "batchId": 7,
+                "batch": "checking",
+                "checkRunId": "chk_run0001"
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a pin in a batch held for a person, with a newer commit waiting",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": "cccccccccccccccccccccccccccccccccccccccc",
+              "state": {
+                "kind": "batched",
+                "batchId": 7,
+                "batch": "held",
+                "checkRunId": "chk_run0001"
+              }
+            }
+          },
+          "inbox": {
+            "items": [
+              {
+                "item": 17,
+                "claimId": "clm_42abcd",
+                "queuedAt": 1789999996000,
+                "entry": {
+                  "kind": "rework",
+                  "decision": {
+                    "decisionId": "dec_upload1",
+                    "version": 2
+                  }
+                },
+                "decision": {
+                  "decisionId": "dec_upload1",
+                  "version": 2,
+                  "supersedes": 1,
+                  "questionId": "qst_upload1",
+                  "question": "Should uploads above 10 MB be rejected or chunked?",
+                  "option": {
+                    "key": "chunk",
+                    "label": "Upload them in chunks"
+                  },
+                  "previous": {
+                    "key": "reject",
+                    "label": "Reject them"
+                  },
+                  "scope": ["src/upload.ts"],
+                  "decidedBy": "usr_lemarier",
+                  "decidedAt": 1789999995000
+                }
+              }
+            ],
+            "pending": 1
+          },
+          "next": "sync"
+        }
+      }
+    },
+    {
+      "name": "a pin in a passed batch moving main",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "batched",
+                "batchId": 7,
+                "batch": "landing",
+                "checkRunId": "chk_run0001"
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a landed pin",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "landed"
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a pin parked with the claim it conflicts with",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "parked",
+                "reason": "conflict"
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "a pin dropped after its check failed",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": {
+              "claimId": "clm_42abcd",
+              "generation": 1,
+              "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "nextCommit": null,
+              "state": {
+                "kind": "dropped",
+                "reason": "check_failed"
+              }
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "an agent without a ready claim",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "pin": null
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "the train module is not installed",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 503,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "unavailable",
+            "message": "The train module is not installed.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": null
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "a body on a route without one",
+      "body": {
+        "claimId": "clm_42abcd"
+      },
+      "stage": "shape"
+    }
+  ]
+}

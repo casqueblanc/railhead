@@ -27,6 +27,8 @@ export interface FakeToken {
   readonly plaintext: string;
   /** What it allows. */
   readonly scope: "read" | "write";
+  /** When it was minted, in fake-clock milliseconds. */
+  readonly createdAtMs: number;
   /** When it stops working, in fake-clock milliseconds. */
   readonly expiresAtMs: number;
   /** Whether it was revoked. */
@@ -214,6 +216,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
       id,
       plaintext: `secret-${this.#nextId}-${crypto.randomUUID()}`,
       scope,
+      createdAtMs: this.#now,
       expiresAtMs: this.#now + ttlSeconds * 1000,
       revoked: false,
     };
@@ -276,7 +279,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
           id: token.id,
           scope: token.scope,
           state: tokenState(token, this.#now),
-          createdAt: new Date(this.#now).toISOString(),
+          createdAt: new Date(token.createdAtMs).toISOString(),
           expiresAt: new Date(token.expiresAtMs).toISOString(),
         }));
         const page = this.#tokenPage;
