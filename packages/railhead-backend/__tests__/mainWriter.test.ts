@@ -21,13 +21,18 @@ import type {
 import { unavailableAuthorization } from "../src/contracts/unavailable";
 import {
   createMainWriter,
+  MAIN_UPDATE_LIFETIME_MS,
   MAX_QUEUED_PUBLICATIONS,
   MAX_WRITE_ATTEMPTS,
   type MainWriterDeps,
 } from "../src/modules/mainWriter/mainWriter";
 import { EventLog } from "../src/repo/eventLog";
 import type { RepoStorage } from "../src/repo/storage";
-import { createAuthorization, TRAIN_ACTOR } from "../src/train/authorize";
+import {
+  createAuthorization,
+  TRAIN_ACTOR,
+  type AuthorizationReaders,
+} from "../src/train/authorize";
 
 const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
@@ -108,8 +113,13 @@ class FakeMain implements MainRefPort {
   }
 }
 
-/** Current claim and decision state, which a test changes to model a concurrent write. */
+/** Current claim and decision state and time, which a test changes to model a concurrent write. */
 class World {
+  now = NOW;
+  /** The decision the first intent's check proves, as an acceptance check. */
+  acceptance: DecisionRef | null = null;
+  /** Whether the first intent's check attempt can still be read. */
+  attemptKnown = true;
   generations = new Map<ClaimId, number>([
     [CLAIM_A, 1],
     [CLAIM_B, 3],
@@ -181,28 +191,31 @@ function harness(
   ref: MainRefPort,
   options: Options = {},
 ): Harness {
-  const log = EventLog.open(storage, REPO, () => NOW);
-  const authorization: AuthorizationPort = createAuthorization(
-    { storage, log, clock: () => NOW },
-    {
-      attemptOutcome: (attemptId) => {
-        if (attemptId === ATTEMPT) return passed(attempt());
-        if (attemptId === ATTEMPT_B && options.secondExpected !== undefined) {
-          return passed(attemptB(options.secondExpected));
-        }
-        return null;
-      },
-      currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
-      currentVersions: (claimId) => world.versions.get(claimId) ?? null,
+  const clock = (): number => world.now;
+  const log = EventLog.open(storage, REPO, clock);
+  const readers: AuthorizationReaders = {
+    attemptOutcome: (attemptId) => {
+      if (attemptId === ATTEMPT && world.attemptKnown) {
+        const first = attempt();
+        const acceptance =
+          world.acceptance === null ? null : { decision: world.acceptance, option: "yes" };
+        return passed({ ...first, definition: { ...first.definition, acceptance } });
+      }
+      if (attemptId === ATTEMPT_B && options.secondExpected !== undefined) {
+        return passed(attemptB(options.secondExpected));
+      }
+      return null;
     },
-    () => (authorization.record(INTENT) === null ? INTENT : INTENT_B),
-  );
-  const deps: MainWriterDeps = {
-    authorization,
     currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
     currentVersions: (claimId) => world.versions.get(claimId) ?? null,
   };
-  const writer = createMainWriter({ log }, () => deps, ref, options.timeoutMs);
+  const authorization: AuthorizationPort = createAuthorization(
+    { storage, log, clock },
+    readers,
+    () => (authorization.record(INTENT) === null ? INTENT : INTENT_B),
+  );
+  const deps: MainWriterDeps = { authorization, ...readers };
+  const writer = createMainWriter({ log, clock }, () => deps, ref, options.timeoutMs);
   return { storage, log, authorization, writer };
 }
 
@@ -256,11 +269,12 @@ function mainEvent(
   outcome: MainOutcome,
   main: CommitSha,
   intentId: string = INTENT,
+  at: number = NOW,
 ): unknown {
   return {
     v: EVENT_SCHEMA_VERSION,
     seq,
-    at: NOW,
+    at,
     repo: REPO,
     actor: TRAIN_ACTOR,
     type: "train.main",
@@ -353,9 +367,10 @@ describe("publish refuses invalid input", () => {
     await runInDurableObject(freshStub(), async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO, () => NOW);
       const writer = createMainWriter(
-        { log },
+        { log, clock: () => NOW },
         () => ({
           authorization: unavailableAuthorization,
+          attemptOutcome: () => null,
           currentGeneration: () => null,
           currentVersions: () => null,
         }),
@@ -578,6 +593,42 @@ describe("publish fences claims and decisions", () => {
     );
   });
 
+  it("refuses when the decision its acceptance check proves is no longer required", async () => {
+    const world = new World();
+    world.acceptance = DEC_FORMAT;
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        // Claim A no longer requires the decision; the authorized set still covers what remains.
+        world.versions.set(CLAIM_A, []);
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+        expect(h.log.head()).toBe(1);
+      },
+      world,
+    );
+  });
+
+  it("refuses when the check attempt the intent rests on cannot be read", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        world.attemptKnown = false;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "check_mismatch" });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+      },
+      world,
+    );
+  });
+
   it("settles a write that landed even if the fence moved afterwards", async () => {
     const world = new World();
     const ref = new FakeMain(MAIN, ["crash-after"]);
@@ -664,6 +715,92 @@ describe("publish holds a moved fence while the intent's own write may still lan
         expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
       },
       world,
+    );
+  });
+});
+
+describe("publish ends the wait for an unsettled write after the update lifetime", () => {
+  it("settles the intent as not landed once its last attempt is that old", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.generations.set(CLAIM_B, 4);
+
+        // One millisecond short of the lifetime, the write may still land.
+        world.now = NOW + MAIN_UPDATE_LIFETIME_MS - 1;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+
+        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, MAIN), updatedAt: world.now },
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", MAIN, INTENT, world.now)]);
+        // Settled for good: a repeat neither reads nor writes.
+        const reads = ref.reads;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: true, value: { main: MAIN } });
+        expect(ref.reads).toBe(reads);
+      },
+      world,
+    );
+  });
+
+  it("writes again instead when the fence still holds after the lifetime", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: true,
+          value: { status: "updated", attempts: 2, main: CANDIDATE },
+        });
+        expectOnlyConditional(ref);
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "updated", main: CANDIDATE },
+        ]);
+      },
+      world,
+    );
+  });
+
+  it("releases a write from another commit once the earlier write is that old", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        ref.readFails = false;
+        await authorizeB(h);
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({ ok: false, code: "unavailable" });
+
+        // A never landed, so B, composed on A's candidate, is rejected rather than held.
+        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { intentId: INTENT_B, status: "rejected", main: MAIN },
+        });
+        expect(ref.updates).toEqual([
+          { expected: MAIN, next: CANDIDATE },
+          { expected: CANDIDATE, next: CANDIDATE_B },
+        ]);
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "reconciled", main: MAIN },
+          { intentId: INTENT_B, outcome: "rejected", main: MAIN },
+        ]);
+      },
+      world,
+      freshStub(),
+      { secondExpected: CANDIDATE },
     );
   });
 });

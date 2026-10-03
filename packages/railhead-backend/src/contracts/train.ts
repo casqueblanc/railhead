@@ -107,7 +107,7 @@ export interface MergeIntentRecord {
   main: CommitSha | null;
   /** When it was authorized. */
   authorizedAt: number;
-  /** When it last changed. */
+  /** When it last changed; while `authorized` with attempts counted, when the last attempt began. */
   updatedAt: number;
 }
 
@@ -225,7 +225,9 @@ export type MainUpdate =
  * it, and it never returns to a commit it left. The writer's reconciliation depends on that, since
  * it reads main anywhere but an intent's expected commit or candidate as proof the intent did not
  * land. Neither call promises a deadline or cancellation, so the main writer bounds each one and
- * treats an update that does not answer in time as uncertain.
+ * treats an update that does not answer in time as uncertain. An update that has not applied
+ * within `MAIN_UPDATE_LIFETIME_MS` of being sent must never apply: past that, the writer reads main
+ * at the expected commit as proof the update did not land.
  */
 export interface MainRefPort {
   /** Reads main's current commit. */

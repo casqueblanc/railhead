@@ -9,9 +9,10 @@ export const mainWriter: MainWriterFactory = (context, ports, mainRef) =>
   createMainWriter(
     context,
     () => {
-      const { authorization, claims, decisions } = ports();
+      const { authorization, claims, decisions, train } = ports();
       return {
         authorization,
+        attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
         currentGeneration: (claimId) => claims.currentGeneration(claimId),
         currentVersions: (claimId) => decisions.currentVersions(claimId),
       };

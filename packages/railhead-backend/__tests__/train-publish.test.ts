@@ -15,7 +15,11 @@ import type {
   MainUpdate,
   MainWriterPort,
 } from "../src/contracts/train";
-import { createMainWriter, MAX_WRITE_ATTEMPTS } from "../src/modules/mainWriter/mainWriter";
+import {
+  createMainWriter,
+  MAIN_UPDATE_LIFETIME_MS,
+  MAX_WRITE_ATTEMPTS,
+} from "../src/modules/mainWriter/mainWriter";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
 import { readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
@@ -114,6 +118,8 @@ interface Harness {
   sql: SqlStorage;
   /** Moves the clock past the wake the train owes, then runs the Repo's alarm for it. */
   alarm(): Promise<void>;
+  /** The Repo's clock, without advancing it. */
+  now(): number;
 }
 
 /**
@@ -144,14 +150,15 @@ function withRepo<R>(
     const currentVersions = (claimId: string): [] | null => (current.has(claimId) ? [] : null);
     const started: CheckAttempt[] = [];
     const real = composeRepo(context);
-    const authorization = createAuthorization(context, {
-      attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
+    const readers = {
+      attemptOutcome: (attemptId: string) => train.attemptOutcome(attemptId),
       currentGeneration,
       currentVersions,
-    });
+    };
+    const authorization = createAuthorization(context, readers);
     const mainWriter: MainWriterPort = createMainWriter(
       context,
-      () => ({ authorization, currentGeneration, currentVersions }),
+      () => ({ authorization, ...readers }),
       ref,
       REF_TIMEOUT_MS,
     );
@@ -195,6 +202,7 @@ function withRepo<R>(
         now = Math.max(now, wake.dueAt);
         await train.resume();
       },
+      now: () => now,
     });
   });
 }
@@ -373,22 +381,41 @@ describe("the train publishes through the real main writer", () => {
     });
   });
 
-  it("holds the batch without writing while the uncertain write never lands", async () => {
+  it("fails the batch and requeues its work once a write that never lands outlives its lifetime", async () => {
     const ref = new FakeMain(MAIN, ["drop"]);
     ref.fallback = "refuse";
-    await withRepo(ref, [pin(1)], async (h) => {
+    await withRepo(ref, [pin(1), pin(2)], async (h) => {
       await h.train.enqueue(pin(1));
       await pass(h);
       const intentId = latestIntent(h.train);
+      const attemptAt = h.authorization.record(intentId)?.updatedAt ?? 0;
+      await h.train.enqueue(pin(2));
 
+      // Claim 1 changes owner while the write is unsettled: the batch is held while it may land.
       const writes = ref.updates.length;
       h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
-      for (let drive = 0; drive < 3; drive += 1) await h.alarm();
-      expect(ref.updates).toHaveLength(writes);
+      await h.alarm();
       expect(batchStates(h.train)).toEqual([["passed", null]]);
       expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized" });
+
+      // The alarm keeps driving; once the attempt is older than the lifetime, the intent settles.
+      let drives = 1;
+      while (batchStates(h.train)[0]?.[0] === "passed") {
+        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_LIFETIME_MS + 5 * 60_000);
+        await h.alarm();
+        drives += 1;
+      }
+      expect(drives).toBeGreaterThan(2);
+      expect(h.now() - attemptAt).toBeGreaterThanOrEqual(MAIN_UPDATE_LIFETIME_MS);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "reconciled", main: MAIN });
+      expect(mainOutcomes(h.events())).toEqual([{ intentId, outcome: "reconciled", main: MAIN }]);
+      expect(batchStates(h.train)[0]).toEqual(["failed", "main_rejected"]);
+      expect(ref.updates).toHaveLength(writes);
       expect(ref.main).toBe(MAIN);
-      expect(mainOutcomes(h.events())).toEqual([]);
+
+      // The train moves on: the queued pin is composed on main in a batch of its own.
+      expect(h.started.at(-1)?.expectedMain).toBe(MAIN);
+      expect(h.started.at(-1)?.pins.map((p) => p.claimId)).toEqual([pin(2).claimId]);
     });
   });
 });

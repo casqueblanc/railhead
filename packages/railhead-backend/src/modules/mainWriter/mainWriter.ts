@@ -18,10 +18,19 @@
 // that same expected commit may start, so whichever of the two lands, the other's conditional
 // update can no longer apply and the next read-back tells them apart. Nothing here forces main.
 //
+// That window has an end. Main's ref promises that an update which has not applied within
+// `MAIN_UPDATE_LIFETIME_MS` of being sent never will, so once an intent's last attempt is older
+// than that, main read back at its expected commit means the write did not land, and the intent
+// settles `reconciled` at that commit. The writer applies this wherever waiting would otherwise
+// hold the train: to another intent that holds this one back, and to this intent once its fence
+// has moved. An intent whose fence still holds writes again instead, conditionally, which starts
+// a new window.
+//
 // A claim or decision fence that moves while the intent's own earlier write is unsettled stops any
-// further write, but the publication returns `unavailable`, not the fence's refusal: that write may
-// still land, and a definitive refusal would let the train fail work that then reaches main. Once
-// main moves, the read-back settles the intent and the publication returns what it found.
+// further write, but until the window ends the publication returns `unavailable`, not the fence's
+// refusal: that write may still land, and a definitive refusal would let the train fail work that
+// then reaches main. Once main moves or the window ends, the read-back settles the intent and the
+// publication returns what it found.
 //
 // Every call to main's ref is bounded by a deadline. A read that does not answer in time refuses
 // the publication; an update that does not answer in time stays counted and is read back on the
@@ -33,7 +42,6 @@
 // so an intent whose writes failed while Git was down still lands once Git answers.
 
 import { isId, type CommitSha, type IntentId } from "@railhead/shared/events";
-import type { ClaimId, DecisionRef } from "@railhead/shared/events";
 import { fail, ok, type PortErrorCode, type PortResult } from "../../contracts/result";
 import type {
   AuthorizationPort,
@@ -44,7 +52,7 @@ import type {
   MergeIntentStatus,
 } from "../../contracts/train";
 import type { EventLog } from "../../repo/eventLog";
-import { TRAIN_ACTOR } from "../../train/authorize";
+import { checkFence, TRAIN_ACTOR, type AuthorizationReaders } from "../../train/authorize";
 
 /** Updates one publication may make before it returns `unavailable`; a later one may try again. */
 export const MAX_WRITE_ATTEMPTS = 3;
@@ -55,28 +63,38 @@ export const MAX_QUEUED_PUBLICATIONS = 32;
 /**
  * How long one call to main's ref may take before the writer stops waiting for it. A publication
  * makes up to `2 * MAX_WRITE_ATTEMPTS + 1` calls, so a slow one can outlast the train's own
- * `PORT_TIMEOUT_MS`. The train then reports the drive unavailable while the publication carries on
- * and records its outcome, which the train's next drive reads; only the wake's retry budget pays.
+ * `PORT_TIMEOUT_MS` and its `DRIVE_LEASE_MS`. The train then reports the drive unavailable while
+ * the publication carries on and records its outcome, which the train's next drive reads; only the
+ * wake's retry budget pays. Publications run one at a time, so a later drive's publication waits.
  */
 export const MAIN_REF_TIMEOUT_MS = 10_000;
+
+/**
+ * How long after it is sent an update of main may still apply. `MainRefPort` promises that an
+ * update which has not applied by then never will; past it, the writer reads main at an intent's
+ * expected commit as proof that the intent's write did not land. This is a design value, not a
+ * measurement: thirty times the writer's own wait for an answer. It must stay well inside the
+ * train's alarm retries (`MAX_WAKE_FAILURES`, about 85 minutes), so a held batch is driven again
+ * after the window ends.
+ */
+export const MAIN_UPDATE_LIFETIME_MS = 30 * MAIN_REF_TIMEOUT_MS;
 
 /** What the main writer needs from its Repo. */
 export interface MainWriterContext {
   /** The event log, whose transactions fence each attempt and record each outcome. */
   readonly log: EventLog;
+  /** The current time, in milliseconds since the Unix epoch; the same clock authorization uses. */
+  readonly clock: () => number;
 }
 
 /**
- * The other modules the writer reads, resolved when a publication runs. The two fence readers are
- * called only inside the writer's transaction; `null` from either refuses the write.
+ * The other modules the writer reads, resolved when a publication runs: the intents, and the same
+ * fence readers authorization uses. The readers are called only inside the writer's transaction;
+ * `null` from any of them refuses the write.
  */
-export interface MainWriterDeps {
+export interface MainWriterDeps extends AuthorizationReaders {
   /** The intents and their progress. */
   readonly authorization: AuthorizationPort;
-  /** The claim's current ownership generation, or `null`. */
-  currentGeneration(claimId: ClaimId): number | null;
-  /** The current version of every decision the claim's work must satisfy, or `null`. */
-  currentVersions(claimId: ClaimId): DecisionRef[] | null;
 }
 
 /**
@@ -103,7 +121,7 @@ export function createMainWriter(
         return fail("busy", "Too many publications are waiting; try again.");
       }
       queued += 1;
-      const run = tail.then(() => publish(context.log, deps(), mainRef, intentId));
+      const run = tail.then(() => publish(context, deps(), mainRef, intentId));
       tail = run.catch(() => undefined);
       try {
         return await run;
@@ -115,7 +133,7 @@ export function createMainWriter(
 }
 
 async function publish(
-  log: EventLog,
+  { log, clock }: MainWriterContext,
   deps: MainWriterDeps,
   mainRef: BoundedRef,
   intentId: IntentId,
@@ -131,7 +149,7 @@ async function publish(
       // A write may have landed unheard: read main and settle what it shows before writing.
       const main = await mainRef.read();
       if (!main.ok) return main;
-      const settled = reconcile(log, deps, unsettled, main.value);
+      const settled = reconcile(log, deps, unsettled, main.value, intentId, clock());
       if (!settled.ok) return settled;
       record = deps.authorization.record(intentId);
       if (record === null) return refusal(await deps.authorization.intent(intentId));
@@ -148,8 +166,12 @@ async function publish(
     const begun = begin(log, deps, record);
     if (!begun.ok) {
       // Main was read back at the expected commit, so an earlier attempt may still land: a fence
-      // that moved since says nothing yet about whether this intent's work reaches main.
+      // that moved since says nothing yet about whether this intent's work reaches main, until
+      // the last attempt outlives the update lifetime.
       if (record.attempts > 0 && isFenceRefusal(begun.code)) {
+        if (expired(record, clock())) {
+          return settle(log, deps, record, "reconciled", record.expectedMain);
+        }
         return fail("unavailable", "An earlier write of this intent may still land; try again.");
       }
       return begun;
@@ -183,17 +205,22 @@ async function publish(
 
 /**
  * Settles every unsettled intent that `main` decides, each with its event, and returns the ones
- * whose write may still apply: those whose expected commit is still main.
+ * whose write may still apply: those whose expected commit is still main. An intent other than
+ * `publishing` whose last attempt has outlived the update lifetime is settled as not landed;
+ * `publishing` itself may write again from the same commit, so `publish` decides it.
  */
 function reconcile(
   log: EventLog,
   deps: MainWriterDeps,
   unsettled: readonly MergeIntentRecord[],
   main: CommitSha,
+  publishing: IntentId,
+  now: number,
 ): PortResult<MergeIntentRecord[]> {
   const pending: MergeIntentRecord[] = [];
   for (const record of unsettled) {
-    if (main === record.expectedMain && main !== record.candidate) {
+    const open = main === record.expectedMain && main !== record.candidate;
+    if (open && (record.intentId === publishing || !expired(record, now))) {
       pending.push(record);
       continue;
     }
@@ -221,23 +248,17 @@ function begin(
     ) {
       return fail("busy", "The merge intent changed during publication; try again.");
     }
-    for (const pin of current.pins) {
-      if (deps.currentGeneration(pin.claimId) !== pin.generation) {
-        return fail("stale_generation", "A claim changed owner since the merge was authorized.");
-      }
+    const outcome = deps.attemptOutcome(current.checkAttemptId);
+    if (outcome === null) {
+      return fail("check_mismatch", "The check attempt the merge rests on is unknown.");
     }
-    const authorized = new Map(current.decisions.map((ref) => [ref.decisionId, ref.version]));
-    for (const pin of current.pins) {
-      const refs = deps.currentVersions(pin.claimId);
-      if (refs === null) {
-        return fail("decision_superseded", "The decisions a claim must satisfy are unknown.");
-      }
-      for (const ref of refs) {
-        if (authorized.get(ref.decisionId) !== ref.version) {
-          return fail("decision_superseded", "A decision changed since the merge was authorized.");
-        }
-      }
-    }
+    const fenced = checkFence(
+      deps,
+      current.pins,
+      current.decisions,
+      outcome.attempt.definition.acceptance?.decision ?? null,
+    );
+    if (!fenced.ok) return fenced;
     const counted = deps.authorization.recordWrite(current.intentId, current.attempts, {
       status: "authorized",
       attempts: current.attempts + 1,
@@ -278,7 +299,12 @@ function settle(
 
 /** A refusal from `begin` because the work the intent rests on is no longer current. */
 function isFenceRefusal(code: PortErrorCode): boolean {
-  return code === "stale_generation" || code === "decision_superseded";
+  return code === "stale_generation" || code === "decision_superseded" || code === "check_mismatch";
+}
+
+/** Whether the intent's last attempt is old enough that it can no longer apply. */
+function expired(record: MergeIntentRecord, now: number): boolean {
+  return now - record.updatedAt >= MAIN_UPDATE_LIFETIME_MS;
 }
 
 /** Passes on the refusal of an intent read that found no record. */
