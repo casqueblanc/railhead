@@ -37,6 +37,12 @@ const POLL_MARGIN: Duration = Duration::from_millis(500);
 /// not polled faster than this.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Test-only: when `--wait` starts, in Unix milliseconds, in place of the moment `rh` begins it.
+/// Read in debug builds alone, so integration tests can time a wait from a point they control
+/// rather than from whenever a loaded machine got the process running. Release builds ignore it.
+#[cfg(debug_assertions)]
+const WAIT_FROM_ENV: &str = "RH_TEST_WAIT_FROM_UNIX_MS";
+
 /// Arguments of `rh ask`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct Args {
@@ -332,7 +338,14 @@ fn wait_for(
         "waiting up to {seconds} s for the answer to {question_id}; if interrupted, resume with rh ask --question {question_id} --wait {seconds}"
     ))
     .map_err(Error::Output)?;
-    let deadline = Instant::now() + wait;
+    let start = Instant::now();
+    // A debug build lets a test set when the wait starts instead.
+    #[cfg(debug_assertions)]
+    let start = match std::env::var_os(WAIT_FROM_ENV) {
+        Some(from) => wait_start_from(&from, start, std::time::SystemTime::now())?,
+        None => start,
+    };
+    let deadline = start + wait;
     loop {
         let started = Instant::now();
         let early = match poll(agent, question_id, deadline) {
@@ -374,6 +387,36 @@ fn wait_for(
         retryable: true,
         next: Some(NextCommand::Ask),
     })
+}
+
+/// Test-only: the [`Instant`] for `from`, a Unix time in milliseconds, given that the monotonic
+/// clock read `now` when the system clock read `system_now`.
+///
+/// # Errors
+///
+/// [`LocalCode::InvalidInput`] when `from` names no time either clock can represent.
+#[cfg(debug_assertions)]
+fn wait_start_from(
+    from: &std::ffi::OsStr,
+    now: Instant,
+    system_now: std::time::SystemTime,
+) -> Result<Instant> {
+    let invalid = || Error::Local {
+        code: LocalCode::InvalidInput,
+        message: format!("{WAIT_FROM_ENV} is not a time in Unix milliseconds"),
+        retryable: false,
+        next: None,
+    };
+    let from = from
+        .to_str()
+        .and_then(|ms| ms.parse().ok())
+        .and_then(|ms| std::time::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+        .ok_or_else(invalid)?;
+    let start = match system_now.duration_since(from) {
+        Ok(since) => now.checked_sub(since),
+        Err(ahead) => now.checked_add(ahead.duration()),
+    };
+    start.ok_or_else(invalid)
 }
 
 /// How long to pause before polling again after `error`, or `None` when the poll must not be
@@ -568,6 +611,32 @@ mod tests {
         let command = <Args as clap::Args>::augment_args(clap::Command::new("ask"));
         let matches = command.no_binary_name(true).try_get_matches_from(args)?;
         <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_wait_counts_from_the_time_its_test_seam_names() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let system_now = std::time::UNIX_EPOCH + Duration::from_millis(10_000);
+        let start = |from: &str| wait_start_from(std::ffi::OsStr::new(from), now, system_now);
+        // A time already past starts the wait earlier, and one still ahead later.
+        assert_eq!(start("8500")? + Duration::from_millis(1_500), now);
+        assert_eq!(start("10000")?, now);
+        assert_eq!(start("10250")?, now + Duration::from_millis(250));
+        for invalid in ["", "-1", "1.5", "soon", "18446744073709551616"] {
+            let error = start(invalid).err();
+            assert!(
+                matches!(
+                    &error,
+                    Some(Error::Local {
+                        code: LocalCode::InvalidInput,
+                        ..
+                    })
+                ),
+                "{invalid}: {error:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
