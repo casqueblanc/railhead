@@ -67,6 +67,10 @@ const SOURCE = {
 const REPOSITORY = { owner: NAMESPACE, repo: REPO };
 
 describe("gatewayCheckout", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("names the exact commit, no token, the admitted sandbox and a grant ending at its deadline", () => {
     expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT)).toEqual({
       kind: "git",
@@ -91,7 +95,6 @@ describe("gatewayCheckout", () => {
       ACCOUNT,
     );
 
-    vi.useRealTimers();
     expect(checkout.fence).toEqual(expect.objectContaining({ expiresAt: deadline }));
   });
 
