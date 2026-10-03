@@ -20,8 +20,8 @@ import {
  * commit 5 against version 2. On that landed commit the old version's reject check passes, the
  * current version's reject check passes, and the current chunk check fails and then errors; later
  * runs pass the chunk check for version 1 and the reject check for version 2. The chunk check
- * also passes on commit 6, which never lands. Atlas then lands commit 8, whose chunk
- * check fails once and passes on a re-run.
+ * also passes on commit 6, which never lands. Atlas's claim is merged, so birch then lands commit 8,
+ * whose chunk check fails once and passes on a re-run.
  */
 export const optionResults = syntheticLog(
   "Synthetic acceptance results for old and current options",
@@ -76,14 +76,14 @@ export const optionResults = syntheticLog(
       decision: sizeDecision(2),
       option: "chunk",
     }),
-    push(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(4), synthCommit(7)),
-    ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(7), [sizeDecision(2)]),
+    push(UPLOAD.birch, UPLOAD.birchClaim, null, synthCommit(7)),
+    ready(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(7), [sizeDecision(2)]),
     checkResult("chk_synth24", synthCommit(8), "test", "pass"),
     intend(
       "int_synth24",
       synthCommit(5),
       synthCommit(8),
-      [UPLOAD.atlasClaim],
+      [UPLOAD.birchClaim],
       [sizeDecision(2)],
       "chk_synth24",
     ),

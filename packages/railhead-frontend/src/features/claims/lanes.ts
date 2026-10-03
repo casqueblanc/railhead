@@ -111,7 +111,7 @@ const statusOf = (state: BoardState, claim: ClaimState): LaneStatus => {
   switch (claim.phase) {
     case "expired":
       return { kind: "expired" };
-    case "landed":
+    case "merged":
       return { kind: "landed" };
     case "ready":
       // A ready claim always carries its pinned commit; see `ClaimState.ready`.
