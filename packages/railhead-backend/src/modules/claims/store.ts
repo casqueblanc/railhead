@@ -182,6 +182,29 @@ export function openClaim(
   return updated.length === 1;
 }
 
+/**
+ * Pins `commit` on a working claim at `generation`, which makes the claim ready. Returns `false`,
+ * and writes nothing, when the claim is no longer working at that generation.
+ */
+export function pinReady(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  commit: CommitSha,
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'ready', ready_commit = ?
+       WHERE claim_id = ? AND generation = ? AND state = 'working'
+       RETURNING claim_id`,
+      commit,
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
 /** The issue filed with `grantId`, or `null`. */
 export function issueByGrant(sql: SqlStorage, grantId: string): IssueId | null {
   const [row] = sql
