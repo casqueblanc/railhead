@@ -160,7 +160,7 @@ test("the acceptance checks are read from the selected commit, never the working
   const lines = await run(["bundle", "--out", out, "--revision", "HEAD~1", "--source-root", repo]);
   assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
   const clone = join(scratch, "checks-clone");
-  execFileSync("git", ["clone", "--quiet", out, clone]);
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", out, clone]);
   assert.equal(readFileSync(join(clone, "acceptance", "checks.json"), "utf8"), compatible);
 
   // A commit whose checks are not JSON is refused, naming that commit.
@@ -179,7 +179,7 @@ test("the bundle is a repository that installs and runs its checks on its own", 
   // An empty directory outside any workspace: nothing above it can supply a package or config.
   const clone = join(mkdtempSync(join(tmpdir(), "railhead-demo-standalone-")), "upload-app");
   after(() => rmSync(dirname(clone), { recursive: true, force: true }));
-  execFileSync("git", ["clone", "--quiet", out, clone]);
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", out, clone]);
   assert.deepEqual(readdirSync(clone).toSorted(), [
     ".git",
     ".node-version",

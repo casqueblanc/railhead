@@ -123,3 +123,51 @@ test("the standalone vitest config differs from the app's only in the workerd as
     ),
   );
 });
+
+/**
+ * The `resolution:` line of every entry under a `packages:` key of a pnpm lockfile, in any of its
+ * YAML documents, keyed by the entry's name and version. The resolution names what the store
+ * holds; the other fields, such as peer ranges an override rewrites, do not change it.
+ */
+function lockedResolutions(path: string): Map<string, string> {
+  const resolutions = new Map<string, string>();
+  let inPackages = false;
+  let key: string | null = null;
+  for (const line of read(path).split("\n")) {
+    if (/^\S/.test(line)) {
+      inPackages = line === "packages:";
+      key = null;
+      continue;
+    }
+    if (!inPackages) continue;
+    const entry = /^ {2}(\S.*):$/.exec(line)?.[1];
+    if (entry !== undefined) {
+      assert.ok(!resolutions.has(entry), `${path} locks ${entry} twice`);
+      key = entry;
+    } else if (line.startsWith("    resolution: ")) {
+      assert.ok(key !== null, `${path}: a resolution outside a package entry`);
+      resolutions.set(key, line.trim());
+    }
+  }
+  return resolutions;
+}
+
+test("the standalone lockfile resolves only packages the root lockfile resolves, identically", () => {
+  // The bundle's install test runs offline from the store the root install filled, so a package the
+  // root does not lock at the same version and integrity would fail it with an unrelated error.
+  const rootResolutions = lockedResolutions(join(root, "pnpm-lock.yaml"));
+  const standalone = lockedResolutions(join(fixtures, "pnpm-lock.yaml"));
+  const refresh = "refresh fixtures/demo/standalone/pnpm-lock.yaml (see docs/demo-seed.md)";
+
+  // Its direct dependencies at least; a parse that found nothing would check nothing.
+  assert.ok(
+    standalone.has(`vitest@${catalog()["vitest"]}`),
+    "the standalone lockfile lacks vitest",
+  );
+  for (const [key, resolution] of standalone) {
+    assert.match(resolution, /^resolution: \{integrity: sha512-/, `${key} has no integrity`);
+    const rootResolution = rootResolutions.get(key);
+    assert.ok(rootResolution !== undefined, `${key} is not in the root lockfile; ${refresh}`);
+    assert.equal(resolution, rootResolution, `${key} resolves differently; ${refresh}`);
+  }
+});

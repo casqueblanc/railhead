@@ -2,8 +2,8 @@
 //
 //   seed --dry-run      plan the seed of demo/upload-app and name every target
 //   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else
-//   bundle --out FILE   write the imported main as a Git bundle for the owner to push; refuses
-//                       --dry-run, since seed --dry-run is the preview
+//   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
+//                       refuses --dry-run, since seed --dry-run is the preview
 //
 // `--org` and `--repo` may be given, and anything but demo/upload-app is refused. Seed and reset
 // only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing

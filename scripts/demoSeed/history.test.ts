@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import {
+  buildMainBundle,
+  bundleHead,
   DEMO_AUTHOR,
   planHistory,
   readFileAt,
@@ -43,7 +45,7 @@ function request(
 
 function cloneOf(bundle: string, name: string): string {
   const clone = join(scratch, name);
-  execFileSync("git", ["clone", "--quiet", bundle, clone]);
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", bundle, clone]);
   return clone;
 }
 
@@ -93,13 +95,13 @@ test("the import keeps every commit that changed the directory, rooted at it", (
   const history = writeHistoryBundle(request(source, "HEAD"), bundle);
 
   assert.equal(history.commits, 3);
-  // Every Git version checks out a bundle that records HEAD; some check out nothing without it.
+  // Main alone, as the backend's seed requires; a clone names the branch to check it out.
   assert.deepEqual(
     execFileSync("git", ["bundle", "list-heads", bundle], { encoding: "utf8" }),
-    `${history.head} HEAD\n${history.head} refs/heads/main\n`,
+    `${history.head} refs/heads/main\n`,
   );
   const clone = join(scratch, "normal-clone");
-  execFileSync("git", ["clone", "--quiet", bundle, clone]);
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", bundle, clone]);
   assert.equal(git(clone, ["rev-parse", "HEAD"]), history.head);
   assert.deepEqual(git(clone, ["log", "--format=%s|%an <%ae>"]).split("\n"), [
     `docs(demo): describe it|${DEMO_AUTHOR.name} <${DEMO_AUTHOR.email}>`,
@@ -128,8 +130,67 @@ test("the same revision always yields the same head, and an earlier one a prefix
   const bundle = join(scratch, "repeat.bundle");
   writeHistoryBundle(request(source, "HEAD"), bundle);
   const clone = join(scratch, "repeat-clone");
-  execFileSync("git", ["clone", "--quiet", bundle, clone]);
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", bundle, clone]);
   assert.equal(git(clone, ["rev-parse", "HEAD~1"]), earlier.head);
+});
+
+test("the seed's bundle is main alone at the head, holding its whole history", () => {
+  const source = sourceRepo("seed-bundle");
+  const expected = planHistory(request(source, "HEAD"));
+
+  const bundle = buildMainBundle(request(source, "HEAD"));
+
+  assert.equal(bundle.head, expected.head);
+  assert.equal(bundle.commits, expected.commits);
+  assert.equal(bundleHead(bundle.bytes), expected.head);
+  const path = join(scratch, "seed-bundle.bundle");
+  writeFileSync(path, bundle.bytes);
+  // No prerequisites: an empty repository can take it, as an empty main does.
+  const empty = join(scratch, "seed-bundle-empty");
+  git(scratch, ["init", "--quiet", "--bare", empty]);
+  git(empty, ["fetch", "--quiet", path, "refs/heads/main:refs/heads/main"]);
+  assert.equal(git(empty, ["rev-parse", "refs/heads/main"]), expected.head);
+  assert.equal(git(empty, ["rev-list", "--count", "refs/heads/main"]), String(expected.commits));
+});
+
+test("a bundle above the size limit is refused, and one at the limit is not", () => {
+  const source = sourceRepo("bundle-limit");
+  const { bytes } = buildMainBundle(request(source, "HEAD"));
+
+  assert.equal(buildMainBundle(request(source, "HEAD"), bytes.length).bytes.length, bytes.length);
+  assert.throws(
+    () => buildMainBundle(request(source, "HEAD"), bytes.length - 1),
+    (error) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        `The bundle is ${bytes.length} bytes; the seed accepts at most ${bytes.length - 1}.`,
+  );
+});
+
+function header(text: string): Uint8Array {
+  return new TextEncoder().encode(text);
+}
+
+test("a bundle header names main alone or yields no head", () => {
+  const a = "a".repeat(40);
+
+  assert.equal(bundleHead(header(`# v2 git bundle\n${a} refs/heads/main\n\nPACK`)), a);
+  for (const text of [
+    "",
+    `# v2 git bundle\n${a} refs/heads/main\n`,
+    `# v3 git bundle\n@object-format=sha1\n${a} refs/heads/main\n\nPACK`,
+    `# v2 git bundle\n${a} HEAD\n${a} refs/heads/main\n\nPACK`,
+    `# v2 git bundle\n-${a}\n${a} refs/heads/main\n\nPACK`,
+    `# v2 git bundle\n${a} refs/heads/main extra\n\nPACK`,
+    `# v2 git bundle\n${a.toUpperCase()} refs/heads/main\n\nPACK`,
+  ]) {
+    assert.equal(bundleHead(header(text)), null, JSON.stringify(text));
+  }
+  // A header that does not end within the bytes read is not a bundle.
+  assert.equal(
+    bundleHead(header(`# v2 git bundle\n${a} refs/heads/main\n${"x".repeat(5000)}\n\n`)),
+    null,
+  );
 });
 
 test("a revision before the directory existed, or a missing directory, is refused", () => {

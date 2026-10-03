@@ -1,15 +1,26 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { MainBundle } from "./history.ts";
 import { loadManifest, SeedRefusal, type SeedManifest } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
-import { describePlan, planSeed, reset, seed } from "./reconcile.ts";
+import { ActionStale, describePlan, planSeed, reset, seed } from "./reconcile.ts";
 
 const manifest = loadManifest(
   join(import.meta.dirname, "..", "..", "fixtures", "demo", "seed.json"),
 );
 const demo = { org: "demo", repo: "upload-app" };
-const history = { head: "a".repeat(40), commits: 4 };
+
+/** A bundle header naming `refs` and a stub pack: enough for the target to read its head. */
+function bundleOf(head: string, refs = `${head} refs/heads/main\n`): MainBundle {
+  return {
+    head,
+    commits: 4,
+    bytes: new TextEncoder().encode(`# v2 git bundle\n${refs}\nPACK`),
+  };
+}
+
+const history = bundleOf("a".repeat(40));
 
 /** Files the manifest's issues as the owner would on the board. */
 function fileSeededIssues(
@@ -74,9 +85,63 @@ test("a seed that failed before importing main imports it on the next run", asyn
   assert.equal((await target.read(demo))?.main, history.head);
 });
 
+test("a seed whose import response was lost finds main in place and does not import again", async () => {
+  const target = new MemoryTarget();
+  target.loseResponseOf("importMain");
+
+  await assert.rejects(seed(manifest, history, target), /importMain response lost/);
+  assert.equal((await target.read(demo))?.main, history.head);
+
+  // Armed again: a second import would throw, so passing shows the plan found main done.
+  target.fail("importMain");
+  const plan = await seed(manifest, history, target);
+  assert.deepEqual(
+    plan.slice(0, 2).map((planned) => planned.status),
+    ["done", "done"],
+  );
+  assert.equal((await target.read(demo))?.main, history.head);
+});
+
+test("importing main only creates it: the same head succeeds and another is stale", async () => {
+  const target = new MemoryTarget();
+  await target.createRepo(demo);
+  await target.importMain(demo, history);
+
+  await target.importMain(demo, history);
+  assert.equal((await target.read(demo))?.main, history.head);
+
+  const other = bundleOf("b".repeat(40));
+  await assert.rejects(target.importMain(demo, other), ActionStale);
+  await assert.rejects(target.importMain(demo, other), /has main at a{40}, not b{40}/);
+  assert.equal((await target.read(demo))?.main, history.head);
+});
+
+test("importing a bundle that is not main alone at the approved head writes nothing", async () => {
+  const target = new MemoryTarget();
+  await target.createRepo(demo);
+  const a = "a".repeat(40);
+  const b = "b".repeat(40);
+
+  for (const bundle of [
+    // Main at another head than the one approved.
+    { ...bundleOf(b), head: a },
+    // A ref beside main.
+    bundleOf(a, `${a} HEAD\n${a} refs/heads/main\n`),
+    // A prerequisite: the bundle lacks history the target would need.
+    bundleOf(a, `-${b}\n${a} refs/heads/main\n`),
+    // Another branch.
+    bundleOf(a, `${a} refs/heads/dev\n`),
+    // No header at all.
+    { head: a, commits: 1, bytes: new Uint8Array([0x50, 0x41, 0x43, 0x4b]) },
+  ]) {
+    await assert.rejects(target.importMain(demo, bundle), /not main alone/);
+  }
+  assert.equal((await target.read(demo))?.main, null);
+});
+
 test("a seed over another main or an edited issue is refused and writes nothing", async () => {
   const target = new MemoryTarget();
-  await seed(manifest, { head: "b".repeat(40), commits: 1 }, target);
+  await seed(manifest, bundleOf("b".repeat(40)), target);
   const before = await target.read(demo);
 
   await assert.rejects(seed(manifest, history, target), /already has main at b{40}/);

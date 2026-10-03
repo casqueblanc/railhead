@@ -18,7 +18,7 @@
 // owner's steps.
 
 import { assertDemoTarget, SeedRefusal, type SeedIssue, type SeedManifest } from "./manifest.ts";
-import type { ImportedHistory } from "./history.ts";
+import type { ImportedHistory, MainBundle } from "./history.ts";
 
 /** A Railhead repository, `org/repo`. */
 export interface RepoRef {
@@ -40,10 +40,20 @@ export interface SeedTarget {
   read(ref: RepoRef): Promise<RepoState | null>;
   /** Creates the repository with an empty main. */
   createRepo(ref: RepoRef): Promise<void>;
-  /** Sets the empty main to the imported history's head. */
-  importMain(ref: RepoRef, history: ImportedHistory): Promise<void>;
+  /**
+   * Imports `bundle` as main, which only creates main and never moves it: when main is already
+   * `bundle.head` it succeeds without writing, and when main holds another head it throws
+   * `ActionStale`. These are the backend's `demo.seed` rules (#149), so a repeat after a lost
+   * response is safe.
+   */
+  importMain(ref: RepoRef, bundle: MainBundle): Promise<void>;
   /** Deletes the repository and everything in it. */
   deleteRepo(ref: RepoRef): Promise<void>;
+}
+
+/** The target refused a write because it holds something else, as the backend's `action_stale`. */
+export class ActionStale extends Error {
+  override readonly name = "ActionStale";
 }
 
 /** One step of a plan. */
@@ -105,15 +115,15 @@ export async function planSeed(
 
 /**
  * Applies the missing repository and main steps of a fresh seed plan, in order, and returns the
- * plan. Missing issues stay missing: the owner files them on the board.
+ * plan. Main is imported from `bundle`, the bytes the target receives. Missing issues stay missing: the owner files them on the board.
  */
 export async function seed(
   manifest: SeedManifest,
-  history: ImportedHistory,
+  bundle: MainBundle,
   target: SeedTarget,
 ): Promise<PlannedStep[]> {
   const ref = demoRef(manifest);
-  const plan = await planSeed(manifest, history, target);
+  const plan = await planSeed(manifest, bundle, target);
   for (const { step, status } of plan) {
     if (status === "done") continue;
     switch (step.action) {
@@ -121,7 +131,7 @@ export async function seed(
         await target.createRepo(ref);
         break;
       case "main.import":
-        await target.importMain(ref, history);
+        await target.importMain(ref, bundle);
         break;
       case "issue.file":
         // The owner's step; the seed holds no authority to file an issue.

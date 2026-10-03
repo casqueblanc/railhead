@@ -13,7 +13,7 @@
 // Every file is read from the source commit, never from a working tree.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { devNull, tmpdir } from "node:os";
 import { join } from "node:path";
 import { SeedRefusal } from "./manifest.ts";
@@ -24,6 +24,11 @@ export const DEMO_AUTHOR = { name: "Railhead demo", email: "demo@railhead.dev" }
 export const MAIN_BRANCH = "main";
 /** The most commits an import may hold. The demo history is small; more means the wrong source. */
 export const MAX_IMPORT_COMMITS = 500;
+/**
+ * The largest bundle the seed sends. It restates the backend's `MAX_DEMO_BUNDLE_BYTES` (#149),
+ * which refuses a larger one; the scripts do not depend on `@railhead/shared`.
+ */
+export const MAX_BUNDLE_BYTES = 8 * 1024 * 1024;
 
 /** One file of the overlay applied on top of the imported directory. */
 export interface OverlayEntry {
@@ -51,6 +56,20 @@ export interface ImportedHistory {
   /** How many commits it holds, all reachable from `head`. */
   readonly commits: number;
 }
+
+/**
+ * The imported main as the seed sends it: a v2 Git bundle whose only ref is `refs/heads/main` at
+ * `head`, with no prerequisites, so it carries every object main reaches. This is the input the
+ * backend's `demo.seed` takes (#149): the bundle bytes and the head the owner approved.
+ */
+export interface MainBundle extends ImportedHistory {
+  readonly bytes: Uint8Array;
+}
+
+const BUNDLE_SIGNATURE = "# v2 git bundle\n";
+const BUNDLE_REF = `refs/heads/${MAIN_BRANCH}`;
+/** The longest bundle header read before giving up on finding its end, as the backend does. */
+const MAX_BUNDLE_HEADER_BYTES = 4096;
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 // `ls-tree -z` prints `<mode> <type> <object>\t<path>\0`.
@@ -87,17 +106,60 @@ export function planHistory(request: ImportRequest): ImportedHistory {
 }
 
 /**
- * Rewrites the history and writes it to `bundlePath` as a Git bundle holding `main`. The owner
- * pushes that bundle to the demo repository's main.
+ * Rewrites the history into a `MainBundle`, refusing one above `maxBytes`. Its only ref is
+ * `refs/heads/main`, so a clone of it needs `--branch main` to check anything out.
  */
-export function writeHistoryBundle(request: ImportRequest, bundlePath: string): ImportedHistory {
+export function buildMainBundle(
+  request: ImportRequest,
+  maxBytes: number = MAX_BUNDLE_BYTES,
+): MainBundle {
   return withScratch(request.sourceRoot, (scratch) => {
     const history = rewrite(request, scratch);
-    git(scratch, ["update-ref", `refs/heads/${MAIN_BRANCH}`, history.head]);
-    // `HEAD` too: without it some Git versions clone the bundle but check nothing out.
-    git(scratch, ["bundle", "create", bundlePath, "HEAD", `refs/heads/${MAIN_BRANCH}`]);
-    return history;
+    git(scratch, ["update-ref", BUNDLE_REF, history.head]);
+    const path = join(scratch, "main.bundle");
+    // The backend accepts exactly one ref, so no `HEAD` beside main.
+    git(scratch, ["bundle", "create", path, BUNDLE_REF]);
+    const bytes = new Uint8Array(readFileSync(path));
+    if (bytes.length > maxBytes) {
+      throw new SeedRefusal(
+        `The bundle is ${bytes.length} bytes; the seed accepts at most ${maxBytes}.`,
+      );
+    }
+    if (bundleHead(bytes) !== history.head) {
+      throw new Error(`git bundle create did not write main at ${history.head} alone.`);
+    }
+    return { ...history, bytes };
   });
+}
+
+/** Writes `buildMainBundle`'s bundle to `bundlePath` for the owner to send to the seed. */
+export function writeHistoryBundle(request: ImportRequest, bundlePath: string): ImportedHistory {
+  const { head, commits, bytes } = buildMainBundle(request);
+  writeFileSync(bundlePath, bytes);
+  return { head, commits };
+}
+
+/**
+ * The head of a v2 Git bundle whose only ref is `refs/heads/main` and that has no prerequisites,
+ * or `null` for any other input. The backend reads a bundle by the same rules before importing it.
+ */
+export function bundleHead(bytes: Uint8Array): string | null {
+  const limit = Math.min(bytes.length, MAX_BUNDLE_HEADER_BYTES);
+  let end = -1;
+  for (let i = 1; i < limit; i += 1) {
+    if (bytes[i] === 0x0a && bytes[i - 1] === 0x0a) {
+      end = i;
+      break;
+    }
+  }
+  if (end === -1) return null;
+  const header = new TextDecoder().decode(bytes.subarray(0, end));
+  if (!header.startsWith(BUNDLE_SIGNATURE)) return null;
+  const lines = header.slice(BUNDLE_SIGNATURE.length, -1).split("\n");
+  const [only, ...rest] = lines;
+  if (only === undefined || rest.length > 0) return null;
+  const [sha = "", ref, ...extra] = only.split(" ");
+  return COMMIT_SHA.test(sha) && ref === BUNDLE_REF && extra.length === 0 ? sha : null;
 }
 
 function rewrite(request: ImportRequest, scratch: string): ImportedHistory {

@@ -1,8 +1,8 @@
 // An in-memory `SeedTarget`: the stand-in for a Railhead instance in the seed's tests, and the empty
 // instance a dry run plans against while no live target exists.
 
-import type { ImportedHistory } from "./history.ts";
-import type { RepoRef, RepoState, SeedTarget } from "./reconcile.ts";
+import { bundleHead, type MainBundle } from "./history.ts";
+import { ActionStale, type RepoRef, type RepoState, type SeedTarget } from "./reconcile.ts";
 
 /** A `SeedTarget` method name. */
 export type TargetMethod = Exclude<keyof SeedTarget, "read">;
@@ -49,11 +49,22 @@ export class MemoryTarget implements SeedTarget {
     this.#after("createRepo");
   }
 
-  async importMain(ref: RepoRef, history: ImportedHistory): Promise<void> {
+  /**
+   * Imports main from the bundle's own header, as the backend does: a bundle that is not main
+   * alone at the approved head is refused, a repeat with the same head succeeds, and a main at
+   * another head is `ActionStale`.
+   */
+  async importMain(ref: RepoRef, bundle: MainBundle): Promise<void> {
     this.#before("importMain");
     const repo = this.#existing(ref);
-    if (repo.main !== null) throw new Error(`${key(ref)} already has a main`);
-    repo.main = history.head;
+    const head = bundleHead(bundle.bytes);
+    if (head === null || head !== bundle.head) {
+      throw new Error(`The bundle is not main alone at ${bundle.head}`);
+    }
+    if (repo.main !== null && repo.main !== head) {
+      throw new ActionStale(`${key(ref)} has main at ${repo.main}, not ${head}`);
+    }
+    repo.main = head;
     this.#after("importMain");
   }
 
