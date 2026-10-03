@@ -35,7 +35,12 @@
 // attempt the runner never reports, whether or not the port acknowledged it, expires at that
 // deadline: the batch fails with `check_timeout`, its pins return to the queue as after a check
 // error, and a report arriving at or after the deadline is refused, so a late pass can never
-// authorize a landing.
+// authorize a landing. An attempt the check port holds for a person (`check_held`: the candidate
+// edits protected check paths) is not an outage: the train records it, asks the port nothing more,
+// waits for the deadline without backing off, and then fails the batch with `check_held`, counting
+// no retry, so a held pin is never dropped for waiting. A shared batch goes back split into isolated
+// pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
+// queue, so it cannot hold the pins behind it.
 
 import {
   isCommitSha,
@@ -75,6 +80,7 @@ import {
   highestGeneration,
   insertBatch,
   insertEntry,
+  markCheckHeld,
   markCheckStarted,
   migrateTrain,
   owesWork,
@@ -175,6 +181,11 @@ export type BlockReason =
   | "merge_unavailable"
   /** The check port did not accept the attempt. */
   | "checks_unavailable"
+  /**
+   * The check port held the attempt for a person: the candidate edits protected check paths. Not
+   * an outage: the train waits for the attempt's deadline without backing off.
+   */
+  | "check_held"
   /** The authorization port did not answer. */
   | "authorization_unavailable"
   /** The main writer did not answer, or left the intent unsettled. */
@@ -360,9 +371,10 @@ export function createTrain(
    */
   function settleWake(generation: number, outcome: DriveOutcome | null): void {
     const now = clock();
+    // A held attempt is not a failure: it waits for its deadline without backing off.
     const failed =
       outcome === null ||
-      outcome.kind === "blocked" ||
+      (outcome.kind === "blocked" && outcome.reason !== "check_held") ||
       outcome.kind === "yielded" ||
       outcome.kind === "superseded";
     const exhausted = context.storage.transactionSync(
@@ -570,8 +582,13 @@ export function createTrain(
     // The deadline commits before the port is asked, so an attempt whose start never answers
     // still expires.
     const deadline = batch.checkDeadline ?? requestDeadline(generation, batch);
+    if (batch.checkHeld) return blocked(batch.batchId, "check_held", "check_held");
     if (!batch.checkStarted) {
       const started = await bounded(generation, "checks", () => ports().checks.start(attempt));
+      if (!started.ok && started.code === "check_held") {
+        fenced(generation, () => markCheckHeld(sql, batch.batchId, clock()));
+        return blocked(batch.batchId, "check_held", "check_held");
+      }
       if (!started.ok) return blocked(batch.batchId, "checks_unavailable", started.code);
       if (started.value.attemptId !== attempt.attemptId) {
         throw new Error("the check port acknowledged another attempt");
@@ -600,7 +617,7 @@ export function createTrain(
     const expired = fenced(generation, () => {
       const current = activeBatch(sql);
       if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
-      failBatchIn(current, "check_timeout", now);
+      failBatchIn(current, current.checkHeld ? "check_held" : "check_timeout", now);
       return true;
     });
     if (expired) {
@@ -698,6 +715,22 @@ export function createTrain(
   function failBatchIn(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
     settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
+    if (failure === "check_held") {
+      // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
+      if (entries.length > 1) {
+        requeueFront(
+          sql,
+          entries.map((entry) => ({ pin: entry.pin, isolate: true, retries: entry.retries })),
+          now,
+        );
+        return;
+      }
+      // Held alone, the pin is the one that edits a protected path. It is parked, keeping its pin,
+      // so the queue behind it moves. A new push enqueues the claim's next generation as a new
+      // entry. The approval action (#174) is the other way back: it will requeue this entry.
+      for (const entry of entries) settleEntry(sql, entry.pin, "parked", "check_held", now);
+      return;
+    }
     const definitive = isDefinitive(failure);
     if (definitive && entries.length === 1) {
       for (const entry of entries) settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
@@ -991,6 +1024,7 @@ function isDefinitive(failure: BatchFailure): boolean {
     case "compose_infrastructure":
     case "check_error":
     case "check_timeout":
+    case "check_held":
     case "authorization_refused":
     case "main_rejected":
     case "publish_refused":
