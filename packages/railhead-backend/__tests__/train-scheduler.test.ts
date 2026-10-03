@@ -90,6 +90,8 @@ class Fakes {
   readonly requirements = new Map<string, DecisionRef[]>();
   /** When true, the decisions fence reader reports every claim's versions unknown. */
   unknownVersions = false;
+  /** How many times the decisions fence reader was read. */
+  versionReads = 0;
   composeCalls: { main: CommitSha; pins: ClaimPin[] }[] = [];
   /** The merge attempt of each compose, in order. */
   composeAttempts: string[] = [];
@@ -182,10 +184,12 @@ class Fakes {
           await this.answer("decisions.requirements");
           return ok(this.requirements.get(claimId) ?? []);
         },
-        currentVersions: (claimId) =>
-          this.pins.has(claimId) && !this.unknownVersions
+        currentVersions: (claimId) => {
+          this.versionReads += 1;
+          return this.pins.has(claimId) && !this.unknownVersions
             ? (this.requirements.get(claimId) ?? [])
-            : null,
+            : null;
+        },
       },
       merge: {
         compose: async (main, pins, attempt) => {
@@ -1908,21 +1912,42 @@ describe("train batch fence", () => {
     }, fakes);
   });
 
-  it("forms no batch while the decisions module cannot answer for a claim", async () => {
+  it("stops blocked after one read while the decision versions are unknown, and forms the batch once they are known", async () => {
     const fakes = new Fakes();
-    await withTrain(async ({ train, sql }) => {
+    await withTrain(async ({ train, sql, now, advance }) => {
       fakes.ready(pin(1));
       const release = fakes.hold("mainWriter.head");
       const enqueued = train.enqueue(pin(1));
       await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
       // The fence reader reports the claim unknown while the async reads still answer.
       fakes.unknownVersions = true;
+      const reads = fakes.versionReads;
       release();
       await enqueued;
 
+      // One pass read the versions once and stopped; it did not read the queue again.
+      expect(fakes.versionReads - reads).toBe(1);
+      const count = (call: PortCall) => fakes.reached.filter((c) => c === call).length;
+      expect(count("decisions.requirements")).toBe(1);
+      expect(count("claims.pin")).toBe(1);
+      expect(count("mainWriter.head")).toBe(1);
       expect(train.batches(8)).toEqual([]);
       expect(train.entries(1)[0]).toMatchObject({ state: "queued" });
       expect(sql.exec("SELECT COUNT(*) AS n FROM train_batches").one().n).toBe(0);
+      expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
+      expect(await train.drive()).toEqual({
+        kind: "blocked",
+        batchId: null,
+        reason: "requirements_unavailable",
+        code: "unavailable",
+      });
+
+      // Once the reader answers again, the alarm's next drive forms the batch and starts its check.
+      fakes.unknownVersions = false;
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      expect(lastStarted(fakes)).toMatchObject({ pins: [pin(1)], decisions: [] });
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched" });
     }, fakes);
   });
 });

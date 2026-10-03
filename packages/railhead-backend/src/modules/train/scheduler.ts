@@ -7,7 +7,8 @@
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
 // again rather than inheriting any part of its result. A batch is formed only while each pin's
 // generation and decision versions are still the ones it was read under, so a decision recorded
-// while the train reads main never schedules a pin that decision superseded.
+// while the train reads main never schedules a pin that decision superseded. While a pin's current
+// versions cannot be read, no batch is formed and the drive stops blocked, for the alarm to retry.
 //
 // A pin is queued only inside the transaction that records `ready`, or that repeats it for a pin
 // with no entry, and the Repo's alarm drives the train once it commits; each `recordCheck` drives
@@ -221,7 +222,7 @@ export type BlockReason =
   | "definition_invalid"
   /** The claims module did not answer for a pin. */
   | "pin_unavailable"
-  /** The decisions module did not answer for a claim. */
+  /** The decisions module did not answer for a claim, or could not read its current versions. */
   | "requirements_unavailable"
   /** The merge port did not answer. */
   | "merge_unavailable"
@@ -580,28 +581,40 @@ export function createTrain(
 
     const pins = members.map((entry) => entry.pin);
     const now = clock();
-    fenced(generation, () => {
+    const formed = fenced(generation, (): "formed" | "moved" | "unknown" => {
       // A pin queued during the reads above may have settled an entry or queued a newer episode of
       // it, and a decision recorded during them may have superseded a pin; form again from storage,
-      // where the next read of a superseded pin reopens its claim and drops it.
-      const unchanged = members.every(
-        (entry) =>
-          stillObserved(entry) &&
-          ports().claims.currentGeneration(entry.pin.claimId) === entry.pin.generation &&
-          sameVersions(
-            ports().decisions.currentVersions(entry.pin.claimId),
-            required.get(entry.pin.claimId),
-          ),
-      );
-      if (!unchanged || activeBatch(sql) !== null) return;
+      // where the next read of a superseded pin reopens its claim and drops it. Versions that cannot
+      // be read are not a move: another pass would read the same entries again and learn nothing.
+      let unknown = false;
+      for (const entry of members) {
+        const { claimId, generation: pinned } = entry.pin;
+        if (!stillObserved(entry) || ports().claims.currentGeneration(claimId) !== pinned) {
+          return "moved";
+        }
+        const versions = ports().decisions.currentVersions(claimId);
+        if (versions === null) unknown = true;
+        else if (!sameVersions(versions, required.get(claimId))) return "moved";
+      }
+      if (unknown) return "unknown";
+      if (activeBatch(sql) !== null) return "moved";
       const decisions = uniqueDecisions([...required.values()].flat());
       // Each claim must also still be ready at its entry's episode with a clear inbox gate, its pin
       // recorded under exactly `decisions`.
-      if (!members.every((entry) => stillReady(entry))) return;
-      if (!checkFence(fenceReaders, pins, decisions, null).ok) return;
+      if (!members.every((entry) => stillReady(entry))) return "moved";
+      if (!checkFence(fenceReaders, pins, decisions, null).ok) return "moved";
       insertBatch(sql, { expectedMain: main.value, pins, decisions, definition }, now);
+      return "formed";
     });
-    return CONTINUE;
+    switch (formed) {
+      case "formed":
+      case "moved":
+        return CONTINUE;
+      case "unknown":
+        return blocked(null, "requirements_unavailable", "unavailable");
+      default:
+        return unreachable(formed);
+    }
   }
 
   async function advance(generation: number, batch: BatchRecord): Promise<Step> {
@@ -1369,10 +1382,10 @@ function isRepoPath(path: string): boolean {
 
 /** True when both lists name the same version of the same decisions, in any order. */
 function sameVersions(
-  current: readonly DecisionRef[] | null,
+  current: readonly DecisionRef[],
   required: readonly DecisionRef[] | undefined,
 ): boolean {
-  if (current === null || required === undefined || current.length !== required.length) {
+  if (required === undefined || current.length !== required.length) {
     return false;
   }
   const versions = new Map(required.map((ref) => [ref.decisionId, ref.version]));
