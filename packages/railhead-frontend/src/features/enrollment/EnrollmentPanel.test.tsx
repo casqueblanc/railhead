@@ -1,12 +1,13 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type {
-  ActionChallenge,
-  BoardResult,
-  EnrollmentChallenge,
-  OwnerAction,
-  OwnerActionResult,
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  INVITE_TTL_MS,
+  type ActionChallenge,
+  type BoardResult,
+  type EnrollmentChallenge,
+  type OwnerAction,
+  type OwnerActionResult,
 } from "@railhead/shared/board-api";
 import type { RailheadEvent } from "@railhead/shared/events";
 import {
@@ -399,6 +400,38 @@ describe("EnrollmentPanel", () => {
     const { owner } = recordingOwner(echo);
     await render(live(fold([])), owner, fakeAuthenticator().authenticator);
     expect(text()).toContain("No agents yet");
+  });
+
+  it("moves an unused invite to the expired invites when it expires", async () => {
+    const { events } = syntheticLog("Synthetic invite", [
+      {
+        type: "agent.invited",
+        actor: SYNTH_OWNER,
+        data: { inviteId: "inv_synthcedar", name: "cedar" },
+      } as const,
+    ]);
+    const invitedAt = events.find((event) => event.type === "agent.invited")?.at;
+    if (invitedAt === undefined) throw new Error("no invite in the log");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      vi.setSystemTime(invitedAt + INVITE_TTL_MS - 1000);
+      const { owner } = recordingOwner(echo);
+      await render(live(fold(events)), owner, fakeAuthenticator().authenticator);
+      expect(text()).toContain("Invited");
+      expect(text()).toContain("Waiting for the agent to join.");
+      expect(text()).not.toContain("Expired");
+
+      await act(async () => vi.advanceTimersByTime(999));
+      expect(text()).toContain("Waiting for the agent to join.");
+
+      await act(async () => vi.advanceTimersByTime(1));
+      expect(text()).not.toContain("Waiting for the agent to join.");
+      expect(text()).toContain("Expired invites");
+      expect(text()).toContain("cedarExpiredNo agent joined in time.");
+      expect(text()).not.toContain("No agents yet");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe("rejecting an agent that waits for confirmation", () => {
