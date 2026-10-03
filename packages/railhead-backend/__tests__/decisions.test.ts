@@ -1,6 +1,6 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_INBOX_PAGE,
   MAX_LONG_POLL_MS,
@@ -768,45 +768,56 @@ describe("question", () => {
   });
 
   it("releases every slot when polls time out, so capacity is whole again", async () => {
-    await withDecisions(async (h) => {
-      const first = await h.ask({ requestId: requestId(1) });
-      const second = await h.ask({ requestId: requestId(2) });
-      const poll = (questionId: string, waitMs: number) =>
-        track(h.decisions.question(h.agent(), questionId, waitMs));
-      const fill = (waitMs: number) =>
-        Array.from({ length: MAX_WAITERS }, (_, i) =>
-          poll(i % 2 === 0 ? first.questionId : second.questionId, waitMs),
+    // The poll timeouts run on a controlled clock, so a stalled runner cannot expire them early.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await withDecisions(async (h) => {
+        const first = await h.ask({ requestId: requestId(1) });
+        const second = await h.ask({ requestId: requestId(2) });
+        const poll = (questionId: string, waitMs: number) =>
+          track(h.decisions.question(h.agent(), questionId, waitMs));
+        const fill = (waitMs: number) =>
+          Array.from({ length: MAX_WAITERS }, (_, i) =>
+            poll(i % 2 === 0 ? first.questionId : second.questionId, waitMs),
+          );
+
+        const timed = fill(50);
+        await vi.advanceTimersByTimeAsync(49);
+        expect(timed.filter((p) => p.settled())).toHaveLength(0);
+        const over = poll(first.questionId, MAX_LONG_POLL_MS);
+        expect(await over.promise).toMatchObject({ ok: true, value: { state: "open" } });
+        await vi.advanceTimersByTimeAsync(1);
+        expect(timed.filter((p) => !p.settled())).toHaveLength(0);
+        for (const result of await Promise.all(timed.map((p) => p.promise))) {
+          expect(result).toMatchObject({ ok: true, value: { state: "open", decision: null } });
+        }
+        expect(vi.getTimerCount()).toBe(0);
+
+        // Every slot came back: exactly MAX_WAITERS polls wait again and the next is refused.
+        const refilled = fill(MAX_LONG_POLL_MS);
+        const overAgain = poll(second.questionId, MAX_LONG_POLL_MS);
+        expect(await overAgain.promise).toMatchObject({ ok: true, value: { state: "open" } });
+        await vi.advanceTimersByTimeAsync(MAX_LONG_POLL_MS - 1);
+        expect(refilled.filter((p) => p.settled())).toHaveLength(0);
+
+        await h.decisions.record(
+          h.grant({ decisionId: first.decisionId, option: "reject", expectedVersion: null }),
         );
-
-      const timed = fill(50);
-      await pause(5);
-      expect(timed.filter((p) => p.settled())).toHaveLength(0);
-      const over = poll(first.questionId, MAX_LONG_POLL_MS);
-      expect(await over.promise).toMatchObject({ ok: true, value: { state: "open" } });
-      for (const result of await Promise.all(timed.map((p) => p.promise))) {
-        expect(result).toMatchObject({ ok: true, value: { state: "open", decision: null } });
-      }
-
-      // Every slot came back: exactly MAX_WAITERS polls wait again and the next is refused.
-      const refilled = fill(MAX_LONG_POLL_MS);
-      const overAgain = poll(second.questionId, MAX_LONG_POLL_MS);
-      expect(await overAgain.promise).toMatchObject({ ok: true, value: { state: "open" } });
-      await pause(10);
-      expect(refilled.filter((p) => p.settled())).toHaveLength(0);
-
-      await h.decisions.record(
-        h.grant({ decisionId: first.decisionId, option: "reject", expectedVersion: null }),
-      );
-      await h.decisions.record(
-        h.grant(
-          { decisionId: second.decisionId, option: "chunk", expectedVersion: null },
-          "chl_grant0002",
-        ),
-      );
-      for (const result of await Promise.all(refilled.map((p) => p.promise))) {
-        expect(result).toMatchObject({ ok: true, value: { state: "answered" } });
-      }
-    });
+        await h.decisions.record(
+          h.grant(
+            { decisionId: second.decisionId, option: "chunk", expectedVersion: null },
+            "chl_grant0002",
+          ),
+        );
+        for (const result of await Promise.all(refilled.map((p) => p.promise))) {
+          expect(result).toMatchObject({ ok: true, value: { state: "answered" } });
+        }
+        // Waking a poll clears its timeout, so no timer outlives the answered polls.
+        expect(vi.getTimerCount()).toBe(0);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("hides another agent's question and refuses an invalid wait or id", async () => {
