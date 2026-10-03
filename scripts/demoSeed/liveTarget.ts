@@ -105,6 +105,14 @@ export class ApprovalNeeded extends Error {
 }
 
 /**
+ * The backend failed or did not answer: the call may be repeated once the cause is fixed. Its
+ * message is the backend's own sentence or the timeout, never a stack.
+ */
+export class BackendFailure extends Error {
+  override readonly name = "BackendFailure";
+}
+
+/**
  * The WebSocket URL of the RPC session on `origin`, an `https:` origin, or `http:` on the local dev
  * server. Anything else is refused: the owner's assertion and the bundle must not cross plain text
  * to another host.
@@ -261,7 +269,7 @@ export class LiveTarget implements SeedTarget, BoardIssues {
 /**
  * The value of a board call, or the error its failure maps to: `action_stale` is `ActionStale`, the
  * reconciler's refusal; a refused request or proof is a `SeedRefusal` with the backend's sentence;
- * anything else is an `Error`.
+ * anything else is a `BackendFailure`.
  */
 function valueOf<T>(result: BoardResult<T>, call: string): T {
   if (result.ok) return result.value;
@@ -280,20 +288,30 @@ function valueOf<T>(result: BoardResult<T>, call: string): T {
     case "busy":
     case "unavailable":
     case "internal":
-      throw new Error(message);
+      throw new BackendFailure(message);
     default:
       return unreachable(result.code);
   }
 }
 
-/** `promise`, or a rejection once `ms` pass. The call is not cancelled; the caller disposes the session. */
+/**
+ * `promise`, or a `BackendFailure` when the session fails, such as a refused connection, or once
+ * `ms` pass. The call is not cancelled; the caller disposes the session.
+ */
 async function within<T>(promise: PromiseLike<T>, ms: number, call: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${call} did not answer within ${ms} ms.`)), ms);
+    timer = setTimeout(
+      () => reject(new BackendFailure(`${call} did not answer within ${ms} ms.`)),
+      ms,
+    );
+  });
+  const answered = Promise.resolve(promise).catch((error: unknown) => {
+    const reason = error instanceof Error ? error.message : "the session failed";
+    throw new BackendFailure(`${call} failed: ${reason}`, { cause: error });
   });
   try {
-    return await Promise.race([promise, timeout]);
+    return await Promise.race([answered, timeout]);
   } finally {
     clearTimeout(timer);
   }

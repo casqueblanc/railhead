@@ -20,7 +20,8 @@
 // and there is no command-line signer yet (#148): without `--assertion` the write stops after
 // `prepare`, prints the challenge and exits 3, writing nothing; `--assertion FILE` performs it with
 // `{ challengeId, assertion }` the owner signed for that challenge. The owner's steps are in
-// `docs/demo-seed.md`. Nothing here creates a Cloudflare resource or reads a secret.
+// `docs/demo-seed.md`. A refusal exits 2; a backend failure or timeout prints the backend's sentence
+// and exits 1. Nothing here creates a Cloudflare resource or reads a secret.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -45,6 +46,7 @@ import {
 } from "./manifest.ts";
 import {
   ApprovalNeeded,
+  BackendFailure,
   LiveTarget,
   liveApiUrl,
   openLiveSession,
@@ -298,6 +300,9 @@ if (import.meta.main) {
     } else if (error instanceof SeedRefusal) {
       process.stderr.write(`${error.message}\n`);
       process.exitCode = 2;
+    } else if (error instanceof BackendFailure) {
+      process.stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
     } else {
       throw error;
     }

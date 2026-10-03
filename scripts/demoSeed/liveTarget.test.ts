@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
 // These load under plain `node`: their own imports are type-only.
@@ -10,6 +12,7 @@ import { MAX_BUNDLE_BYTES, type MainBundle } from "./history.ts";
 import {
   API_PATH,
   ApprovalNeeded,
+  BackendFailure,
   LiveTarget,
   liveApiUrl,
   MAX_EVENT_PAGE,
@@ -183,8 +186,7 @@ test("the backend's refusals reach the seed as refusals, and its failures as err
   backend.failNextPerform = "internal";
   await assert.rejects(
     withTarget(backend, signed(needed), (target) => seed(manifest, bundleAt(HEAD), target, target)),
-    (error: unknown) =>
-      error instanceof Error && !(error instanceof SeedRefusal) && /internal/.test(error.message),
+    (error: unknown) => error instanceof BackendFailure && /internal/.test(error.message),
   );
   assert.equal(backend.exists, false);
 });
@@ -246,4 +248,36 @@ test("issues are read from every page of the log, and a missing repository has n
     withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF)),
     /stopped at 0 before its head/,
   );
+});
+
+test("an unavailable backend is a failure with its sentence, not a refusal", async () => {
+  const backend = new FakeBackend();
+  const needed = await preparedSeed(backend, HEAD);
+  backend.failNextPerform = "unavailable";
+  await assert.rejects(
+    withTarget(backend, signed(needed), (target) => target.seed(DEMO_REF, bundleAt(HEAD))),
+    (error: unknown) =>
+      error instanceof BackendFailure &&
+      error.message ===
+        "demo.seed failed with unavailable: The fake backend refused with unavailable.",
+  );
+  assert.equal(backend.exists, false);
+});
+
+test("the CLI reports a backend it cannot reach in one line and exits 1", async () => {
+  // A port that was just free: nothing listens on it.
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  await new Promise((done) => server.close(done));
+
+  const result = spawnSync(
+    process.execPath,
+    [join(import.meta.dirname, "cli.ts"), "reset", "--target", `http://127.0.0.1:${address.port}`],
+    { encoding: "utf8", timeout: 60_000 },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "demoSeed failed: WebSocket connection failed.\n");
 });
