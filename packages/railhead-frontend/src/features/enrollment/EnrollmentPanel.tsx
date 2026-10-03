@@ -98,25 +98,28 @@ export const EnrollmentPanel = ({
   );
 };
 
+/** The longest the roster waits before rereading the clock, so a clock moved forward shows soon. */
+const EXPIRY_RECHECK_MS = 60_000;
+
 const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) => {
   const [now, setNow] = useState(Date.now);
   const rows = roster(board, now);
   const expiry = nextExpiry(rows.invites);
-  // No event records an expiry, so the clock moves the next invite to the expired rows. A timeout
-  // can fire before the wall clock reaches the expiry (the clock moved back), so each callback
-  // rereads the clock and waits again until it does.
+  // No event records an expiry, so the clock moves the next invite to the expired rows. The wall
+  // clock can move while a timeout waits, so each callback rereads it and waits again, at most
+  // EXPIRY_RECHECK_MS at a time, until it reaches the expiry.
   useEffect(() => {
     if (expiry === null) return;
     let timer: ReturnType<typeof setTimeout>;
     const check = () => {
       const current = Date.now();
       if (current < expiry) {
-        timer = setTimeout(check, expiry - current);
+        timer = setTimeout(check, Math.min(EXPIRY_RECHECK_MS, expiry - current));
         return;
       }
       setNow(current);
     };
-    timer = setTimeout(check, Math.max(0, expiry - Date.now()));
+    timer = setTimeout(check, Math.min(EXPIRY_RECHECK_MS, Math.max(0, expiry - Date.now())));
     return () => clearTimeout(timer);
   }, [expiry]);
   const empty =
