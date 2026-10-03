@@ -434,6 +434,39 @@ describe("EnrollmentPanel", () => {
     }
   });
 
+  it("still expires an unused invite after the clock moves back before the timer fires", async () => {
+    const { events } = syntheticLog("Synthetic invite", [
+      {
+        type: "agent.invited",
+        actor: SYNTH_OWNER,
+        data: { inviteId: "inv_synthcedar", name: "cedar" },
+      } as const,
+    ]);
+    const invitedAt = events.find((event) => event.type === "agent.invited")?.at;
+    if (invitedAt === undefined) throw new Error("no invite in the log");
+    const expiry = invitedAt + INVITE_TTL_MS;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      vi.setSystemTime(expiry - 1000);
+      const { owner } = recordingOwner(echo);
+      await render(live(fold(events)), owner, fakeAuthenticator().authenticator);
+
+      // The first timeout fires at what is now expiry - 4000 on the wall clock.
+      vi.setSystemTime(expiry - 5000);
+      await act(async () => vi.advanceTimersByTime(1000));
+      expect(text()).toContain("Waiting for the agent to join.");
+
+      await act(async () => vi.advanceTimersByTime(3999));
+      expect(text()).toContain("Waiting for the agent to join.");
+
+      await act(async () => vi.advanceTimersByTime(1));
+      expect(text()).not.toContain("Waiting for the agent to join.");
+      expect(text()).toContain("cedarExpiredNo agent joined in time.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   describe("rejecting an agent that waits for confirmation", () => {
     it("revokes it with one passkey assertion, and moves it only once the log records it", async () => {
       const { owner, prepares, performs } = recordingOwner(echo);

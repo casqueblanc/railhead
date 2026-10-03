@@ -102,10 +102,21 @@ const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) 
   const [now, setNow] = useState(Date.now);
   const rows = roster(board, now);
   const expiry = nextExpiry(rows.invites);
-  // No event records an expiry, so the clock moves the next invite to the expired rows.
+  // No event records an expiry, so the clock moves the next invite to the expired rows. A timeout
+  // can fire before the wall clock reaches the expiry (the clock moved back), so each callback
+  // rereads the clock and waits again until it does.
   useEffect(() => {
     if (expiry === null) return;
-    const timer = setTimeout(() => setNow(Date.now()), Math.max(0, expiry - Date.now()));
+    let timer: ReturnType<typeof setTimeout>;
+    const check = () => {
+      const current = Date.now();
+      if (current < expiry) {
+        timer = setTimeout(check, expiry - current);
+        return;
+      }
+      setNow(current);
+    };
+    timer = setTimeout(check, Math.max(0, expiry - Date.now()));
     return () => clearTimeout(timer);
   }, [expiry]);
   const empty =
