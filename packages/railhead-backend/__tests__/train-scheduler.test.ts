@@ -12,7 +12,9 @@ import type {
   MergeOutcome,
 } from "../src/contracts/train";
 import {
+  CHECK_DEADLINE_MS,
   createTrain,
+  DRIVE_LEASE_MS,
   MAX_QUEUE,
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
@@ -30,6 +32,7 @@ import {
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
+import { EarliestAlarm } from "../src/repo/storage";
 
 const REPO_ID = "rep_train0001";
 const MAIN = sha("1");
@@ -231,6 +234,11 @@ function owed(sql: SqlStorage): PendingWake {
   const wake = readWake(sql);
   if (wake === null) throw new Error("the train owes no drive");
   return wake;
+}
+
+/** A clock a lease behind real time, so a lease alarm it asks for is due within a second. */
+function leaseBehind(): number {
+  return Date.now() - DRIVE_LEASE_MS + 500;
 }
 
 function states(train: Train): Record<string, string> {
@@ -779,28 +787,32 @@ describe("train wake", () => {
     };
     await withTrain(async ({ train, sql, wakes, now, advance }) => {
       fakes.ready(pin(1));
+      const accepted = now() + 1;
       expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
       expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
-      expect(wakes).toEqual([now() + WAKE_BASE_MS]);
+      // The lease alarm set with the queue entry, then the backoff that moved it earlier.
+      expect(wakes).toEqual([accepted + DRIVE_LEASE_MS, now() + WAKE_BASE_MS]);
 
       // An alarm set by another module fires early: nothing is driven, and the wake is asked again.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       await train.resume();
       expect(fakes.composeCalls).toHaveLength(1);
-      expect(wakes).toHaveLength(2);
-      expect(wakes[1]).toBe(wakes[0]);
+      expect(wakes).toHaveLength(3);
+      expect(wakes[2]).toBe(wakes[1]);
 
       advance(WAKE_BASE_MS);
       await train.resume();
       const attempt = lastStarted(fakes);
       expect(attempt.pins).toEqual([pin(1)]);
-      // Waiting for the runner's report owes no drive: the report drives.
-      expect(readWake(sql)).toBeNull();
+      // Waiting for the runner's report owes a drive at the attempt's deadline.
+      const [checking] = train.batches(1);
+      expect(checking?.checkDeadline).toBe(attempt.createdAt + 1 + CHECK_DEADLINE_MS);
+      expect(owed(sql)).toEqual({ dueAt: checking?.checkDeadline, failures: 0 });
+      expect(wakes.at(-1)).toBe(checking?.checkDeadline);
 
       await train.recordCheck(report(attempt, "pass"));
       expect(fakes.main).toBe(attempt.candidate);
       expect(readWake(sql)).toBeNull();
-      expect(wakes).toHaveLength(2);
     }, fakes);
   });
 
@@ -820,12 +832,13 @@ describe("train wake", () => {
         expect(owed(sql)).toEqual({ dueAt: now() + delay, failures });
       }
       expect(owed(sql).dueAt - now()).toBe(WAKE_MAX_MS);
-      expect(wakes).toHaveLength(MAX_WAKE_FAILURES);
+      // The enqueue's lease, then one backoff per failure.
+      expect(wakes).toHaveLength(MAX_WAKE_FAILURES + 1);
 
       advance(WAKE_MAX_MS);
       await train.resume();
       expect(readWake(sql)).toBeNull();
-      expect(wakes).toHaveLength(MAX_WAKE_FAILURES);
+      expect(wakes).toHaveLength(MAX_WAKE_FAILURES + 1);
       expect(fakes.started).toHaveLength(MAX_WAKE_FAILURES + 1);
       expect(train.batches(64)).toMatchObject([{ state: "checking", checkStarted: false }]);
 
@@ -851,7 +864,8 @@ describe("train wake", () => {
 
       await again.resume();
       expect(lastStarted(fakes).pins).toEqual([pin(1)]);
-      expect(readWake(sql)).toBeNull();
+      // Now the train waits for the report until the attempt's deadline.
+      expect(owed(sql)).toEqual({ dueAt: again.batches(1)[0]?.checkDeadline, failures: 0 });
     }, fakes);
   });
 
@@ -879,7 +893,7 @@ describe("train wake", () => {
       // Two passes ran; the passed second batch is owed a drive now rather than left to stall.
       expect(train.batches(64).map((b) => b.state)).toEqual(["passed", "landed"]);
       expect(owed(sql)).toEqual({ dueAt: now(), failures: 0 });
-      expect(wakes).toEqual([now()]);
+      expect(wakes.at(-1)).toBe(now());
 
       await train.resume();
       expect(train.batches(64).map((b) => b.state)).toEqual(["landed", "landed"]);
@@ -887,6 +901,98 @@ describe("train wake", () => {
       expect(fakes.published).toHaveLength(2);
       expect(new Set(fakes.published).size).toBe(2);
       expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+});
+
+describe("train check deadline", () => {
+  it("expires a started attempt with no report at its deadline and lands the pin on a fresh one", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, wakes, restart, now, advance, events }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const silent = lastStarted(fakes);
+      const deadline = owed(sql).dueAt;
+      expect(train.batches(1)).toMatchObject([{ state: "checking", checkDeadline: deadline }]);
+      expect(wakes.at(-1)).toBe(deadline);
+
+      // A restart before the deadline asks for the same wake, and resuming early changes nothing.
+      const again = restart();
+      expect(wakes.at(-1)).toBe(deadline);
+      advance(deadline - now() - 10);
+      await again.resume();
+      expect(fakes.started).toHaveLength(1);
+      expect(again.batches(1)).toMatchObject([{ state: "checking", failure: null }]);
+
+      advance(10);
+      await again.resume();
+      const fresh = lastStarted(fakes);
+      expect(fresh.attemptId).not.toBe(silent.attemptId);
+      expect(fresh.pins).toEqual([pin(1)]);
+      expect(again.batches(2).map((b) => [b.state, b.failure])).toEqual([
+        ["checking", null],
+        ["failed", "check_timeout"],
+      ]);
+      expect(again.entries(1)).toMatchObject([{ state: "batched", retries: 1 }]);
+      expect(owed(sql).dueAt).toBe(again.batches(1)[0]?.checkDeadline);
+
+      // The expired attempt's late pass is refused and leaves it without a result.
+      expect(await again.recordCheck(report(silent, "pass"))).toMatchObject({
+        ok: false,
+        code: "check_mismatch",
+      });
+      expect(again.attemptOutcome(silent.attemptId)).toEqual({ attempt: silent, report: null });
+      expect(events()).toEqual([]);
+
+      expect(await again.recordCheck(report(fresh, "pass"))).toEqual(ok(fresh));
+      expect(fakes.authorized).toEqual([fresh.attemptId]);
+      expect(fakes.main).toBe(fresh.candidate);
+      expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+
+  it("refuses a report that arrives at the deadline, before any drive expires the attempt", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, now, advance, events }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const attempt = lastStarted(fakes);
+      // The report reads the clock once more, which lands exactly on the deadline.
+      advance(owed(sql).dueAt - now() - 1);
+
+      expect(await train.recordCheck(report(attempt, "pass"))).toMatchObject({
+        ok: false,
+        code: "check_mismatch",
+      });
+      expect(train.batches(1)).toMatchObject([{ state: "checking", checkResult: null }]);
+      expect(events()).toEqual([]);
+
+      await train.resume();
+      expect(train.batches(2).map((b) => b.failure)).toEqual([null, "check_timeout"]);
+      expect(fakes.authorized).toEqual([]);
+      expect(fakes.main).toBe(MAIN);
+    }, fakes);
+  });
+
+  it("drops a pin whose attempts keep expiring and moves the next queued pin", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(pin(1), pin(2));
+      await train.enqueue(pin(1));
+      await train.enqueue(pin(2));
+      for (let expiry = 0; expiry <= MAX_RETRIES; expiry += 1) {
+        advance(owed(sql).dueAt - now());
+        await train.resume();
+      }
+      expect(states(train)).toEqual({ "clm_claim001@1": "dropped", "clm_claim002@1": "batched" });
+      expect(train.entries(64).find((e) => e.pin.claimId === pin(1).claimId)?.reason).toBe(
+        "retries_exhausted",
+      );
+      const last = lastStarted(fakes);
+      expect(last.pins).toEqual([pin(2)]);
+      expect(await train.recordCheck(report(last, "pass"))).toEqual(ok(last));
+      expect(states(train)).toEqual({ "clm_claim001@1": "dropped", "clm_claim002@1": "landed" });
+      expect(fakes.authorized).toEqual([last.attemptId]);
     }, fakes);
   });
 });
@@ -978,6 +1084,61 @@ describe("train module", () => {
     }));
     expect(alarm).toBe(wake?.dueAt);
     expect(entry).toEqual([{ state: "queued" }]);
+    await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+  });
+  it("persists the lease alarm with an accepted pin, so the alarm drives it after the object stops mid-drive", async () => {
+    const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const stub = env.REPO.getByName(repoObjectName("acme", name));
+    const summary = await stub.initialize("acme", name);
+    if (!summary.ok) throw new Error(summary.code);
+
+    // A train over the Repo's storage accepts a pin, then its drive hangs on the claims port. Its
+    // clock runs a lease behind, so the lease alarm is due within a second of real time.
+    const due = await runInDurableObject(stub, async (_instance, state) => {
+      const alarm = new EarliestAlarm(state.storage, () => {});
+      await alarm.load();
+      const clock = leaseBehind;
+      const context: RepoContext = {
+        repoId: summary.value.repoId,
+        storage: state.storage,
+        log: EventLog.open(state.storage, summary.value.repoId),
+        clock,
+        env,
+        wake: (at) => alarm.request(at),
+      };
+      const real = composeRepo(context);
+      let reached: (() => void) | null = null;
+      const hanging = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const ports: RepoPorts = {
+        ...real,
+        claims: {
+          ...real.claims,
+          pin: () => {
+            reached?.();
+            return new Promise(() => {});
+          },
+        },
+      };
+      const accepted = clock();
+      void createTrain(context, () => ports).enqueue(pin(1));
+      await hanging;
+      return accepted + 1 + DRIVE_LEASE_MS;
+    });
+    // The object stops while the drive waits on the port.
+    await evictDurableObject(stub);
+
+    // Nothing touches the object until the alarm is well past due.
+    await new Promise((resolve) => setTimeout(resolve, Math.max(due - Date.now(), 0) + 1_500));
+    const after = await runInDurableObject(stub, (_instance, state) => ({
+      wake: readWake(state.storage.sql),
+      entry: state.storage.sql.exec("SELECT state FROM train_queue").toArray(),
+    }));
+    // The alarm drove the pin before this read: with no claims module installed, each drive stops
+    // on the pin and backs off, and the first backoff may have fired too.
+    expect(after.wake?.failures).toBeGreaterThanOrEqual(1);
+    expect(after.entry).toEqual([{ state: "queued" }]);
     await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
   });
 });

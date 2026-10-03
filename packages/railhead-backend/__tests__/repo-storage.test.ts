@@ -1,11 +1,11 @@
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   StorageError,
   atomically,
   migrate,
-  wakeNoLaterThan,
+  EarliestAlarm,
   type RepoStorage,
 } from "../src/repo/storage";
 
@@ -141,34 +141,99 @@ describe("atomically", () => {
   });
 });
 
-describe("wakeNoLaterThan", () => {
+describe("EarliestAlarm", () => {
   it("sets an unset alarm, keeps an earlier one and moves a later one earlier", async () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     // An hour away and more, so no alarm fires during the test.
     const base = Date.now() + 3_600_000;
     const alarms = await runInDurableObject(stub, async (_instance, state) => {
+      const alarm = new EarliestAlarm(state.storage, () => {});
+      await alarm.load();
       const seen: (number | null)[] = [];
-      await wakeNoLaterThan(state.storage, base + 2_000);
-      seen.push(await state.storage.getAlarm());
-      await wakeNoLaterThan(state.storage, base + 5_000);
-      seen.push(await state.storage.getAlarm());
-      await wakeNoLaterThan(state.storage, base + 2_000);
-      seen.push(await state.storage.getAlarm());
-      await wakeNoLaterThan(state.storage, base + 1_000);
-      seen.push(await state.storage.getAlarm());
+      for (const at of [base + 2_000, base + 5_000, base + 2_000, base + 1_000]) {
+        alarm.request(at);
+        await alarm.settle();
+        seen.push(await state.storage.getAlarm());
+      }
       await state.storage.deleteAlarm();
       return seen;
     });
     expect(alarms).toEqual([base + 2_000, base + 2_000, base + 2_000, base + 1_000]);
   });
 
-  it("refuses a time the runtime cannot schedule and leaves the alarm unset", async () => {
+  it("commits an alarm asked for inside a transaction with its rows, before any await", async () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
-    const { error, alarm } = await runInDurableObject(stub, async (_instance, state) => {
-      const refused = await wakeNoLaterThan(state.storage, 0).catch((e: unknown) => e);
-      return { error: refused, alarm: await state.storage.getAlarm() };
+    const at = Date.now() + 3_600_000;
+    await runInDurableObject(stub, async (_instance, state) => {
+      const alarm = new EarliestAlarm(state.storage, () => {});
+      await alarm.load();
+      state.storage.sql.exec("CREATE TABLE owed (id INTEGER PRIMARY KEY)");
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("INSERT INTO owed (id) VALUES (1)");
+        alarm.request(at);
+      });
     });
-    expect(error).toBeInstanceOf(TypeError);
-    expect(alarm).toBeNull();
+    // A fresh instance reads only what storage committed.
+    await evictDurableObject(stub);
+    const after = await runInDurableObject(stub, async (_instance, state) => {
+      const committed = {
+        rows: state.storage.sql.exec("SELECT id FROM owed").toArray(),
+        alarm: await state.storage.getAlarm(),
+      };
+      await state.storage.deleteAlarm();
+      return committed;
+    });
+    expect(after).toEqual({ rows: [{ id: 1 }], alarm: at });
+  });
+
+  it("reads the stored alarm on load, so a later request leaves it in place", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const base = Date.now() + 3_600_000;
+    const stored = await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.setAlarm(base);
+      const alarm = new EarliestAlarm(state.storage, () => {});
+      await alarm.load();
+      alarm.request(base + 1_000);
+      await alarm.settle();
+      const kept = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      return kept;
+    });
+    expect(stored).toBe(base);
+  });
+
+  it("reports a refused write from settle until the alarm fires, and writes again after it", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const base = Date.now() + 3_600_000;
+    const result = await runInDurableObject(stub, async (_instance, state) => {
+      const errors: unknown[] = [];
+      const alarm = new EarliestAlarm(state.storage, (error) => errors.push(error));
+      await alarm.load();
+      alarm.request(0);
+      const refused = await alarm.settle().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      const unset = await state.storage.getAlarm();
+      // The refused time is not remembered, so a later time is written.
+      alarm.request(base);
+      const stillFailed = await alarm.settle().then(
+        () => false,
+        () => true,
+      );
+      alarm.fired();
+      alarm.request(base + 1_000);
+      await alarm.settle();
+      const after = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      return { errors, refused, unset, stillFailed, after };
+    });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toBeInstanceOf(TypeError);
+    expect(result.refused).toBeInstanceOf(Error);
+    expect(result.unset).toBeNull();
+    expect(result.stillFailed).toBe(true);
+    // After firing nothing is set, so a later time than the last request is written too.
+    expect(result.after).toBe(base + 1_000);
   });
 });

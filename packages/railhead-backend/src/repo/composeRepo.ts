@@ -64,8 +64,9 @@ export interface RepoContext {
    * Asks the Repo to run its alarm no later than `at`, in milliseconds since the Unix epoch. The
    * Repo keeps one alarm at the earliest time any module asked for and calls every module's
    * `resume` when it fires, so a module records what it owes in its own tables and asks again from
-   * `resume` when its time has not come. A wake is lost if the object stops before it reaches
-   * storage, so a module also asks again when it is built.
+   * `resume` when its time has not come. The alarm write is issued at once, so a wake asked for
+   * inside a transaction commits with that transaction's rows; ask for it as the transaction's last
+   * write.
    */
   readonly wake: (at: number) => void;
 }

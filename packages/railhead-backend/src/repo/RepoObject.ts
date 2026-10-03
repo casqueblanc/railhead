@@ -28,7 +28,7 @@ import type { GitTarget } from "../modules/git/entry";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
 import { EventLog, EventLogError } from "./eventLog";
-import { migrate, wakeNoLaterThan } from "./storage";
+import { EarliestAlarm, migrate } from "./storage";
 
 /** A repository as it was recorded. */
 export interface RepoSummary {
@@ -67,14 +67,22 @@ interface Installed {
 
 /** One repository. */
 export class Repo extends DurableObject<Env> {
-  #installed: Installed | null;
-  // Wakes reach storage one at a time, so each reads the alarm the previous one left.
-  #wakes: Promise<void> = Promise.resolve();
+  #installed: Installed | null = null;
+  readonly #alarm: EarliestAlarm;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const summary = this.#readSummary();
-    this.#installed = summary === null ? null : this.#install(summary);
+    this.#alarm = new EarliestAlarm(ctx.storage, (error) => {
+      const name = error instanceof Error ? error.name : "unknown";
+      const repo = this.#installed?.summary.repoId ?? null;
+      console.error(JSON.stringify({ event: "repo.wake_failed", repo, error: name }));
+    });
+    // Modules ask for wakes while they are built, so the alarm is read first.
+    void ctx.blockConcurrencyWhile(async () => {
+      await this.#alarm.load();
+      const summary = this.#readSummary();
+      this.#installed = summary === null ? null : this.#install(summary);
+    });
   }
 
   /** The repository, or `null` when it was never initialized. */
@@ -201,22 +209,16 @@ export class Repo extends DurableObject<Env> {
     return ports.git.serve(request, target, path);
   }
 
-  /** Resumes every module that owes work. Each module asks for its own next wake. */
+  /**
+   * Resumes every module that owes work. Each module asks for its own next wake. If one of those
+   * wakes failed to reach storage, the handler throws so the runtime retries the alarm.
+   */
   async alarm(): Promise<void> {
+    this.#alarm.fired();
     const installed = this.#installed;
     if (installed === null) return;
     await resumeAll(installed.summary.repoId, resumables(installed.ports));
-    // Let the wakes the modules asked for reach storage before the handler returns.
-    await this.#wakes;
-  }
-
-  #wake(repoId: RepoId, at: number): void {
-    this.#wakes = this.#wakes
-      .then(() => wakeNoLaterThan(this.ctx.storage, at))
-      .catch((error: unknown) => {
-        const name = error instanceof Error ? error.name : "unknown";
-        console.error(JSON.stringify({ event: "repo.wake_failed", repo: repoId, error: name }));
-      });
+    await this.#alarm.settle();
   }
 
   #ports(): RepoPorts | null {
@@ -248,7 +250,7 @@ export class Repo extends DurableObject<Env> {
       log,
       clock: Date.now,
       env: this.env,
-      wake: (at) => this.#wake(summary.repoId, at),
+      wake: (at) => this.#alarm.request(at),
     });
     return { summary, log, ports };
   }

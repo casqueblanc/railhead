@@ -12,12 +12,59 @@ export type RepoStorage = Pick<DurableObjectStorage, "sql" | "transactionSync">;
 export type AlarmStorage = Pick<DurableObjectStorage, "getAlarm" | "setAlarm">;
 
 /**
- * Sets the object's one alarm to `at` unless it is already set earlier, so one module's wake
+ * The object's one alarm, kept at the earliest time any module asked for, so one module's wake
  * never delays another's. A module woken before its own time asks again from its `resume`.
+ *
+ * `request` issues the alarm write synchronously, without first reading the alarm, so a request made
+ * inside `transactionSync` commits or rolls back with that transaction's rows. It remembers the time
+ * it set rather than reading it back, so make the request the last write of a transaction: a
+ * rollback after it leaves this record earlier than storage.
  */
-export async function wakeNoLaterThan(storage: AlarmStorage, at: number): Promise<void> {
-  const current = await storage.getAlarm();
-  if (current === null || at < current) await storage.setAlarm(at);
+export class EarliestAlarm {
+  readonly #storage: AlarmStorage;
+  readonly #onError: (error: unknown) => void;
+  #at: number | null = null;
+  #failed = false;
+  // Every write issued, settled; it never rejects.
+  #writes: Promise<void> = Promise.resolve();
+
+  constructor(storage: AlarmStorage, onError: (error: unknown) => void) {
+    this.#storage = storage;
+    this.#onError = onError;
+  }
+
+  /** Reads the alarm storage holds. Call once, before the first `request`. */
+  async load(): Promise<void> {
+    this.#at = await this.#storage.getAlarm();
+  }
+
+  /** Sets the alarm to `at` unless it is already set no later. */
+  request(at: number): void {
+    if (this.#at !== null && this.#at <= at) return;
+    this.#at = at;
+    const write = this.#storage.setAlarm(at).catch((error: unknown) => {
+      // Storage may hold any alarm now, so the next request writes again.
+      this.#at = null;
+      this.#failed = true;
+      this.#onError(error);
+    });
+    this.#writes = this.#writes.then(() => write);
+  }
+
+  /** Records that the alarm fired: none is set until a module asks again. */
+  fired(): void {
+    this.#at = null;
+    this.#failed = false;
+  }
+
+  /**
+   * Waits for every write issued so far, and throws if one failed since the alarm last fired, so an
+   * alarm handler that ends with it is retried by the runtime rather than ending without a wake.
+   */
+  async settle(): Promise<void> {
+    await this.#writes;
+    if (this.#failed) throw new Error("an alarm write failed");
+  }
 }
 
 /** Why a storage operation was refused. */

@@ -6,7 +6,8 @@
 //
 // `train_wake` holds at most one row: the drive the train owes and when it is due. A call that
 // accepts work writes it in the same transaction, so the debt survives a restart even when the
-// Repo's alarm was never set.
+// Repo's alarm was never set. While the active batch waits for a runner's report, the row is due at
+// the attempt's deadline.
 
 import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
@@ -59,6 +60,7 @@ const MIGRATIONS: readonly string[] = [
     due_at INTEGER NOT NULL,
     failures INTEGER NOT NULL CHECK (failures >= 0)
   ) STRICT`,
+  "ALTER TABLE train_batches ADD COLUMN check_deadline INTEGER",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -127,6 +129,8 @@ export type BatchFailure =
   | "check_fail"
   /** The check could not run. Never a pass. */
   | "check_error"
+  /** The runner did not report before the attempt's deadline. Never a pass. */
+  | "check_timeout"
   /** Authorization refused the passed attempt, such as a changed generation or decision. */
   | "authorization_refused"
   /** Main was not at the expected commit when the writer tried to move it. */
@@ -156,6 +160,8 @@ export interface BatchRecord {
   attemptAt: number | null;
   /** Whether the check port accepted the attempt. */
   checkStarted: boolean;
+  /** Once the attempt started, when it expires unless the runner has reported. */
+  checkDeadline: number | null;
   /** The runner's result, once reported. */
   checkResult: CheckResult | null;
   /** SHA-256 of the check log, as reported. */
@@ -193,6 +199,7 @@ type BatchRow = {
   attempt_id: string | null;
   attempt_at: number | null;
   check_started: number;
+  check_deadline: number | null;
   check_result: string | null;
   log_digest: string | null;
   finished_at: number | null;
@@ -204,7 +211,7 @@ type BatchRow = {
 
 const QUEUE_COLUMNS = "claim_id, generation, commit_sha, state, isolate, retries, reason";
 const BATCH_COLUMNS =
-  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
+  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
 /** The queue entry of `claimId` at `generation`, or `null`. */
 export function readEntry(sql: SqlStorage, claimId: string, generation: number): QueueEntry | null {
@@ -408,10 +415,16 @@ export function recordCandidate(
   );
 }
 
-/** Records that the check port accepted the attempt. */
-export function markCheckStarted(sql: SqlStorage, batchId: number, now: number): void {
+/** Records that the check port accepted the attempt, and when it expires without a report. */
+export function markCheckStarted(
+  sql: SqlStorage,
+  batchId: number,
+  deadline: number,
+  now: number,
+): void {
   sql.exec(
-    "UPDATE train_batches SET check_started = 1, updated_at = ? WHERE batch_id = ?",
+    "UPDATE train_batches SET check_started = 1, check_deadline = ?, updated_at = ? WHERE batch_id = ?",
+    deadline,
     now,
     batchId,
   );
@@ -549,6 +562,8 @@ function toBatch(row: BatchRow): BatchRecord {
     attemptId: row.attempt_id,
     attemptAt: row.attempt_at,
     checkStarted: row.check_started === 1,
+    // A started attempt always has a deadline; one recorded without it has already expired.
+    checkDeadline: row.check_started === 1 ? (row.check_deadline ?? row.updated_at) : null,
     checkResult: row.check_result === null ? null : parseCheckResult(row.check_result),
     logDigest: row.log_digest,
     finishedAt: row.finished_at,
@@ -577,6 +592,7 @@ const BATCH_FAILURES = [
   "compose_infrastructure",
   "check_fail",
   "check_error",
+  "check_timeout",
   "authorization_refused",
   "main_rejected",
   "publish_refused",

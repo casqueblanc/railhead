@@ -9,11 +9,17 @@
 //
 // Each `enqueue` and `recordCheck` drives the train until it waits for a check report or a port,
 // or the queue is empty. Accepting work also records, in the same transaction, that a drive is
-// owed. When a drive ends, the train settles that debt from storage: it clears it once nothing can
-// move, asks the Repo's alarm to drive again at once when work arrived too late for the drive, and
-// backs off when a port refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row. A
-// thrown drive error does not undo the call's committed write: the call still returns its result.
-// A restarted train asks for the wake it owes, so a lost alarm is set again.
+// owed and sets the Repo's alarm `DRIVE_LEASE_MS` later, so the work is resumed even if the object
+// stops during the drive and nothing else wakes it. When a drive ends, the train settles that debt
+// from storage: it asks the alarm to drive again at once when work arrived too late for the drive,
+// waits for the active attempt's deadline while a runner's report is due, backs off when a port
+// refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it.
+// A thrown drive error does not undo the call's committed write: the call still returns its result.
+// A restarted train asks again for the wake it owes.
+//
+// A started attempt the runner never reports expires at its deadline: the batch fails with
+// `check_timeout`, its pins return to the queue as after a check error, and a report arriving at or
+// after the deadline is refused, so a late pass can never authorize a landing.
 
 import {
   isCommitSha,
@@ -64,6 +70,7 @@ import {
   type BatchFailure,
   type BatchRecord,
   type DropReason,
+  type PendingWake,
   type QueueEntry,
 } from "./store";
 
@@ -81,6 +88,18 @@ export const WAKE_BASE_MS = 1_000;
 
 /** The longest delay between drives that fail. */
 export const WAKE_MAX_MS = 5 * 60_000;
+
+/**
+ * How long after accepting work the Repo's alarm resumes it, in case the drive that follows never
+ * settles. A drive that settles first moves or keeps the alarm as its outcome needs.
+ */
+export const DRIVE_LEASE_MS = 60_000;
+
+/**
+ * How long a started check attempt waits for its runner's report before it expires. The trusted
+ * check definition carries no limit yet, so every attempt gets this one.
+ */
+export const CHECK_DEADLINE_MS = 60 * 60_000;
 
 /**
  * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
@@ -130,8 +149,8 @@ export type BlockReason =
 export type DriveOutcome =
   /** Nothing is waiting and no batch is active. */
   | { kind: "idle" }
-  /** The active batch waits for its runner's report. */
-  | { kind: "checking"; batchId: number; attemptId: string }
+  /** The active batch waits for its runner's report until `deadline`. */
+  | { kind: "checking"; batchId: number; attemptId: string; deadline: number }
   /** The train cannot move until a port answers; the alarm tries again after a delay. */
   | { kind: "blocked"; batchId: number | null; reason: BlockReason; code: PortErrorCode | null }
   /** The drive used its step budget, which a correct queue never reaches; the alarm continues. */
@@ -197,25 +216,25 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
   function settleWake(outcome: DriveOutcome | null): void {
     const now = clock();
     const failed = outcome === null || outcome.kind === "blocked" || outcome.kind === "yielded";
-    const due = context.storage.transactionSync((): number | "exhausted" | null => {
+    // The alarm is asked for inside the transaction, so the row and the alarm commit together.
+    const exhausted = context.storage.transactionSync((): boolean => {
       if (failed) {
         const failures = (readWake(sql)?.failures ?? 0) + 1;
         if (failures > MAX_WAKE_FAILURES) {
           clearWake(sql);
-          return "exhausted";
+          return true;
         }
-        const dueAt = now + wakeDelay(failures);
-        writeWake(sql, { dueAt, failures });
-        return dueAt;
+        writeWakeIn({ dueAt: now + wakeDelay(failures), failures });
+      } else if (hasMovableWork(sql)) {
+        writeWakeIn({ dueAt: now, failures: 0 });
+      } else {
+        const deadline = pendingDeadline();
+        if (deadline === null) clearWake(sql);
+        else writeWakeIn({ dueAt: deadline, failures: 0 });
       }
-      if (hasMovableWork(sql)) {
-        writeWake(sql, { dueAt: now, failures: 0 });
-        return now;
-      }
-      clearWake(sql);
-      return null;
+      return false;
     });
-    if (due === "exhausted") {
+    if (exhausted) {
       console.error(
         JSON.stringify({
           event: "train.wake_exhausted",
@@ -223,14 +242,28 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
           failures: MAX_WAKE_FAILURES,
         }),
       );
-    } else if (due !== null) {
-      context.wake(due);
     }
   }
 
-  /** Records, inside the caller's transaction, that accepted work is owed a drive now. */
+  /** Records a wake due at `dueAt` and asks the Repo's alarm for it, inside one transaction. */
+  function writeWakeIn(wake: PendingWake): void {
+    writeWake(sql, wake);
+    context.wake(wake.dueAt);
+  }
+
+  /** The deadline of the active batch's started attempt, or `null`. */
+  function pendingDeadline(): number | null {
+    const batch = activeBatch(sql);
+    return batch?.state === "checking" ? batch.checkDeadline : null;
+  }
+
+  /**
+   * Records, inside the caller's transaction and as its last write, that accepted work is owed a
+   * drive now, and sets the alarm that resumes it if the drive that follows never settles.
+   */
   function oweDrive(now: number): void {
     writeWake(sql, { dueAt: now, failures: readWake(sql)?.failures ?? 0 });
+    context.wake(now + DRIVE_LEASE_MS);
   }
 
   async function pass(): Promise<DriveOutcome> {
@@ -353,15 +386,48 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
 
   async function startCheck(batch: BatchRecord): Promise<Step> {
     const attempt = attemptOf(batch);
-    if (!batch.checkStarted) {
+    let deadline = batch.checkDeadline;
+    if (deadline === null) {
       const started = await ports().checks.start(attempt);
       if (!started.ok) return blocked(batch.batchId, "checks_unavailable", started.code);
       if (started.value.attemptId !== attempt.attemptId) {
         throw new Error("the check port acknowledged another attempt");
       }
-      context.storage.transactionSync(() => markCheckStarted(sql, batch.batchId, clock()));
+      const now = clock();
+      const recorded = now + CHECK_DEADLINE_MS;
+      context.storage.transactionSync(() => markCheckStarted(sql, batch.batchId, recorded, now));
+      deadline = recorded;
+    } else if (clock() >= deadline) {
+      expireCheck(batch);
+      return CONTINUE;
     }
-    return stop({ kind: "checking", batchId: batch.batchId, attemptId: attempt.attemptId });
+    return stop({
+      kind: "checking",
+      batchId: batch.batchId,
+      attemptId: attempt.attemptId,
+      deadline,
+    });
+  }
+
+  /** Fails a started attempt whose runner did not report by its deadline. */
+  function expireCheck(batch: BatchRecord): void {
+    const now = clock();
+    const expired = context.storage.transactionSync(() => {
+      const current = activeBatch(sql);
+      if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
+      failBatchIn(current, "check_timeout", now);
+      return true;
+    });
+    if (expired) {
+      console.error(
+        JSON.stringify({
+          event: "train.check_expired",
+          repo: context.repoId,
+          batch: batch.batchId,
+          attempt: batch.attemptId,
+        }),
+      );
+    }
   }
 
   async function land(batch: BatchRecord): Promise<Step> {
@@ -616,6 +682,10 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
         return fail("check_mismatch", "This attempt is no longer waiting for a report.");
       }
       const now = clock();
+      // The deadline is the cutoff even before a drive expires the attempt.
+      if (batch.checkDeadline !== null && now >= batch.checkDeadline) {
+        return fail("check_mismatch", "This attempt expired before its report arrived.");
+      }
       recordCheckResult(
         sql,
         batch.batchId,
@@ -624,7 +694,6 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
         report.finishedAt,
         now,
       );
-      oweDrive(now);
       if (report.result !== "pass") {
         failBatchIn(batch, report.result === "fail" ? "check_fail" : "check_error", now);
       }
@@ -638,6 +707,7 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts): Train
           acceptance: attempt.definition.acceptance,
         },
       });
+      oweDrive(now);
       return ok(attempt);
     });
     const { value } = result;
@@ -692,6 +762,7 @@ function isDefinitive(failure: BatchFailure): boolean {
     case "compose_timeout":
     case "compose_infrastructure":
     case "check_error":
+    case "check_timeout":
     case "authorization_refused":
     case "main_rejected":
     case "publish_refused":
