@@ -39,8 +39,8 @@ pub enum RunError {
 
 /// Runs `command` and waits at most `limit` for it, capturing stdout when `capture` is set.
 ///
-/// A child still running at the deadline is stopped and reaped, with its process group on Unix,
-/// before this returns.
+/// A child still running at the deadline, or one whose captured stdout is still held open then by a
+/// process it started, is stopped and reaped, with its process group on Unix, before this returns.
 ///
 /// # Errors
 ///
@@ -76,6 +76,26 @@ pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Fini
         }
     };
 
+    // Captured stdout is collected before the child is reaped: until then its process id, and so
+    // its process group id, cannot be reused, and a process it left behind holding stdout can
+    // still be stopped with the group.
+    let stdout = match stdout {
+        None => Vec::new(),
+        Some(receiver) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    stop(&mut child)?;
+                    return Err(error.into());
+                }
+                Err(_) => {
+                    stop(&mut child)?;
+                    return Err(RunError::TimedOut(limit));
+                }
+            }
+        }
+    };
     let status = match wait_until(&mut child, deadline) {
         Ok(Some(status)) => status,
         Ok(None) => {
@@ -85,17 +105,6 @@ pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Fini
         Err(error) => {
             stop(&mut child)?;
             return Err(error.into());
-        }
-    };
-    let stdout = match stdout {
-        None => Vec::new(),
-        Some(receiver) => {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            // A process the child left behind may still hold stdout open; never wait past the
-            // deadline for it.
-            receiver
-                .recv_timeout(remaining)
-                .map_err(|_| RunError::TimedOut(limit))??
         }
     };
     Ok(Finished { status, stdout })
@@ -207,6 +216,24 @@ mod tests {
         for pid in recorded {
             assert!(!alive(pid), "process {pid} outlived the deadline");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_descendant_holding_stdout_past_the_deadline_is_stopped() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pid = dir.path().join("pid");
+        // The child exits at once, leaving a SIGTERM-ignoring process that keeps stdout open.
+        let script = format!("(trap '' TERM; sleep 600) & echo $! > '{}'", pid.display());
+        let started = Instant::now();
+        let error = run(&mut sh(&script), Duration::from_millis(300), true).err();
+        assert!(
+            matches!(error, Some(RunError::TimedOut(limit)) if limit == Duration::from_millis(300)),
+            "{error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let recorded: i32 = std::fs::read_to_string(&pid)?.trim().parse()?;
+        assert!(!alive(recorded), "process {recorded} outlived the deadline");
         Ok(())
     }
 
