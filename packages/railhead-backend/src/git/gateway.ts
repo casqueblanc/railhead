@@ -14,10 +14,14 @@
 // before a write token is minted, and again immediately before it is sent upstream. A claim closed or
 // passed on while the client held its head back, or while the token was being minted, therefore
 // never gets a token minted for it or a push sent under it. The head itself must arrive within its
-// own time limit; a client that stalls inside it is cut off and its body released.
+// own time limit; a client that stalls inside it is cut off and its body released. While the push
+// uploads, its last bytes are held back: the upstream cannot finish the pack, or apply any ref,
+// without them. They are passed on only if the claim is still working at the push's generation once
+// the client has sent everything; otherwise the exchange is ended and the push refused.
 //
-// A push is recorded as `claim.pushed` only for the refs the upstream itself reported updated, once
-// its response has ended, and only if the claim is still working at the push's generation then. The
+// A push must ask for a report, since without one nothing it did could be recorded. It is recorded
+// as `claim.pushed` only for the refs the upstream itself reported updated, once its response has
+// ended, and only if the claim is still working at the push's generation then. The
 // gateway reads a push's response to its end whether or not the client keeps reading it, so a client
 // that stops reading or goes away after its push was applied does not lose the record. A refused,
 // failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
@@ -121,6 +125,12 @@ const textEncoder = new TextEncoder();
  * receive-pack response is progress and a report capped at 64 KiB, so this holds a whole one.
  */
 const PUSH_RESPONSE_BUFFER_BYTES = 1024 * 1024;
+/**
+ * How many of a push's last bytes are held back until its claim is checked once more: a pack's
+ * trailing SHA-1 checksum, or the whole command list's end for a push that sends no pack.
+ */
+const HELD_PUSH_BYTES = 20;
+const CLAIM_CHANGED = "the claim changed while this push was being sent";
 
 /** Builds the Git gateway of one repository. */
 export function createGitGateway(
@@ -227,11 +237,20 @@ class GitGateway implements GitPort {
         ),
       );
     }
+    if (reportFraming(head.capabilities) === "none") {
+      // Git would take a push it sent without asking for a report as applied, so it is refused as an
+      // HTTP error rather than in a report the client never asked for.
+      deadline.clear();
+      await parsed.body.cancel();
+      return text(403, "railhead: pushes must request report-status");
+    }
     return this.#forward(request, route, grant, {
       head,
       body: parsed.body,
       deadline,
       admit: () => this.#readmit(route, access, grant, head),
+      current: () =>
+        this.#context.ports().claims.workingGeneration(fence.claimId) === fence.generation,
       record: (updated) => {
         this.#recordPush(principal, fence, head, updated);
       },
@@ -259,11 +278,7 @@ class GitGateway implements GitPort {
       );
     }
     if (sameGrant(current.value, grant)) return null;
-    const message = "the claim changed while this push was being sent";
-    return gitResult(
-      route.service,
-      receivePackRefusal(head, `railhead: ${message}`, () => message),
-    );
+    return claimChanged(head);
   }
 
   /** Answers a push refused by the claims module in Git's own report, read from its head. */
@@ -381,7 +396,8 @@ class GitGateway implements GitPort {
         deadline.expire();
       }, this.#limits.headersTimeoutMs);
     };
-    const sent = body === null ? null : limited(body, maxBody, deadline, awaitHeaders);
+    const sent =
+      body === null ? null : limited(body, maxBody, deadline, push?.current ?? null, awaitHeaders);
     if (sent === null) awaitHeaders();
     const headers = new Headers();
     for (const name of FORWARDED_REQUEST_HEADERS) {
@@ -406,6 +422,7 @@ class GitGateway implements GitPort {
       if (sent?.exceeded === true) {
         return text(413, "railhead: the request is larger than Railhead accepts");
       }
+      if (sent?.withheld === true && push !== null) return claimChanged(push.head);
       const outcome = deadline.expired ? "timeout" : "unreachable";
       logFailure(route, outcome);
       return outcome === "timeout"
@@ -506,6 +523,8 @@ interface PendingPush {
   readonly deadline: Deadline;
   /** Decides the push again against current claim state: `null` to go ahead, or the refusal. */
   readonly admit: () => Promise<Response | null>;
+  /** Whether the claim is still working at the push's generation, read without awaiting. */
+  readonly current: () => boolean;
   /** Records the refs the upstream reported updated. */
   readonly record: (updated: ReadonlySet<string>) => void;
 }
@@ -557,6 +576,14 @@ function sameGrant(current: GitGrant, original: GitGrant): boolean {
     current.scope === original.scope &&
     current.fence?.claimId === original.fence?.claimId &&
     current.fence?.generation === original.fence?.generation
+  );
+}
+
+/** Refuses every ref of a push whose claim changed after it was admitted. */
+function claimChanged(head: ReceivePackHead): Response {
+  return gitResult(
+    "git-receive-pack",
+    receivePackRefusal(head, `railhead: ${CLAIM_CHANGED}`, () => CLAIM_CHANGED),
   );
 }
 
@@ -852,16 +879,25 @@ function cancelledOnAbort(
 
 /**
  * A request body that errors once more than `max` bytes pass or the deadline expires, and calls
- * `ended` once the whole body has passed.
+ * `ended` once the whole body has passed. With `current`, the body's last `HELD_PUSH_BYTES` bytes
+ * are held back until the client has sent everything, and passed on only if `current` still holds
+ * then; otherwise the exchange is ended and the body is `withheld`.
  */
 function limited(
   body: ReadableStream<Uint8Array>,
   max: number,
   deadline: Deadline,
+  current: (() => boolean) | null,
   ended: () => void,
-): { readonly stream: ReadableStream<Uint8Array>; readonly exceeded: boolean } {
+): {
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly exceeded: boolean;
+  readonly withheld: boolean;
+} {
   let seen = 0;
   let exceeded = false;
+  let withheld = false;
+  let held = new Uint8Array(0);
   const stream = body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       start(controller) {
@@ -874,9 +910,34 @@ function limited(
           controller.error(new Error("the request body is too large"));
           return;
         }
-        controller.enqueue(chunk);
+        if (current === null) {
+          controller.enqueue(chunk);
+          return;
+        }
+        if (chunk.length >= HELD_PUSH_BYTES) {
+          // The held bytes come before this chunk, which now holds the last ones itself.
+          if (held.length > 0) controller.enqueue(held);
+          controller.enqueue(chunk.subarray(0, chunk.length - HELD_PUSH_BYTES));
+          held = chunk.slice(chunk.length - HELD_PUSH_BYTES);
+          return;
+        }
+        const data = new Uint8Array(held.length + chunk.length);
+        data.set(held);
+        data.set(chunk, held.length);
+        const cut = Math.max(0, data.length - HELD_PUSH_BYTES);
+        if (cut > 0) controller.enqueue(data.subarray(0, cut));
+        held = data.slice(cut);
       },
-      flush() {
+      flush(controller) {
+        if (current !== null) {
+          if (!current()) {
+            withheld = true;
+            controller.error(new Error(CLAIM_CHANGED));
+            deadline.abort();
+            return;
+          }
+          if (held.length > 0) controller.enqueue(held);
+        }
         ended();
       },
     }),
@@ -885,6 +946,9 @@ function limited(
     stream,
     get exceeded() {
       return exceeded;
+    },
+    get withheld() {
+      return withheld;
     },
   };
 }

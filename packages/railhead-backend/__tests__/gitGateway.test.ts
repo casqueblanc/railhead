@@ -591,6 +591,109 @@ describe("authority", () => {
       expect(pushedEvents(world)).toEqual([]);
     });
   });
+
+  it("refuses a bare refs/heads/, a branch name past the event limit and non-SHA-1 ids", async () => {
+    // refs/heads/ is 11 bytes, so this name is one byte past the 1024 an event can carry.
+    const tooLong = `refs/heads/${"b".repeat(1014)}`;
+    const cases: [string, string, string][] = [
+      [
+        "bare prefix",
+        `${ZERO} ${HEAD} refs/heads/`,
+        "only branches under refs/heads/ can be pushed",
+      ],
+      ["long branch", `${ZERO} ${HEAD} ${tooLong}`, "the branch name is too long"],
+      [
+        "SHA-256 create",
+        `${"0".repeat(64)} ${"2".repeat(64)} refs/heads/topic`,
+        "only SHA-1 repositories are supported",
+      ],
+      [
+        "SHA-256 update",
+        `${"1".repeat(64)} ${"2".repeat(64)} refs/heads/topic`,
+        "only SHA-1 repositories are supported",
+      ],
+      [
+        "SHA-256 delete",
+        `${"1".repeat(64)} ${"0".repeat(64)} refs/heads/topic`,
+        "only SHA-1 repositories are supported",
+      ],
+    ];
+    for (const [label, command, reason] of cases) {
+      await withGateway(async (world) => {
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody([command])),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status, label).toBe(200);
+        const ref = command.split(" ")[2] ?? "";
+        expect(decoder.decode(await bytesOf(response)), label).toContain(`ng ${ref} ${reason}`);
+        expect(world.seen, label).toEqual([]);
+        expect(world.minted(), label).toBe(0);
+        expect(world.events(), label).toEqual([]);
+      });
+    }
+  });
+
+  it("forwards and records a branch name exactly at the event limit", async () => {
+    const longest = `refs/heads/${"b".repeat(1013)}`;
+    expect(encoder.encode(longest).length).toBe(1024);
+    await withGateway(async (world) => {
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          sideBand(`${pkt("unpack ok\n")}${pkt(`ok ${longest}\n`)}0000`),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${ZERO} ${HEAD} ${longest}`])),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await bytesOf(response);
+      expect(world.seen).toHaveLength(1);
+      expect(pushedEvents(world)).toMatchObject([{ data: { ref: longest, from: null, to: HEAD } }]);
+    });
+  });
+
+  it("refuses a push that does not ask for a report, before minting a token", async () => {
+    for (const caps of ["side-band-64k", "", "ofs-delta"]) {
+      await withGateway(async (world) => {
+        world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody([`${ZERO} ${HEAD} refs/heads/topic`], caps)),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status, caps).toBe(403);
+        expect(await response.text(), caps).toBe("railhead: pushes must request report-status\n");
+        expect(world.seen, caps).toEqual([]);
+        expect(world.minted(), caps).toBe(0);
+        expect(world.events(), caps).toEqual([]);
+      });
+    }
+  });
+
+  it("forwards a push that asks only for report-status-v2", async () => {
+    await withGateway(async (world) => {
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          `${pkt("unpack ok\n")}${pkt("ok refs/heads/topic\n")}0000`,
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${ZERO} ${HEAD} refs/heads/topic`], "report-status-v2")),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await bytesOf(response);
+      expect(world.seen).toHaveLength(1);
+      expect(pushedEvents(world)).toMatchObject([{ data: { ref: "refs/heads/topic", to: HEAD } }]);
+    });
+  });
 });
 
 /** A push body that sends `PUSH_REQUEST` up to `cut` bytes, then the rest once `resume` is called. */
@@ -783,6 +886,88 @@ describe("a push decided again after it was admitted", () => {
         expect(logged, label).toContain(
           JSON.stringify({ event: "git_push_unrecorded", outcome: "claim_changed" }),
         );
+      });
+    }
+  });
+
+  it("withholds the end of the pack when the claim changes during the upload", async () => {
+    const held = 20;
+    // The client stops five bytes short of the end, inside the pack's trailing checksum.
+    const cut = PUSH_REQUEST.length - 5;
+    const changes: [string, (world: World) => void][] = [
+      [
+        "expired",
+        (world) => {
+          world.claim.state = "expired";
+        },
+      ],
+      [
+        "reassigned",
+        (world) => {
+          world.claim.agentId = OTHER.agentId;
+          world.claim.generation += 1;
+        },
+      ],
+      [
+        "ready",
+        (world) => {
+          world.claim.state = "ready";
+        },
+      ],
+      [
+        "reclaimed at a new generation",
+        (world) => {
+          world.claim.generation += 1;
+        },
+      ],
+      ["unchanged", () => undefined],
+    ];
+    for (const [label, change] of changes) {
+      await withGateway(async (world) => {
+        const received: Uint8Array[] = [];
+        let upstreamFailed = false;
+        world.upstream = async (request) => {
+          const reader = request.body?.getReader();
+          if (reader === undefined) throw new Error("no body");
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received.push(value);
+            }
+          } catch (error) {
+            upstreamFailed = true;
+            throw error;
+          }
+          return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+        };
+        const { body, resume } = pausedPush(cut);
+        const pending = world.gateway.serve(
+          rpc("git-receive-pack", body),
+          FORK,
+          "/git-receive-pack",
+        );
+        // The upstream has everything the gateway can pass on before the client finishes.
+        await until(() => concatAll(received).length === cut - held);
+        change(world);
+        resume();
+        const response = await pending;
+        expect(response.status, label).toBe(200);
+        const answer = decoder.decode(await bytesOf(response));
+        if (label === "unchanged") {
+          expect(concatAll(received), label).toEqual(PUSH_REQUEST);
+          expect(pushedEvents(world), label).toHaveLength(1);
+          return;
+        }
+        expect(answer, label).toContain(
+          "ng refs/heads/feature the claim changed while this push was being sent",
+        );
+        expect(upstreamFailed, label).toBe(true);
+        expect(concatAll(received), label).toEqual(
+          PUSH_REQUEST.slice(0, PUSH_REQUEST.length - held),
+        );
+        expect(world.authorizations, label).toHaveLength(3);
+        expect(world.events(), label).toEqual([]);
       });
     }
   });
