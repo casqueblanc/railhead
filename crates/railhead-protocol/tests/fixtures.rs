@@ -110,7 +110,7 @@ fn decodes_and_round_trips_one_event_of_every_type() -> TestResult {
         assert_eq!(text(value, "type")?, event.payload.type_name());
         types.insert(event.payload.type_name());
     }
-    assert_eq!(types.len(), 20, "every event type has one fixture");
+    assert_eq!(types.len(), 21, "every event type has one fixture");
     Ok(())
 }
 
