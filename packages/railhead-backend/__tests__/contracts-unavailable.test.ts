@@ -51,6 +51,7 @@ const SYNC = new Map<string, unknown>([
   ["decisions.relied", "throws"],
   ["decisions.obligations", null],
   ["inbox.queue", "throws"],
+  ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
 ]);
 

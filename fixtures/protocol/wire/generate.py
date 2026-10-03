@@ -651,6 +651,7 @@ def events_fixture() -> dict:
         ("claim.expired", SYSTEM, {"claimId": "clm_42abcd", "generation": 1}),
         ("claim.reassigned", SYSTEM, {"claimId": "clm_42abcd", "from": AGENT, "to": "agt_ember01", "generation": 2}),
         ("agent.revoked", HUMAN, {"agentId": AGENT}),
+        ("claim.reopened", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "decisions": [{"decisionId": "dec_upload1", "version": 2}]}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]

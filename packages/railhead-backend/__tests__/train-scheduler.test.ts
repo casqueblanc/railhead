@@ -36,6 +36,7 @@ import {
   writeWake,
   type PendingWake,
 } from "../src/modules/train/store";
+import { unavailableClaims } from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
@@ -1481,18 +1482,26 @@ describe("train module", () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO_ID);
-      const ports = composeRepo({
+      const context: RepoContext = {
         repoId: REPO_ID,
         storage: state.storage,
         log,
         clock: () => 0,
         env,
         wake: () => {},
-      });
+      };
+      // The real claims module would drop a pin for a claim it never opened, so its port is the
+      // missing one here: the pin must wait for it rather than be dropped.
+      const ports: RepoPorts = { ...composeRepo(context), claims: unavailableClaims };
+      const train = createTrain(context, () => ports);
 
-      expect(await ports.train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(state.storage.sql.exec("SELECT state, reason FROM train_queue").toArray()).toEqual([
+        { state: "queued", reason: null },
+      ]);
+      expect(owed(state.storage.sql).failures).toBeGreaterThanOrEqual(1);
       expect(
-        await ports.train.recordCheck({
+        await train.recordCheck({
           attemptId: "chk_attempt01",
           candidate: sha("2"),
           result: "pass",
@@ -1523,25 +1532,20 @@ describe("train module", () => {
     });
     await evictDurableObject(stub);
 
-    // The rebuilt train asks for its wake; the alarm drives it, and with no claims module
-    // installed the drive stops on the pin and backs off. Nobody called the train.
+    // The rebuilt train asks for its wake; the alarm drives it. The real claims module has no
+    // such claim, so the drive drops the pin and the train goes idle. Nobody called the train.
     await vi.waitFor(
       async () => {
         await runDurableObjectAlarm(stub);
-        const after = await runInDurableObject(stub, (_instance, state) =>
-          readWake(state.storage.sql),
+        const entry = await runInDurableObject(stub, (_instance, state) =>
+          state.storage.sql.exec("SELECT state, reason FROM train_queue").toArray(),
         );
-        expect(after).toMatchObject({ failures: 1 });
+        expect(entry).toEqual([{ state: "dropped", reason: "pin_changed" }]);
       },
       { timeout: 5_000, interval: 20 },
     );
-    const { wake, alarm, entry } = await runInDurableObject(stub, async (_instance, state) => ({
-      wake: readWake(state.storage.sql),
-      alarm: await state.storage.getAlarm(),
-      entry: state.storage.sql.exec("SELECT state FROM train_queue").toArray(),
-    }));
-    expect(alarm).toBe(wake?.dueAt);
-    expect(entry).toEqual([{ state: "queued" }]);
+    const wake = await runInDurableObject(stub, (_instance, state) => readWake(state.storage.sql));
+    expect(wake).toBeNull();
     await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
   });
   it("persists the lease alarm with an accepted pin, so the alarm drives it after the object stops mid-drive", async () => {
@@ -1593,12 +1597,12 @@ describe("train module", () => {
     await new Promise((resolve) => setTimeout(resolve, Math.max(due - Date.now(), 0) + 1_500));
     const after = await runInDurableObject(restarted, (_instance, state) => ({
       wake: readWake(state.storage.sql),
-      entry: state.storage.sql.exec("SELECT state FROM train_queue").toArray(),
+      entry: state.storage.sql.exec("SELECT state, reason FROM train_queue").toArray(),
     }));
-    // The alarm drove the pin before this read: with no claims module installed, each drive stops
-    // on the pin and backs off, and the first backoff may have fired too.
-    expect(after.wake?.failures).toBeGreaterThanOrEqual(1);
-    expect(after.entry).toEqual([{ state: "queued" }]);
+    // The alarm drove the pin before this read: the restarted object's real claims module has no
+    // such claim, so the drive dropped the pin and owes no further work.
+    expect(after.entry).toEqual([{ state: "dropped", reason: "pin_changed" }]);
+    expect(after.wake).toBeNull();
     await runInDurableObject(restarted, (_instance, state) => state.storage.deleteAlarm());
   });
 });

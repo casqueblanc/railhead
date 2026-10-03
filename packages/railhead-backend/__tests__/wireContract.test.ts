@@ -249,6 +249,7 @@ describe("events on the wire", () => {
     "claim.pushed": true,
     "claim.ready": true,
     "claim.refused": true,
+    "claim.reopened": true,
     "claim.expired": true,
     "claim.reassigned": true,
     "question.asked": true,

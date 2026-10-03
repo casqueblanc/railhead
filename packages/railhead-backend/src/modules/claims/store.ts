@@ -7,9 +7,21 @@
 // A claim is recorded in `allocating` before its fork exists: that row is the fork intent. It
 // reserves the issue for the agent, and a repeat request finishes it instead of forking again. The
 // base is written once, when the fork opens, and never changed.
+//
+// A ready claim keeps the decision versions its pin was recorded under, as JSON, so the train's
+// read of the pin can compare them with the current versions. A claim also keeps the last refusal
+// it recorded, so a repeated refusal is not recorded again.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
-import type { AgentId, ClaimId, CommitSha, IssueId, UserId } from "@railhead/shared/events";
+import {
+  isId,
+  type AgentId,
+  type ClaimId,
+  type CommitSha,
+  type DecisionRef,
+  type IssueId,
+  type UserId,
+} from "@railhead/shared/events";
 import { migrate, type RepoStorage } from "../../repo/storage";
 
 /** Released schema steps. Append a step to change the schema; never edit one. */
@@ -38,6 +50,8 @@ const MIGRATIONS: readonly string[] = [
     WHERE state IN ('allocating', 'working', 'ready')`,
   `CREATE INDEX claims_active_by_owner ON claims_claims (owner_id)
     WHERE state IN ('allocating', 'working', 'ready')`,
+  "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -59,6 +73,11 @@ export interface ClaimRow {
   /** The fork's head when it opened; `null` exactly while allocating. */
   base: CommitSha | null;
   readyCommit: CommitSha | null;
+  /**
+   * The decision versions the pin was recorded under. `null` before ready, and for a stored list
+   * that cannot be read, which no pin is trusted with.
+   */
+  readyDecisions: DecisionRef[] | null;
   title: string;
   body: string;
 }
@@ -73,12 +92,13 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   fork_base: string | null;
   base: string | null;
   ready_commit: string | null;
+  ready_decisions: string | null;
   title: string;
   body: string;
 }
 
 const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.state,
-    c.fork_base, c.base, c.ready_commit, i.title, i.body
+    c.fork_base, c.base, c.ready_commit, c.ready_decisions, i.title, i.body
   FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id`;
 
 /** Creates or migrates the claims tables. */
@@ -182,6 +202,69 @@ export function openClaim(
   return updated.length === 1;
 }
 
+/**
+ * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
+ * makes the claim ready, and forgets its last refusal. Returns `false`, and writes nothing, when the
+ * claim is no longer working at that generation.
+ */
+export function pinReady(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  commit: CommitSha,
+  decisions: readonly DecisionRef[],
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
+         last_refusal = NULL
+       WHERE claim_id = ? AND generation = ? AND state = 'working'
+       RETURNING claim_id`,
+      commit,
+      JSON.stringify(decisions.map(({ decisionId, version }) => ({ decisionId, version }))),
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/**
+ * Returns a ready claim at `generation` to working, clears its pin and forgets its last refusal.
+ * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
+ */
+export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
+         last_refusal = NULL
+       WHERE claim_id = ? AND generation = ? AND state = 'ready'
+       RETURNING claim_id`,
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/**
+ * Records `refusal` as the claim's last refusal. Returns `false`, and writes nothing, when it is
+ * already the last one recorded.
+ */
+export function noteRefusal(sql: SqlStorage, claimId: ClaimId, refusal: string): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET last_refusal = ?
+       WHERE claim_id = ? AND last_refusal IS NOT ?
+       RETURNING claim_id`,
+      refusal,
+      claimId,
+      refusal,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
 /** The issue filed with `grantId`, or `null`. */
 export function issueByGrant(sql: SqlStorage, grantId: string): IssueId | null {
   const [row] = sql
@@ -219,9 +302,29 @@ function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
     forkBase: raw.fork_base,
     base: raw.base,
     readyCommit: raw.ready_commit,
+    readyDecisions: raw.ready_decisions === null ? null : decisionList(raw.ready_decisions),
     title: raw.title,
     body: raw.body,
   };
+}
+
+function decisionList(json: string): DecisionRef[] | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const refs: DecisionRef[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) return null;
+    const { decisionId, version }: { decisionId?: unknown; version?: unknown } = item;
+    if (typeof decisionId !== "string" || !isId("decision", decisionId)) return null;
+    if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) return null;
+    refs.push({ decisionId, version });
+  }
+  return refs;
 }
 
 function storedState(value: string): StoredState {
