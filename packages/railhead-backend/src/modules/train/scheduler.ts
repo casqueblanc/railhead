@@ -101,6 +101,7 @@ import type {
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import type { EventTransaction } from "../../repo/eventLog";
 import { checkFence, type FenceReaders } from "../../train/authorize";
+import { sameVersions } from "../claims/module";
 import {
   activeBatch,
   batchByAttempt,
@@ -593,8 +594,9 @@ export function createTrain(
           return "moved";
         }
         const versions = ports().decisions.currentVersions(claimId);
+        const pinnedUnder = required.get(claimId);
         if (versions === null) unknown = true;
-        else if (!sameVersions(versions, required.get(claimId))) return "moved";
+        else if (pinnedUnder === undefined || !sameVersions(versions, pinnedUnder)) return "moved";
       }
       if (unknown) return "unknown";
       if (activeBatch(sql) !== null) return "moved";
@@ -1394,21 +1396,6 @@ function validDefinition(definition: CheckDefinition, main: CommitSha): boolean 
 function isRepoPath(path: string): boolean {
   if (path === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
   return !path.split("/").some((segment) => segment === "" || segment === "." || segment === "..");
-}
-
-/** True when both lists name the same version of the same decisions, in any order. */
-function sameVersions(
-  current: readonly DecisionRef[],
-  required: readonly DecisionRef[] | undefined,
-): boolean {
-  if (required === undefined || current.length !== required.length) {
-    return false;
-  }
-  const versions = new Map(required.map((ref) => [ref.decisionId, ref.version]));
-  return (
-    versions.size === required.length &&
-    current.every((ref) => versions.get(ref.decisionId) === ref.version)
-  );
 }
 
 function uniqueDecisions(refs: readonly DecisionRef[]): DecisionRef[] {
