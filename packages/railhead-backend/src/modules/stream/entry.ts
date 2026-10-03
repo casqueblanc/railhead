@@ -162,7 +162,9 @@ class Subscription {
       this.#release();
       return;
     }
-    void withTimeout(this.#listener.ended(reason), this.#timeoutMs)
+    // Started inside the chain, so a listener that throws synchronously is still released.
+    void Promise.resolve()
+      .then(() => withTimeout(this.#listener.ended(reason), this.#timeoutMs))
       .then((outcome) => {
         if (outcome === "timeout") reportFailure("stream listener ended timed out", null);
       })

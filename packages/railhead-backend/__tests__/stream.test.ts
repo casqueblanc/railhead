@@ -288,6 +288,36 @@ describe("stream subscriptions", () => {
     });
   });
 
+  it("releases a listener whose ended throws synchronously, and frees its slot", async () => {
+    await withLog(async (log) => {
+      append(log, 1);
+      let released = 0;
+      const listener = {
+        events: () => new Promise<void>(() => {}),
+        ended: (): Promise<void> => {
+          throw new Error("stub disposed");
+        },
+        dup: () => listener,
+        [Symbol.dispose]: () => {
+          released += 1;
+        },
+      };
+      const port = streamPort(log, { deliveryTimeoutMs: 20 });
+      value(await port.subscribe(0, listener));
+      const others = [];
+      for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
+        others.push(value(await port.subscribe(1, new Recorder())));
+      }
+
+      await until(() => released === 1);
+      await settle();
+
+      expect(released).toBe(1);
+      expect(await port.subscribe(1, new Recorder())).toMatchObject({ ok: true });
+      await Promise.all(others.map((other) => other.cancel()));
+    });
+  });
+
   it("drops a listener that fails, with no further calls", async () => {
     await withLog(async (log) => {
       append(log, 1);
@@ -536,16 +566,19 @@ describe("board subscriptions over the RPC session", () => {
     // Disposing the stub alone, with the session still open, must release the Repo.
     subscription[Symbol.dispose]();
     await settle();
+    await appendIn(stub, repoId, 1);
+    await settle();
+    expect(before.seqs).toEqual([1]);
 
     await evictDurableObject(stub);
     await appendIn(stub, repoId, 1);
     const after = new BoardRecorder();
-    using live = value(await board.subscribe(1, after));
+    using live = value(await board.subscribe(2, after));
     await appendIn(stub, repoId, 1);
     await until(() => after.seqs.length === 2);
     await settle();
 
-    expect(after.seqs).toEqual([2, 3]);
+    expect(after.seqs).toEqual([3, 4]);
     expect(before.seqs).toEqual([1]);
     await live.cancel();
   });
