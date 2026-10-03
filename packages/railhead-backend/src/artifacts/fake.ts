@@ -76,6 +76,8 @@ export class FakeArtifacts implements ArtifactsNamespace {
   openHandles = 0;
   /** How many `fork` calls reached the fake. */
   forkCalls = 0;
+  /** How many `createToken` calls reached the fake, whether or not they minted. */
+  createTokenCalls = 0;
   /** How many tokens were minted with `createToken`. */
   tokensMinted = 0;
   #now: number;
@@ -228,6 +230,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
         if (!Number.isInteger(ttl) || ttl < 60 || ttl > 31_536_000) {
           throw new FakeArtifactsError("INVALID_TTL");
         }
+        this.createTokenCalls += 1;
         await this.#hold("createTokenBeforeMint");
         this.tokensMinted += 1;
         const token = this.#mint(repo, scope, ttl);

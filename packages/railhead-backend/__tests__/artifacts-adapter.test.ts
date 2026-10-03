@@ -373,7 +373,8 @@ describe("revokeTokens", () => {
       const port = adapter();
       const repo = await forkClaim(port);
 
-      const paused = fake.pauseNext("createToken");
+      // Held before minting, so the token appears after the revocation's sweep has listed.
+      const paused = fake.pauseNext("createTokenBeforeMint");
       const minting = port.token(repo, "write", 10 * MINUTE);
       await paused.reached;
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
@@ -390,7 +391,7 @@ describe("revokeTokens", () => {
       const port = adapter();
       const repo = await forkClaim(port);
 
-      const paused = fake.pauseNext("createToken");
+      const paused = fake.pauseNext("createTokenBeforeMint");
       const minting = port.token(repo, "write", 10 * MINUTE);
       await paused.reached;
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
@@ -402,21 +403,21 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("drops the fork's other cached tokens when a racing mint's cleanup sweeps the fork", async () => {
+  it("drops the fork's cached tokens when a racing mint's cleanup sweeps the fork", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
       const repo = await forkClaim(port);
+      const reader = await tokenValue(port, repo, "read");
 
-      const paused = fake.pauseNext("createToken");
+      const paused = fake.pauseNext("createTokenBeforeMint");
       const minting = port.token(repo, "write", 10 * MINUTE);
       await paused.reached;
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
-      // Minted and cached after that revocation returned, while the write mint still runs.
-      const reader = await tokenValue(port, repo, "read");
       fake.failRevocations(1);
       paused.release();
 
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toEqual([]);
       expect(fake.accepts(reader)).toBe(false);
       const renewed = await tokenValue(port, repo, "read");
       expect(renewed).not.toBe(reader);
@@ -429,7 +430,7 @@ describe("revokeTokens", () => {
       const port = adapter();
       const repo = await forkClaim(port);
 
-      const mintPaused = fake.pauseNext("createToken");
+      const mintPaused = fake.pauseNext("createTokenBeforeMint");
       const minting = port.token(repo, "write", 10 * MINUTE);
       await mintPaused.reached;
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
@@ -438,14 +439,15 @@ describe("revokeTokens", () => {
       mintPaused.release();
       await sweepPaused.reached;
 
-      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(fake.tokensMinted).toBe(1);
+      // The read waits behind the write and its cleanup rather than minting beside them.
+      const reading = port.token(repo, "read", 10 * MINUTE);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(fake.createTokenCalls).toBe(1);
       sweepPaused.release();
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
-      expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
+      const read = await reading;
+      expect(read.ok && fake.accepts(read.value.value)).toBe(true);
+      expect(fake.createTokenCalls).toBe(2);
     });
   });
 
@@ -542,7 +544,7 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("holds revocation after a restart until the old mint's token must have expired", async () => {
+  it("sweeps on every revocation after a restart and succeeds only past the old mint's bound", async () => {
     await withArtifacts(async ({ fake, adapter, storage }) => {
       const before = adapter();
       const repo = await forkClaim(before);
@@ -552,15 +554,15 @@ describe("revokeTokens", () => {
       if (minted === undefined) throw new Error("the paused mint created no token");
 
       // A fresh adapter on the same storage, as after the Durable Object restarts. The old request
-      // cannot answer it, so only the token's lifetime bounds how long revocation stays busy.
+      // cannot answer it, so revocation sweeps and stays busy until the mint's bound has passed.
       const after = adapter();
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.accepts(minted.plaintext)).toBe(false);
       fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
       expect(mintRows(storage)).toBe(1);
 
       fake.advance(1);
-      expect(fake.accepts(minted.plaintext)).toBe(false);
       expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
       expect(mintRows(storage)).toBe(0);
 
@@ -570,44 +572,157 @@ describe("revokeTokens", () => {
         expect(fake.openHandles).toBe(0);
       });
       expect(fake.liveTokens(repo)).toEqual([]);
-      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
       const fresh = await tokenValue(after, repo, "write");
       expect(fake.accepts(fresh)).toBe(true);
       expect(mintRows(storage)).toBe(0);
     });
   });
 
-  it("bounds a previous incarnation's mint by the lifetime it asked for", async () => {
+  it("revokes a token a previous incarnation's mint creates late, on the next revocation", async () => {
     await withArtifacts(async ({ fake, adapter, storage }) => {
       const before = adapter();
       const repo = await forkClaim(before);
-      const short = fake.pauseNext("createToken");
+      // The request takes effect only later, and its answer never reaches the old adapter.
+      const effect = fake.pauseNext("createTokenBeforeMint");
+      fake.pauseNext("createToken");
       expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      fake.advance(MINUTE);
-      const long = fake.pauseNext("createToken");
-      expect(await before.token(repo, "read", 60 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(mintRows(storage)).toBe(2);
 
       const after = adapter();
-      // Past the shorter mint's bound, the longer one still holds revocation.
-      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS);
+      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
-      expect(mintRows(storage)).toBe(1);
-      fake.advance(50 * MINUTE);
-      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
-      expect(mintRows(storage)).toBe(0);
-
       expect(fake.liveTokens(repo)).toEqual([]);
 
-      // The old calls answer at last. Their records are gone, and nothing the new incarnation holds
-      // changes.
-      short.release();
-      long.release();
+      effect.release();
+      await vi.waitFor(() => {
+        expect(fake.liveTokens(repo)).toHaveLength(1);
+      });
+      expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(mintRows(storage)).toBe(1);
+
+      fake.advance(1);
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(mintRows(storage)).toBe(0);
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("refuses a fork's tokens while a previous incarnation's mint is unsettled", async () => {
+    await withArtifacts(async ({ fake, adapter, storage }) => {
+      const before = adapter();
+      const repo = await forkClaim(before);
+      const paused = fake.pauseNext("createTokenBeforeMint");
+      expect(await before.token(repo, "write", 60 * MINUTE)).toMatchObject({ code: "busy" });
+
+      const after = adapter();
+      for (const scope of ["write", "read"] as const) {
+        expect(await after.token(repo, scope, 10 * MINUTE)).toMatchObject({
+          ok: false,
+          code: "busy",
+        });
+      }
+      fake.advance(60 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
+      expect(await after.token(repo, "read", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(fake.createTokenCalls).toBe(1);
+      expect(mintRows(storage)).toBe(1);
+
+      // Past the bound the record is dropped and minting resumes.
+      fake.advance(1);
+      expect(fake.accepts(await tokenValue(after, repo, "read"))).toBe(true);
+      expect(mintRows(storage)).toBe(0);
+
+      paused.release();
       await vi.waitFor(() => {
         expect(fake.openHandles).toBe(0);
       });
-      expect(mintRows(storage)).toBe(0);
-      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+    });
+  });
+
+  it("refuses new mints at once while one is unanswered, with bounded calls and rows", async () => {
+    await withArtifacts(async ({ fake, adapter, storage, main }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const paused = fake.pauseNext("createTokenBeforeMint");
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+
+      const started = Date.now();
+      for (let i = 0; i < 10; i += 1) {
+        for (const scope of ["write", "read"] as const) {
+          expect(await port.token(repo, scope, 10 * MINUTE)).toMatchObject({
+            ok: false,
+            code: "busy",
+          });
+        }
+      }
+      // Each refusal is decided before any binding call, well inside one call timeout.
+      expect(Date.now() - started).toBeLessThan(FAST.callTimeoutMs);
+      expect(fake.createTokenCalls).toBe(1);
+      expect(mintRows(storage)).toBe(1);
+      // Another repository's lane is independent.
+      expect(await port.token(main, "read", 10 * MINUTE)).toMatchObject({ ok: true });
+
+      paused.release();
+      await vi.waitFor(() => {
+        expect(mintRows(storage)).toBe(0);
+        expect(fake.openHandles).toBe(0);
+      });
+      // The late token was revoked, and the next request mints normally.
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
+    });
+  });
+
+  it("refuses callers beyond the waiting queue without calling Artifacts", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter(REPO, { ...FAST, callTimeoutMs: 1_000, maxWaitingMints: 2 });
+      const repo = await forkClaim(port);
+      const paused = fake.pauseNext("createTokenBeforeMint");
+
+      const admitted = Array.from({ length: 3 }, () => port.token(repo, "write", 10 * MINUTE));
+      await paused.reached;
+      const refused = await Promise.all(
+        Array.from({ length: 4 }, () => port.token(repo, "write", 10 * MINUTE)),
+      );
+      expect(refused.map((result) => !result.ok && result.code)).toEqual([
+        "busy",
+        "busy",
+        "busy",
+        "busy",
+      ]);
+      expect(fake.createTokenCalls).toBe(1);
+
+      paused.release();
+      const values = await Promise.all(admitted);
+      expect(values.every((result) => result.ok)).toBe(true);
+      expect(new Set(values.map((result) => result.ok && result.value.value)).size).toBe(1);
+      expect(fake.createTokenCalls).toBe(1);
+      // Once the queue drains it admits again.
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ ok: true });
+    });
+  });
+
+  it("gives up a waiting caller after the queue wait, and it never mints", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter(REPO, { ...FAST, callTimeoutMs: 1_000, queueWaitMs: 50 });
+      const repo = await forkClaim(port);
+      const paused = fake.pauseNext("createTokenBeforeMint");
+
+      const first = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      const started = Date.now();
+      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      expect(Date.now() - started).toBeLessThan(500);
+
+      paused.release();
+      expect(await first).toMatchObject({ ok: true });
+      // The abandoned read request did not run when its turn came.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(fake.createTokenCalls).toBe(1);
+      expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
+      expect(fake.createTokenCalls).toBe(2);
     });
   });
 

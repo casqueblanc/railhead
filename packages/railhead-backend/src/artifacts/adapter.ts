@@ -4,8 +4,14 @@
 // A fork whose response was lost is recorded as pending before the call and reconciled on the next
 // request, and the token Artifacts returns with a new fork is revoked before the fork is used. A
 // fork's token mint is recorded before the call too, so a revocation never reports success while a
-// mint that started before it may still create a token. A record left by a previous incarnation of
-// the Durable Object is dropped once any token its mint could have created has expired.
+// mint of this incarnation may still create a token. Each repository has at most one unanswered
+// mint and a short queue of waiting callers; anyone beyond that is told the repository is busy.
+//
+// A record left by a previous incarnation of the Durable Object can never be settled, and Artifacts
+// offers no cancellation or issuance deadline. Every revocation of that fork sweeps all its live
+// tokens and reports busy until the mint's start, its requested lifetime and the clock skew have
+// passed, so a late token created within that window is revoked by a later sweep. A token Artifacts
+// creates after the final sweep escapes; how late a mint can take effect is not yet measured.
 //
 // Tokens never leave this module except through `token`, whose caller streams them to Artifacts.
 // Nothing here logs a token, a repository name or a binding error's message.
@@ -53,6 +59,10 @@ export interface ArtifactsAdapterLimits {
   readonly sweepDeadlineMs: number;
   /** How many tokens one sweep revokes before it reports the repository busy. */
   readonly maxRevokesPerSweep: number;
+  /** How many token requests may wait for a repository's running mint before more are refused. */
+  readonly maxWaitingMints: number;
+  /** How long a token request waits for its turn before it reports the repository busy. */
+  readonly queueWaitMs: number;
 }
 
 /** The production limits. */
@@ -61,6 +71,8 @@ export const ARTIFACTS_LIMITS: ArtifactsAdapterLimits = {
   maxCachedTokens: 256,
   sweepDeadlineMs: 30_000,
   maxRevokesPerSweep: 64,
+  maxWaitingMints: 8,
+  queueWaitMs: 20_000,
 };
 
 /** The shortest token lifetime Artifacts accepts. */
@@ -68,8 +80,8 @@ export const MIN_TOKEN_TTL_MS = 60_000;
 /** The longest token lifetime this adapter mints. Artifacts allows a year; Railhead never needs it. */
 export const MAX_TOKEN_TTL_MS = 3_600_000;
 /**
- * How far Artifacts' clock may run ahead of ours when it sets a token's expiry. A design margin, not
- * a measured bound.
+ * How long after a previous incarnation's mint started, beyond its requested lifetime, revocation
+ * keeps sweeping for a token it may still create. A design margin, not a measured bound.
  */
 export const MINT_CLOCK_SKEW_MS = 300_000;
 /** How many list-and-revoke rounds `revokeTokens` makes before reporting the repository busy. */
@@ -130,6 +142,14 @@ interface CachedToken {
   claimId: ClaimId | null;
 }
 
+/** The mint requests of one repository: at most one runs, and the rest wait in order. */
+interface Lane {
+  /** Settles when the last request in the lane has finished. */
+  tail: Promise<void>;
+  /** The running request and those waiting behind it. */
+  size: number;
+}
+
 interface BoundedOptions<T> {
   /** Takes ownership of the call's eventual outcome when the call times out. */
   late?: (pending: Promise<T>) => void;
@@ -157,8 +177,10 @@ class ArtifactsAdapter implements ArtifactsPort {
   readonly #epochs = new Map<ArtifactsRepoName, number>();
   // How many sweeps of each repository are running. While one runs, no mint starts there.
   readonly #revoking = new Map<ArtifactsRepoName, number>();
-  // The latest mint per cache key, so concurrent misses for one key mint one token at a time.
-  readonly #minting = new Map<string, Promise<void>>();
+  // Token requests per repository, so concurrent misses mint one token at a time.
+  readonly #lanes = new Map<ArtifactsRepoName, Lane>();
+  // Repositories with a mint call of this incarnation that has not answered. At most one each.
+  readonly #unanswered = new Set<ArtifactsRepoName>();
   // The mint records this incarnation wrote. Only these can still be settled by their call's answer.
   readonly #ownMints = new Set<string>();
   #mainName: Promise<ArtifactsRepoName> | null = null;
@@ -210,7 +232,7 @@ class ArtifactsAdapter implements ArtifactsPort {
         return invalid("main is written only through the main writer");
       }
       const key = cacheKey(repo, scope, target.kind === "fork" ? target.claimId : null);
-      return await this.#oneAtATime(key, () => this.#issue(repo, target, scope, ttlMs, key));
+      return await this.#inLane(repo, () => this.#issue(repo, target, scope, ttlMs, key));
     });
   }
 
@@ -220,13 +242,15 @@ class ArtifactsAdapter implements ArtifactsPort {
       if (target === null) return unknownRepo();
       if (target.kind === "main") return invalid("main's tokens are not revoked through a claim");
       return await this.#fenced(repo, async () => {
-        // A mint that has not answered could create a token after the sweep lists, so sweep only
-        // once none is running.
-        if (this.#mintsRunning(repo)) {
-          return fail("busy", "A token for the repository is still being minted; try again.");
-        }
+        // Checked before the sweep: a mint that has not answered could create a token after the
+        // sweep lists, so success waits for it. The sweep still runs, revoking what exists now.
+        const unsettled = this.#unanswered.has(repo) || this.#previousMints(repo) > 0;
         using handle = await this.#open(repo);
-        return await this.#revokeActive(handle);
+        const swept = await this.#revokeActive(handle);
+        if (!swept.ok) return swept;
+        return unsettled
+          ? fail("busy", "A token for the repository may still be minted; try again.")
+          : ok(undefined);
       });
     });
   }
@@ -248,10 +272,14 @@ class ArtifactsAdapter implements ArtifactsPort {
     if (cached !== undefined && cached.token.expiresAt - now >= ttlMs / 2) {
       return ok({ ...cached.token });
     }
+    // A mint that timed out may still answer; another beside it would let unanswered calls pile up.
+    if (this.#unanswered.has(repo) || (target.kind === "fork" && this.#previousMints(repo) > 0)) {
+      return fail("busy", "An earlier token for the repository is still being minted; try again.");
+    }
     const epoch = this.#epoch(repo);
     // Recorded in the same step as the fence check above, so a revocation that starts later sees it.
     const ttlSeconds = Math.ceil(ttlMs / 1000);
-    const mint = target.kind === "fork" ? this.#recordMint(repo, ttlSeconds * 1000) : null;
+    const mint = this.#beginMint(repo, target.kind === "fork" ? ttlSeconds * 1000 : null);
     let settled = true;
     try {
       using handle = await this.#open(repo);
@@ -283,7 +311,7 @@ class ArtifactsAdapter implements ArtifactsPort {
       return ok({ ...token });
     } finally {
       // Once the call has answered, any token it created exists, and a revocation's sweep finds it.
-      if (settled && mint !== null) this.#forgetMint(mint);
+      if (settled) this.#endMint(repo, mint);
     }
   }
 
@@ -301,26 +329,53 @@ class ArtifactsAdapter implements ArtifactsPort {
       // No caller remains to report to. A fork's token left live is revoked by the next sweep, as
       // `revokeTokens` waits for this mint; any token expires within its requested lifetime.
     } finally {
-      if (mint !== null) this.#forgetMint(mint);
+      this.#endMint(repo, mint);
     }
   }
 
-  /** Runs `work` after the previous work for `key` has finished. */
-  async #oneAtATime<T>(key: string, work: () => Promise<T>): Promise<T> {
-    const current = (this.#minting.get(key) ?? Promise.resolve()).then(work);
-    const finished = current.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.#minting.set(key, finished);
+  /**
+   * Runs `work` once the repository's earlier token requests have finished. A request that finds
+   * the queue full, or waits longer than the queue allows, is refused without running.
+   */
+  async #inLane<T>(
+    repo: ArtifactsRepoName,
+    work: () => Promise<PortResult<T>>,
+  ): Promise<PortResult<T>> {
+    let lane = this.#lanes.get(repo);
+    if (lane === undefined) {
+      lane = { tail: Promise.resolve(), size: 0 };
+      this.#lanes.set(repo, lane);
+    }
+    // The running request counts toward the size, so this admits it and `maxWaitingMints` more.
+    if (lane.size > this.#limits.maxWaitingMints) {
+      return fail("busy", "Too many token requests for the repository are waiting; try again.");
+    }
+    const current = lane;
+    const turn = current.tail;
+    const { promise: finished, resolve: release } = signal();
+    current.tail = finished;
+    current.size += 1;
+    // The next request waits for this one's predecessor as well, even when this one gives up.
+    const leave = (): void => {
+      release();
+      current.size -= 1;
+      if (current.size === 0 && this.#lanes.get(repo) === current) this.#lanes.delete(repo);
+    };
+    if (!(await settlesWithin(turn, this.#limits.queueWaitMs))) {
+      void turn.then(leave);
+      return fail("busy", "An earlier token request for the repository is still running.");
+    }
     try {
-      return await current;
+      return await work();
     } finally {
-      if (this.#minting.get(key) === finished) this.#minting.delete(key);
+      leave();
     }
   }
 
-  #recordMint(repo: ArtifactsRepoName, ttlMs: number): string {
+  /** Marks a mint of `repo` unanswered, and records a fork's mint so a restart still sees it. */
+  #beginMint(repo: ArtifactsRepoName, forkTtlMs: number | null): string | null {
+    this.#unanswered.add(repo);
+    if (forkTtlMs === null) return null;
     const id = crypto.randomUUID();
     atomically(this.#context.storage, () => {
       this.#context.storage.sql.exec(
@@ -328,14 +383,16 @@ class ArtifactsAdapter implements ArtifactsPort {
         id,
         repo,
         this.#context.clock(),
-        ttlMs,
+        forkTtlMs,
       );
     });
     this.#ownMints.add(id);
     return id;
   }
 
-  #forgetMint(id: string): void {
+  #endMint(repo: ArtifactsRepoName, id: string | null): void {
+    this.#unanswered.delete(repo);
+    if (id === null) return;
     this.#ownMints.delete(id);
     atomically(this.#context.storage, () => {
       this.#context.storage.sql.exec("DELETE FROM artifacts_mints WHERE id = ?", id);
@@ -343,33 +400,30 @@ class ArtifactsAdapter implements ArtifactsPort {
   }
 
   /**
-   * Whether a mint for `repo` may still create a usable token. A mint of this incarnation is
-   * settled only by its call's answer. A mint of a previous incarnation can no longer answer, so its
-   * record is dropped once its start, the lifetime it asked for and the clock skew have passed: any
-   * token it created by then has expired. Until then it keeps revocation busy.
+   * How many mints of a previous incarnation of the Durable Object may still create a token on
+   * `repo`. They can never answer, so each counts until its start, the lifetime it asked for and
+   * `MINT_CLOCK_SKEW_MS` have passed, and its record is dropped then. A revocation reports success
+   * only after a sweep that runs once none counts; a token created after that sweep escapes it.
    */
-  #mintsRunning(repo: ArtifactsRepoName): boolean {
+  #previousMints(repo: ArtifactsRepoName): number {
     const storage = this.#context.storage;
-    const expiredBefore = this.#context.clock() - MINT_CLOCK_SKEW_MS;
-    const stale = storage.sql
-      .exec<{ id: string }>(
-        "SELECT id FROM artifacts_mints WHERE repo = ? AND started_at + ttl_ms <= ?",
+    const rows = storage.sql
+      .exec<{ id: string; started_at: number; ttl_ms: number }>(
+        "SELECT id, started_at, ttl_ms FROM artifacts_mints WHERE repo = ?",
         repo,
-        expiredBefore,
       )
       .toArray()
       .filter((row) => !this.#ownMints.has(row.id));
-    if (stale.length > 0) {
+    const now = this.#context.clock();
+    const over = rows.filter((row) => row.started_at + row.ttl_ms + MINT_CLOCK_SKEW_MS <= now);
+    if (over.length > 0) {
       atomically(storage, () => {
-        for (const row of stale) {
+        for (const row of over) {
           storage.sql.exec("DELETE FROM artifacts_mints WHERE id = ?", row.id);
         }
       });
     }
-    const rows = storage.sql
-      .exec("SELECT 1 FROM artifacts_mints WHERE repo = ? LIMIT 1", repo)
-      .toArray();
-    return rows.length > 0;
+    return rows.length - over.length;
   }
 
   async #fork(
@@ -579,6 +633,30 @@ class ArtifactsAdapter implements ArtifactsPort {
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+/** A promise and the function that resolves it. */
+function signal(): { promise: Promise<void>; resolve: () => void } {
+  let settle: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, resolve: () => settle?.() };
+}
+
+/** Whether `work` settles within `ms` milliseconds of wall time. */
+async function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(false);
+    }, ms);
+  });
+  try {
+    return await Promise.race([work.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
