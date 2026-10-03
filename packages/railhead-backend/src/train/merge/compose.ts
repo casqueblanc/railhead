@@ -10,6 +10,12 @@
 // conflicts with and reports the pair with the conflicted paths if the conflict is one the train can
 // classify: text edits on both sides of every path. Any other conflict is `unsupported`.
 //
+// `missing_commit`, `unsupported` and a conflict drop pins for good, so each is returned only for a
+// condition Git or Artifacts proved: a pin Artifacts says its fork does not hold, no merge base
+// within the deepest fetch, or a merge that stopped with unmerged entries. Every other failure of
+// a Git step, including one of `git merge-base`, a fetch of main or a push, is `infrastructure`,
+// which the train retries.
+//
 // The whole compose, release included, runs within `MERGE_TIMEOUT_MS`, under the train's own bound
 // on a port call, so a slow merge is reported as `timeout` rather than lost. Every sandbox and
 // Artifacts call is raced against one deadline, which stops `RELEASE_WAIT_MS` short of the budget
@@ -244,9 +250,10 @@ class Run {
       const { exitCode } = step.exec;
       if (exitCode === 0) return null;
       if (exitCode === NO_MERGE_BASE_EXIT) continue;
+      // Target 0 is main's own commit: a failed fetch of it says nothing about the pins.
       const target = targets[exitCode - FETCH_FAILED_EXIT];
-      if (exitCode < FETCH_FAILED_EXIT || target === undefined) return failure("infrastructure");
-      // A commit the repository does not hold is missing; any other fetch failure is Railhead's.
+      if (exitCode <= FETCH_FAILED_EXIT || target === undefined) return failure("infrastructure");
+      // A pin its fork does not hold is missing; any other fetch failure is Railhead's.
       const exists = await this.#deadline.race(this.#deps.commitExists(target.repo, target.commit));
       if (exists.kind === "timeout" || this.#deadline.passed()) return failure("timeout");
       return exists.kind === "done" && exists.value.ok && !exists.value.value

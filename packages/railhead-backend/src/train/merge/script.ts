@@ -16,14 +16,24 @@ export const TIMEOUT_EXITS: readonly number[] = [124, 137];
 /** A fetch step that could not fetch repository `index` exits with `FETCH_FAILED_EXIT + index`. */
 export const FETCH_FAILED_EXIT = 10;
 
-/** A fetch step whose pins have no merge base with main within the fetched depth exits with this. */
+/**
+ * A fetch step whose pins have no merge base with main within the fetched depth exits with this.
+ * Only `git merge-base`'s own status 1, which means no common ancestor, maps here; any other failure
+ * of it is an error and exits 2.
+ */
 export const NO_MERGE_BASE_EXIT = 30;
 
-/** A merge step that conflicted on pin `index` (1-based) exits with `CONFLICT_EXIT + index`. */
+/**
+ * A merge step that conflicted on pin `index` (1-based) exits with `CONFLICT_EXIT + index`: its merge
+ * stopped with unmerged entries. A merge that failed with none exits 2.
+ */
 export const CONFLICT_EXIT = 40;
 
-/** Where the merge works inside the sandbox. */
-const WORKDIR = "/tmp/railhead-merge";
+/**
+ * Where the merge works inside the sandbox. `RAILHEAD_MERGE_DIR` moves it only for the real-Git
+ * tests, which run the commands on a shared host; the sandbox never sets it.
+ */
+const WORKDIR = '"${RAILHEAD_MERGE_DIR:-/tmp/railhead-merge}"';
 
 const SHA = /^[0-9a-f]{40}$/;
 const HOST =
@@ -86,8 +96,8 @@ export function initCommand(seconds: number): string {
  * Fetches main's commit (the first target) and each pin at `depth`, then checks that every pin
  * shares a merge base with main. An explicit depth is required: a full fetch from a repository
  * imported shallow fails (#13), and fetching again with a larger depth deepens what is held.
- * Exits `FETCH_FAILED_EXIT + i` when target `i` cannot be fetched and `NO_MERGE_BASE_EXIT` when a
- * pin's history does not reach main's within `depth`.
+ * Exits `FETCH_FAILED_EXIT + i` when target `i` cannot be fetched, `NO_MERGE_BASE_EXIT` when a
+ * pin's history does not reach main's within `depth`, and 2 when `git merge-base` fails otherwise.
  */
 export function fetchCommand(
   targets: readonly FetchTarget[],
@@ -103,21 +113,29 @@ export function fetchCommand(
   );
   const bases = pins.map(
     (pin) =>
-      `git merge-base ${sha(main.commit)} ${sha(pin.commit)} >/dev/null 2>&1 || exit ${NO_MERGE_BASE_EXIT}`,
+      `step git merge-base ${sha(main.commit)} ${sha(pin.commit)} >/dev/null 2>&1 || no_base`,
   );
-  return script(seconds, [...lines, ...bases]);
+  return script(seconds, [
+    // Status 1 is Git's answer that there is no common ancestor; anything else is an error.
+    `no_base() { r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ "$r" -eq 1 ] && exit ${NO_MERGE_BASE_EXIT}; exit 2; }`,
+    ...lines,
+    ...bases,
+  ]);
 }
 
 /**
  * Checks out `main` and merges each pin in order with `--no-ff`. Prints the resulting commit on a
- * clean merge; exits `CONFLICT_EXIT + i` when pin `i` (1-based) conflicts.
+ * clean merge; exits `CONFLICT_EXIT + i` when pin `i` (1-based) conflicts, and 2 when a step fails
+ * in any other way, including a merge that stops with no unmerged entry.
  */
 export function mergeCommand(main: string, pins: readonly string[], seconds: number): string {
   const merges = pins.map(
     (pin, index) =>
-      `step git merge -q --no-ff --no-edit -m ${quote(`Compose pin ${index + 1} of ${pins.length}`)} ${sha(pin)} >/dev/null 2>&1 || fail ${CONFLICT_EXIT + index + 1}`,
+      `step git merge -q --no-ff --no-edit -m ${quote(`Compose pin ${index + 1} of ${pins.length}`)} ${sha(pin)} >/dev/null 2>&1 || conflict ${CONFLICT_EXIT + index + 1}`,
   );
   return script(seconds, [
+    // A merge that stopped with no unmerged entry failed for another reason, not a conflict.
+    'conflict() { r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ -n "$(git ls-files -u)" ] || exit 2; exit "$1"; }',
     `step git checkout -q --detach ${sha(main)} || fail 2`,
     ...merges,
     "git rev-parse HEAD",

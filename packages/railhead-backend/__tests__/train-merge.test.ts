@@ -369,11 +369,48 @@ describe("compose", () => {
     });
   });
 
+  it("reports a failed fetch of main's commit as infrastructure, without asking Artifacts", async () => {
+    await withMerge(async (harness) => {
+      // Target 0 is main's commit; the lookup would say it is missing.
+      harness.fake.replies.fetch = [{ exitCode: 10 }];
+
+      expect(await harness.merge.compose(MAIN, [PIN_A])).toEqual(
+        ok({ kind: "error", reason: "infrastructure" }),
+      );
+      expect(harness.exists.calls).toEqual([]);
+      await expectReleased(harness);
+    });
+  });
+
+  it("reports a Git error in the fetch step as infrastructure, without deepening", async () => {
+    await withMerge(async (harness) => {
+      // What the fetch step exits with when `git merge-base` fails for any reason but no ancestor.
+      harness.fake.replies.fetch = [{ exitCode: 2 }];
+
+      expect(await harness.merge.compose(MAIN, [PIN_A])).toEqual(
+        ok({ kind: "error", reason: "infrastructure" }),
+      );
+      expect(harness.fake.steps()).toEqual(["init", "fetch"]);
+      expect(harness.exists.calls).toEqual([]);
+    });
+  });
+
+  it("reports a merge step that failed without a conflict as infrastructure", async () => {
+    await withMerge(async (harness) => {
+      harness.fake.replies.merge = [{ exitCode: 2 }];
+
+      expect(await harness.merge.compose(MAIN, [PIN_A, PIN_B])).toEqual(
+        ok({ kind: "error", reason: "infrastructure" }),
+      );
+      expect(harness.fake.steps()).toEqual(["init", "fetch", "merge"]);
+    });
+  });
+
   it("reports a failed fetch of a commit that exists, or cannot be checked, as infrastructure", async () => {
     for (const answer of [ok(true), fail("unavailable", "no artifacts")]) {
       await withMerge(
         async (harness) => {
-          harness.fake.replies.fetch = [{ exitCode: 10 }];
+          harness.fake.replies.fetch = [{ exitCode: 11 }];
           expect(await harness.merge.compose(MAIN, [PIN_A])).toEqual(
             ok({ kind: "error", reason: "infrastructure" }),
           );
@@ -451,7 +488,7 @@ describe("compose", () => {
     const late: Promise<void>[] = [];
     await withMerge(
       async (harness) => {
-        harness.fake.replies.fetch = [{ exitCode: 10 }];
+        harness.fake.replies.fetch = [{ exitCode: 11 }];
 
         const started = Date.now();
         const result = await harness.merge.compose(MAIN, [PIN_A]);
