@@ -322,6 +322,26 @@ pub fn inert(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Untrusted text as one inert JSON string: quotes and escapes keep it on its own line, and
+/// [`inert`] neutralises the characters JSON leaves as they are.
+///
+/// JSON leaves the Unicode line breaks NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR raw, and
+/// readers that split lines the Unicode way would start a new line at each, so they are escaped.
+#[must_use]
+pub fn quoted(text: &str) -> String {
+    let json = serde_json::to_string(text).unwrap_or_else(|_| String::from("\"\""));
+    let mut escaped = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '\u{85}' => escaped.push_str("\\u0085"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            other => escaped.push(other),
+        }
+    }
+    inert(&escaped).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -543,5 +563,15 @@ mod tests {
             out.credential(&[("username", "a")]),
             Err(CredentialError::Io(io::ErrorKind::BrokenPipe))
         );
+    }
+
+    #[test]
+    fn quoted_line_separators_stay_valid_json() -> anyhow::Result<()> {
+        let original = "a\u{2028}b\u{2029}c\u{85}d";
+        let text = quoted(original);
+        assert_eq!(text, "\"a\\u2028b\\u2029c\\u0085d\"");
+        assert_eq!(serde_json::from_str::<String>(&text)?, original);
+        assert_eq!(quoted(""), "\"\"");
+        Ok(())
     }
 }

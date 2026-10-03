@@ -612,12 +612,12 @@ describe("subscriptions through the Repo binding", () => {
   it("frees the slot when the native handle is released without cancel", async () => {
     const { stub, repoId } = await freshRepo();
     const released = new NativeRecorder();
-    const handle = value(await stub.subscribe(0, released));
+    const handle = value(await stub.subscribe(0, released, null));
     const others = [];
     for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
-      others.push(value(await stub.subscribe(0, new NativeRecorder())));
+      others.push(value(await stub.subscribe(0, new NativeRecorder(), null)));
     }
-    expect(await stub.subscribe(0, new NativeRecorder())).toMatchObject({
+    expect(await stub.subscribe(0, new NativeRecorder(), null)).toMatchObject({
       ok: false,
       code: "quota_exceeded",
     });
@@ -629,7 +629,7 @@ describe("subscriptions through the Repo binding", () => {
     await settle();
 
     expect(released.seqs).toEqual([]);
-    expect(await stub.subscribe(0, new NativeRecorder())).toMatchObject({
+    expect(await stub.subscribe(0, new NativeRecorder(), null)).toMatchObject({
       ok: false,
       code: "quota_exceeded",
     });
@@ -644,7 +644,7 @@ describe("subscriptions through the Repo binding", () => {
 async function subscribeWhenFree(stub: DurableObjectStub<Repo>, ms = 5_000) {
   const deadline = Date.now() + ms;
   for (;;) {
-    const result = await stub.subscribe(0, new NativeRecorder());
+    const result = await stub.subscribe(0, new NativeRecorder(), null);
     if (result.ok) return result.value;
     if (result.code !== "quota_exceeded" || Date.now() > deadline) {
       throw new Error(`expected a free slot, got ${result.code}`);
@@ -675,6 +675,28 @@ describe("board subscriptions over the RPC session", () => {
       ok: false,
       code: "invalid_request",
     });
+    await subscription.cancel();
+  });
+
+  it("subscribes only under the history the cursor was read in", async () => {
+    const { name, stub, repoId } = await freshRepo();
+    await appendIn(stub, repoId, 2);
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using board = value(await api.openBoard("acme", name));
+    const page = value(await board.readEvents(0, 1));
+
+    const refused = new BoardRecorder();
+    expect(await board.subscribe(page.cursor, refused, "0".repeat(32))).toMatchObject({
+      ok: false,
+      code: "cursor_ahead",
+    });
+    const listener = new BoardRecorder();
+    using subscription = value(await board.subscribe(page.cursor, listener, page.history));
+    await appendIn(stub, repoId, 1);
+    await until(() => listener.seqs.length === 2);
+
+    expect(listener.seqs).toEqual([2, 3]);
+    expect(refused.seqs).toEqual([]);
     await subscription.cancel();
   });
 
@@ -763,7 +785,7 @@ describe("board subscriptions over the RPC session", () => {
       async events(): Promise<void> {}
       async ended(): Promise<void> {}
     }
-    expect(await stub.subscribe(0, new Listener())).toMatchObject({
+    expect(await stub.subscribe(0, new Listener(), null)).toMatchObject({
       ok: false,
       code: "not_found",
     });
@@ -842,7 +864,7 @@ function shortenDeliveryTimeout(): void {
 async function takeSlots(stub: DurableObjectStub<Repo>, count: number) {
   const taken = [];
   for (let n = 0; n < count; n += 1)
-    taken.push(value(await stub.subscribe(0, new NativeRecorder())));
+    taken.push(value(await stub.subscribe(0, new NativeRecorder(), null)));
   return taken;
 }
 

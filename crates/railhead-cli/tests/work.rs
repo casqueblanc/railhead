@@ -373,10 +373,10 @@ async fn status_inside_a_clone_prints_the_task_and_the_inbox() -> anyhow::Result
     let run = rh(&world, &clone, None, &["status"])?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let expected = format!(
-        "agent atlas (agt_atlas01), confirmed\nclaim clm_42abcd\n\
-         issue iss_upload1, working, generation 1\ntask: Handle large uploads\n\
-         \x20 Uploads above 10 MB fail. Follow the decision.\nclone: {}\n\
-         inbox item 17: rework for decision dec_upload1 v2\n\
+        "agent \"atlas\" (\"agt_atlas01\"), confirmed\nclaim \"clm_42abcd\"\n\
+         issue \"iss_upload1\", working, generation 1\ntask: \"Handle large uploads\"\n\
+         \x20 \"Uploads above 10 MB fail. Follow the decision.\"\nclone: {}\n\
+         inbox item 17: rework for decision \"dec_upload1\" v2\n\
          inbox: 1 unacknowledged; read them with rh sync\nnext: rh sync\n",
         clone.display()
     );
@@ -402,12 +402,12 @@ async fn a_repeated_claim_resumes_the_same_clone_and_keeps_edits() -> anyhow::Re
     )?;
     assert_eq!(first.code, Some(0), "{}", first.stderr);
     assert!(
-        first.stdout.starts_with("claimed clm_42abcd\n"),
+        first.stdout.starts_with("claimed \"clm_42abcd\"\n"),
         "{}",
         first.stdout
     );
     assert!(
-        first.stdout.contains("task: Handle large uploads"),
+        first.stdout.contains("task: \"Handle large uploads\""),
         "{}",
         first.stdout
     );
@@ -1039,7 +1039,7 @@ async fn ready_pins_head_with_the_clone_generation() -> anyhow::Result<()> {
     );
     assert!(
         run.stdout
-            .contains("issue iss_upload1, ready, generation 1"),
+            .contains("issue \"iss_upload1\", ready, generation 1"),
         "{}",
         run.stdout
     );
@@ -1141,7 +1141,7 @@ async fn status_without_a_claim_points_at_work_and_a_revoked_agent_fails() -> an
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(
         run.stdout,
-        "agent atlas (agt_atlas01), confirmed\nno claim\nnext: rh work\n"
+        "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\nnext: rh work\n"
     );
 
     world.server.reset().await;

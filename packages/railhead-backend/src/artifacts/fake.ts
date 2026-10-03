@@ -41,7 +41,16 @@ export interface FakeRepo {
   readonly tokens: FakeToken[];
   /** True while the fake reports the repository as still forking. */
   forking: boolean;
+  /** The ref `HEAD` names. Only `refs/heads/main` holds `commits`; any other ref is empty. */
+  headRef: string;
 }
+
+/** How a paged `listTokens` chooses its tokens. */
+export type TokenPageOrder =
+  /** The first tokens in creation order, whatever their state. */
+  | "creation"
+  /** Live tokens first, then the others, each in creation order. */
+  | "live-first";
 
 /** How the next `fork` call misbehaves. */
 export type ForkFault =
@@ -80,11 +89,14 @@ export class FakeArtifacts implements ArtifactsNamespace {
   createTokenCalls = 0;
   /** How many tokens were minted with `createToken`. */
   tokensMinted = 0;
+  /** How many `listTokens` calls reached the fake. */
+  listTokensCalls = 0;
   #now: number;
   #nextId = 1;
   #forkFaults: ForkFault[] = [];
   #revokeFails = 0;
   #revokeDelayMs = 0;
+  #tokenPage: { size: number; order: TokenPageOrder } | null = null;
   readonly #gates = new Map<PausableCall, Gate>();
 
   constructor(now = 1_000_000) {
@@ -101,7 +113,12 @@ export class FakeArtifacts implements ArtifactsNamespace {
 
   /** Creates a repository whose default branch holds `commits`, oldest first. */
   seed(name: string, commits: string[]): FakeRepo {
-    const repo: FakeRepo = { commits: [...commits], tokens: [], forking: false };
+    const repo: FakeRepo = {
+      commits: [...commits],
+      tokens: [],
+      forking: false,
+      headRef: "refs/heads/main",
+    };
     this.repos.set(name, repo);
     return repo;
   }
@@ -119,6 +136,15 @@ export class FakeArtifacts implements ArtifactsNamespace {
   /** Makes every `revokeToken` call take `ms` milliseconds of wall time before it answers. */
   slowRevocations(ms: number): void {
     this.#revokeDelayMs = ms;
+  }
+
+  /**
+   * Makes `listTokens` return at most `size` tokens, chosen by `order`, with `total` still counting
+   * every token, revoked and expired ones too; `null` lists them all. Which order the binding uses,
+   * and whether it keeps revoked tokens, is not known, so tests cover both.
+   */
+  pageTokens(size: number | null, order: TokenPageOrder = "creation"): void {
+    this.#tokenPage = size === null ? null : { size, order };
   }
 
   /**
@@ -244,6 +270,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
       },
       listTokens: async () => {
         live();
+        this.listTokensCalls += 1;
         await this.#hold("listTokens");
         const tokens = repo.tokens.map((token) => ({
           id: token.id,
@@ -252,7 +279,16 @@ export class FakeArtifacts implements ArtifactsNamespace {
           createdAt: new Date(this.#now).toISOString(),
           expiresAt: new Date(token.expiresAtMs).toISOString(),
         }));
-        return { tokens, total: tokens.length };
+        const page = this.#tokenPage;
+        if (page === null) return { tokens, total: tokens.length };
+        const ordered =
+          page.order === "creation"
+            ? tokens
+            : [
+                ...tokens.filter((token) => token.state === "active"),
+                ...tokens.filter((token) => token.state !== "active"),
+              ];
+        return { tokens: ordered.slice(0, page.size), total: tokens.length };
       },
       revokeToken: async (tokenOrId) => {
         live();
@@ -287,7 +323,9 @@ export class FakeArtifacts implements ArtifactsNamespace {
       log: async (opts) => {
         live();
         const limit = opts?.limit ?? 50;
-        return repo.commits
+        const ref = opts?.ref === undefined || opts.ref === "HEAD" ? repo.headRef : opts.ref;
+        const commits = ref === "refs/heads/main" || ref === "main" ? repo.commits : [];
+        return commits
           .toReversed()
           .slice(0, limit)
           .map((hash) => ({

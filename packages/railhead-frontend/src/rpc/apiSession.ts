@@ -44,8 +44,12 @@ export interface EnrollmentSession extends Disposable {
 
 /** Read access to one repository's log, after `BoardApi`. */
 export interface BoardSession extends Disposable {
-  readEvents(cursor: number, limit: number): PromiseLike<BoardResult<EventPage>>;
-  subscribe(cursor: number, listener: BoardListener): PromiseLike<BoardResult<SubscriptionSession>>;
+  readEvents(cursor: number, limit: number, history?: string): PromiseLike<BoardResult<EventPage>>;
+  subscribe(
+    cursor: number,
+    listener: BoardListener,
+    history?: string,
+  ): PromiseLike<BoardResult<SubscriptionSession>>;
   owner(): PromiseLike<OwnerSession>;
 }
 

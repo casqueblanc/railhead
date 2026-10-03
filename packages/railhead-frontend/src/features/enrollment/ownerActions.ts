@@ -146,6 +146,8 @@ export const failureMessage = (code: BoardErrorCode): string => {
       return "The invite limit was reached. Revoke an unused agent or wait for an invite to expire.";
     case "unavailable":
       return "This Railhead cannot perform the action: its module is not installed.";
+    case "busy":
+      return "The backend is busy. Nothing changed; try again shortly.";
     case "invalid_request":
       return "The backend refused the request as invalid. Nothing changed.";
     case "not_found":
