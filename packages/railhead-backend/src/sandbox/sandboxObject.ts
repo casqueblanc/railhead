@@ -14,7 +14,19 @@
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
 
-import { ContainerProxy, Sandbox, getSandbox } from "@cloudflare/sandbox";
+import {
+  ContainerProxy,
+  Sandbox,
+  getSandbox,
+  type BackupOptions,
+  type DirectoryBackup,
+  type ExecOptions,
+  type ExecResult,
+  type ListFilesOptions,
+  type Process,
+  type ProcessOptions,
+  type RestoreBackupResult,
+} from "@cloudflare/sandbox";
 import { MAX_OUTPUT_BYTES, type SandboxCommand, type SandboxDriver } from "./entry";
 import { SandboxFence } from "./fence";
 import { serveGitGateway } from "./gateway";
@@ -42,6 +54,11 @@ const GIT_GATEWAY = "gitGateway";
 export class RailheadSandbox extends Sandbox<Env> {
   override enableInternet = false;
   override interceptHttps = true;
+
+  constructor(...args: ConstructorParameters<typeof Sandbox<Env>>) {
+    super(...args);
+    admitSandboxClient(this, () => this.#fence.admit());
+  }
 
   readonly #fence = new SandboxFence(
     this.ctx.storage,
@@ -89,6 +106,157 @@ export class RailheadSandbox extends Sandbox<Env> {
   async railheadExpire(): Promise<void> {
     await this.#fence.expire();
   }
+
+  // The SDK calls a CI run issues on this object, each run through `fenceSandbox`.
+  readonly #sdk = fenceSandbox(this.#fence, {
+    restoreBackup: (backup) => super.restoreBackup(backup),
+    createBackup: (options) => super.createBackup(options),
+    execWithSessionToken: (command, sessionId, options) =>
+      super.execWithSessionToken(command, sessionId, options),
+    listFiles: (path, options) => super.listFiles(path, options),
+    startProcess: (command, options, sessionId) => super.startProcess(command, options, sessionId),
+    containerFetch: (requestOrUrl, portOrInit, portParam) =>
+      super.containerFetch(requestOrUrl, portOrInit, portParam),
+  });
+
+  override restoreBackup(backup: DirectoryBackup): Promise<RestoreBackupResult> {
+    return this.#sdk.restoreBackup(backup);
+  }
+
+  override createBackup(options: BackupOptions): Promise<DirectoryBackup> {
+    return this.#sdk.createBackup(options);
+  }
+
+  override execWithSessionToken(
+    command: string,
+    sessionId: string,
+    options?: ExecOptions,
+  ): Promise<ExecResult> {
+    return this.#sdk.execWithSessionToken(command, sessionId, options);
+  }
+
+  override listFiles(path: string, options?: ListFilesOptions): ReturnType<Sandbox["listFiles"]> {
+    return this.#sdk.listFiles(path, options);
+  }
+
+  override startProcess(
+    command: string,
+    options?: ProcessOptions,
+    sessionId?: string,
+  ): Promise<Process> {
+    return this.#sdk.startProcess(command, options, sessionId);
+  }
+
+  override containerFetch(
+    requestOrUrl: Request | string | URL,
+    portOrInit?: number | RequestInit,
+    portParam?: number,
+  ): Promise<Response> {
+    return this.#sdk.containerFetch(requestOrUrl, portOrInit, portParam);
+  }
+}
+
+/**
+ * The Sandbox SDK methods through which the patched CI runner reaches a sandbox's container, either
+ * by calling them or, for `containerFetch`, through the SDK's HTTP transport and the WebSocket
+ * upgrade of its RPC transport. `RailheadSandbox` overrides each one to run through `fenceSandbox`.
+ */
+export const FENCED_SANDBOX_METHODS = [
+  "restoreBackup",
+  "createBackup",
+  "execWithSessionToken",
+  "listFiles",
+  "startProcess",
+  "containerFetch",
+] as const satisfies readonly (keyof Sandbox)[];
+
+/** The SDK calls `fenceSandbox` wraps. */
+export type FencedSandboxCalls = Pick<Sandbox, (typeof FENCED_SANDBOX_METHODS)[number]>;
+
+/**
+ * Wraps `base`'s SDK calls so each runs inside `fence`'s live incarnation: retirement waits for it,
+ * and none starts, or reports, after it. A started process's own calls, such as its exit wait, run
+ * the same way. `containerFetch`, which starts the container and opens every connection to it, is
+ * refused outside the live incarnation; calls on a connection already open are refused by
+ * `admitSandboxClient`.
+ */
+export function fenceSandbox(
+  fence: Pick<SandboxFence, "operate" | "admit">,
+  base: FencedSandboxCalls,
+): FencedSandboxCalls {
+  const fenceProcess = (process: Process): Process => ({
+    ...process,
+    kill: (signal) => fence.operate(() => process.kill(signal)),
+    getStatus: () => fence.operate(() => process.getStatus()),
+    getLogs: () => fence.operate(() => process.getLogs()),
+    waitForLog: (pattern, timeout) => fence.operate(() => process.waitForLog(pattern, timeout)),
+    waitForPort: (port, options) => fence.operate(() => process.waitForPort(port, options)),
+    waitForExit: (timeout) => fence.operate(() => process.waitForExit(timeout)),
+  });
+  return {
+    restoreBackup: (backup) => fence.operate(() => base.restoreBackup(backup)),
+    createBackup: (options) => fence.operate(() => base.createBackup(options)),
+    execWithSessionToken: (command, sessionId, options) =>
+      fence.operate(() => base.execWithSessionToken(command, sessionId, options)),
+    listFiles: (path, options) => fence.operate(() => base.listFiles(path, options)),
+    startProcess: async (command, options, sessionId) =>
+      fenceProcess(await fence.operate(() => base.startProcess(command, options, sessionId))),
+    containerFetch: async (requestOrUrl, portOrInit, portParam) => {
+      fence.admit();
+      return base.containerFetch(requestOrUrl, portOrInit, portParam);
+    },
+  };
+}
+
+/**
+ * Members of the SDK's transport client that only manage its connection inside this object and
+ * never reach the container. `admitSandboxClient` lets these through after retirement, so a destroy
+ * can still close the connection.
+ */
+export const LOCAL_CLIENT_MEMBERS: ReadonlySet<PropertyKey> = new Set([
+  "disconnect",
+  "setRetryTimeoutMs",
+  "getTransportMode",
+  "isWebSocketConnected",
+]);
+
+/**
+ * Makes every read of `sandbox.client`, the SDK's transport client, pass `admit` first, for each
+ * client the SDK installs, including after a transport change. Each SDK call reads a member of that
+ * client, such as `client.utils`, just before it sends: over the RPC transport a call on an open
+ * WebSocket never passes through `containerFetch`, so a call that resumes after retirement, such
+ * as a restore whose archive read outlived the deadline, is refused here before it can reach a
+ * container whose destroy failed or has not yet finished. Only `LOCAL_CLIENT_MEMBERS` pass
+ * without admission.
+ */
+export function admitSandboxClient<C extends object>(
+  sandbox: { client: C },
+  admit: () => void,
+): void {
+  let client = admitClient(sandbox.client, admit);
+  Object.defineProperty(sandbox, "client", {
+    get: () => client,
+    set: (next: C) => {
+      client = admitClient(next, admit);
+    },
+    configurable: true,
+    enumerable: true,
+  });
+}
+
+function admitClient<C extends object>(client: C, admit: () => void): C {
+  return new Proxy(client, {
+    get(target, member) {
+      if (!LOCAL_CLIENT_MEMBERS.has(member)) {
+        admit();
+        // Not bound: an RPC stub is callable, and reading its `bind` would be a remote call.
+        return Reflect.get(target, member, target);
+      }
+      const value: unknown = Reflect.get(target, member, target);
+      // Bound to the client itself, so a disconnect after retirement is not refused partway.
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 // Until a policy selects the gateway, every request is refused.

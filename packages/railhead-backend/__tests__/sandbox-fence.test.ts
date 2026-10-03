@@ -903,3 +903,172 @@ describe("sandbox teardown racing a late command", () => {
     });
   });
 });
+
+/**
+ * A container operation the fence does not issue itself, such as the SDK's backup restore: it
+ * waits on R2 until the test answers, then reaches the container through `admit`, as every SDK path
+ * to it does through `RailheadSandbox.containerFetch`.
+ */
+function pausedOperation(fence: SandboxFence, fake: FakeContainer) {
+  const r2 = deferred();
+  const touched: string[] = [];
+  let started = false;
+  const operation = async () => {
+    started = true;
+    await r2.promise;
+    fence.admit();
+    fake.running = true;
+    touched.push("extract");
+    return "restored";
+  };
+  return { operation, answer: r2.resolve, touched, started: () => started };
+}
+
+describe("sandbox operations the fence does not issue itself", () => {
+  it("runs one inside the live incarnation and leaves it live", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      const paused = pausedOperation(fence, fake);
+      const result = fence.operate(paused.operation);
+      paused.answer();
+      expect(await result).toBe("restored");
+      expect(paused.touched).toEqual(["extract"]);
+      expect(phase()).toBe("live");
+      expect(fence.grantCurrent(DEADLINE)).toBe(true);
+    });
+  });
+
+  it("refuses one before the start, after retirement or past the deadline without running it", async () => {
+    await withFence(async ({ fence, fake, advance }) => {
+      const early = pausedOperation(fence, fake);
+      expect(await refusal(fence.operate(early.operation))).toBe("not_started");
+      expect(early.started()).toBe(false);
+
+      await fence.start(POLICY, DEADLINE);
+      advance(60_000);
+      const late = pausedOperation(fence, fake);
+      const destroysBefore = fake.destroys;
+      expect(await refusal(fence.operate(late.operation))).toBe("expired");
+      expect(late.started()).toBe(false);
+      expect(fake.destroys).toBe(destroysBefore + 1);
+
+      const retired = pausedOperation(fence, fake);
+      expect(await refusal(fence.operate(retired.operation))).toBe("retired");
+      expect(retired.started()).toBe(false);
+      expect(fake.running).toBe(false);
+    });
+  });
+
+  it("never touches the container when a restore started before expiry resumes after it", async () => {
+    await withFence(async ({ fence, fake, phase, advance }) => {
+      await fence.start(POLICY, DEADLINE);
+      const restore = pausedOperation(fence, fake);
+      const result = refusal(fence.operate(restore.operation));
+      await flush();
+      expect(restore.started()).toBe(true);
+
+      // The deadline's wake-up, in the same object, retires the incarnation while the restore waits
+      // on R2, and cannot confirm the teardown.
+      advance(60_000);
+      expect(await refusal(fence.expire())).toBe("unsettled");
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retiring");
+      expect(fence.grantCurrent(DEADLINE)).toBe(false);
+      // A release cannot confirm the teardown while the restore is unresolved.
+      expect(await refusal(fence.retire())).toBe("unsettled");
+      expect(phase()).toBe("retiring");
+
+      const destroysBefore = fake.destroys;
+      restore.answer();
+      expect(await result).toBe("retired");
+      expect(restore.touched).toEqual([]);
+      expect(fake.running).toBe(false);
+      // Settling destroys again and confirms the teardown.
+      expect(fake.destroys).toBe(destroysBefore + 1);
+      expect(phase()).toBe("retired");
+      await fence.retire();
+    });
+  });
+
+  it("holds a release until a paused operation settles, then refuses it", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      const restore = pausedOperation(fence, fake);
+      const result = refusal(fence.operate(restore.operation));
+      await flush();
+
+      let confirmed = false;
+      const retire = fence.retire().then(() => {
+        confirmed = true;
+      });
+      await flush();
+      expect(confirmed).toBe(false);
+
+      restore.answer();
+      await retire;
+      expect(await result).toBe("retired");
+      expect(restore.touched).toEqual([]);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("destroys the container when an operation fails, and refuses the next", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      const failure = new Error("backup not found");
+      await expect(
+        fence.operate(async () => {
+          fake.running = true;
+          throw failure;
+        }),
+      ).rejects.toBe(failure);
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+      const next = pausedOperation(fence, fake);
+      expect(await refusal(fence.operate(next.operation))).toBe("retired");
+      expect(next.started()).toBe(false);
+    });
+  });
+
+  it("abandons an operation at the deadline and destroys the container when it settles", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      // Twenty milliseconds of lifetime is the operation's whole budget.
+      await fence.start(POLICY, START + 20);
+      const restore = pausedOperation(fence, fake);
+      expect(await refusal(fence.operate(restore.operation))).toBe("timed_out");
+      expect(phase()).toBe("retiring");
+      expect(await refusal(fence.retire())).toBe("unsettled");
+
+      const destroysBefore = fake.destroys;
+      restore.answer();
+      await flush();
+      expect(restore.touched).toEqual([]);
+      expect(fake.destroys).toBe(destroysBefore + 1);
+      expect(phase()).toBe("retired");
+    });
+  });
+});
+
+describe("sandbox admission to the container", () => {
+  it("admits only the live incarnation, up to one millisecond before its deadline", async () => {
+    await withFence(async ({ fence, advance }) => {
+      expect(await refusal(Promise.resolve().then(() => fence.admit()))).toBe("not_started");
+      await fence.start(POLICY, DEADLINE);
+      fence.admit();
+      advance(DEADLINE - START - 1);
+      fence.admit();
+      advance(1);
+      expect(await refusal(Promise.resolve().then(() => fence.admit()))).toBe("expired");
+    });
+  });
+
+  it("refuses from the moment retirement is recorded, before the destroy returns", async () => {
+    await withFence(async ({ fence, fake }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyHangs = true;
+      void fence.retire();
+      await flush();
+      expect(await refusal(Promise.resolve().then(() => fence.admit()))).toBe("retired");
+    });
+  });
+});

@@ -164,6 +164,9 @@ settings:
 
 catalogs:
   default:
+    '@cloudflare/ci':
+      specifier: 0.2.0
+      version: 0.2.0
     '@cloudflare/sandbox':
       specifier: 0.12.1
       version: 0.12.1
@@ -195,6 +198,9 @@ catalogs:
 overrides:
   vite@*: 7.3.6
   '@types/node': 24.19.0
+
+patchedDependencies:
+  '@cloudflare/ci@0.2.0': 067a3292950c0430801d5b1b0eb916843c0ff6eb1a2776effb88ed97b06f1a57
 
 importers:
 
@@ -242,6 +248,9 @@ importers:
 
   packages/railhead-backend:
     dependencies:
+      '@cloudflare/ci':
+        specifier: 'catalog:'
+        version: 0.2.0(patch_hash=067a3292950c0430801d5b1b0eb916843c0ff6eb1a2776effb88ed97b06f1a57)
       '@cloudflare/sandbox':
         specifier: 'catalog:'
         version: 0.12.1
@@ -500,6 +509,9 @@ packages:
   '@bramus/specificity@2.4.2':
     resolution: {integrity: sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw==}
     hasBin: true
+
+  '@cloudflare/ci@0.2.0':
+    resolution: {integrity: sha512-uAr54YhZy4sYHaJM2fYMPg2BtmS2btemBMtED59XDdYQhw08lGr29IS+njNKSWnrBGpbJuQGRWc/jWWiMgg3vg==}
 
   '@cloudflare/config@0.22.0':
     resolution: {integrity: sha512-6FoqVlQicGs6DcUn5zbWUbcXomqtqIe+dFKwYJGKTJI/3W1dNQ2sKzxttNthiQG9RJhrENki4BNrpZtZuHwvXw==}
@@ -3573,6 +3585,15 @@ snapshots:
   '@bramus/specificity@2.4.2':
     dependencies:
       css-tree: 3.2.1
+
+  '@cloudflare/ci@0.2.0(patch_hash=067a3292950c0430801d5b1b0eb916843c0ff6eb1a2776effb88ed97b06f1a57)':
+    dependencies:
+      '@cloudflare/sandbox': 0.12.1
+      zod: 4.6.5
+    transitivePeerDependencies:
+      - '@openai/agents'
+      - '@opencode-ai/sdk'
+      - '@xterm/xterm'
 
   '@cloudflare/config@0.22.0':
     dependencies:
