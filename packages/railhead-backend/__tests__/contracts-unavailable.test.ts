@@ -42,6 +42,8 @@ const PORTS: [PortName, object][] = [
  * back.
  */
 const SYNC = new Map<string, unknown>([
+  ["authorization.record", null],
+  ["authorization.recordWrite", "throws"],
   ["claims.currentGeneration", null],
   ["decisions.currentVersions", null],
   ["inbox.queue", "throws"],

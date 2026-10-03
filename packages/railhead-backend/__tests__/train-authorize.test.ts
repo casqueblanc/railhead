@@ -9,7 +9,13 @@ import {
 } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import type { PortErrorCode, PortResult } from "../src/contracts/result";
-import type { CheckAttempt, CheckReport, MergeIntentRecord } from "../src/contracts/train";
+import type {
+  AuthorizationPort,
+  CheckAttempt,
+  CheckReport,
+  MergeIntentRecord,
+} from "../src/contracts/train";
+import { unavailableAuthorization, UnavailableError } from "../src/contracts/unavailable";
 import { EventLog } from "../src/repo/eventLog";
 import type { RepoStorage } from "../src/repo/storage";
 import {
@@ -106,6 +112,7 @@ interface Harness {
   log: EventLog;
   authorize: (attemptId?: string) => Promise<PortResult<MergeIntentRecord>>;
   intent: (intentId: string) => Promise<PortResult<MergeIntentRecord>>;
+  port: AuthorizationPort;
 }
 
 function harness(storage: RepoStorage, readers: AuthorizationReaders): Harness {
@@ -116,6 +123,7 @@ function harness(storage: RepoStorage, readers: AuthorizationReaders): Harness {
     log,
     authorize: (attemptId = ATTEMPT) => port.authorize(attemptId),
     intent: (intentId) => port.intent(intentId),
+    port,
   };
 }
 
@@ -406,6 +414,97 @@ describe("authorize fails closed", () => {
     await withHarness(new World(stored), async (h) => {
       await expect(h.authorize()).rejects.toMatchObject({ code: "invalid_event" });
       expect(intentRows(h.storage)).toBe(0);
+      expect(h.log.head()).toBe(0);
+    });
+  });
+});
+
+describe("record and recordWrite", () => {
+  const OTHER = "b".repeat(40);
+
+  it("reads the stored intent, and nothing for an unknown or malformed id", async () => {
+    await withHarness(new World(), async (h) => {
+      expect(h.port.record(INTENT)).toBeNull();
+      await h.authorize();
+      expect(h.port.record(INTENT)).toEqual(expectedRecord());
+      expect(h.port.record("int_unknown01")).toBeNull();
+      expect(h.port.record("chk_attempt01")).toBeNull();
+    });
+  });
+
+  it("records progress only against the attempts it expects, then settles once", async () => {
+    await withHarness(new World(), async (h) => {
+      await h.authorize();
+      const counted = h.port.recordWrite(INTENT, 0, {
+        status: "authorized",
+        attempts: 1,
+        main: null,
+      });
+      expect(counted).toEqual({ ...expectedRecord(), attempts: 1 });
+      // A writer that read the intent before that attempt was counted changes nothing.
+      expect(
+        h.port.recordWrite(INTENT, 0, { status: "updated", attempts: 1, main: CANDIDATE }),
+      ).toBeNull();
+
+      const settled = h.port.recordWrite(INTENT, 1, {
+        status: "updated",
+        attempts: 1,
+        main: CANDIDATE,
+      });
+      expect(settled).toEqual({
+        ...expectedRecord(),
+        status: "updated",
+        attempts: 1,
+        main: CANDIDATE,
+      });
+      // A settled intent never changes again.
+      expect(
+        h.port.recordWrite(INTENT, 1, { status: "rejected", attempts: 1, main: OTHER }),
+      ).toBeNull();
+      expect(h.port.record(INTENT)).toEqual(settled);
+      // Only authorization appended an event; settling is the writer's event to append.
+      expect(h.log.head()).toBe(1);
+    });
+  });
+
+  it("refuses a change it cannot store faithfully", async () => {
+    await withHarness(new World(), async (h) => {
+      await h.authorize();
+      h.port.recordWrite(INTENT, 0, { status: "authorized", attempts: 2, main: null });
+      for (const change of [
+        { status: "authorized" as const, attempts: 1, main: null },
+        { status: "updated" as const, attempts: 2, main: null },
+        { status: "rejected" as const, attempts: 2, main: "not-a-commit" },
+        { status: "authorized" as const, attempts: 2.5, main: null },
+      ]) {
+        expect(h.port.recordWrite(INTENT, 2, change)).toBeNull();
+      }
+      expect(
+        h.port.recordWrite("int_unknown01", 0, { status: "authorized", attempts: 1, main: null }),
+      ).toBeNull();
+      expect(
+        h.port.recordWrite("bad", 0, { status: "authorized", attempts: 1, main: null }),
+      ).toBeNull();
+      expect(h.port.record(INTENT)).toEqual({ ...expectedRecord(), attempts: 2 });
+    });
+  });
+
+  it("rolls its caller's transaction back while the module is missing", async () => {
+    await withHarness(new World(), async (h) => {
+      expect(unavailableAuthorization.record(INTENT)).toBeNull();
+      expect(() =>
+        h.log.transaction((tx) => {
+          tx.append(TRAIN_ACTOR, {
+            type: "train.main",
+            data: { intentId: INTENT, outcome: "updated", main: CANDIDATE },
+          });
+          return unavailableAuthorization.recordWrite(INTENT, 0, {
+            status: "updated",
+            attempts: 1,
+            main: CANDIDATE,
+          });
+        }),
+      ).toThrow(UnavailableError);
       expect(h.log.head()).toBe(0);
     });
   });

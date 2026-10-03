@@ -28,6 +28,7 @@ import type {
   CheckReport,
   MergeIntentRecord,
   MergeIntentStatus,
+  MergeIntentWrite,
 } from "../contracts/train";
 import type { EventLog } from "../repo/eventLog";
 import { migrate, type RepoStorage } from "../repo/storage";
@@ -97,7 +98,40 @@ export function createAuthorization(
       const record = readIntent(context.storage, "intent_id", intentId);
       return record === null ? fail("not_found", "No such merge intent.") : ok(record);
     },
+    record: (intentId) =>
+      isId("intent", intentId) ? readIntent(context.storage, "intent_id", intentId) : null,
+    recordWrite: (intentId, expectedAttempts, change) =>
+      recordWrite(context, intentId, expectedAttempts, change),
   };
+}
+
+/**
+ * Applies the main writer's change if the intent is still `authorized` at `expectedAttempts`. A
+ * change that would lower the attempt count, or record main moved without an observed commit, is a
+ * bug in the caller and is refused rather than stored.
+ */
+function recordWrite(
+  context: AuthorizationContext,
+  intentId: IntentId,
+  expectedAttempts: number,
+  change: MergeIntentWrite,
+): MergeIntentRecord | null {
+  if (!isId("intent", intentId)) return null;
+  if (!Number.isSafeInteger(change.attempts) || change.attempts < expectedAttempts) return null;
+  if (change.main !== null && !isCommitSha(change.main)) return null;
+  if (change.status !== "authorized" && change.main === null) return null;
+  const cursor = context.storage.sql.exec(
+    `UPDATE merge_intents SET status = ?, attempts = ?, main = ?, updated_at = ?
+     WHERE intent_id = ? AND status = 'authorized' AND attempts = ?`,
+    change.status,
+    change.attempts,
+    change.main,
+    context.clock(),
+    intentId,
+    expectedAttempts,
+  );
+  if (cursor.rowsWritten === 0) return null;
+  return readIntent(context.storage, "intent_id", intentId);
 }
 
 function authorize(

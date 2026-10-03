@@ -103,6 +103,10 @@ export const unavailableTrain: TrainPort = {
 export const unavailableAuthorization: AuthorizationPort = {
   authorize: refuse("authorization"),
   intent: refuse("authorization"),
+  record: () => null,
+  recordWrite: () => {
+    throw new UnavailableError("authorization");
+  },
 };
 
 /** Main's ref while the main writer is missing: main is neither read nor moved. */

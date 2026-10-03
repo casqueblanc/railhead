@@ -156,16 +156,46 @@ export interface TrainPort {
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
 }
 
+/** What the main writer records about its progress on an intent. */
+export interface MergeIntentWrite {
+  /** Where the intent stands now. `authorized` records an attempt that has not settled. */
+  status: MergeIntentStatus;
+  /** Write attempts made so far, including one about to start. */
+  attempts: number;
+  /** Main as last observed by the writer, or `null` before it observed main. */
+  main: CommitSha | null;
+}
+
 /**
  * Authorizes a merge. Inside one Repo transaction it checks that the attempt passed on exactly its
  * candidate, that every pin's generation and every required decision version is still current,
  * and records the `MergeIntentRecord`. A repeat for the same attempt returns the same record.
+ *
+ * `record` and `recordWrite` are fence methods: they are synchronous and touch only the Repo's
+ * storage, so a caller calls them inside its own `log.transaction` body, and what they read or
+ * write commits or rolls back with that transaction.
  */
 export interface AuthorizationPort {
   /** Authorizes the merge of a passed attempt. */
   authorize(attemptId: CheckRunId): Promise<PortResult<MergeIntentRecord>>;
   /** Reads an intent. */
   intent(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
+  /**
+   * The stored intent, or `null` when it is unknown or the module is missing; `null` is a refusal.
+   * Call it only inside the caller's transaction.
+   */
+  record(intentId: IntentId): MergeIntentRecord | null;
+  /**
+   * Records the main writer's progress, only if the intent is still `authorized` with exactly
+   * `expectedAttempts` attempts, and returns the updated record; otherwise changes nothing and
+   * returns `null`. Only the main writer calls it, inside the transaction that appends the
+   * `train.main` event when the intent settles.
+   */
+  recordWrite(
+    intentId: IntentId,
+    expectedAttempts: number,
+    change: MergeIntentWrite,
+  ): MergeIntentRecord | null;
 }
 
 /** The result of one conditional update of main. */
