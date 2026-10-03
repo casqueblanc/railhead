@@ -119,8 +119,8 @@ export class SandboxFence {
   async retire(): Promise<void> {
     const state = this.#read();
     if (state?.retired !== true) this.#write({ deadline: state?.deadline ?? 0, retired: true });
-    await this.#container.destroy();
     const outstanding = [...this.#inflight];
+    await this.#container.destroy();
     if (outstanding.length === 0) return;
     await Promise.allSettled(outstanding);
     await this.#container.destroy();

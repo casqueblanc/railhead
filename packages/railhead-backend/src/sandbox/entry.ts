@@ -184,6 +184,10 @@ export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxP
       }
       const { deadline } = slot;
       const limit = Math.min(command.timeoutMs, deadline - clock());
+      if (limit <= 0) {
+        await sweep();
+        return fail("not_found", "This attempt has no running sandbox.");
+      }
       const outcome = await settle(driver.exec(slot.sandbox, command), limit + execGraceMs);
       // The slot may have been released, replaced or passed its deadline while the command ran.
       const current = slots.get(attemptId);
