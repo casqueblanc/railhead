@@ -203,10 +203,11 @@ test("the bundle is a repository that installs and runs its checks on its own", 
 
   // From the bundle's own lockfile, offline: the versions are the catalog's (standalone.test.ts),
   // so the store the monorepo's install filled holds every package, and the test never reaches
-  // the registry.
+  // the registry. The release-age policy needs registry metadata the store lacks; the monorepo's
+  // own install already applied it to these same versions.
   const pnpm = (args: string[]) =>
     execFileSync("pnpm", args, { cwd: clone, encoding: "utf8", timeout: 180_000 });
-  pnpm(["install", "--frozen-lockfile", "--offline"]);
+  pnpm(["install", "--frozen-lockfile", "--offline", "--config.minimum-release-age=0"]);
   pnpm(["run", "typecheck"]);
   // The fixture's own tests and the current option's suite, under workerd.
   // The default reporter lists each file; Vitest picks a terser one when it detects an agent.

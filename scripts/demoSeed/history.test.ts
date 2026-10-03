@@ -325,7 +325,11 @@ test("the caller's Git config cannot change the imported history", () => {
     source,
     ["-c", `gpg.program=${gpg}`, "commit", "--quiet", "-S", "-m", "feat(demo): accept café"],
     {
+      GIT_AUTHOR_NAME: "Someone",
+      GIT_AUTHOR_EMAIL: "someone@example.com",
       GIT_AUTHOR_DATE: "1700100000 +0000",
+      GIT_COMMITTER_NAME: "Someone",
+      GIT_COMMITTER_EMAIL: "someone@example.com",
       GIT_COMMITTER_DATE: "1700100000 +0000",
     },
   );
