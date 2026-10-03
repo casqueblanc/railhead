@@ -654,6 +654,31 @@ describe("checks.report", () => {
     });
   });
 
+  it.each([
+    ["a two-byte", "é"],
+    ["a four-byte", "😀"],
+  ])("leaves out %s character split at the cut, staying within the cap", async (_name, char) => {
+    await withChecks(async (harness) => {
+      const digest = await started(harness);
+      // The cut falls one byte into the character, which a decoder would turn into U+FFFD.
+      const log = `${char}${"x".repeat(MAX_CHECK_LOG_BYTES - 1)}`;
+
+      await harness.checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest,
+        result: "fail",
+        log,
+        finishedAt: NOW,
+      });
+
+      const state = harness.attempts.get(ATTEMPT)?.state;
+      if (state?.kind !== "reported") throw new Error("not reported");
+      expect(state.log).toBe("x".repeat(MAX_CHECK_LOG_BYTES - 1));
+      expect(harness.world.reports[0]?.logDigest).toBe(await sha256Hex(encoder.encode(state.log)));
+    });
+  });
+
   it("accepts a duplicate of the recorded report and refuses one with another result", async () => {
     await withChecks(async (harness) => {
       const digest = await started(harness);

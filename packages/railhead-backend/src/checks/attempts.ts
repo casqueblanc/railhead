@@ -212,13 +212,16 @@ export class AttemptTable {
 }
 
 /**
- * `log` cut to its last `MAX_CHECK_LOG_BYTES` bytes of UTF-8. A character split at the cut decodes
- * to U+FFFD rather than failing.
+ * `log` cut to at most its last `MAX_CHECK_LOG_BYTES` bytes of UTF-8. A character split at the cut
+ * is left out whole, so the result never grows past the cap by decoding its remains.
  */
 export function boundedLog(log: string): string {
   const bytes = new TextEncoder().encode(log);
   if (bytes.byteLength <= MAX_CHECK_LOG_BYTES) return log;
-  return new TextDecoder().decode(bytes.subarray(bytes.byteLength - MAX_CHECK_LOG_BYTES));
+  let start = bytes.byteLength - MAX_CHECK_LOG_BYTES;
+  // Continuation bytes (0b10xxxxxx) at the cut belong to a character that starts before it.
+  while (((bytes[start] ?? 0) & 0xc0) === 0x80) start += 1;
+  return new TextDecoder().decode(bytes.subarray(start));
 }
 
 function toRecord(row: AttemptRow): AttemptRecord {
