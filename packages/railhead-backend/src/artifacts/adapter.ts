@@ -52,11 +52,6 @@ export interface ArtifactsAdapterLimits {
   readonly sweepDeadlineMs: number;
   /** How many tokens one sweep revokes before it reports the repository busy. */
   readonly maxRevokesPerSweep: number;
-  /**
-   * How long after it started a mint that never answered still blocks revocation. After this the
-   * call is taken as abandoned: an unverified assumption about Artifacts that H04 must qualify.
-   */
-  readonly mintSettleMs: number;
 }
 
 /** The production limits. */
@@ -65,7 +60,6 @@ export const ARTIFACTS_LIMITS: ArtifactsAdapterLimits = {
   maxCachedTokens: 256,
   sweepDeadlineMs: 30_000,
   maxRevokesPerSweep: 64,
-  mintSettleMs: 60_000,
 };
 
 /** The shortest token lifetime Artifacts accepts. */
@@ -336,22 +330,15 @@ class ArtifactsAdapter implements ArtifactsPort {
   }
 
   /**
-   * Whether a mint for `repo` may still create a token. A record outlives its adapter, so a mint
-   * started before a restart counts until `mintSettleMs` has passed.
+   * Whether a mint for `repo` may still create a token. Only the call's answer settles a mint: its
+   * record outlives a restart, and Artifacts documents no time after which an unanswered request
+   * can no longer take effect, so a mint started before a restart keeps revocation busy.
    */
   #mintsRunning(repo: ArtifactsRepoName): boolean {
-    const abandonedBefore = this.#context.clock() - this.#limits.mintSettleMs;
-    return atomically(this.#context.storage, () => {
-      const sql = this.#context.storage.sql;
-      sql.exec(
-        "DELETE FROM artifacts_mints WHERE repo = ? AND started_at <= ?",
-        repo,
-        abandonedBefore,
-      );
-      return (
-        sql.exec("SELECT 1 FROM artifacts_mints WHERE repo = ? LIMIT 1", repo).toArray().length > 0
-      );
-    });
+    const rows = this.#context.storage.sql
+      .exec("SELECT 1 FROM artifacts_mints WHERE repo = ? LIMIT 1", repo)
+      .toArray();
+    return rows.length > 0;
   }
 
   async #fork(

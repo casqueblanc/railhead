@@ -52,8 +52,16 @@ export type ForkFault =
   /** The call never answers and creates nothing. */
   | "hang";
 
-/** A fake call `pauseNext` can hold. */
-export type PausableCall = "get" | "createToken" | "listTokens";
+/** A point in a fake call where `pauseNext` can hold it. */
+export type PausableCall =
+  /** `get`, after the handle is open. */
+  | "get"
+  /** `createToken`, after the token is minted. */
+  | "createToken"
+  /** `createToken`, before anything is minted, as a request whose effect is delayed. */
+  | "createTokenBeforeMint"
+  /** `listTokens`, before it lists. */
+  | "listTokens";
 
 interface Gate {
   held: Promise<void>;
@@ -112,9 +120,8 @@ export class FakeArtifacts implements ArtifactsNamespace {
   }
 
   /**
-   * Holds the next `call` until `release` is called, so a test can act while it is in flight.
-   * `get` and `createToken` hold after they take effect, so a handle is open or a token minted;
-   * `listTokens` holds before it lists. `reached` resolves once the call is held.
+   * Holds the next call at `call` until `release` is called, so a test can act while it is in
+   * flight. `reached` resolves once the call is held.
    */
   pauseNext(call: PausableCall): { reached: Promise<void>; release: () => void } {
     let release: (() => void) | undefined;
@@ -221,6 +228,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
         if (!Number.isInteger(ttl) || ttl < 60 || ttl > 31_536_000) {
           throw new FakeArtifactsError("INVALID_TTL");
         }
+        await this.#hold("createTokenBeforeMint");
         this.tokensMinted += 1;
         const token = this.#mint(repo, scope, ttl);
         await this.#hold("createToken");

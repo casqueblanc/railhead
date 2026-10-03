@@ -25,7 +25,6 @@ const FAST: ArtifactsAdapterLimits = {
   ...ARTIFACTS_LIMITS,
   callTimeoutMs: 50,
   sweepDeadlineMs: 1_000,
-  mintSettleMs: MINUTE,
 };
 
 interface Setup {
@@ -438,6 +437,7 @@ describe("revokeTokens", () => {
         ok: false,
         code: "busy",
       });
+      expect(fake.tokensMinted).toBe(1);
       sweepPaused.release();
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
       expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
@@ -532,26 +532,29 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("holds revocation after a restart until an unanswered mint is taken as abandoned", async () => {
+  it("holds revocation after a restart until a mint whose effect is delayed answers", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const before = adapter();
       const repo = await forkClaim(before);
-      const paused = fake.pauseNext("createToken");
+      const paused = fake.pauseNext("createTokenBeforeMint");
       expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(fake.repos.get(repo)?.tokens).toHaveLength(1);
 
-      // A fresh adapter on the same storage, as after the Durable Object restarts.
+      // A fresh adapter on the same storage, as after the Durable Object restarts. However long the
+      // old request stays unanswered, revocation must not report success while it may mint.
       const after = adapter();
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
-      fake.advance(MINUTE - 1);
+      fake.advance(60 * MINUTE);
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
-      fake.advance(1);
-      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
-      expect(fake.liveTokens(repo)).toEqual([]);
 
+      // The delayed request now mints; its answer is what settles the record.
       paused.release();
       await vi.waitFor(() => {
         expect(fake.openHandles).toBe(0);
+        expect(fake.tokensMinted).toBe(1);
+        expect(fake.liveTokens(repo)).toEqual([]);
       });
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
     });
   });
 
