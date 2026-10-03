@@ -214,8 +214,11 @@ export type MainUpdate =
 
 /**
  * Main's ref. Only the main-writer module receives this port; no other port can mint a token that
- * writes main. Neither call promises a deadline or cancellation, so the main writer bounds each one
- * and treats an update that does not answer in time as uncertain.
+ * writes main. An implementation must give the writer sole control of the ref: nothing else moves
+ * it, and it never returns to a commit it left. The writer's reconciliation depends on that, since
+ * it reads main anywhere but an intent's expected commit or candidate as proof the intent did not
+ * land. Neither call promises a deadline or cancellation, so the main writer bounds each one and
+ * treats an update that does not answer in time as uncertain.
  */
 export interface MainRefPort {
   /** Reads main's current commit. */
