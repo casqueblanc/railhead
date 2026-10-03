@@ -329,6 +329,25 @@ describe("IssuesPanel", () => {
     expect(values()).toEqual({ title: "", body: "" });
   });
 
+  it("lets the owner file again once the backend reports it is busy", async () => {
+    let answer: BoardResult<OwnerActionResult> = {
+      ok: false,
+      code: "busy",
+      message: "not settled",
+    };
+    const { owner, performs } = recordingOwner(async () => answer);
+    await render(live(board()), owner);
+    await draft("Show upload limits", "");
+    await submit();
+    expect(text()).toContain("The backend is busy. Nothing was filed; try again shortly.");
+    answer = FILED;
+
+    await submit();
+
+    expect(performs).toEqual(["chl_1", "chl_1"]);
+    expect(values()).toEqual({ title: "", body: "" });
+  });
+
   it("lets the owner retry when the challenge could not be prepared", async () => {
     let fail = true;
     const { owner, prepares, performs } = recordingOwner(undefined, () =>
