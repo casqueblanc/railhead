@@ -119,6 +119,35 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
       }),
     /current names an option the decision lacks/,
   );
+  // The option in force at a version no suite carries, or no usable version: the app's checks
+  // could not start.
+  assert.throws(
+    () =>
+      assertMatchesChecks(manifest, {
+        decision: "upload-size-limit",
+        current: suite("a", 2),
+        suites: both,
+      }),
+    /no suite tagged a@2, the one in force/,
+  );
+  for (const version of [0, 1.5, "1", null]) {
+    assert.throws(
+      () =>
+        assertMatchesChecks(manifest, {
+          decision: "upload-size-limit",
+          current: { option: "a", version },
+          suites: both,
+        }),
+      /current.version must be a positive integer/,
+    );
+  }
+  assert.doesNotThrow(() =>
+    assertMatchesChecks(manifest, {
+      decision: "upload-size-limit",
+      current: suite("b", 2),
+      suites: both,
+    }),
+  );
 });
 
 /** The `ask` route's wire fixture, which the backend and the Rust protocol crate both check. */

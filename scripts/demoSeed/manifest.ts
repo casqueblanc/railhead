@@ -215,8 +215,8 @@ export function assertAskable(ask: Ask): void {
 
 /**
  * Checks the decision against the app's `acceptance/checks.json`: the same decision key, a suite
- * for every option and an option for every suite, with the option in force among them, so the
- * check the train runs can follow any answer.
+ * for every option and an option for every suite, and a suite tagged with the option and version
+ * in force, so the check the train runs can follow any answer and the current one can start.
  */
 export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): void {
   const root = record(checks, "checks.json");
@@ -225,21 +225,34 @@ export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): vo
   }
   const offered = new Set(manifest.decision.options.map((option) => option.key));
   const tagged = new Set<string>();
+  const versions = new Set<string>();
   for (const [index, entry] of list(root["suites"], "checks.json suites").entries()) {
-    const option = record(entry, `checks.json suites[${index}]`)["option"];
+    const suite = record(entry, `checks.json suites[${index}]`);
+    const option = suite["option"];
     if (typeof option !== "string" || !offered.has(option)) {
       throw new SeedRefusal(`checks.json suites[${index}] tags an option the decision lacks.`);
     }
     tagged.add(option);
+    versions.add(`${option}@${String(suite["version"])}`);
   }
   for (const option of offered) {
     if (!tagged.has(option)) {
       throw new SeedRefusal(`The decision offers ${option}, which no checks.json suite tags.`);
     }
   }
-  const current = record(root["current"], "checks.json current")["option"];
-  if (typeof current !== "string" || !offered.has(current)) {
+  const current = record(root["current"], "checks.json current");
+  const option = current["option"];
+  if (typeof option !== "string" || !offered.has(option)) {
     throw new SeedRefusal("checks.json current names an option the decision lacks.");
+  }
+  const version = current["version"];
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version <= 0) {
+    throw new SeedRefusal("checks.json current.version must be a positive integer.");
+  }
+  if (!versions.has(`${option}@${version}`)) {
+    throw new SeedRefusal(
+      `checks.json has no suite tagged ${option}@${version}, the one in force.`,
+    );
   }
 }
 
