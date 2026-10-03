@@ -17,12 +17,13 @@
 // again. `owe` also snapshots, in the same row, the decision versions and options each landed claim
 // depends on, while the claims are still held. It then calls `recordLanding`, which settles the
 // landing in its own nested transaction, so a refusal or a throw rolls back only the settlement and
-// leaves the landing pending. A pending
-// landing (its settlement threw, a reader reported unknown, or the intent has not settled) is
-// retried with a doubling backoff by the Repo's alarm through `resume`, and by later landings, up
-// to `MAX_SETTLE_TRIES` times. A landing that settled stays settled; `adapted` re-checks the decision's
-// current version and option every time it is read, so a later supersession removes the adaptation
-// without rewriting it.
+// leaves the landing pending. A pending landing (its settlement threw, a reader reported unknown,
+// or the intent has not settled) is retried by the Repo's alarm through `resume`, and by later
+// landings, with a doubling backoff capped at `RETRY_MAX_MS` and at most `MAX_SETTLE_PER_CALL`
+// landings per call. It stays pending until a reader gives a final answer: an outage never settles
+// it. A landing that settled stays settled; `adapted` re-checks the decision's current version and
+// option every time it is read, so a later supersession removes the adaptation without rewriting
+// it.
 //
 // The decisions module answers a claim's requirements only while the claim is held, so a merged or
 // expired claim's requirements cannot be read again later. Settlement therefore reads a landed
@@ -49,14 +50,11 @@ export const ADAPTATION_OWNER = "adaptation";
 /** Most pending landings one `recordLanding` call settles, its own included. */
 export const MAX_SETTLE_PER_CALL = 8;
 
-/** How many times a pending landing is read before it is settled as `unknown`. */
-export const MAX_SETTLE_TRIES = 16;
-
 /** The delay before a pending landing is retried after its first try. Each try doubles it. */
 export const RETRY_BASE_MS = 1_000;
 
 /** The longest delay before a pending landing is retried. */
-export const RETRY_MAX_MS = 5 * 60_000;
+export const RETRY_MAX_MS = 60 * 60_000;
 
 /** Released schema steps. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [
@@ -105,9 +103,7 @@ export type LandingOutcome =
   /** The acceptance check proves another option than the current version chose. */
   | "wrong_option"
   /** No claim of the landing depended on the proven version. */
-  | "no_dependent_claim"
-  /** Its facts could not be read after `MAX_SETTLE_TRIES` tries. */
-  | "unknown";
+  | "no_dependent_claim";
 
 const OUTCOMES: ReadonlySet<string> = new Set<LandingOutcome>([
   "adapted",
@@ -118,7 +114,6 @@ const OUTCOMES: ReadonlySet<string> = new Set<LandingOutcome>([
   "obsolete_version",
   "wrong_option",
   "no_dependent_claim",
-  "unknown",
 ]);
 
 /** A decision version a claim depended on when it landed, and the option that version chose. */
@@ -416,14 +411,11 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     const now = clock();
     sql.exec(
       `UPDATE adaptation_landings
-       SET tries = ?, next_at = ?, updated_at = ?,
-           outcome = CASE WHEN ? >= ? THEN 'unknown' ELSE NULL END
+       SET tries = ?, next_at = ?, updated_at = ?
        WHERE intent_id = ?`,
       tries,
       now + retryDelay(tries),
       now,
-      tries,
-      MAX_SETTLE_TRIES,
       intentId,
     );
   }

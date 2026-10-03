@@ -17,7 +17,13 @@ import type { AgentPrincipal } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import { parseAgentResponse } from "../src/contracts/wireShape";
 import { dispatchAgent, type AgentCommand } from "../src/gateway/agentDispatch";
-import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
+import {
+  composeRepo,
+  RESUME_RETRY_MS,
+  resumables,
+  resumeAll,
+  type RepoPorts,
+} from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 
@@ -350,9 +356,15 @@ async function withFakePorts<R>(
 describe("Repo alarm", () => {
   it("resumes every module after one throws, logging the failure by name only", async () => {
     const order: string[] = [];
+    const wakes: number[] = [];
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const context = {
+      repoId: "rep_alarm0001",
+      clock: () => 5_000,
+      wake: (at: number) => wakes.push(at),
+    };
     try {
-      await resumeAll("rep_alarm0001", [
+      await resumeAll(context, [
         {
           module: "train",
           resume: async () => {
@@ -375,16 +387,27 @@ describe("Repo alarm", () => {
             repo: "rep_alarm0001",
             module: "train",
             error: "TypeError",
+            retryAt: 5_000 + RESUME_RETRY_MS,
           }),
         ],
       ]);
+      // The failed module may not have asked for its next wake, so the alarm asks for a retry.
+      expect(wakes).toEqual([5_000 + RESUME_RETRY_MS]);
     } finally {
       logged.mockRestore();
     }
   });
 
   it("resumes nothing for an empty list and lists the Git gateway, the train and adaptation for a composed Repo", async () => {
-    await expect(resumeAll("rep_alarm0001", [])).resolves.toBeUndefined();
+    const wakes: number[] = [];
+    const context = {
+      repoId: "rep_alarm0001",
+      clock: () => 0,
+      wake: (at: number) => wakes.push(at),
+    };
+    await expect(resumeAll(context, [])).resolves.toBeUndefined();
+    // Nothing failed, so no retry wake is asked for.
+    expect(wakes).toEqual([]);
     const { stub, repoId } = await freshRepo();
     const modules = await runInDurableObject(stub, (_instance, state) =>
       resumables(

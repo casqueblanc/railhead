@@ -148,19 +148,34 @@ export function resumables(ports: RepoPorts): readonly Resumable[] {
   ];
 }
 
+/** How long after a module's resume throws the Repo's alarm runs again. */
+export const RESUME_RETRY_MS = 60_000;
+
 /**
- * Resumes each module in order. A module that throws is logged by name, never with its message,
- * and does not stop the others; each module asks for its own next wake.
+ * Resumes each module in order. Each module asks for its own next wake. A module that throws may
+ * not have asked, so it is logged by name, never with its message, the alarm is asked to run again
+ * `RESUME_RETRY_MS` later, and the others still run.
  */
-export async function resumeAll(repoId: RepoId, modules: readonly Resumable[]): Promise<void> {
+export async function resumeAll(
+  context: Pick<RepoContext, "repoId" | "clock" | "wake">,
+  modules: readonly Resumable[],
+): Promise<void> {
   for (const { module, resume } of modules) {
     try {
       await resume();
     } catch (error) {
       const name = error instanceof Error ? error.name : "unknown";
+      const retryAt = context.clock() + RESUME_RETRY_MS;
       console.error(
-        JSON.stringify({ event: "repo.resume_failed", repo: repoId, module, error: name }),
+        JSON.stringify({
+          event: "repo.resume_failed",
+          repo: context.repoId,
+          module,
+          error: name,
+          retryAt,
+        }),
       );
+      context.wake(retryAt);
     }
   }
 }

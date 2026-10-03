@@ -16,12 +16,17 @@ import { unavailableChecks } from "../src/contracts/unavailable";
 import { adaptation as adaptationModule } from "../src/modules/adaptation/entry";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
-import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
+import {
+  composeRepo,
+  RESUME_RETRY_MS,
+  resumeAll,
+  type RepoContext,
+  type RepoPorts,
+} from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import {
   createAdaptation,
   MAX_SETTLE_PER_CALL,
-  MAX_SETTLE_TRIES,
   RETRY_BASE_MS,
   RETRY_MAX_MS,
   type AdaptationPort,
@@ -453,21 +458,32 @@ describe("failures", () => {
     });
   });
 
-  it("settles a landing as unknown after the last try", async () => {
-    await withAdaptation(({ adaptation, world }) => {
-      adaptation.owe(INTENT, [pinOf(ATLAS)]);
-      world.intents.delete(INTENT);
-      for (let attempt = 1; attempt < MAX_SETTLE_TRIES; attempt += 1) {
-        expect(adaptation.recordLanding(INTENT)).toMatchObject({ outcome: null, tries: attempt });
-      }
-      expect(adaptation.recordLanding(INTENT)).toMatchObject({
-        outcome: "unknown",
-        tries: MAX_SETTLE_TRIES,
+  it("keeps retrying through a long outage with a capped backoff, then adapts", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await withAdaptation(async ({ adaptation, world, wakes, now, advance }) => {
+        adaptation.owe(INTENT, [pinOf(ATLAS)]);
+        world.intents.delete(INTENT);
+        // More tries than any former give-up limit, alternating a missing intent and a reader that
+        // throws.
+        for (let attempt = 1; attempt <= 24; attempt += 1) {
+          world.failure = attempt % 2 === 0 ? new TypeError("storage gone") : null;
+          await adaptation.resume();
+          world.failure = null;
+          expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: attempt });
+          // The next try is never further away than the cap.
+          expect(wakes.at(-1)).toBeLessThanOrEqual(now() + RETRY_MAX_MS);
+          advance(RETRY_MAX_MS);
+        }
+
+        world.intents.set(INTENT, intentOf());
+        await adaptation.resume();
+        expect(adaptation.landing(INTENT)).toMatchObject({ outcome: "adapted", tries: 24 });
+        expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
       });
-      world.intents.set(INTENT, intentOf());
-      expect(adaptation.recordLanding(INTENT)?.outcome).toBe("unknown");
-      expect(adaptation.adapted(ATLAS, DECISION)).toBe(false);
-    });
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it("settles at most a bounded number of pending landings per call", async () => {
@@ -562,6 +578,50 @@ describe("owe and resume", () => {
       await adaptation.resume();
       expect(wakes).toHaveLength(asked);
     });
+  });
+
+  it("retries a minute after the alarm's resume throws once, and adapts on that wake", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await withAdaptation(async ({ adaptation, wakes, now, advance }) => {
+        adaptation.owe(INTENT, [pinOf(ATLAS)]);
+        let failing = true;
+        const modules = [
+          {
+            module: "adaptation" as const,
+            resume: async () => {
+              if (failing) {
+                failing = false;
+                throw new TypeError("storage busy");
+              }
+              await adaptation.resume();
+            },
+          },
+        ];
+        const context = { repoId: REPO_ID, clock: now, wake: (at: number) => wakes.push(at) };
+
+        await resumeAll(context, modules);
+        const retryAt = now() + RESUME_RETRY_MS;
+        expect(wakes.at(-1)).toBe(retryAt);
+        expect(errors).toHaveBeenCalledWith(
+          JSON.stringify({
+            event: "repo.resume_failed",
+            repo: REPO_ID,
+            module: "adaptation",
+            error: "TypeError",
+            retryAt,
+          }),
+        );
+        expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 0 });
+
+        advance(RESUME_RETRY_MS);
+        await resumeAll(context, modules);
+        expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+        expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
+      });
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it("settles at most a bounded number of due landings per alarm", async () => {
