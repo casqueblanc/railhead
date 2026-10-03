@@ -204,6 +204,12 @@ export const SETTLE_WAKE_MS = 60 * 60_000;
  */
 export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
 
+/** How many times a restarted train tries to confirm the alarm for the wake it owes. */
+export const STARTUP_WAKE_ATTEMPTS = 5;
+
+/** The delay before the second of those attempts; each later delay doubles, about 3 seconds in all. */
+export const STARTUP_WAKE_BASE_MS = 200;
+
 /**
  * Most state transitions one call drives. Every transition that does not stop the drive settles or
  * consumes queue state: a batch costs at most four (form, compose, start or land, and a drop of
@@ -276,6 +282,12 @@ export interface Train extends TrainPort {
   batches(limit: number): BatchRecord[];
   /** Up to `limit` queue entries in any state, most recently changed first. */
   entries(limit: number): QueueEntry[];
+  /**
+   * Settles once the train has confirmed the alarm for the wake it found in storage when it was
+   * built: `true` when storage holds that alarm or the train owes none, `false` when every one of
+   * `STARTUP_WAKE_ATTEMPTS` failed. It never rejects.
+   */
+  readonly startup: Promise<boolean>;
 }
 
 type Step = { kind: "continue" } | { kind: "stop"; outcome: DriveOutcome };
@@ -339,13 +351,7 @@ export function createTrain(
   let discarding: Promise<void> | null = null;
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
-  const owed = readWake(sql);
-  if (owed !== null && !isExhausted(owed)) context.wake(owed.dueAt);
-  else if (owed !== null) {
-    // An exhausted wake is owed only while a write to main may have landed unheard, which needs
-    // the authorization port. Ports exist once the composition building this train has returned.
-    queueMicrotask(() => wakeForSettlement(owed));
-  }
+  const startup = confirmStartupWake();
   wakeForDiscards();
 
   /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
@@ -1099,18 +1105,29 @@ export function createTrain(
   }
 
   /**
-   * Asks the Repo's alarm for the exhausted wake `exhausted` if the train still owes a settlement,
-   * so an alarm for nothing is never set. A failed read is logged by name and asks for nothing.
+   * Asks the Repo's alarm for the wake stored when the train was built until a write is confirmed,
+   * with `STARTUP_WAKE_ATTEMPTS` attempts. Each attempt reads the wake again. An idle repository
+   * gets no other call that would ask, so an owed settlement depends on this alarm.
    */
-  function wakeForSettlement(exhausted: PendingWake): void {
-    try {
-      if (owesSettlement()) context.wake(exhausted.dueAt);
-    } catch (error) {
-      const name = error instanceof Error ? error.name : "unknown";
-      console.error(
-        JSON.stringify({ event: "train.settle_wake_failed", repo: context.repoId, error: name }),
-      );
+  async function confirmStartupWake(): Promise<boolean> {
+    // An exhausted wake is owed only while a write to main may have landed unheard, which needs
+    // the authorization port. Ports exist once the composition building this train has returned,
+    // so only that first attempt waits for it; any other is asked for while the train is built.
+    const stored = readWake(sql);
+    if (stored !== null && isExhausted(stored)) await Promise.resolve();
+    for (let attempt = 1; attempt <= STARTUP_WAKE_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) await sleep(STARTUP_WAKE_BASE_MS * 2 ** (attempt - 2));
+      try {
+        if (await armWake()) return true;
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "unknown";
+        console.error(
+          JSON.stringify({ event: "train.startup_wake_failed", repo: context.repoId, error: name }),
+        );
+      }
     }
+    console.error(JSON.stringify({ event: "train.startup_wake_exhausted", repo: context.repoId }));
+    return false;
   }
 
   /** Asks the Repo's alarm for the earliest pending discard, if any. */
@@ -1325,6 +1342,7 @@ export function createTrain(
     attemptOutcome,
     holdsLiveEntry,
     armWake,
+    startup,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
@@ -1508,4 +1526,8 @@ function stop(outcome: DriveOutcome): Step {
 
 function unreachable(value: never): never {
   throw new Error(`unhandled train state: ${String(value)}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

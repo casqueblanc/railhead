@@ -26,9 +26,10 @@ import {
   EXHAUSTED_FAILURES,
   MAX_WAKE_FAILURES,
   SETTLE_WAKE_MS,
+  STARTUP_WAKE_ATTEMPTS,
   type Train,
 } from "../src/modules/train/scheduler";
-import { readEntry, readWake } from "../src/modules/train/store";
+import { readEntry, readWake, writeWake } from "../src/modules/train/store";
 import {
   composeRepo,
   resumables,
@@ -37,7 +38,7 @@ import {
   type RepoPorts,
 } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
-import { EarliestAlarm } from "../src/repo/storage";
+import { EarliestAlarm, type AlarmStorage } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
 import { queueing, type QueueingTrain } from "./trainQueue";
 
@@ -178,6 +179,10 @@ interface RepoTarget {
    * clock then starts a day ahead of real time, so the runtime never fires a stored alarm itself.
    */
   realAlarm: boolean;
+  /** How many of the first storage alarm writes reject, as a storage fault would. */
+  failedAlarmWrites?: number;
+  /** How many of the first merge intent reads throw, as a storage fault would. */
+  failedIntentReads?: number;
 }
 
 /**
@@ -192,10 +197,22 @@ function withRepo<R>(
   target: RepoTarget = { stub: env.REPO.getByName(crypto.randomUUID()), realAlarm: false },
 ): Promise<R> {
   const { stub, realAlarm } = target;
+  let failedWrites = target.failedAlarmWrites ?? 0;
+  let failedReads = target.failedIntentReads ?? 0;
   return runInDurableObject(stub, async (_instance, state) => {
     let now = realAlarm ? Date.now() + 24 * 60 * 60_000 : 1_000;
     const log = EventLog.open(state.storage, REPO_ID, () => now);
-    const alarm = new EarliestAlarm(state.storage, () => {});
+    const alarmStorage: AlarmStorage = {
+      getAlarm: (options) => state.storage.getAlarm(options),
+      setAlarm: async (at, options) => {
+        if (failedWrites > 0) {
+          failedWrites -= 1;
+          throw new Error("alarm write failed");
+        }
+        return state.storage.setAlarm(at, options);
+      },
+    };
+    const alarm = new EarliestAlarm(alarmStorage, () => {});
     if (realAlarm) await alarm.load();
     const context: RepoContext = {
       repoId: REPO_ID,
@@ -274,7 +291,16 @@ function withRepo<R>(
         report: async () => fail("unavailable", "Not used."),
         detail: async () => fail("unavailable", "Not used."),
       },
-      authorization,
+      authorization: {
+        ...authorization,
+        record: (intentId) => {
+          if (failedReads > 0) {
+            failedReads -= 1;
+            throw new Error("intent read failed");
+          }
+          return authorization.record(intentId);
+        },
+      },
       mainWriter,
     };
     let train = queueing(
@@ -640,6 +666,36 @@ async function exhaust(h: Harness): Promise<void> {
   throw new Error("the wake was never exhausted");
 }
 
+/**
+ * Leaves an exhausted wake owing the settlement of an intent whose main write went unheard, in
+ * `target`'s storage with no stored alarm, then stops the object.
+ */
+async function owedAcrossRestart(
+  target: RepoTarget,
+  ref: FakeMain,
+): Promise<{ intentId: string; candidate: CommitSha; owed: number | undefined }> {
+  const left = await withRepo(
+    ref,
+    [pin(1)],
+    async (h) => {
+      await h.train.enqueue(pin(1));
+      ref.down = true;
+      const first = await pass(h);
+      const intent = latestIntent(h.train);
+      expect(h.authorization.record(intent)).toMatchObject({ status: "authorized", attempts: 1 });
+      await exhaust(h);
+      const wake = readWake(h.sql);
+      expect(wake?.failures).toBe(EXHAUSTED_FAILURES);
+      return { intentId: intent, candidate: first.candidate, owed: wake?.dueAt };
+    },
+    { stub: target.stub, realAlarm: true },
+  );
+  // The object stops before its alarm write reached storage.
+  await runInDurableObject(target.stub, (_instance, state) => state.storage.deleteAlarm());
+  await evictDurableObject(target.stub);
+  return left;
+}
+
 describe("the train's settle wake", () => {
   it("settles an intent whose write may have landed once Git recovers, with no further call", async () => {
     const ref = new FakeMain(MAIN, ["drop"]);
@@ -796,25 +852,7 @@ describe("the train's settle wake", () => {
   it("settles an owed intent from the stored alarm after the object restarts, with no call", async () => {
     const target: RepoTarget = { stub: env.REPO.getByName(crypto.randomUUID()), realAlarm: true };
     const ref = new FakeMain(MAIN, ["drop"]);
-    const { intentId, candidate, owed } = await withRepo(
-      ref,
-      [pin(1)],
-      async (h) => {
-        await h.train.enqueue(pin(1));
-        ref.down = true;
-        const first = await pass(h);
-        const intent = latestIntent(h.train);
-        expect(h.authorization.record(intent)).toMatchObject({ status: "authorized", attempts: 1 });
-        await exhaust(h);
-        const wake = readWake(h.sql);
-        expect(wake?.failures).toBe(EXHAUSTED_FAILURES);
-        return { intentId: intent, candidate: first.candidate, owed: wake?.dueAt };
-      },
-      target,
-    );
-    // The object stops before its alarm write reached storage.
-    await runInDurableObject(target.stub, (_instance, state) => state.storage.deleteAlarm());
-    await evictDurableObject(target.stub);
+    const { intentId, candidate, owed } = await owedAcrossRestart(target, ref);
 
     ref.down = false;
     await withRepo(
@@ -823,7 +861,7 @@ describe("the train's settle wake", () => {
       async (h) => {
         // The rebuilt train asks for the settle wake once its composition returns, and storage
         // holds it.
-        await Promise.resolve();
+        expect(await h.train.startup).toBe(true);
         expect(owed).toBeDefined();
         expect(await h.storedAlarm()).toBe(owed);
 
@@ -852,6 +890,89 @@ describe("the train's settle wake", () => {
       target,
     );
     await runInDurableObject(target.stub, (_instance, state) => state.storage.deleteAlarm());
+  });
+
+  it.each([
+    ["alarm write", { failedAlarmWrites: 1 }],
+    ["intent read", { failedIntentReads: 1 }],
+  ])(
+    "retries a restarted train's settle wake after a failed %s, and the alarm settles the intent",
+    async (_fault, fault) => {
+      const stub = env.REPO.getByName(crypto.randomUUID());
+      const ref = new FakeMain(MAIN, ["drop"]);
+      const { intentId, candidate, owed } = await owedAcrossRestart({ stub, realAlarm: true }, ref);
+
+      ref.down = false;
+      await withRepo(
+        ref,
+        [pin(1)],
+        async (h) => {
+          // The first attempt failed; a later one stored the alarm.
+          expect(await h.train.startup).toBe(true);
+          expect(owed).toBeDefined();
+          expect(await h.storedAlarm()).toBe(owed);
+
+          // Nothing calls the train: the stored alarm settles the intent.
+          await h.fireAlarm();
+          expect(ref.main).toBe(candidate);
+          expect(h.authorization.record(intentId)).toMatchObject({
+            status: "updated",
+            main: candidate,
+          });
+          expect(batchStates(h.train)).toEqual([["landed", null]]);
+        },
+        { stub, realAlarm: true, ...fault },
+      );
+      await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+    },
+  );
+
+  it("reports a restarted train whose every settle wake write failed, and a repeated ready stores it", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const ref = new FakeMain(MAIN, ["drop"]);
+    const { owed } = await owedAcrossRestart({ stub, realAlarm: true }, ref);
+
+    await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        expect(await h.train.startup).toBe(false);
+        expect(await h.storedAlarm()).toBeNull();
+        // The wake row still owes the settlement, so a ready's `armWake` asks again.
+        expect(readWake(h.sql)?.failures).toBe(EXHAUSTED_FAILURES);
+        expect(await h.train.armWake()).toBe(true);
+        expect(owed).toBeDefined();
+        expect(await h.storedAlarm()).toBe(owed);
+      },
+      { stub, realAlarm: true, failedAlarmWrites: STARTUP_WAKE_ATTEMPTS },
+    );
+    await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+  });
+
+  it("confirms no startup wake for an exhausted train that owes no settlement", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        // Work exhausted its retries, and no batch holds an intent that may have moved main.
+        writeWake(h.sql, { dueAt: h.now(), failures: EXHAUSTED_FAILURES });
+      },
+      { stub, realAlarm: true },
+    );
+    await evictDurableObject(stub);
+    await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        const asked = h.wakes.length;
+        expect(await h.train.startup).toBe(true);
+        expect(h.wakes).toHaveLength(asked);
+        expect(await h.storedAlarm()).toBeNull();
+      },
+      { stub, realAlarm: true },
+    );
   });
 
   it("settles a batch whose intent settled without the train hearing it", async () => {
