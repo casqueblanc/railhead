@@ -420,6 +420,30 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("mints nothing while a racing mint's cleanup sweeps the fork", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const mintPaused = fake.pauseNext("createToken");
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await mintPaused.reached;
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      fake.failRevocations(1);
+      const sweepPaused = fake.pauseNext("listTokens");
+      mintPaused.release();
+      await sweepPaused.reached;
+
+      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      sweepPaused.release();
+      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
+    });
+  });
+
   it("mints nothing while a revocation runs, and the next token is accepted", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();

@@ -154,7 +154,7 @@ class ArtifactsAdapter implements ArtifactsPort {
   readonly #cache = new Map<string, CachedToken>();
   // Bumped by `revokeTokens`, so a token minted while a revocation ran is never cached or returned.
   readonly #epochs = new Map<ArtifactsRepoName, number>();
-  // How many revocations of each repository are running. While one runs, no mint starts there.
+  // How many sweeps of each repository are running. While one runs, no mint starts there.
   readonly #revoking = new Map<ArtifactsRepoName, number>();
   // The latest mint per cache key, so concurrent misses for one key mint one token at a time.
   readonly #minting = new Map<string, Promise<void>>();
@@ -216,22 +216,15 @@ class ArtifactsAdapter implements ArtifactsPort {
       const target = await this.#resolve(repo);
       if (target === null) return unknownRepo();
       if (target.kind === "main") return invalid("main's tokens are not revoked through a claim");
-      this.#revoking.set(repo, (this.#revoking.get(repo) ?? 0) + 1);
-      try {
-        // Before revoking, so no token is handed out even if revocation fails.
-        this.#forgetTokens(repo);
+      return await this.#fenced(repo, async () => {
         // A mint that has not answered could create a token after the sweep lists, so sweep only
-        // once none is running. New mints are refused until this revocation returns.
+        // once none is running.
         if (this.#mintsRunning(repo)) {
           return fail("busy", "A token for the repository is still being minted; try again.");
         }
         using handle = await this.#open(repo);
         return await this.#revokeActive(handle);
-      } finally {
-        const running = (this.#revoking.get(repo) ?? 1) - 1;
-        if (running === 0) this.#revoking.delete(repo);
-        else this.#revoking.set(repo, running);
-      }
+      });
     });
   }
 
@@ -273,9 +266,8 @@ class ArtifactsAdapter implements ArtifactsPort {
           if (target.kind === "main") {
             return fail("internal", "A minted token could not be revoked.");
           }
-          // The sweep may revoke the fork's other cached tokens, so none of them is handed out.
-          this.#forgetTokens(repo);
-          const swept = await this.#revokeActive(handle);
+          // The sweep may revoke the fork's other tokens, so none is handed out or minted meanwhile.
+          const swept = await this.#fenced(repo, () => this.#revokeActive(handle));
           if (!swept.ok) return swept;
         }
         return this.#epoch(repo) !== epoch
@@ -516,11 +508,22 @@ class ArtifactsAdapter implements ArtifactsPort {
     });
   }
 
-  /** Forgets `repo`'s cached tokens and invalidates its running mints. */
-  #forgetTokens(repo: ArtifactsRepoName): void {
-    this.#epochs.set(repo, this.#epoch(repo) + 1);
-    for (const [key, entry] of this.#cache) {
-      if (entry.token.repo === repo) this.#cache.delete(key);
+  /**
+   * Runs `sweep` with new mints for `repo` refused and its cached tokens and running mints
+   * forgotten first, so no token is handed out even if the sweep fails. Sweeps may overlap.
+   */
+  async #fenced<T>(repo: ArtifactsRepoName, sweep: () => Promise<T>): Promise<T> {
+    this.#revoking.set(repo, (this.#revoking.get(repo) ?? 0) + 1);
+    try {
+      this.#epochs.set(repo, this.#epoch(repo) + 1);
+      for (const [key, entry] of this.#cache) {
+        if (entry.token.repo === repo) this.#cache.delete(key);
+      }
+      return await sweep();
+    } finally {
+      const running = (this.#revoking.get(repo) ?? 1) - 1;
+      if (running === 0) this.#revoking.delete(repo);
+      else this.#revoking.set(repo, running);
     }
   }
 
