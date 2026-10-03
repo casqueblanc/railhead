@@ -636,7 +636,12 @@ describe("pin", () => {
         expect(setup.events().at(-1)).toMatchObject({
           actor: { kind: "system", id: "sys_claims" },
           type: "claim.reopened",
-          data: { claimId: claim.claimId, generation: 1, decisions: versions },
+          data: {
+            claimId: claim.claimId,
+            generation: 1,
+            reason: "decision_superseded",
+            decisions: versions,
+          },
         });
         expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
         // The holder marks the work ready again under the versions that are now current.
@@ -766,7 +771,12 @@ describe("a decision superseded after ready", () => {
       expect(setup.events().at(-1)).toMatchObject({
         actor: { kind: "system", id: "sys_claims" },
         type: "claim.reopened",
-        data: { claimId: claim.claimId, generation: 1, decisions: [second] },
+        data: {
+          claimId: claim.claimId,
+          generation: 1,
+          reason: "decision_superseded",
+          decisions: [second],
+        },
       });
       expect(await setup.port.activeClaim(agent(1))).toEqual(
         ok({ ...claim, state: "working", readyCommit: null }),

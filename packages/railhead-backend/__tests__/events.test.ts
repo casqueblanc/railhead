@@ -82,6 +82,7 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     data: {
       claimId: "clm_42abcd",
       generation: 1,
+      reason: "decision_superseded",
       decisions: [{ decisionId: "dec_upload1", version: 2 }],
     },
   },

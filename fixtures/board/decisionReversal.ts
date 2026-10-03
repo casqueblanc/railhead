@@ -86,7 +86,12 @@ export const decisionReversal = syntheticLog("Synthetic decision reversal, rejec
   {
     type: "claim.reopened",
     actor: SYNTH_CLAIMS,
-    data: { claimId: UPLOAD.atlasClaim, generation: 1, decisions: [sizeDecision(2)] },
+    data: {
+      claimId: UPLOAD.atlasClaim,
+      generation: 1,
+      reason: "decision_superseded",
+      decisions: [sizeDecision(2)],
+    },
   },
   {
     type: "claim.refused",

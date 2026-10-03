@@ -9,7 +9,13 @@ import type {
   ReadyRequest,
   ReadyResult,
 } from "@railhead/shared/agent-api";
-import type { ClaimId, CommitSha, DecisionRef, IssueId } from "@railhead/shared/events";
+import type {
+  ClaimId,
+  CommitSha,
+  DecisionRef,
+  IssueId,
+  ReopenReason,
+} from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
 import type { ArtifactsRepoName } from "./artifacts";
 import type { AgentPrincipal, GrantFor } from "./principals";
@@ -25,6 +31,16 @@ export interface ClaimPin {
   commit: CommitSha;
 }
 
+/**
+ * A pin with the ready episode it was batched in: what a check attempt and a merge intent rest on.
+ * A claim reopened and readied again with the same commit is a new episode, which a check of the
+ * earlier one does not cover.
+ */
+export interface EpisodePin extends ClaimPin {
+  /** The claim's ready episode the pin was batched in. */
+  episode: number;
+}
+
 /** A ready claim's stored pin, as `ClaimsPort.readyPin` reads it. */
 export interface ReadyPin {
   /** The pin at the claim's current generation. */
@@ -35,13 +51,11 @@ export interface ReadyPin {
   decisions: DecisionRef[];
 }
 
-/** A pin the train landed, with the ready episode its batch was checked for. */
-export interface LandedPin {
-  /** The landed pin. */
-  pin: ClaimPin;
-  /** The claim's ready episode the train holds for the pin. */
-  episode: number;
-}
+/**
+ * A reason another module may reopen a ready claim for. A superseded decision is not one: the
+ * claims module itself reopens a pin the decisions it was recorded under no longer match.
+ */
+export type ReworkReason = Exclude<ReopenReason, "decision_superseded">;
 
 /** What a Git request asks to do. */
 export interface GitAccess {
@@ -131,14 +145,13 @@ export interface ClaimsPort {
   /**
    * Merges the claim of each landed pin that is still ready with that pin in that episode, appends
    * `claim.merged` for it and records `main`, the commit the landing published, as each holder's
-   * closed claim. A pin whose
-   * claim was reopened, re-pinned or taken over is left as it is. A merged claim no longer counts
-   * as its holder's, so the holder may reopen a merged claim waiting for rework, as
-   * `reopenMerged` does. Writes inside `tx`, the transaction that settles the landing, after
+   * closed claim. A pin whose claim was reopened, re-pinned or taken over is left as it is. A merged
+   * claim no longer counts as its holder's, so the holder may reopen a merged claim waiting for
+   * rework, as `reopenMerged` does. Writes inside `tx`, the transaction that settles the landing, after
    * anything that reads the claims as held. Throws when the module is missing, so the landing rolls
    * back rather than leaving its claims ready.
    */
-  merged(tx: EventTransaction, landed: readonly LandedPin[], main: CommitSha): void;
+  merged(tx: EventTransaction, landed: readonly EpisodePin[], main: CommitSha): void;
   /**
    * Called inside `tx`, the transaction that queued a decision item to the holder of the claim.
    * When a newer decision version superseded the pin of a merged claim, the claim reopens to working
@@ -148,6 +161,16 @@ export interface ClaimsPort {
    * item is queued to one.
    */
   reopenMerged(tx: EventTransaction, claimId: ClaimId): void;
+  /**
+   * Returns the claim to working because its pinned work must be redone for `reason`, inside the
+   * caller's transaction, and appends `claim.reopened` with the claim's current decision versions.
+   * The holder pushes the reworked commit and marks it ready again, which queues it on the train as
+   * a new episode. Reopens only while the claim is ready with exactly `pin` in `episode`, so a
+   * decision that reopened it first, a newer pin or a takeover is never undone; otherwise it
+   * answers `false` and writes nothing. Throws `UnavailableError` while the claim's decision
+   * versions are unknown or the module is missing, so the caller's transaction rolls back.
+   */
+  reopen(tx: EventTransaction, pin: ClaimPin, episode: number, reason: ReworkReason): boolean;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */

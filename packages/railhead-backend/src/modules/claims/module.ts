@@ -29,6 +29,10 @@
 // push, the train's `pin` or a status read, returns it to working, clears the pin and appends
 // `claim.reopened`. The holder then pushes and marks the work ready again under the new versions,
 // once it has acknowledged them. While the versions are unknown, the pin stays and is refused.
+// Another module that decides a pin's work must be redone, such as the train for a pin that lost a
+// conflict, reopens it with `reopen` inside its own transaction, fenced to the pin and its episode,
+// and the event names that reason. Either way the holder's next `ready` is a new episode, which the
+// train queues again, whether the earlier episode's entry was parked, dropped or still queued.
 //
 // A refusal the agent sees is recorded as `claim.refused` only when it differs from the claim's
 // last recorded refusal, so an agent that repeats a refused `ready` does not grow the log.
@@ -102,6 +106,7 @@ import {
   type DecisionRef,
   type IssueId,
   type RefusalReason,
+  type ReopenReason,
 } from "@railhead/shared/events";
 import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName, mintCutoff } from "../../artifacts/adapter";
 import type { MintCutoff, TokenRevocation } from "../../contracts/artifacts";
@@ -521,7 +526,7 @@ export function createClaims(
   const settle = (tx: EventTransaction, row: ClaimRow): ClaimRow => {
     if (row.state !== "ready") return row;
     const decisions = superseding(row);
-    return decisions === null ? row : backToWorking(tx, row, "ready", decisions);
+    return decisions === null ? row : reopenAs(tx, row, "decision_superseded", decisions);
   };
 
   /**
@@ -537,17 +542,22 @@ export function createClaims(
   };
 
   /**
-   * Returns `row`, `from` ready or merged, to working under `decisions`, the versions that
-   * superseded its pin, appends `claim.reopened` and answers the claim as it now stands. Runs in the
-   * caller's transaction.
+   * Returns `row`, a ready or merged claim read in the caller's transaction, to working for
+   * `reason`, appending `claim.reopened` with `decisions`, its current versions, and answers the
+   * claim as it now stands. Runs in the caller's transaction.
    */
-  const backToWorking = (
+  const reopenAs = (
     tx: EventTransaction,
     row: ClaimRow,
-    from: "ready" | "merged",
+    reason: ReopenReason,
     decisions: readonly DecisionRef[],
   ): ClaimRow => {
-    if (!reopenClaim(tx.sql, row.claimId, row.generation, from, clock() + CLAIM_LEASE_MS)) {
+    const from = row.state === "ready" || row.state === "merged" ? row.state : null;
+    const lease = clock() + CLAIM_LEASE_MS;
+    if (
+      from === null ||
+      !reopenClaim(tx.sql, row.claimId, row.generation, row.episode, from, lease)
+    ) {
       throw new Error("a claim read in this transaction could not be reopened");
     }
     tx.append(CLAIMS_ACTOR, {
@@ -555,9 +565,11 @@ export function createClaims(
       data: {
         claimId: row.claimId,
         generation: row.generation,
+        reason,
         decisions: decisions.map(({ decisionId, version }) => ({ decisionId, version })),
       },
     });
+    // The reopened claim is a lease again, which must lapse even if its holder never calls.
     wakeForDeadline(tx.sql);
     const reopened = claimById(tx.sql, row.claimId);
     if (reopened === null) throw new Error("a reopened claim cannot be read back");
@@ -573,8 +585,11 @@ export function createClaims(
     if (row.state !== "merged") return;
     const decisions = superseding(row);
     if (decisions === null) return;
-    if (activeClaimOf(tx.sql, row.agentId) === null) backToWorking(tx, row, "merged", decisions);
-    else markReworkWaiting(tx.sql, row.claimId, row.generation, clock());
+    if (activeClaimOf(tx.sql, row.agentId) === null) {
+      reopenAs(tx, row, "decision_superseded", decisions);
+    } else {
+      markReworkWaiting(tx.sql, row.claimId, row.generation, clock());
+    }
   };
 
   /**
@@ -950,8 +965,8 @@ export function createClaims(
     merged(tx, landed, main) {
       if (!isCommitSha(main)) throw new Error("a landing must name the commit it published");
       const now = clock();
-      for (const { pin, episode } of landed) {
-        const row = mergeClaim(tx.sql, pin.claimId, pin.generation, episode, pin.commit);
+      for (const pin of landed) {
+        const row = mergeClaim(tx.sql, pin.claimId, pin.generation, pin.episode, pin.commit);
         if (row === null) continue;
         recordClosed(tx.sql, row.agentId, row, { kind: "merged", commit: main }, now);
         tx.append(CLAIMS_ACTOR, {
@@ -968,6 +983,22 @@ export function createClaims(
       if (!isId("claim", claimId)) return;
       const row = claimById(tx.sql, claimId);
       if (row !== null) reviveMerged(tx, row);
+    },
+
+    reopen(tx, pin, episode, reason) {
+      const row = claimById(tx.sql, pin.claimId);
+      if (
+        row?.state !== "ready" ||
+        row.generation !== pin.generation ||
+        row.episode !== episode ||
+        row.readyCommit !== pin.commit
+      ) {
+        return false;
+      }
+      const decisions = ports().decisions.currentVersions(pin.claimId);
+      if (decisions === null) throw new UnavailableError("decisions");
+      reopenAs(tx, row, reason, decisions);
+      return true;
     },
 
     async authorizeGit(access) {

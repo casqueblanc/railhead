@@ -93,7 +93,7 @@ const atlas = (state: BoardState) => state.claims[UPLOAD.atlasClaim];
 const reopen = (decisions = [sizeDecision(2)]): SyntheticStep => ({
   type: "claim.reopened",
   actor: SYNTH_TRAIN,
-  data: { claimId: UPLOAD.atlasClaim, generation: 1, decisions },
+  data: { claimId: UPLOAD.atlasClaim, generation: 1, reason: "decision_superseded", decisions },
 });
 
 describe("foldEvents over a delivered stream", () => {
@@ -864,15 +864,7 @@ describe("claim.merged", () => {
       merge(UPLOAD.atlasClaim, synthCommit(3)),
       "merged while working",
     ],
-    [
-      "another generation",
-      () => published(),
-      {
-        ...merge(UPLOAD.atlasClaim, synthCommit(3)),
-        data: { claimId: UPLOAD.atlasClaim, generation: 2, commit: synthCommit(3) },
-      },
-      "",
-    ],
+    ["another generation", () => published(), merge(UPLOAD.atlasClaim, synthCommit(3), 2), ""],
   ])("halts on a merge of %s", (_name, start, step, message) => {
     const before = start();
     const state = append(before, step);

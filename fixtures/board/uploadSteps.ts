@@ -206,9 +206,9 @@ export const moveMain = (
   data: { intentId, outcome, main },
 });
 
-/** The backend closing a claim whose pin landed as `commit` on main, at generation 1. */
-export const merge = (claimId: ClaimId, commit: CommitSha): SyntheticStep => ({
+/** The backend closing a claim whose pin landed as `commit` on main. */
+export const merge = (claimId: ClaimId, commit: CommitSha, generation = 1): SyntheticStep => ({
   type: "claim.merged",
   actor: SYNTH_CLAIMS,
-  data: { claimId, generation: 1, commit },
+  data: { claimId, generation, commit },
 });

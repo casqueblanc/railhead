@@ -205,7 +205,7 @@ describe("an agent's closed claim", () => {
       setup.log.transaction((tx) => {
         const ready = setup.claims.readyPin(second.claimId);
         if (ready === null) throw new Error("the second claim has no pin");
-        setup.claims.merged(tx, [{ pin: ready.pin, episode: ready.episode }], HEAD);
+        setup.claims.merged(tx, [{ ...ready.pin, episode: ready.episode }], HEAD);
       });
       const merged = {
         claimId: second.claimId,

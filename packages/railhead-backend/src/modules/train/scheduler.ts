@@ -33,7 +33,10 @@
 // Settling any batch restores a fresh count, so the work that settlement exposes has its own retries.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
-// exhausted one only while such an intent is unsettled.
+// exhausted one only while such an intent is unsettled. Those attempts use timers inside the object,
+// so they report rather than outlive it: the Repo awaits them before serving anything, and when
+// every one failed it resets the object, so the next request or alarm builds the train again and
+// asks again from the stored wake row.
 //
 // The claims module queues a pin inside the transaction that records `ready`, so a pin and its
 // queue entry commit together and a repeated `ready` queues nothing. Each such call is a new ready
@@ -87,7 +90,7 @@ import {
   type DecisionRef,
   type IntentId,
 } from "@railhead/shared/events";
-import type { ClaimPin, LandedPin } from "../../contracts/claims";
+import type { ClaimPin, EpisodePin } from "../../contracts/claims";
 import {
   fail,
   ok,
@@ -283,12 +286,6 @@ export interface Train extends TrainPort {
   batches(limit: number): BatchRecord[];
   /** Up to `limit` queue entries in any state, most recently changed first. */
   entries(limit: number): QueueEntry[];
-  /**
-   * Settles once the train has confirmed the alarm for the wake it found in storage when it was
-   * built: `true` when storage holds that alarm or the train owes none, `false` when every one of
-   * `STARTUP_WAKE_ATTEMPTS` failed. It never rejects.
-   */
-  readonly startup: Promise<boolean>;
 }
 
 type Step = { kind: "continue" } | { kind: "stop"; outcome: DriveOutcome };
@@ -352,7 +349,7 @@ export function createTrain(
   let discarding: Promise<void> | null = null;
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
-  const startup = confirmStartupWake();
+  const startupWake = confirmStartupWake();
   wakeForDiscards();
 
   /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
@@ -628,7 +625,7 @@ export function createTrain(
       return blocked(null, "definition_invalid", null);
     }
 
-    const pins = members.map((entry) => entry.pin);
+    const pins = members.map((entry) => ({ ...entry.pin, episode: entry.episode }));
     const now = clock();
     const formed = fenced(generation, (): "formed" | "moved" | "unknown" => {
       // A pin queued during the reads above may have settled an entry or queued a newer episode of
@@ -689,7 +686,7 @@ export function createTrain(
     const attempt = `mrg_${crypto.randomUUID().replaceAll("-", "")}`;
     fenced(generation, () => recordMergeAttempt(sql, batch.batchId, attempt, clock()));
     const result = await bounded(generation, "merge", () =>
-      ports().merge.compose(batch.expectedMain, batch.pins, attempt),
+      ports().merge.compose(batch.expectedMain, batch.pins.map(claimPinOf), attempt),
     );
     if (!result.ok) return blocked(batch.batchId, "merge_unavailable", result.code);
     const outcome = result.value;
@@ -855,10 +852,11 @@ export function createTrain(
       const landed = batch.pins.filter(
         (pin) => !unchecked.some((entry) => samePin(entry.pin, pin)),
       );
-      // Each landed pin closes its claim only in the ready episode the train holds for it.
-      const closing = landed.flatMap((pin): LandedPin[] => {
+      // Each landed pin closes its claim only in the ready episode the train now holds for it, which
+      // a renewed entry checked under its current versions has raised since the batch formed.
+      const closing = landed.flatMap((pin): EpisodePin[] => {
         const entry = entries.find((candidate) => samePin(candidate.pin, pin));
-        return entry === undefined ? [] : [{ pin, episode: entry.episode }];
+        return entry === undefined ? [] : [{ ...claimPinOf(pin), episode: entry.episode }];
       });
       for (const pin of landed) settleEntry(sql, pin, "landed", null, now);
       requeueFront(sql, unchecked.map(asFreshWork), now);
@@ -1120,7 +1118,8 @@ export function createTrain(
   /**
    * Asks the Repo's alarm for the wake stored when the train was built until a write is confirmed,
    * with `STARTUP_WAKE_ATTEMPTS` attempts. Each attempt reads the wake again. An idle repository
-   * gets no other call that would ask, so an owed settlement depends on this alarm.
+   * gets no other call that would ask, so an owed settlement depends on this alarm, and a `false`
+   * here must not be dropped: the Repo resets itself on it.
    */
   async function confirmStartupWake(): Promise<boolean> {
     // An exhausted wake is owed only while a write to main may have landed unheard, which needs
@@ -1139,7 +1138,13 @@ export function createTrain(
         );
       }
     }
-    console.error(JSON.stringify({ event: "train.startup_wake_exhausted", repo: context.repoId }));
+    console.error(
+      JSON.stringify({
+        event: "train.startup_wake_exhausted",
+        repo: context.repoId,
+        attempts: STARTUP_WAKE_ATTEMPTS,
+      }),
+    );
     return false;
   }
 
@@ -1356,7 +1361,7 @@ export function createTrain(
     holdsLiveEntry,
     pinView: async (claimId, generation) => readPinView(sql, claimId, generation),
     armWake,
-    startup,
+    startup: () => startupWake,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
@@ -1464,6 +1469,11 @@ function isTransient(code: PortErrorCode): boolean {
     code === "rate_limited" ||
     code === "quota_exceeded"
   );
+}
+
+/** The pin alone, without the episode the train fences it to; merging needs only the commit. */
+function claimPinOf({ claimId, generation, commit }: EpisodePin): ClaimPin {
+  return { claimId, generation, commit };
 }
 
 function samePin(left: ClaimPin, right: ClaimPin): boolean {

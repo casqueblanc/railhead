@@ -379,6 +379,7 @@
       "data": {
         "claimId": "clm_42abcd",
         "generation": 1,
+        "reason": "decision_superseded",
         "decisions": [
           {
             "decisionId": "dec_upload1",

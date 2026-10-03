@@ -678,16 +678,18 @@ export function pinReady(
 }
 
 /**
- * Returns a claim that is `from`, ready or merged, at `generation` to working with a lease until
- * `leaseUntil`, clears its pin and the revocation the pin owed, since its holder may push again,
- * raises its episode, forgets its last refusal and any rework it waited with. A sweep the pin
- * started keeps its barrier, so the holder pushes only once that sweep has ended.
- * Returns `false`, and writes nothing, when the claim is no longer `from` at that generation.
+ * Returns a claim that is `from`, ready or merged, at `generation` in `episode` to working with a
+ * lease until `leaseUntil`, clears its pin and the revocation the pin owed, since its holder may
+ * push again, raises its episode, forgets its last refusal and any rework it waited with. A sweep
+ * the pin started keeps its barrier, so the holder pushes only once that sweep has ended.
+ * Returns `false`, and writes nothing, when the claim is no longer `from` at that generation and
+ * episode.
  */
 export function reopenClaim(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
+  episode: number,
   from: "ready" | "merged",
   leaseUntil: number,
 ): boolean {
@@ -696,11 +698,12 @@ export function reopenClaim(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
          episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL,
          rework_waiting = NULL
-       WHERE claim_id = ? AND generation = ? AND state = ?
+       WHERE claim_id = ? AND generation = ? AND episode = ? AND state = ?
        RETURNING claim_id`,
       leaseUntil,
       claimId,
       generation,
+      episode,
       from,
     )
     .toArray();
