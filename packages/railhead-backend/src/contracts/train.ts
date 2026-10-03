@@ -5,6 +5,7 @@
 // storage the safety argument rests on: `MergeIntentRecord` is, and it is written in the Repo
 // transaction that authorizes the merge, before any write to main is attempted.
 
+import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
   CheckRunId,
@@ -65,6 +66,25 @@ export interface CheckReport {
   finishedAt: number;
 }
 
+/**
+ * What the check workflow reports for one run, from outside the sandbox. The checks module accepts
+ * it only for its own started attempt, on the same candidate and definition.
+ */
+export interface CheckRunReport {
+  /** The attempt it reports on. */
+  attemptId: CheckRunId;
+  /** The candidate it ran on. */
+  candidate: CommitSha;
+  /** SHA-256 of the trusted definition the run used. */
+  digest: string;
+  /** The outcome: `fail` only when the check's own command failed, `error` when it could not run. */
+  result: CheckResult;
+  /** The run's output. Untrusted text: stored cut to its end, never logged. */
+  log: string;
+  /** When the run finished. */
+  finishedAt: number;
+}
+
 /** The result of composing pins on main. */
 export type MergeOutcome =
   /** Git merged every pin; `candidate` is the composed commit, published only for checking. */
@@ -111,10 +131,33 @@ export interface MergeIntentRecord {
   updatedAt: number;
 }
 
-/** Composes pins into a candidate in a sandbox. It never writes main. */
+/**
+ * How long after `MergePort.compose` is called it may still publish under its attempt, in
+ * milliseconds. An implementation never pushes later, so a discard after it is final.
+ */
+export const MERGE_PUSH_WINDOW_MS = 90_000;
+
+/**
+ * Composes pins into a candidate in a sandbox. It never writes main.
+ *
+ * Each compose publishes under the candidate prefix of one merge attempt, a `mrg_` ID the caller
+ * chooses and records before calling, so it can discard that prefix whatever the compose's outcome.
+ * A caller gives each compose a fresh attempt and never composes under one it has discarded.
+ */
 export interface MergePort {
-  /** Merges `pins`, in order, onto `expectedMain`. */
-  compose(expectedMain: CommitSha, pins: ClaimPin[]): Promise<PortResult<MergeOutcome>>;
+  /** Merges `pins`, in order, onto `expectedMain`, publishing a clean result under `attempt`. */
+  compose(
+    expectedMain: CommitSha,
+    pins: ClaimPin[],
+    attempt: string,
+  ): Promise<PortResult<MergeOutcome>>;
+  /**
+   * Deletes every ref under `attempt`'s candidate prefix and nothing else. Succeeds once none is
+   * left, including when there was none, so a repeat is harmless; `removed` counts this call's
+   * deletes. A compose under `attempt` may publish until `MERGE_PUSH_WINDOW_MS` after it was
+   * called, so a caller discards an attempt only after that.
+   */
+  discard(attempt: string): Promise<PortResult<{ removed: number }>>;
 }
 
 /** Starts trusted check runs. Results arrive later through `TrainPort.recordCheck`. */
@@ -124,8 +167,24 @@ export interface CheckPort {
    * `source` is `main`; nothing is read from the candidate.
    */
   definitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
-  /** Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. */
+  /**
+   * Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. A
+   * candidate that edits the definition or a path it protects is refused with `check_held` and
+   * never run.
+   */
   start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
+  /**
+   * Records a run's report for its started attempt and passes it to `TrainPort.recordCheck`. A
+   * report for an attempt it did not start, on another candidate or definition, or with another
+   * result than one already recorded, is refused with `check_mismatch`.
+   */
+  report(run: CheckRunReport): Promise<PortResult<CheckAttempt>>;
+  /**
+   * What was recorded for an attempt this module held or started: its candidate, the command its
+   * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its output.
+   * An attempt it never recorded, or no longer keeps, is `not_found`.
+   */
+  detail(attemptId: CheckRunId): Promise<PortResult<CheckDetail>>;
 }
 
 /** A persisted check attempt and the report recorded for it, if one has been. */

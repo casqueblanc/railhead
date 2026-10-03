@@ -112,7 +112,7 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..313689a60b31712c80f6c8e703cd6d8d
    );
    if (!archive) {
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a11b5a360 100644
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..7cf12df2e8a054cfc58918c6768f34754954d8cc 100644
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
 @@ -1,5 +1,6 @@
@@ -122,17 +122,31 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
  
  import { z } from 'zod';
  import type {
-@@ -103,7 +104,8 @@ async function prepareStep(
-   const cacheKey = await resolveStepCacheKey(
-     sourceControlProvider,
-     source,
+@@ -100,11 +101,18 @@ async function prepareStep(
+     providerData: input.providerData,
+   };
+   const checkout = await sourceControlProvider.getSourceCheckout(source);
+-  const cacheKey = await resolveStepCacheKey(
+-    sourceControlProvider,
+-    source,
 -    input
-+    input,
-+    env.BACKUP_BUCKET !== undefined
-   );
+-  );
++  // Railhead patch: a fenced checkout is a trusted check in an admitted
++  // sandbox. Its result must come from its command run there, so it never
++  // looks up or publishes a cached workspace that could skip the command.
++  const fenced = checkout.kind === 'git' && !!checkout.fence;
++  const cacheKey = fenced
++    ? undefined
++    : await resolveStepCacheKey(
++        sourceControlProvider,
++        source,
++        input,
++        env.BACKUP_BUCKET !== undefined
++      );
    const extraEnv: Record<string, string> = { ...input.env };
    if (
-@@ -167,6 +169,7 @@ async function executeStep(
+     input.cloudflareCredentials !== undefined &&
+@@ -167,6 +175,7 @@ async function executeStep(
      ? await lookupSnapshotCache(env, {
          key: prepared.cacheKey,
          label: input.label,
@@ -140,7 +154,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
        })
      : { status: 'miss' as const };
    if (cache.status === 'hit') {
-@@ -210,9 +213,14 @@ async function finalizeStep(
+@@ -210,9 +219,14 @@ async function finalizeStep(
    prepared: PreparedStep,
    execution: CompletedStepExecution
  ): Promise<CompletedStepExecution> {
@@ -155,7 +169,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
    // Write the small JSON pointer at the deterministic cache key. It records the
    // randomly generated id of the sandbox workspace backup so a future run can
    // rediscover it; the backup already exists, we only add the indirection.
-@@ -234,11 +242,19 @@ async function finalizeStep(
+@@ -234,11 +248,19 @@ async function finalizeStep(
  async function resolveStepCacheKey(
    sourceControlProvider: SourceControlProvider,
    source: SourceControlSource,
@@ -177,7 +191,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
      throw new Error(`cache(${input.label}): inputs must not be empty`);
    }
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f1115a07c61 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..3a618ff766ee15c7333741aa0a1e77698a896623 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
 @@ -1,5 +1,6 @@
@@ -187,7 +201,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
  
  import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
  import { posix } from 'node:path';
-@@ -33,7 +34,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -33,25 +34,76 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    /**
     * Copies source, runs the command, and snapshots `/workspace` after a
     * successful exit. A restored Snapshot is overlaid with the current source.
@@ -196,16 +210,44 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
     */
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
-@@ -45,13 +46,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-       containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
-     });
+   ): Promise<RunStepResult<DirectoryBackup>> {
++    // Railhead patch: a fenced checkout names the sandbox its repository
++    // admitted for the run, so the runner joins that slot's incarnation and is
++    // counted against the repository's bound. A fresh name is used only
++    // without a fence.
++    const fenced = input.source.kind === 'git' && !!input.source.fence;
++    if (fenced && typeof input.source.fence.sandbox !== 'string') {
++      throw new Error('a fenced checkout must name its admitted sandbox');
++    }
++    // The admitted sandbox serves one runner: the first runner's release
++    // retires it for good, so a chained runner, which restores its parent's
++    // workspace, is refused here before it opens the sandbox.
++    if (fenced && input.restore) {
++      throw new Error(
++        'a fenced sandbox serves one runner, so a chained runner cannot continue its workspace'
++      );
++    }
+     // create the sandbox handle
+-    const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
+-      transport: 'rpc',
+-      enableDefaultSession: false,
+-      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
+-    });
++    const sandbox = getSandbox(
++      this.env.SANDBOX,
++      fenced ? input.source.fence.sandbox : createRunnerId(input.label),
++      {
++        transport: 'rpc',
++        enableDefaultSession: false,
++        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
++      }
++    );
  
 -    let cleanupTransferredToStreams = false;
 +    // Railhead patch: a fenced sandbox is released through its fence's
 +    // retirement, which ends the grant before it destroys the container and
 +    // keeps retrying a destroy that fails. That failure is not swallowed: the
 +    // run fails instead of settling over a sandbox that may still be running.
-+    const fenced = input.source.kind === 'git' && !!input.source.fence;
 +    const release = () =>
 +      fenced ? sandbox.railheadRetire() : destroySandbox(sandbox);
 +    let released = false;
@@ -215,13 +257,16 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
 -      // into a single request, which can exceed the local dev request limit.
 -      const localBucket =
 -        (await sandbox.exec('test -c /dev/fuse')).exitCode !== 0;
-+      // Railhead patch: start the sandbox's fenced incarnation before the first
-+      // command. The fence routes the checkout's Git requests to the gateway
-+      // under the grant and retires the sandbox when the grant lapses. Every
-+      // call below (restore, exec, process, backup, file listing) runs inside
-+      // that incarnation, so none touches the container after it retires.
++      // Railhead patch: join the fenced incarnation the repository's admission
++      // started, before the first command. The join is refused unless that
++      // incarnation is live under exactly this grant's policy and deadline, so
++      // a run never starts a sandbox, nor changes its grant, outside admission.
++      // The fence routes the checkout's Git requests to the gateway under the
++      // grant and retires the sandbox when the grant lapses. Every call below
++      // (restore, exec, process, backup, file listing) runs inside that
++      // incarnation, so none touches the container after it retires.
 +      if (fenced) {
-+        await sandbox.railheadStart(
++        await sandbox.railheadJoin(
 +          input.source.fence.policy,
 +          input.source.fence.expiresAt
 +        );
@@ -229,10 +274,12 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
 +      // Railhead patch: back up and restore only through the R2 binding. The
 +      // container has no route to R2 presigned URLs, and RPC streams those
 +      // archives instead of base64-encoding them into a single request. Without
-+      // the binding the run makes no backup and cannot restore one.
++      // the binding the run makes no backup and cannot restore one. A fenced
++      // run makes none either: it publishes no cache and no runner continues
++      // its workspace, so nothing would read the backup.
 +      const localBucket = true;
-+      const backups = this.env.BACKUP_BUCKET !== undefined;
-+      if (!backups) {
++      const backups = !fenced && this.env.BACKUP_BUCKET !== undefined;
++      if (!fenced && !backups) {
 +        console.warn('[sandbox] no BACKUP_BUCKET binding; no workspace backup', {
 +          label: input.label,
 +        });
@@ -243,7 +290,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
          // Overlay (no rm) so cached node_modules survive while tracked source
-@@ -59,20 +87,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -59,20 +111,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          // different commit's source (e.g. a reused install cache), so this is
          // what keeps it correct. Files deleted since then linger; the next
          // install/build regenerates derived output.
@@ -283,7 +330,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
        }
  
        const proc = await sandbox.startProcess(
-@@ -95,53 +130,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -95,53 +154,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          return { exitCode, logs: preview, preview };
        }
  
@@ -372,7 +419,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -157,11 +187,20 @@ async function readLog(
+@@ -157,11 +211,20 @@ async function readLog(
    sandbox: ReturnType<typeof getSandbox>,
    file: string,
    size: number
@@ -397,7 +444,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f11
  }
  
  async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
-@@ -198,43 +237,6 @@ function resolveCwd(cwd: string | undefined) {
+@@ -198,43 +261,6 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -519,7 +566,7 @@ index bf350484ff9f6a861b661800e48ed2b52a10e77b..c3bc3075d1e23912f6fcb5c725be40a1
    CLOUDFLARE_ACCOUNT_ID: string;
    SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox>;
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
-index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160fc0066e7 100644
+index a0ac164d44c2caace0a209652d181b013a2138e9..1bef17e13d9d07c182cccd5810385348a74f355e 100644
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
 @@ -1,5 +1,6 @@
@@ -529,7 +576,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160
  
  import {
    WorkflowEntrypoint,
-@@ -140,9 +141,20 @@ export abstract class CIWorkflow<
+@@ -140,9 +141,21 @@ export abstract class CIWorkflow<
      // Workflow waits.
      const invoke = (
        options: RunnerOptions,
@@ -539,19 +586,20 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160
      ): Promise<CiRunnerResult> =>
        runners.run(options, inherited, () => {
 +        // Railhead patch: a chained runner continues its parent's workspace.
-+        // Without a BACKUP_BUCKET binding the parent saved none, so the runner
-+        // fails before it starts a sandbox instead of running on a bare checkout.
++        // A fenced parent, or one without a BACKUP_BUCKET binding, saved none,
++        // so the runner fails before it starts a sandbox instead of running on
++        // a bare checkout.
 +        if (chained && inherited === undefined) {
 +          return Promise.reject(
 +            new Error(
-+              `runner(${options.name}): no BACKUP_BUCKET binding, so a chained runner cannot inherit its parent's workspace`
++              `runner(${options.name}): its parent saved no workspace (a fenced run, or no BACKUP_BUCKET binding), so a chained runner cannot inherit it`
 +            )
 +          );
 +        }
          const config = resolveRunnerConfig(options);
          return step
            .do(options.name, config.workflow, (ctx) =>
-@@ -166,7 +178,7 @@ export abstract class CIWorkflow<
+@@ -166,7 +179,7 @@ export abstract class CIWorkflow<
              Object.freeze({
                ...output,
                runner: (nextOptions: RunnerOptions) =>
@@ -620,7 +668,7 @@ index f83770cfc430aacd3c257dc90e46ae8b2fa8be51..5defe23bfdbb4cfc3ae358b0cc9a1603
      : undefined;
  }
 diff --git a/src/source-control.ts b/src/source-control.ts
-index 83946a318ec5493d258581f33babf8ed43a9e909..fb4e5506cb24b61600dc7b236a5f9815c4d869d9 100644
+index 83946a318ec5493d258581f33babf8ed43a9e909..2e1656f0053302dc2f64436c424c4f24caece751 100644
 --- a/src/source-control.ts
 +++ b/src/source-control.ts
 @@ -1,5 +1,6 @@
@@ -630,7 +678,7 @@ index 83946a318ec5493d258581f33babf8ed43a9e909..fb4e5506cb24b61600dc7b236a5f9815
  
  import type {
    CiParams,
-@@ -114,8 +115,13 @@ export type SourceControlCheckout =
+@@ -114,8 +115,14 @@ export type SourceControlCheckout =
    | {
        kind: 'git';
        remote: string;
@@ -641,7 +689,8 @@ index 83946a318ec5493d258581f33babf8ed43a9e909..fb4e5506cb24b61600dc7b236a5f9815
        sha: string;
 +      // Railhead patch: the grant the sandbox's fenced incarnation starts
 +      // under; its Git requests are served only while that incarnation is live.
-+      fence?: { policy: unknown; expiresAt: number };
++      // `sandbox` names the sandbox the repository admitted for the run.
++      fence?: { policy: unknown; expiresAt: number; sandbox: string };
      };
  
  export type SourceControlEvent<

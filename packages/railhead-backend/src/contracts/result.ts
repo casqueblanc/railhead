@@ -12,6 +12,8 @@ export type TrainErrorCode =
   | "check_mismatch"
   /** The check for this candidate did not pass, or has not finished. */
   | "check_not_passed"
+  /** The candidate edits its check definition or a path it protects; a person must approve it. */
+  | "check_held"
   /** Main is no longer at the expected commit. */
   | "main_moved";
 

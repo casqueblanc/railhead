@@ -35,7 +35,19 @@
 // attempt the runner never reports, whether or not the port acknowledged it, expires at that
 // deadline: the batch fails with `check_timeout`, its pins return to the queue as after a check
 // error, and a report arriving at or after the deadline is refused, so a late pass can never
-// authorize a landing.
+// authorize a landing. An attempt the check port holds for a person (`check_held`: the candidate
+// edits protected check paths) is not an outage: the train records it, asks the port nothing more,
+// waits for the deadline without backing off, and then fails the batch with `check_held`, counting
+// no retry, so a held pin is never dropped for waiting. A shared batch goes back split into isolated
+// pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
+// queue, so it cannot hold the pins behind it.
+//
+// Each compose runs under a fresh merge attempt, recorded on the batch before the merge port is
+// called. When the batch settles, or a new compose of it supersedes that attempt, the attempt is
+// queued for discard, and the Repo's alarm asks the merge port to delete its candidate refs once
+// its compose can no longer push. A failed discard is tried again on the alarm, with a delay that
+// doubles from `DISCARD_BASE_MS` up to `DISCARD_MAX_MS`, until it succeeds; each wake tries at most
+// `MAX_DISCARDS_PER_WAKE`, outside any drive, so cleanup never holds up a batch.
 
 import {
   isCommitSha,
@@ -70,13 +82,17 @@ import {
   batchByAttempt,
   batchedEntries,
   clearWake,
+  completeDiscard,
   countPending,
+  dueDiscards,
   hasMovableWork,
   highestGeneration,
   insertBatch,
   insertEntry,
+  markCheckHeld,
   markCheckStarted,
   migrateTrain,
+  nextDiscardAt,
   owesWork,
   readDrive,
   readEntry,
@@ -86,8 +102,10 @@ import {
   recordCandidate,
   recordCheckResult,
   recordIntent,
+  recordMergeAttempt,
   requeueFront,
   requestCheck,
+  retryDiscard,
   settleBatch,
   settleEntry,
   waitingEntries,
@@ -152,6 +170,15 @@ export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
  */
 export const MAX_STEPS = 4 * MAX_QUEUE * (MAX_RETRIES + 3);
 
+/** The first delay after a discard fails. Each failure in a row doubles it. */
+export const DISCARD_BASE_MS = 60_000;
+
+/** The longest delay between discards of one attempt that fail. */
+export const DISCARD_MAX_MS = 60 * 60_000;
+
+/** Most discards one wake of the Repo's alarm tries, so cleanup holds few sandboxes at once. */
+export const MAX_DISCARDS_PER_WAKE = 4;
+
 /** Most rows a diagnostic read returns. */
 export const MAX_DIAGNOSTIC_ROWS = 64;
 
@@ -175,6 +202,11 @@ export type BlockReason =
   | "merge_unavailable"
   /** The check port did not accept the attempt. */
   | "checks_unavailable"
+  /**
+   * The check port held the attempt for a person: the candidate edits protected check paths. Not
+   * an outage: the train waits for the attempt's deadline without backing off.
+   */
+  | "check_held"
   /** The authorization port did not answer. */
   | "authorization_unavailable"
   /** The main writer did not answer, or left the intent unsettled. */
@@ -255,10 +287,12 @@ export function createTrain(
   const { log, clock } = context;
   const sql = context.storage.sql;
   let running: Running | null = null;
+  let discarding: Promise<void> | null = null;
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
   const owed = readWake(sql);
   if (owed !== null && !isExhausted(owed)) context.wake(owed.dueAt);
+  wakeForDiscards();
 
   function drive(): Promise<DriveOutcome> {
     if (running !== null) {
@@ -339,6 +373,14 @@ export function createTrain(
     call: () => Promise<PortResult<T>>,
   ): Promise<PortResult<T>> {
     if (!holds(generation)) throw new DriveSuperseded();
+    return withTimeout(port, call);
+  }
+
+  /** Waits at most `portTimeoutMs` for a port call; one that does not answer fails as `unavailable`. */
+  async function withTimeout<T>(
+    port: PortName,
+    call: () => Promise<PortResult<T>>,
+  ): Promise<PortResult<T>> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<PortResult<T>>((resolve) => {
       timer = setTimeout(() => {
@@ -360,14 +402,17 @@ export function createTrain(
    */
   function settleWake(generation: number, outcome: DriveOutcome | null): void {
     const now = clock();
+    // A held attempt is not a failure: it waits for its deadline without backing off.
     const failed =
       outcome === null ||
-      outcome.kind === "blocked" ||
+      (outcome.kind === "blocked" && outcome.reason !== "check_held") ||
       outcome.kind === "yielded" ||
       outcome.kind === "superseded";
-    const exhausted = context.storage.transactionSync(
-      (): boolean => holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" }),
-    );
+    const exhausted = context.storage.transactionSync((): boolean => {
+      // A batch the drive settled, or a compose it superseded, may have queued a discard.
+      wakeForDiscards();
+      return holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" });
+    });
     if (exhausted) {
       console.error(
         JSON.stringify({
@@ -533,8 +578,12 @@ export function createTrain(
   }
 
   async function compose(generation: number, batch: BatchRecord): Promise<Step> {
+    // The attempt commits before the port is asked, so its candidate refs are discarded whatever
+    // the compose does; an attempt it supersedes is queued for discard.
+    const attempt = `mrg_${crypto.randomUUID().replaceAll("-", "")}`;
+    fenced(generation, () => recordMergeAttempt(sql, batch.batchId, attempt, clock()));
     const result = await bounded(generation, "merge", () =>
-      ports().merge.compose(batch.expectedMain, batch.pins),
+      ports().merge.compose(batch.expectedMain, batch.pins, attempt),
     );
     if (!result.ok) return blocked(batch.batchId, "merge_unavailable", result.code);
     const outcome = result.value;
@@ -570,8 +619,13 @@ export function createTrain(
     // The deadline commits before the port is asked, so an attempt whose start never answers
     // still expires.
     const deadline = batch.checkDeadline ?? requestDeadline(generation, batch);
+    if (batch.checkHeld) return blocked(batch.batchId, "check_held", "check_held");
     if (!batch.checkStarted) {
       const started = await bounded(generation, "checks", () => ports().checks.start(attempt));
+      if (!started.ok && started.code === "check_held") {
+        fenced(generation, () => markCheckHeld(sql, batch.batchId, clock()));
+        return blocked(batch.batchId, "check_held", "check_held");
+      }
       if (!started.ok) return blocked(batch.batchId, "checks_unavailable", started.code);
       if (started.value.attemptId !== attempt.attemptId) {
         throw new Error("the check port acknowledged another attempt");
@@ -600,7 +654,7 @@ export function createTrain(
     const expired = fenced(generation, () => {
       const current = activeBatch(sql);
       if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
-      failBatchIn(current, "check_timeout", now);
+      failBatchIn(current, current.checkHeld ? "check_held" : "check_timeout", now);
       return true;
     });
     if (expired) {
@@ -698,6 +752,22 @@ export function createTrain(
   function failBatchIn(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
     settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
+    if (failure === "check_held") {
+      // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
+      if (entries.length > 1) {
+        requeueFront(
+          sql,
+          entries.map((entry) => ({ pin: entry.pin, isolate: true, retries: entry.retries })),
+          now,
+        );
+        return;
+      }
+      // Held alone, the pin is the one that edits a protected path. It is parked, keeping its pin,
+      // so the queue behind it moves. A new push enqueues the claim's next generation as a new
+      // entry. The approval action (#174) is the other way back: it will requeue this entry.
+      for (const entry of entries) settleEntry(sql, entry.pin, "parked", "check_held", now);
+      return;
+    }
     const definitive = isDefinitive(failure);
     if (definitive && entries.length === 1) {
       for (const entry of entries) settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
@@ -806,15 +876,75 @@ export function createTrain(
     }
   }
 
+  /**
+   * Called by the Repo's alarm: drives the train if it is due, then discards what was due when the
+   * alarm fired.
+   */
   async function resume(): Promise<void> {
+    const firedAt = await resumeDrive();
+    if (nextDiscardAt(sql) === null) return;
+    await discardDue(firedAt ?? clock());
+  }
+
+  /**
+   * Asks the merge port to delete the candidate refs of up to `MAX_DISCARDS_PER_WAKE` attempts due
+   * at `now`, one at a time, and asks the alarm for the next one due. A failure is logged with its
+   * code and tried again after a delay; it never throws. A call while discards run waits for them.
+   */
+  function discardDue(now: number): Promise<void> {
+    discarding ??= discardBatch(now).finally(() => {
+      discarding = null;
+    });
+    return discarding;
+  }
+
+  async function discardBatch(dueAt: number): Promise<void> {
+    try {
+      for (const discard of dueDiscards(sql, dueAt, MAX_DISCARDS_PER_WAKE)) {
+        // A port that throws counts as a failure, so the row moves on and the alarm cannot spin.
+        const result = await withTimeout("merge", () =>
+          ports().merge.discard(discard.attempt),
+        ).catch(() => fail("internal", "The merge module failed while discarding."));
+        const failures = discard.failures + 1;
+        // Each row change commits with the wake it needs, as every other write here does.
+        context.storage.transactionSync(() => {
+          if (result.ok) completeDiscard(sql, discard.attempt);
+          else retryDiscard(sql, { ...discard, dueAt: clock() + discardDelay(failures), failures });
+          wakeForDiscards();
+        });
+        if (!result.ok) {
+          console.error(
+            JSON.stringify({
+              event: "train.discard_failed",
+              repo: context.repoId,
+              attempt: discard.attempt,
+              code: result.code,
+              failures,
+            }),
+          );
+        }
+      }
+    } finally {
+      context.storage.transactionSync(() => wakeForDiscards());
+    }
+  }
+
+  /** Asks the Repo's alarm for the earliest pending discard, if any. */
+  function wakeForDiscards(): void {
+    const next = nextDiscardAt(sql);
+    if (next !== null) context.wake(next);
+  }
+
+  /** Drives the train if its wake is due. Returns the time it read, or `null` when it read none. */
+  async function resumeDrive(): Promise<number | null> {
     const owedNow = readWake(sql);
     // Exhausted work waits for a call; an alarm another module asked for does not restart it.
-    if (owedNow === null || isExhausted(owedNow)) return;
+    if (owedNow === null || isExhausted(owedNow)) return null;
     const now = clock();
     // Another module's alarm may fire first; ask again for this train's own time.
     if (owedNow.dueAt > now) {
       context.wake(owedNow.dueAt);
-      return;
+      return now;
     }
     const current = running?.drive ?? null;
     if (current !== null) {
@@ -824,7 +954,7 @@ export function createTrain(
         // ends, without waiting on it here.
         current.again = true;
         context.wake(lease.leaseUntil);
-        return;
+        return now;
       }
       // The drive outlived its lease, so it is waiting on something that will not answer in time.
       // The next generation takes over, and the earlier drive's writes are refused from here on.
@@ -838,6 +968,7 @@ export function createTrain(
       );
     }
     await driveLogged();
+    return now;
   }
 
   function attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null {
@@ -955,6 +1086,11 @@ function isExhausted(wake: PendingWake): boolean {
   return wake.failures >= EXHAUSTED_FAILURES;
 }
 
+/** `DISCARD_BASE_MS` doubled for each failure after the first, at most `DISCARD_MAX_MS`. */
+function discardDelay(failures: number): number {
+  return Math.min(DISCARD_BASE_MS * 2 ** Math.min(failures - 1, 20), DISCARD_MAX_MS);
+}
+
 /** `WAKE_BASE_MS` doubled for each failure after the first, at most `WAKE_MAX_MS`. */
 function wakeDelay(failures: number): number {
   return Math.min(WAKE_BASE_MS * 2 ** Math.min(failures - 1, 20), WAKE_MAX_MS);
@@ -991,6 +1127,7 @@ function isDefinitive(failure: BatchFailure): boolean {
     case "compose_infrastructure":
     case "check_error":
     case "check_timeout":
+    case "check_held":
     case "authorization_refused":
     case "main_rejected":
     case "publish_refused":
