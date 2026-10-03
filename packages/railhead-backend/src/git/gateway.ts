@@ -231,6 +231,13 @@ class GitGateway implements GitPort {
       return text(400, `railhead: ${describeHeadFailure(parsed.reason)}`);
     }
     const { head } = parsed;
+    if (head.updates.length === 0) {
+      // Git probes with a bare flush before streaming a push larger than `http.postBuffer`, and
+      // fails the push unless the probe gets a 200. It updates nothing, so it reaches no upstream.
+      deadline.clear();
+      await parsed.body.cancel();
+      return gitResult(route.service, new Uint8Array(0));
+    }
     const reasons = new Map<RefUpdate, string>();
     // A ref named twice could be reported both updated and refused, so its outcome is unknowable.
     const named = new Set<string>();

@@ -501,6 +501,123 @@ describe("stock Git through the gateway", () => {
   });
 });
 
+// Stock Git 2.50.1 POSTs this 4-byte body, with `content-length: 4`, before streaming a push
+// larger than `http.postBuffer` (1 MiB by default), and fails the push unless it gets a 200.
+const PROBE = "0000";
+
+/** A request with `bytes` sent in `size`-byte chunks and no declared length, as Git streams it. */
+function chunked(bytes: Uint8Array, size: number): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(bytes.slice(offset, offset + size));
+      offset += size;
+    },
+  });
+}
+
+describe("a push larger than Git's post buffer", () => {
+  it("answers Git's probe with an empty result, minting nothing and reaching no upstream", async () => {
+    await withGateway(async (world) => {
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PROBE),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("application/x-git-receive-pack-result");
+      expect(await bytesOf(response)).toEqual(new Uint8Array(0));
+      expect(world.authorizations.map((access) => access.operation)).toEqual(["push"]);
+      expect(world.seen).toEqual([]);
+      expect(world.minted()).toBe(0);
+      expect(world.events()).toEqual([]);
+      expect(logged).toEqual([]);
+    });
+  });
+
+  it("still asks a probe without valid credentials to authenticate", async () => {
+    await withGateway(async (world) => {
+      for (const auth of [null, basic(AGENT.agentId, "not-a-session")]) {
+        const headers = new Headers({ "content-type": "application/x-git-receive-pack-request" });
+        if (auth !== null) headers.set("authorization", auth);
+        const response = await world.gateway.serve(
+          new Request("https://railhead.test/git/acme/demo.git/git-receive-pack", {
+            method: "POST",
+            headers,
+            body: PROBE,
+          }),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status).toBe(401);
+        expect(response.headers.get("www-authenticate")).toContain("Basic");
+      }
+      expect(world.seen).toEqual([]);
+      expect(world.minted()).toBe(0);
+    });
+  });
+
+  it("refuses the push after the probe when the agent does not hold the claim", async () => {
+    await withGateway(async (world) => {
+      world.claim.agentId = OTHER.agentId;
+      const probed = await world.gateway.serve(
+        rpc("git-receive-pack", PROBE),
+        FORK,
+        "/git-receive-pack",
+      );
+      // Git reads the refusal from the report of the push that follows, beside each ref.
+      expect(probed.status).toBe(200);
+      expect(await bytesOf(probed)).toEqual(new Uint8Array(0));
+      const pushed = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(decoder.decode(await bytesOf(pushed))).toContain(
+        "ng refs/heads/feature This agent does not hold the claim.",
+      );
+      expect(world.seen).toEqual([]);
+      expect(world.minted()).toBe(0);
+      expect(world.events()).toEqual([]);
+    });
+  });
+
+  it("forwards and records the chunked push of more than 1 MiB that follows the probe", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      const pack = new Uint8Array(1536 * 1024);
+      for (let index = 0; index < pack.length; index += 1) pack[index] = index % 251;
+      const large = concatAll([PUSH_REQUEST, pack]);
+
+      const probed = await world.gateway.serve(
+        rpc("git-receive-pack", PROBE),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(probed.status).toBe(200);
+      await bytesOf(probed);
+      const pushed = await world.gateway.serve(
+        rpc("git-receive-pack", chunked(large, 64 * 1024)),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(pushed.status).toBe(200);
+      expect(await bytesOf(pushed)).toEqual(PUSH_RESULT);
+
+      expect(world.seen).toHaveLength(1);
+      expect(world.seen[0]?.body).toEqual(large);
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { ref: "refs/heads/feature", from: null, to: PUSHED } },
+      ]);
+      expect(unknownOutcomes()).toBe(0);
+    });
+  });
+});
+
 function concatAll(chunks: readonly Uint8Array[]): Uint8Array {
   const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
