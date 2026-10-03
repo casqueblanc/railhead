@@ -66,6 +66,8 @@ class FakeMain implements MainRefPort {
   readonly late: (() => void)[] = [];
   /** How every update past `steps` answers. */
   fallback: Step = "honest";
+  /** Runs once while the next read is in flight: after it observes main, before it answers. */
+  duringRead: (() => void) | null = null;
 
   constructor(
     public main: CommitSha,
@@ -73,7 +75,11 @@ class FakeMain implements MainRefPort {
   ) {}
 
   async read(): Promise<PortResult<CommitSha>> {
-    return ok(this.main);
+    const seen = this.main;
+    const during = this.duringRead;
+    this.duringRead = null;
+    during?.();
+    return ok(seen);
   }
 
   async update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>> {
@@ -120,6 +126,8 @@ interface Harness {
   alarm(): Promise<void>;
   /** The Repo's clock, without advancing it. */
   now(): number;
+  /** Moves the Repo's clock forward to `at`. */
+  advance(at: number): void;
 }
 
 /**
@@ -203,6 +211,9 @@ function withRepo<R>(
         await train.resume();
       },
       now: () => now,
+      advance: (at) => {
+        now = Math.max(now, at);
+      },
     });
   });
 }
@@ -377,6 +388,37 @@ describe("the train publishes through the real main writer", () => {
       expect(mainOutcomes(h.events())).toEqual([
         { intentId, outcome: "reconciled", main: first.candidate },
       ]);
+      expect(ref.updates).toHaveLength(1);
+    });
+  });
+
+  it("lands a batch whose write lands while a read begun before its lifetime ends is answering", async () => {
+    const ref = new FakeMain(MAIN, ["hang"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      const attemptAt = h.authorization.record(intentId)?.updatedAt ?? 0;
+      h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
+
+      // The drive's read sees main at the expected commit; the update reaches Git within its
+      // lifetime, and the read's answer arrives after the lifetime has ended.
+      ref.duringRead = () => {
+        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_LIFETIME_MS);
+        ref.release();
+        h.advance(attemptAt + MAIN_UPDATE_LIFETIME_MS + 500);
+      };
+      await h.alarm();
+      expect(ref.main).toBe(first.candidate);
+      expect(h.authorization.record(intentId)).toMatchObject({
+        status: "reconciled",
+        main: first.candidate,
+      });
+      expect(mainOutcomes(h.events())).toEqual([
+        { intentId, outcome: "reconciled", main: first.candidate },
+      ]);
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
       expect(ref.updates).toHaveLength(1);
     });
   });

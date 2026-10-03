@@ -72,6 +72,8 @@ class FakeMain implements MainRefPort {
   updates: { expected: CommitSha; next: CommitSha }[] = [];
   reads = 0;
   readFails = false;
+  /** Runs once while the next read is in flight: after it observes main, before it answers. */
+  duringRead: (() => void) | null = null;
 
   constructor(
     public main: CommitSha = MAIN,
@@ -80,7 +82,11 @@ class FakeMain implements MainRefPort {
 
   async read(): Promise<PortResult<CommitSha>> {
     this.reads += 1;
-    return this.readFails ? fail("unavailable", "Git is not answering.") : ok(this.main);
+    const seen = this.main;
+    const during = this.duringRead;
+    this.duringRead = null;
+    during?.();
+    return this.readFails ? fail("unavailable", "Git is not answering.") : ok(seen);
   }
 
   async update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>> {
@@ -793,6 +799,140 @@ describe("publish ends the wait for an unsettled write after the update lifetime
           { expected: MAIN, next: CANDIDATE },
           { expected: CANDIDATE, next: CANDIDATE_B },
         ]);
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "reconciled", main: MAIN },
+          { intentId: INTENT_B, outcome: "rejected", main: MAIN },
+        ]);
+      },
+      world,
+      freshStub(),
+      { secondExpected: CANDIDATE },
+    );
+  });
+});
+
+/** Main is read just before the lifetime ends; `apply` runs before the answer arrives after it. */
+function readAcrossExpiry(world: World, ref: FakeMain, apply: () => void): void {
+  world.now = NOW + MAIN_UPDATE_LIFETIME_MS - 1_000;
+  ref.duringRead = () => {
+    apply();
+    world.now = NOW + MAIN_UPDATE_LIFETIME_MS + 500;
+  };
+}
+
+describe("publish settles a write as not landed only from a read begun after its lifetime", () => {
+  it("records a write that lands during a read begun before expiry as landed", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.generations.set(CLAIM_B, 4);
+
+        // The read sees the expected commit; the update lands within its lifetime before the
+        // stale answer arrives after it.
+        readAcrossExpiry(world, ref, () => {
+          ref.main = CANDIDATE;
+        });
+        const reads = ref.reads;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, CANDIDATE), updatedAt: world.now },
+        });
+        expect(ref.reads).toBe(reads + 2);
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([
+          mainEvent(2, "reconciled", CANDIDATE, INTENT, world.now),
+        ]);
+      },
+      world,
+    );
+  });
+
+  it("settles a write that never lands from a second read begun after expiry", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.generations.set(CLAIM_B, 4);
+
+        let readsBegun: number[] = [];
+        readAcrossExpiry(world, ref, () => undefined);
+        const read = ref.read.bind(ref);
+        ref.read = async () => {
+          readsBegun = [...readsBegun, world.now];
+          return read();
+        };
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, MAIN), updatedAt: world.now },
+        });
+        // The settling read began after the lifetime ended; the one before it proved nothing.
+        expect(readsBegun).toEqual([
+          NOW + MAIN_UPDATE_LIFETIME_MS - 1_000,
+          NOW + MAIN_UPDATE_LIFETIME_MS + 500,
+        ]);
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", MAIN, INTENT, world.now)]);
+      },
+      world,
+    );
+  });
+
+  it("records an earlier intent's late landing before another intent writes past it", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        ref.readFails = false;
+        await authorizeB(h);
+
+        readAcrossExpiry(world, ref, () => {
+          ref.main = CANDIDATE;
+        });
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { intentId: INTENT_B, status: "updated", main: CANDIDATE_B },
+        });
+        expect(ref.updates).toEqual([
+          { expected: MAIN, next: CANDIDATE },
+          { expected: CANDIDATE, next: CANDIDATE_B },
+        ]);
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+          { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+        ]);
+      },
+      world,
+      freshStub(),
+      { secondExpected: CANDIDATE },
+    );
+  });
+
+  it("settles an earlier intent that never landed only after reading main again", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        ref.readFails = false;
+        await authorizeB(h);
+
+        readAcrossExpiry(world, ref, () => undefined);
+        const reads = ref.reads;
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { intentId: INTENT_B, status: "rejected", main: MAIN },
+        });
+        expect(ref.reads).toBe(reads + 2);
         expect(outcomes(h.log)).toEqual([
           { intentId: INTENT, outcome: "reconciled", main: MAIN },
           { intentId: INTENT_B, outcome: "rejected", main: MAIN },
