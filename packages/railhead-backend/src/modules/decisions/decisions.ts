@@ -7,16 +7,29 @@
 //   `requestId` returns the same question and appends nothing. The claim's generation is read again
 //   inside the transaction, so a claim released or taken over while it was being read records
 //   nothing.
-// - `record` takes a consumed human grant, appends `decision.recorded` with the person as actor and
-//   queues one inbox item for each dependent claim still held at its recorded generation, in the
-//   same transaction. If any item cannot be queued, nothing is recorded and nothing is queued. A
-//   repeat of the same grant returns the version it recorded; a stale `expectedVersion` records
-//   nothing.
+// - `record` takes a consumed human grant and records the next version: version 1 answers the
+//   question, and a later one supersedes the current version. It appends `decision.recorded` with
+//   the person as actor and records one obligation for each dependent claim, in the same
+//   transaction. If any item cannot be queued, nothing is recorded and nothing is queued. A repeat
+//   of the same grant returns the version it recorded; a stale `expectedVersion` records nothing,
+//   so a person who answered against an older version never overwrites a newer one.
 //
-// A decision's dependencies name the claim, and the agent and ownership generation the inbox item
-// goes to. A dependency whose claim has moved to another generation, or is no longer known, keeps
-// its row but gets no item: delivering the decision to the claim's later owner belongs to
-// supersession, as does replacing a decision's version, which is refused here.
+// A decision's dependencies name the claim, and the agent and ownership generation an inbox item
+// goes to. An obligation is queued as an item only when the claims module reports that generation
+// as current, inside the transaction that records it. A dependency whose claim was merged, expired,
+// is unknown or has moved to an owner it was not transferred to keeps a pending obligation and gets
+// no item, so nothing reaches a former owner:
+//
+// - `transfer`, called inside a takeover's transaction, moves the claim's dependencies to the new
+//   holder and queues it the current version of each decision, delivering what was pending.
+// - `relied`, called inside the transaction that authorizes or lands the claim's work, records the
+//   versions that work relied on. A version recorded later, or one already newer, makes the
+//   obligation `rework`: the work cannot follow it any more, so it must be redone. The rework goes
+//   to whoever holds the claim's dependency now, which after a takeover is the successor, even when
+//   the work was done under an earlier generation.
+//
+// One obligation exists per claim, version and kind, so a repeated or restarted fanout never
+// queues an item twice, and a failed one leaves none.
 //
 // Question text and option labels are untrusted. They are stored and returned as bounded data,
 // never logged.
@@ -44,11 +57,13 @@ import {
   type QuestionId,
   type QuestionOption,
 } from "@railhead/shared/events";
-import type { DecisionsPort } from "../../contracts/decisions";
+import type { DecisionObligation, DecisionsPort } from "../../contracts/decisions";
+import type { InboxTarget } from "../../contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../../contracts/result";
 import { UnavailableError } from "../../contracts/unavailable";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
+import type { EventTransaction } from "../../repo/eventLog";
 import { migrate } from "../../repo/storage";
 
 /** The migration owner name of the decisions' tables. */
@@ -91,6 +106,21 @@ const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (decision_id, claim_id)
   ) STRICT`,
   "CREATE INDEX decision_claims_claim ON decision_claims (claim_id)",
+  // The newest version the claim's authorized or merged work relied on, or `NULL` before any.
+  "ALTER TABLE decision_claims ADD COLUMN relied INTEGER CHECK (relied IS NULL OR relied > 0)",
+  // What each version asks of each dependent claim. `agent_id` and `item` name its latest delivery,
+  // since item numbers are per agent, or are both `NULL` while no current holder could receive it.
+  `CREATE TABLE decision_obligations (
+    claim_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('decision', 'rework')),
+    agent_id TEXT,
+    item INTEGER CHECK (item IS NULL OR item > 0),
+    recorded_at INTEGER NOT NULL,
+    CHECK ((agent_id IS NULL) = (item IS NULL)),
+    PRIMARY KEY (claim_id, decision_id, version, kind)
+  ) STRICT`,
 ];
 
 /**
@@ -138,9 +168,32 @@ interface VersionRow extends Record<string, SqlStorageValue> {
 }
 
 interface DependencyRow extends Record<string, SqlStorageValue> {
+  decision_id: string;
   claim_id: string;
   agent_id: string;
   generation: number;
+  relied: number | null;
+}
+
+interface ObligationRow extends Record<string, SqlStorageValue> {
+  claim_id: string;
+  decision_id: string;
+  version: number;
+  kind: string;
+  agent_id: string | null;
+  item: number | null;
+  recorded_at: number;
+}
+
+const SELECT_DEPENDENCY =
+  "SELECT decision_id, claim_id, agent_id, generation, relied FROM decision_claims";
+
+/** A `transfer` or `relied` call refused. It throws inside the caller's transaction, which rolls back. */
+export class DecisionsWriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DecisionsWriteError";
+  }
 }
 
 /** Builds the decisions of one repository, creating or migrating its tables first. */
@@ -194,17 +247,20 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
 
   // The decision's current version as an agent reads it, or `null` while the question is open.
   function view(question: QuestionRow): DecisionView | null {
+    return viewAt(question, currentVersion(question.decision_id));
+  }
+
+  // One recorded version as an agent reads it, or `null` when it was never recorded.
+  function viewAt(question: QuestionRow, version: number): DecisionView | null {
     const decisionId = question.decision_id;
-    const current = currentVersion(decisionId);
-    if (current === 0) return null;
-    const row = versionOf(decisionId, current);
+    const row = versionOf(decisionId, version);
     if (row === undefined) return null;
     const options = readOptions(question.options);
-    const previous = current === 1 ? undefined : versionOf(decisionId, current - 1);
+    const previous = version === 1 ? undefined : versionOf(decisionId, version - 1);
     return {
       decisionId,
-      version: current,
-      supersedes: current === 1 ? null : current - 1,
+      version,
+      supersedes: version === 1 ? null : version - 1,
       questionId: question.question_id,
       question: question.text,
       option: optionOf(options, row.option),
@@ -288,6 +344,61 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       )
       .toArray()
       .map((row) => ({ decisionId: row.decision_id, version: row.current }));
+  }
+
+  // Records what `ref` asks of the dependency's claim, once per claim, version and kind. It is
+  // queued to the dependency's agent when that agent still holds the claim at the dependency's
+  // generation. An inbox refusal throws and rolls back.
+  function owe(
+    tx: EventTransaction,
+    dependency: DependencyRow,
+    ref: DecisionRef,
+    kind: DecisionObligation["kind"],
+  ): void {
+    const owed = tx.sql
+      .exec(
+        `SELECT 1 FROM decision_obligations
+         WHERE claim_id = ? AND decision_id = ? AND version = ? AND kind = ?`,
+        dependency.claim_id,
+        ref.decisionId,
+        ref.version,
+        kind,
+      )
+      .toArray();
+    if (owed.length > 0) return;
+    const item =
+      ports().claims.currentGeneration(dependency.claim_id) === dependency.generation
+        ? ports().inbox.queue(
+            tx,
+            {
+              agentId: dependency.agent_id,
+              claimId: dependency.claim_id,
+              generation: dependency.generation,
+            },
+            { entry: { kind, decision: ref }, decision: recordedView(ref) },
+          )
+        : null;
+    tx.sql.exec(
+      `INSERT INTO decision_obligations
+         (claim_id, decision_id, version, kind, agent_id, item, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      dependency.claim_id,
+      ref.decisionId,
+      ref.version,
+      kind,
+      item === null ? null : dependency.agent_id,
+      item,
+      clock(),
+    );
+  }
+
+  // A recorded version's view. Every caller names a version it read from storage in the same
+  // transaction, so a missing one is a broken invariant.
+  function recordedView(ref: DecisionRef): DecisionView {
+    const question = questionOfDecision(ref.decisionId);
+    const decision = question === undefined ? null : viewAt(question, ref.version);
+    if (decision === null) throw new Error("a recorded decision version cannot be read back");
+    return decision;
   }
 
   return {
@@ -405,7 +516,6 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       if (invalid !== null) return fail("invalid_request", invalid);
       const { action, grantId, userId } = grant;
       const { decisionId, option } = action;
-      const inbox = ports().inbox;
       let committed;
       try {
         committed = log.transaction(
@@ -436,10 +546,10 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                 "The decision has changed since this answer was prepared.",
               );
             }
-            if (current !== 0) {
-              return fail("unavailable", "Replacing a decision's answer is not available.");
+            if (current !== 0 && versionOf(decisionId, current)?.option === option) {
+              return fail("invalid_request", "The decision already chose that option.");
             }
-            const version = 1;
+            const version = current + 1;
             const decidedAt = clock();
             tx.sql.exec(
               `INSERT INTO decision_versions (decision_id, version, option, decided_by, decided_at,
@@ -462,45 +572,23 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                   version,
                   questionId: question.question_id,
                   option,
-                  supersedes: null,
+                  supersedes: current === 0 ? null : current,
                   scope,
                 },
               },
             );
-            const decision: DecisionView = {
-              decisionId,
-              version,
-              supersedes: null,
-              questionId: question.question_id,
-              question: question.text,
-              option: optionOf(options, option),
-              previous: null,
-              scope,
-              decidedBy: userId,
-              decidedAt,
-            };
             const targets = tx.sql
               .exec<DependencyRow>(
-                `SELECT claim_id, agent_id, generation FROM decision_claims
-                 WHERE decision_id = ? ORDER BY claim_id`,
+                `${SELECT_DEPENDENCY} WHERE decision_id = ? ORDER BY claim_id`,
                 decisionId,
               )
               .toArray();
-            const claims = ports().claims;
             // Any refusal throws and rolls back the version, its event and every item before it.
             for (const target of targets) {
-              // An item for a generation the claim has left would go to its former owner; the
-              // dependency stays for supersession to deliver to the current one.
-              if (claims.currentGeneration(target.claim_id) !== target.generation) continue;
-              inbox.queue(
-                tx,
-                {
-                  agentId: target.agent_id,
-                  claimId: target.claim_id,
-                  generation: target.generation,
-                },
-                { entry: { kind: "decision", decision: { decisionId, version } }, decision },
-              );
+              // Work that relied on an older version can no longer follow this one.
+              const kind =
+                target.relied !== null && target.relied < version ? "rework" : "decision";
+              owe(tx, target, { decisionId, version }, kind);
             }
             return ok({ decisionId, version });
           },
@@ -526,7 +614,182 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         return null;
       return dependencies(claimId);
     },
+
+    transfer(tx, target) {
+      const invalid = invalidTarget(target);
+      if (invalid !== null) throw new DecisionsWriteError(invalid);
+      const { agentId, claimId, generation } = target;
+      if (ports().claims.currentGeneration(claimId) !== generation) {
+        throw new DecisionsWriteError("the claim is not held at that generation");
+      }
+      const moving = tx.sql
+        .exec<DependencyRow>(
+          `${SELECT_DEPENDENCY} WHERE claim_id = ? ORDER BY decision_id`,
+          claimId,
+        )
+        .toArray()
+        // A repeat for the same holder moves and queues nothing.
+        .filter((row) => row.agent_id !== agentId || row.generation !== generation);
+      for (const row of moving) {
+        if (row.generation > generation) {
+          throw new DecisionsWriteError("a dependency is held at a newer generation");
+        }
+        tx.sql.exec(
+          "UPDATE decision_claims SET agent_id = ?, generation = ? WHERE decision_id = ? AND claim_id = ?",
+          agentId,
+          generation,
+          row.decision_id,
+          claimId,
+        );
+        const current = currentVersion(row.decision_id);
+        // Still open: recording its answer reaches the new holder through the moved row.
+        if (current === 0) continue;
+        const pendingRework = tx.sql
+          .exec(
+            `SELECT 1 FROM decision_obligations
+             WHERE claim_id = ? AND decision_id = ? AND kind = 'rework' AND item IS NULL`,
+            claimId,
+            row.decision_id,
+          )
+          .toArray();
+        const kind =
+          pendingRework.length > 0 || (row.relied !== null && row.relied < current)
+            ? "rework"
+            : "decision";
+        const decision = { decisionId: row.decision_id, version: current };
+        const item = ports().inbox.queue(tx, target, {
+          entry: { kind, decision },
+          decision: recordedView(decision),
+        });
+        // The current version subsumes every older one still waiting for a holder.
+        tx.sql.exec(
+          `UPDATE decision_obligations SET agent_id = ?, item = ?
+           WHERE claim_id = ? AND decision_id = ? AND item IS NULL`,
+          agentId,
+          item,
+          claimId,
+          row.decision_id,
+        );
+        tx.sql.exec(
+          // The holder's delivery replaces the former holder's, whose item the event log keeps.
+          `INSERT INTO decision_obligations
+             (claim_id, decision_id, version, kind, agent_id, item, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (claim_id, decision_id, version, kind)
+           DO UPDATE SET agent_id = excluded.agent_id, item = excluded.item`,
+          claimId,
+          row.decision_id,
+          current,
+          kind,
+          agentId,
+          item,
+          clock(),
+        );
+      }
+    },
+
+    relied(tx, claimId, generation, refs) {
+      const invalid = invalidReliance(claimId, generation, refs);
+      if (invalid !== null) throw new DecisionsWriteError(invalid);
+      // Work lands under the generation that held the claim or an earlier one, never a later one.
+      // A claim that merged or expired has no current generation to compare against.
+      const current = ports().claims.currentGeneration(claimId);
+      if (current !== null && generation > current) {
+        throw new DecisionsWriteError("the work names a generation newer than the claim's");
+      }
+      for (const ref of refs) {
+        const dependency = tx.sql
+          .exec<DependencyRow>(
+            `${SELECT_DEPENDENCY} WHERE decision_id = ? AND claim_id = ?`,
+            ref.decisionId,
+            claimId,
+          )
+          .toArray()[0];
+        // Another claim's decision in the same merge.
+        if (dependency === undefined) continue;
+        const latest = currentVersion(ref.decisionId);
+        if (ref.version > latest) {
+          throw new DecisionsWriteError("a relied version was never recorded");
+        }
+        if (dependency.relied === null || dependency.relied < ref.version) {
+          tx.sql.exec(
+            "UPDATE decision_claims SET relied = ? WHERE decision_id = ? AND claim_id = ?",
+            ref.version,
+            ref.decisionId,
+            claimId,
+          );
+        }
+        // The work relied on a version that was already replaced. Its rework goes to the
+        // dependency's holder, who after a takeover is the successor, not the work's author.
+        if (ref.version < latest) {
+          owe(tx, dependency, { decisionId: ref.decisionId, version: latest }, "rework");
+        }
+      }
+    },
+
+    obligations(claimId) {
+      if (!isId("claim", claimId)) return null;
+      return sql
+        .exec<ObligationRow>(
+          `SELECT claim_id, decision_id, version, kind, agent_id, item, recorded_at
+           FROM decision_obligations o
+           WHERE claim_id = ? AND version = (
+             SELECT MAX(version) FROM decision_obligations l
+             WHERE l.claim_id = o.claim_id AND l.decision_id = o.decision_id AND l.kind = o.kind)
+           ORDER BY rowid`,
+          claimId,
+        )
+        .toArray()
+        .map((row) => ({
+          claimId: row.claim_id,
+          decision: { decisionId: row.decision_id, version: row.version },
+          kind: obligationKind(row.kind),
+          delivery:
+            row.agent_id === null || row.item === null
+              ? null
+              : { agentId: row.agent_id, item: row.item },
+          recordedAt: row.recorded_at,
+        }));
+    },
   };
+}
+
+function invalidTarget(target: InboxTarget): string | null {
+  if (!isId("agent", target.agentId)) return "the target is not an agent";
+  if (!isId("claim", target.claimId)) return "the target names no claim";
+  if (!Number.isSafeInteger(target.generation) || target.generation < 1) {
+    return "the generation is not a whole number from 1";
+  }
+  return null;
+}
+
+function invalidReliance(claimId: ClaimId, generation: number, refs: DecisionRef[]): string | null {
+  if (!isId("claim", claimId)) return "the claim is not a claim identifier";
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    return "the generation is not a whole number from 1";
+  }
+  if (refs.length > MAX_LIST_LENGTH) return `at most ${MAX_LIST_LENGTH} versions may be relied on`;
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    if (!isId("decision", ref.decisionId)) return "a relied decision is not a decision identifier";
+    if (!Number.isSafeInteger(ref.version) || ref.version < 1) {
+      return "a relied version is not a whole number from 1";
+    }
+    if (seen.has(ref.decisionId)) return "a decision is relied on twice";
+    seen.add(ref.decisionId);
+  }
+  return null;
+}
+
+/** Reads a stored kind. The table's CHECK admits only these two. */
+function obligationKind(kind: string): DecisionObligation["kind"] {
+  switch (kind) {
+    case "decision":
+    case "rework":
+      return kind;
+    default:
+      throw new Error("decision_obligations holds an unknown kind");
+  }
 }
 
 function notForThisRepo(): PortResult<never> {
