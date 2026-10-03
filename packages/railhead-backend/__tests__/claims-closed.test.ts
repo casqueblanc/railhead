@@ -31,6 +31,7 @@ interface Setup {
   fake: FakeArtifacts;
   claims: ClaimsPort;
   sql: SqlStorage;
+  log: EventLog;
   events: () => RailheadEvent[];
   /** Files an issue titled `title` and returns its id. */
   file: (title: string) => Promise<string>;
@@ -72,6 +73,7 @@ function withClaims<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       fake,
       claims,
       sql: state.storage.sql,
+      log,
       events: () => log.replay(0, 256).events,
       async file(title) {
         filed += 1;
@@ -182,6 +184,49 @@ describe("an agent's closed claim", () => {
         ok: true,
         value: { claimId: second.claimId, reason: { kind: "expired" } },
       });
+      expect(closedRows(setup.sql)).toBe(1);
+    });
+  });
+
+  it("keeps a newer merge when an older expired claim of the agent is taken over", async () => {
+    await withClaims(async (setup) => {
+      const first = await setup.open(agent(1));
+      setup.fake.advance(CLAIM_LEASE_MS);
+      expect(await setup.claims.activeClaim(agent(1))).toEqual(ok(null));
+
+      // The agent's second claim lands while its first still waits for a successor.
+      const second = await setup.open(agent(1));
+      const commit = "3".repeat(40);
+      await setup.push(second.claimId, commit);
+      expect(
+        await setup.claims.ready(agent(1), second.claimId, { generation: 1, commit }),
+      ).toMatchObject({ ok: true });
+      const landedAt = setup.fake.clock();
+      setup.log.transaction((tx) => {
+        const ready = setup.claims.readyPin(second.claimId);
+        if (ready === null) throw new Error("the second claim has no pin");
+        setup.claims.merged(tx, [{ pin: ready.pin, episode: ready.episode }], HEAD);
+      });
+      const merged = {
+        claimId: second.claimId,
+        issueId: second.issueId,
+        generation: 1,
+        reason: { kind: "merged", commit: HEAD },
+        closedAt: landedAt,
+      };
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(merged));
+
+      // Only now does another agent take the first claim over.
+      setup.fake.advance(1);
+      expect(await setup.claims.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: first.claimId, generation: 2 } },
+      });
+      expect(setup.events().at(-1)).toMatchObject({
+        type: "claim.reassigned",
+        data: { claimId: first.claimId, from: agent(1).agentId },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(merged));
       expect(closedRows(setup.sql)).toBe(1);
     });
   });

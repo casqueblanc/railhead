@@ -787,7 +787,8 @@ export type ClosedReason = ClosedClaimView["reason"];
 
 /**
  * Records `claim`, at the generation `agentId` held it, as that agent's most recently closed claim,
- * replacing the one recorded before.
+ * replacing the one recorded before. A takeover closes a claim that already expired, possibly
+ * before a later claim of the agent closed, so it replaces only that same claim's expiry, or no row.
  */
 export function recordClosed(
   sql: SqlStorage,
@@ -801,7 +802,10 @@ export function recordClosed(
      VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (agent_id) DO UPDATE SET claim_id = excluded.claim_id,
        issue_id = excluded.issue_id, generation = excluded.generation, reason = excluded.reason,
-       commit_sha = excluded.commit_sha, closed_at = excluded.closed_at`,
+       commit_sha = excluded.commit_sha, closed_at = excluded.closed_at
+     WHERE excluded.reason <> 'taken_over'
+       OR (claims_closed.claim_id = excluded.claim_id
+         AND claims_closed.generation = excluded.generation)`,
     agentId,
     claim.claimId,
     claim.issueId,
