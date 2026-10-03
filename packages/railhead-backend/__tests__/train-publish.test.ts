@@ -183,6 +183,7 @@ function withRepo<R>(
       merge: {
         compose: async (main, composed) =>
           ok({ kind: "clean", candidate: candidateOf(main, composed) }),
+        discard: async () => ok({ removed: 1 }),
       },
       checks: {
         definitions: async (main) =>
@@ -193,6 +194,7 @@ function withRepo<R>(
         },
         // Reports reach the train through `recordCheck` in these tests.
         report: async () => fail("unavailable", "Not used."),
+        detail: async () => fail("unavailable", "Not used."),
       },
       authorization,
       mainWriter,

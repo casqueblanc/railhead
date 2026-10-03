@@ -96,6 +96,7 @@ export const unavailableArtifacts: ArtifactsPort = {
 /** Merging while its module is missing. */
 export const unavailableMerge: MergePort = {
   compose: refuse("merge"),
+  discard: refuse("merge"),
 };
 
 /** Checks while their module is missing: nothing runs, so nothing passes. */
@@ -103,6 +104,7 @@ export const unavailableChecks: CheckPort = {
   definitions: refuse("checks"),
   start: refuse("checks"),
   report: refuse("checks"),
+  detail: refuse("checks"),
 };
 
 /**

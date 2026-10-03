@@ -40,6 +40,7 @@ const HOST =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const REF = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/[a-z]+$/;
+const PREFIX = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/$/;
 
 /** Where a repository's Git remote lives: the Artifacts host and namespace. */
 export interface RemoteLocation {
@@ -194,6 +195,30 @@ export function pushCommand(url: string, commit: string, ref: string, seconds: n
 }
 
 /**
+ * Deletes every ref under the candidate `prefix` of `url`, and prints `discarded <n>` with how many
+ * it deleted. It pushes from an empty repository with `--prune`, so Git deletes every remote ref the
+ * prefix pattern matches, and a prefix with nothing left succeeds without a delete. Only
+ * receive-pack is used: the sandbox's grant fetches nothing. Exits 2 when a step fails.
+ */
+export function discardCommand(url: string, prefix: string, seconds: number): string {
+  if (!PREFIX.test(prefix)) throw new Error("invalid candidate prefix");
+  const pattern = `${prefix}*`;
+  return script(seconds, [
+    "rm -rf discard && mkdir discard && cd discard || exit 2",
+    "step git init -q || fail 2",
+    `out=$(step git push --porcelain --prune ${quote(url)} ${quote(`${pattern}:${pattern}`)}) || fail 2`,
+    "n=0",
+    "tab=$(printf '\\t')",
+    "while IFS= read -r line; do",
+    '  case "$line" in "-$tab"*) n=$((n + 1)) ;; esac',
+    "done <<EOF",
+    "$out",
+    "EOF",
+    'echo "discarded $n"',
+  ]);
+}
+
+/**
  * A command body under one deadline. `step` runs a command cut to the time left; `fail` exits with
  * the timeout's status when the step was cut, else with its own code.
  */
@@ -272,6 +297,12 @@ export function parseBinary(stdout: string, count: number): Set<number> | null {
     if (match[2] === "-" || match[3] === "-") binary.add(index);
   }
   return binary;
+}
+
+/** Reads how many refs `discardCommand` deleted, or `null`. */
+export function parseDiscarded(stdout: string): number | null {
+  const match = /^discarded (0|[1-9][0-9]{0,5})\n$/.exec(stdout);
+  return match === null ? null : Number(match[1]);
 }
 
 /** Reads the commit `mergeCommand` printed, or `null`. */
