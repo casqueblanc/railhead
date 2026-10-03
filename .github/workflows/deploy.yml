@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Git ref to deploy (branch, tag or commit)
+        description: Git ref to deploy; it must resolve to a commit on main
         required: true
         default: main
         type: string
@@ -31,11 +31,23 @@ jobs:
       url: ${{ steps.deploy.outputs.url }}
     timeout-minutes: 30
     steps:
+      # Full history, so the next step can see main's.
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
+          fetch-depth: 0
+
+      # The ref input is not the dispatch ref, so the environment's branch rules never see it. Only a
+      # commit main has reached may run here: later steps run its code, and the deploy step hands
+      # that code the secrets. Nothing from the checkout has run yet.
+      - name: Require a commit on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "::error::The ref does not resolve to a commit on main; only main's history is deployed"
+            exit 1
+          fi
 
       - name: Enable Corepack
         run: corepack enable

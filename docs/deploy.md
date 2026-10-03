@@ -2,7 +2,7 @@
 
 The **Deploy** workflow (`.github/workflows/deploy.yml`) deploys the `railhead` Worker to its workers.dev host. It exists to qualify Railhead against real Cloudflare services, such as Artifacts, before any demo: there is no custom domain and no demo enrollment. Secrets live in GitHub and reach the Worker only at deploy time, so nobody pastes one into a terminal.
 
-The workflow runs only when started by hand. Every pull request instead dry-runs the same deploy in CI's **Build and test** job, with placeholder secrets: it builds the board, the Worker bundle, its config and the sandbox image, and uploads nothing.
+The workflow runs only when started by hand. CI's **Build and test** job instead dry-runs the same deploy on each pull request that changes its inputs (`scripts/ci-changes.mjs`), with placeholder secrets: it builds the board, the Worker bundle, its config and the sandbox image, and uploads nothing.
 
 ## Secrets
 
@@ -33,7 +33,7 @@ If the token lacks a permission, the deploy step fails with Cloudflare's error f
 ## Running a deploy
 
 1. Open **Actions → Deploy → Run workflow**.
-2. Enter the Git ref to deploy: a branch, tag or commit. It defaults to `main`.
+2. Enter the Git ref to deploy: a branch, tag or commit SHA. It defaults to `main`, and must resolve to a commit on main's history. Any other commit fails before its code runs: the deploy step hands that code the secrets, and the environment's branch rules only see the ref the workflow was started from, not this input.
 3. If the `qualification` environment has required reviewers, a reviewer approves the run.
 
 The job checks that the generated `wrangler.jsonc` matches `cloudflare.config.ts`, builds the board, then runs `wrangler deploy`, which builds and pushes the sandbox image with the runner's Docker. Its summary shows the deployed version ID and URL, and the run links the URL from the environment.
@@ -42,7 +42,7 @@ Only one deploy runs at a time, and a running one is never cancelled. GitHub kee
 
 ## Rolling back
 
-To return to an earlier commit, run the workflow again with that commit's SHA as the ref. This rebuilds and redeploys it through the same checks.
+To return to an earlier commit of main, run the workflow again with that commit's SHA as the ref. This rebuilds and redeploys it through the same checks.
 
 To return to an earlier Worker version without rebuilding, use **Workers & Pages → railhead → Deployments** in the dashboard, or, logged in to the account, from `packages/railhead-backend`:
 
