@@ -38,7 +38,13 @@ export interface GitGrant {
   fence: { claimId: ClaimId; generation: number } | null;
 }
 
-/** Issues and claims. */
+/**
+ * Issues and claims.
+ *
+ * `currentGeneration` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
+ * until that transaction commits. Read outside a transaction, the result may already be stale.
+ */
 export interface ClaimsPort {
   /** The agent's active claim, or `null`. */
   activeClaim(agent: AgentPrincipal): Promise<PortResult<ClaimView | null>>;
@@ -57,6 +63,12 @@ export interface ClaimsPort {
   ): Promise<PortResult<ReadyResult>>;
   /** The claim's current pin, for the train. Fails unless the claim is ready. */
   pin(claimId: ClaimId): Promise<PortResult<ClaimPin>>;
+  /**
+   * The claim's current ownership generation, or `null` when it is unknown, such as for an unknown
+   * or released claim or a missing module. Call it only inside the caller's transaction; a pin is
+   * current only if its generation equals this one, and `null` is a refusal.
+   */
+  currentGeneration(claimId: ClaimId): number | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */
