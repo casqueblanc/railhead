@@ -20,6 +20,8 @@ import {
   createAdaptation,
   MAX_SETTLE_PER_CALL,
   MAX_SETTLE_TRIES,
+  RETRY_BASE_MS,
+  RETRY_MAX_MS,
   type AdaptationPort,
   type AdaptationReaders,
 } from "../src/train/adaptation/adaptation";
@@ -146,6 +148,12 @@ interface Harness {
   world: World;
   /** Rows in each adaptation table. */
   counts(): { landings: number; claims: number; adaptations: number };
+  /** Every time the module asked the Repo's alarm for, oldest first. */
+  wakes: number[];
+  /** The clock's current time. */
+  now(): number;
+  /** Moves the clock forward. */
+  advance(ms: number): void;
 }
 
 async function withAdaptation<R>(
@@ -155,10 +163,12 @@ async function withAdaptation<R>(
 ): Promise<R> {
   return runInDurableObject(stub, async (_instance, state) => {
     let now = 1_000;
+    const wakes: number[] = [];
     const port = createAdaptation({
       storage: state.storage,
       readers: () => world.readers(),
       clock: () => (now += 1),
+      wake: (at) => wakes.push(at),
     });
     const count = (table: string): number =>
       state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
@@ -170,6 +180,11 @@ async function withAdaptation<R>(
         claims: count("adaptation_claims"),
         adaptations: count("adaptations"),
       }),
+      wakes,
+      now: () => now,
+      advance: (ms) => {
+        now += ms;
+      },
     });
   });
 }
@@ -372,7 +387,7 @@ describe("failures", () => {
   it("keeps a landing pending when a reader throws, then settles it at the next landing", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await withAdaptation(({ adaptation, world, counts }) => {
+      await withAdaptation(({ adaptation, world, counts, advance }) => {
         world.failure = new TypeError("storage gone");
         expect(adaptation.recordLanding(INTENT)).toMatchObject({ outcome: null, tries: 1 });
         // The throw rolled back everything the settlement wrote; only the pending row is kept.
@@ -382,6 +397,7 @@ describe("failures", () => {
         );
 
         world.failure = null;
+        advance(RETRY_BASE_MS);
         world.intents.set("int_intent002", intentOf({ intentId: "int_intent002", pins: [] }));
         adaptation.recordLanding("int_intent002");
         expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
@@ -418,18 +434,81 @@ describe("failures", () => {
   });
 
   it("settles at most a bounded number of pending landings per call", async () => {
-    await withAdaptation(({ adaptation, world }) => {
+    await withAdaptation(({ adaptation, world, advance }) => {
       const ids = Array.from(
         { length: MAX_SETTLE_PER_CALL + 2 },
         (_, n) => `int_pending${String(n).padStart(3, "0")}`,
       );
       for (const id of ids) adaptation.recordLanding(id);
       for (const id of ids) world.intents.set(id, intentOf({ intentId: id }));
-      // The call settles its own landing and only the least recently tried others.
+      advance(RETRY_MAX_MS);
+      // The call settles its own landing and only the least recently due others.
       adaptation.recordLanding(INTENT);
       const settled = ids.filter((id) => adaptation.landing(id)?.outcome === "adapted");
       expect(settled).toHaveLength(MAX_SETTLE_PER_CALL - 1);
       expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+    });
+  });
+});
+
+describe("owe and resume", () => {
+  it("owes a landing due now, and the alarm settles it", async () => {
+    await withAdaptation(async ({ adaptation, counts, wakes, now }) => {
+      adaptation.owe(INTENT);
+      adaptation.owe(INTENT);
+      expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 0, claims: [] });
+      expect(counts()).toEqual({ landings: 1, claims: 0, adaptations: 0 });
+      expect(wakes.at(-1)).toBeLessThanOrEqual(now());
+      await adaptation.resume();
+      expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+      expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
+    });
+  });
+
+  it("refuses to owe an id that is not an intent, writing nothing", async () => {
+    await withAdaptation(({ adaptation, counts, wakes }) => {
+      for (const id of ["", "clm_claim001", "int_bad id!"]) {
+        expect(() => adaptation.owe(id)).toThrow("the landing does not name an intent");
+      }
+      expect(counts()).toEqual({ landings: 0, claims: 0, adaptations: 0 });
+      expect(wakes).toEqual([]);
+    });
+  });
+
+  it("backs off a pending landing and retries it only once it is due", async () => {
+    await withAdaptation(async ({ adaptation, world, wakes, now, advance }) => {
+      world.decisions.delete(DECISION);
+      adaptation.owe(INTENT);
+      await adaptation.resume();
+      expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 1 });
+      const due = wakes.at(-1);
+      expect(due).toBeGreaterThanOrEqual(now() + RETRY_BASE_MS - 2);
+
+      world.decisions.set(DECISION, { version: 1, option: "chunk" });
+      // Not due yet: nothing is read again.
+      await adaptation.resume();
+      expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 1 });
+
+      advance(RETRY_BASE_MS);
+      await adaptation.resume();
+      expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+      // Nothing is pending, so no further wake is asked for.
+      const asked = wakes.length;
+      await adaptation.resume();
+      expect(wakes).toHaveLength(asked);
+    });
+  });
+
+  it("settles at most a bounded number of due landings per alarm", async () => {
+    await withAdaptation(async ({ adaptation }) => {
+      const ids = Array.from(
+        { length: MAX_SETTLE_PER_CALL + 1 },
+        (_, n) => `int_pending${String(n).padStart(3, "0")}`,
+      );
+      for (const id of ids) adaptation.owe(id);
+      await adaptation.resume();
+      const tried = ids.filter((id) => (adaptation.landing(id)?.tries ?? 0) > 0);
+      expect(tried).toHaveLength(MAX_SETTLE_PER_CALL);
     });
   });
 });
@@ -439,9 +518,14 @@ async function land(
   stub: DurableObjectStub,
   world: World,
   adaptationOf: (context: RepoContext, ports: () => RepoPorts) => AdaptationPort,
-): Promise<{ states: string[]; landing: ReturnType<AdaptationPort["landing"]> }> {
+): Promise<{
+  states: string[];
+  landing: ReturnType<AdaptationPort["landing"]>;
+  wakes: number[];
+}> {
   return runInDurableObject(stub, async (_instance, state) => {
     let now = 1_000;
+    const wakes: number[] = [];
     const log = EventLog.open(state.storage, REPO_ID, () => now);
     const context: RepoContext = {
       repoId: REPO_ID,
@@ -449,7 +533,7 @@ async function land(
       log,
       clock: () => (now += 1),
       env,
-      wake: () => {},
+      wake: (at) => wakes.push(at),
     };
     const composed = composeRepo(context);
     let main = MAIN;
@@ -512,12 +596,11 @@ async function land(
     expect(await train.enqueue(pinOf(ATLAS))).toEqual(ok({ queued: true }));
     const attempt = started.at(-1);
     if (attempt === undefined) throw new Error("no check was started");
-    expect(await train.recordCheck(reportOf({ attemptId: attempt.attemptId }))).toMatchObject({
-      ok: true,
-    });
+    await train.recordCheck(reportOf({ attemptId: attempt.attemptId }));
     return {
       states: train.entries(8).map((entry) => entry.state),
       landing: port.landing(INTENT),
+      wakes,
     };
   });
 }
@@ -536,28 +619,68 @@ describe("train landing", () => {
     });
   });
 
-  it("lands the batch when adaptation throws, and keeps a failed settlement for retry", async () => {
+  it("lands the batch when settling throws, and the alarm adapts it after a restart", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const throwing = await land(env.REPO.getByName(crypto.randomUUID()), new World(), () => ({
+      const stub = env.REPO.getByName(crypto.randomUUID());
+      const world = new World();
+      const throwing = await land(stub, world, (context, ports) => ({
+        ...adaptationModule(context, ports),
         recordLanding: () => {
           throw new TypeError("adaptation is broken");
         },
-        adapted: () => null,
-        landing: () => null,
       }));
       expect(throwing.states).toEqual(["landed"]);
+      expect(throwing.landing).toEqual({ intentId: INTENT, outcome: null, claims: [], tries: 0 });
+      expect(throwing.wakes.length).toBeGreaterThan(0);
       expect(errors).toHaveBeenCalledWith(
         JSON.stringify({ event: "train.adaptation_failed", repo: REPO_ID, error: "TypeError" }),
       );
 
-      const world = new World();
-      world.decisions.delete(DECISION);
-      const pending = await land(env.REPO.getByName(crypto.randomUUID()), world, adaptationModule);
-      expect(pending.states).toEqual(["landed"]);
-      expect(pending.landing).toMatchObject({ outcome: null, tries: 1 });
+      // The Repo restarts; its alarm resumes the owed landing from storage alone.
+      await evictDurableObject(stub);
+      await withAdaptation(
+        async ({ adaptation, advance }) => {
+          // The alarm fires at the time the landing asked for, after the restarted clock.
+          advance(Math.max(...throwing.wakes));
+          await adaptation.resume();
+          expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+          expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
+        },
+        stub,
+        world,
+      );
     } finally {
       errors.mockRestore();
     }
+  });
+
+  it("keeps the batch unlanded when the adaptation cannot be owed", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const refused = await land(
+        env.REPO.getByName(crypto.randomUUID()),
+        new World(),
+        (context, ports) => ({
+          ...adaptationModule(context, ports),
+          owe: () => {
+            throw new TypeError("storage refused");
+          },
+        }),
+      );
+      // The landing rolled back with it; the train lands the batch again on a later drive.
+      expect(refused.states).toEqual(["batched"]);
+      expect(refused.landing).toBeNull();
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("keeps a settlement it cannot decide pending, owed in the landing", async () => {
+    const world = new World();
+    world.decisions.delete(DECISION);
+    const pending = await land(env.REPO.getByName(crypto.randomUUID()), world, adaptationModule);
+    expect(pending.states).toEqual(["landed"]);
+    expect(pending.landing).toMatchObject({ outcome: null, tries: 1 });
   });
 });

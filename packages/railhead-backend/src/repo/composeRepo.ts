@@ -144,6 +144,7 @@ export function resumables(ports: RepoPorts): readonly Resumable[] {
   return [
     { module: "git", resume: () => ports.git.resume() },
     { module: "train", resume: () => ports.train.resume() },
+    { module: "adaptation", resume: () => ports.adaptation.resume() },
   ];
 }
 

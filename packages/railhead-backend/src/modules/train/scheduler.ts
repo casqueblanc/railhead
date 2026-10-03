@@ -704,8 +704,10 @@ export function createTrain(
     fenced(generation, () => {
       for (const pin of batch.pins) settleEntry(sql, pin, "landed", null, now);
       settleBatch(sql, batch.batchId, { state: "landed" }, now);
-      // Adaptation never undoes a landing: it settles in its own nested transaction, keeps what it
-      // cannot settle pending for the next landing, and a throw here is logged and dropped.
+      // The adaptation is owed in the landing's own transaction, so neither commits without the
+      // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
+      // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
+      ports().adaptation.owe(intentId);
       try {
         ports().adaptation.recordLanding(intentId);
       } catch (error) {

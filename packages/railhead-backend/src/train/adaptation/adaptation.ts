@@ -12,11 +12,13 @@
 //   that version chose;
 // - the claim depended on that version when it landed.
 //
-// The train calls `recordLanding` inside the transaction that marks a batch landed. Each landing is
-// settled in its own nested transaction, so a refusal or a throw rolls back only the adaptation,
-// never the landing. A landing whose facts cannot be read yet (a reader reports unknown, or the
-// intent has not settled) stays pending and is settled again at the next `recordLanding`, up to
-// `MAX_SETTLE_TRIES` times. A landing that settled stays settled; `adapted` re-checks the decision's
+// The train calls `owe` inside the transaction that marks a batch landed, so the landing and its
+// pending adaptation commit together: if `owe` throws, the landing rolls back and the train lands it
+// again. It then calls `recordLanding`, which settles the landing in its own nested transaction, so
+// a refusal or a throw rolls back only the settlement and leaves the landing pending. A pending
+// landing (its settlement threw, a reader reported unknown, or the intent has not settled) is
+// retried with a doubling backoff by the Repo's alarm through `resume`, and by later landings, up
+// to `MAX_SETTLE_TRIES` times. A landing that settled stays settled; `adapted` re-checks the decision's
 // current version and option every time it is read, so a later supersession removes the adaptation
 // without rewriting it.
 //
@@ -47,17 +49,25 @@ export const MAX_SETTLE_PER_CALL = 8;
 /** How many times a pending landing is read before it is settled as `unknown`. */
 export const MAX_SETTLE_TRIES = 16;
 
+/** The delay before a pending landing is retried after its first try. Each try doubles it. */
+export const RETRY_BASE_MS = 1_000;
+
+/** The longest delay before a pending landing is retried. */
+export const RETRY_MAX_MS = 5 * 60_000;
+
 /** Released schema steps. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [
-  // One row per landed intent. `outcome` is `NULL` while the landing is pending.
+  // One row per landed intent. `outcome` is `NULL` while the landing is pending, and `next_at` is
+  // when a pending landing is next due.
   `CREATE TABLE adaptation_landings (
     intent_id TEXT PRIMARY KEY,
     outcome TEXT,
     tries INTEGER NOT NULL CHECK (tries >= 0),
+    next_at INTEGER NOT NULL,
     recorded_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   ) STRICT`,
-  "CREATE INDEX adaptation_landings_pending ON adaptation_landings (updated_at) WHERE outcome IS NULL",
+  "CREATE INDEX adaptation_landings_pending ON adaptation_landings (next_at) WHERE outcome IS NULL",
   // The claims a landing merged, and the decision versions each depended on when it landed, as JSON.
   // `decisions` is `NULL` when they could not be read; such a claim never adapts from this landing.
   `CREATE TABLE adaptation_claims (
@@ -142,8 +152,14 @@ export interface LandingRecord {
  */
 export interface AdaptationPort {
   /**
+   * Records, inside the caller's transaction, that the intent landed and its adaptation is owed,
+   * and asks the Repo's alarm to settle it. A repeat records nothing more. Throws on an id that is
+   * not an intent, so the caller's landing rolls back rather than landing without it.
+   */
+  owe(intentId: IntentId): void;
+  /**
    * Records that the intent landed and settles it, together with up to `MAX_SETTLE_PER_CALL - 1`
-   * other pending landings, oldest attempt first. Returns the intent's record, or `null` for an
+   * other pending landings that are due, least recently due first. Returns the intent's record, or `null` for an
    * id that is not an intent. A settlement that throws rolls back alone and stays pending.
    */
   recordLanding(intentId: IntentId): LandingRecord | null;
@@ -154,6 +170,11 @@ export interface AdaptationPort {
   adapted(claimId: ClaimId, decisionId: DecisionId): boolean | null;
   /** What was recorded about the intent's landing, or `null` when nothing was. */
   landing(intentId: IntentId): LandingRecord | null;
+  /**
+   * Called by the Repo's alarm. Settles up to `MAX_SETTLE_PER_CALL` pending landings that are due
+   * and asks for the next wake while any stay pending. A throwing settlement stays pending.
+   */
+  resume(): Promise<void>;
 }
 
 /** The fence readers adaptation reads, each inside the transaction it settles in. */
@@ -176,6 +197,8 @@ export interface AdaptationDeps {
   readers: () => AdaptationReaders;
   /** The current time. */
   clock: () => number;
+  /** Asks the Repo's alarm to run no later than `at`. */
+  wake: (at: number) => void;
 }
 
 interface LandingRow extends Record<string, SqlStorageValue> {
@@ -197,9 +220,17 @@ interface AdaptationRow extends Record<string, SqlStorageValue> {
 /** A settlement that cannot be decided yet. */
 const PENDING = null;
 
+/** An `owe` call refused. It throws inside the caller's transaction, which rolls back. */
+export class AdaptationWriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AdaptationWriteError";
+  }
+}
+
 /** Builds the adaptation module, creating or migrating its tables first. */
 export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
-  const { storage, readers, clock } = deps;
+  const { storage, readers, clock, wake } = deps;
   migrate(storage, ADAPTATION_OWNER, MIGRATIONS);
   const sql = storage.sql;
 
@@ -306,6 +337,45 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     return "adapted";
   }
 
+  // Records the landing as owed and due now, once.
+  function insertOwed(intentId: IntentId): void {
+    const now = clock();
+    sql.exec(
+      `INSERT OR IGNORE INTO adaptation_landings
+         (intent_id, outcome, tries, next_at, recorded_at, updated_at)
+       VALUES (?, NULL, 0, ?, ?, ?)`,
+      intentId,
+      now,
+      now,
+      now,
+    );
+  }
+
+  // Pending landings that are due, least recently due first, besides `except`.
+  function due(limit: number, except: IntentId | null): IntentId[] {
+    return sql
+      .exec<{ intent_id: string }>(
+        `SELECT intent_id FROM adaptation_landings
+         WHERE outcome IS NULL AND next_at <= ? AND intent_id != ?
+         ORDER BY next_at, intent_id LIMIT ?`,
+        clock(),
+        except ?? "",
+        limit,
+      )
+      .toArray()
+      .map((row) => row.intent_id);
+  }
+
+  // Asks the alarm for the earliest pending landing, if any. Call it as a transaction's last write.
+  function requestWake(): void {
+    const row = sql
+      .exec<{ next: number | null }>(
+        "SELECT MIN(next_at) AS next FROM adaptation_landings WHERE outcome IS NULL",
+      )
+      .toArray()[0];
+    if (row?.next !== null && row?.next !== undefined) wake(row.next);
+  }
+
   // Settles one pending landing in its own nested transaction. A throw rolls back what it wrote and
   // counts a try, like an unknown reader.
   function settle(intentId: IntentId): void {
@@ -334,43 +404,47 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
       outcome = PENDING;
     }
     if (outcome !== PENDING) return;
+    const tries = (landingRow(intentId)?.tries ?? 0) + 1;
+    const now = clock();
     sql.exec(
       `UPDATE adaptation_landings
-       SET tries = tries + 1, updated_at = ?,
-           outcome = CASE WHEN tries + 1 >= ? THEN 'unknown' ELSE NULL END
+       SET tries = ?, next_at = ?, updated_at = ?,
+           outcome = CASE WHEN ? >= ? THEN 'unknown' ELSE NULL END
        WHERE intent_id = ?`,
-      clock(),
+      tries,
+      now + retryDelay(tries),
+      now,
+      tries,
       MAX_SETTLE_TRIES,
       intentId,
     );
   }
 
   return {
+    owe(intentId) {
+      if (!isId("intent", intentId)) {
+        throw new AdaptationWriteError("the landing does not name an intent");
+      }
+      insertOwed(intentId);
+      requestWake();
+    },
+
     recordLanding(intentId) {
       if (!isId("intent", intentId)) return null;
       return atomically(storage, () => {
-        const now = clock();
-        sql.exec(
-          `INSERT OR IGNORE INTO adaptation_landings (intent_id, outcome, tries, recorded_at,
-             updated_at)
-           VALUES (?, NULL, 0, ?, ?)`,
-          intentId,
-          now,
-          now,
-        );
-        const others = sql
-          .exec<{ intent_id: string }>(
-            `SELECT intent_id FROM adaptation_landings
-             WHERE outcome IS NULL AND intent_id != ?
-             ORDER BY updated_at, intent_id LIMIT ?`,
-            intentId,
-            MAX_SETTLE_PER_CALL - 1,
-          )
-          .toArray()
-          .map((row) => row.intent_id);
+        insertOwed(intentId);
+        const others = due(MAX_SETTLE_PER_CALL - 1, intentId);
         if (landingRow(intentId)?.outcome === null) settle(intentId);
         for (const other of others) settle(other);
+        requestWake();
         return record(intentId);
+      });
+    },
+
+    async resume() {
+      atomically(storage, () => {
+        for (const intentId of due(MAX_SETTLE_PER_CALL, null)) settle(intentId);
+        requestWake();
       });
     },
 
@@ -411,6 +485,11 @@ function landedCommit(intent: MergeIntentRecord): CommitSha | "not_landed" | typ
     default:
       return unreachable(intent.status);
   }
+}
+
+/** How long a landing waits after its `tries`-th unsettled try. */
+function retryDelay(tries: number): number {
+  return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(tries - 1, 20));
 }
 
 function readOutcome(value: string): LandingOutcome {
