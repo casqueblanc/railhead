@@ -39,6 +39,7 @@ export type AgentCommand =
   | { route: "work" }
   | { route: "claim"; body: ClaimRequest }
   | { route: "ready"; claimId: ClaimId; body: ReadyRequest }
+  | { route: "pin" }
   | { route: "inbox"; limit: number }
   | { route: "ack"; item: number; body: AckRequest }
   | { route: "ask"; claimId: ClaimId; body: AskRequest }
@@ -93,6 +94,7 @@ export async function dispatchAgent(
     case "work":
     case "claim":
     case "ready":
+    case "pin":
     case "inbox":
     case "ack":
     case "ask":
@@ -150,6 +152,15 @@ async function runSessionCommand(
       return located(remotes, await ports.claims.claim(agent, command.body.issueId));
     case "ready":
       return located(remotes, await ports.claims.ready(agent, command.claimId, command.body));
+    case "pin": {
+      // Only the caller's own ready claim, at its current generation: an older generation's pin
+      // may have been another agent's.
+      const claim = await ports.claims.activeClaim(agent);
+      if (!claim.ok) return claim;
+      if (claim.value === null || claim.value.state !== "ready") return ok({ pin: null });
+      const pin = await ports.train.pinView(claim.value.claimId, claim.value.generation);
+      return pin.ok ? ok({ pin: pin.value }) : pin;
+    }
     case "inbox":
       return ports.inbox.pending(agent, command.limit);
     case "ack":

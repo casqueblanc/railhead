@@ -89,6 +89,8 @@ pub enum AgentRoute {
     Claim,
     /// Pin a commit for the train.
     Ready,
+    /// Where the calling agent's pin stands on the train.
+    Pin,
     /// Unacknowledged inbox items.
     Inbox,
     /// Acknowledge one inbox item.
@@ -101,7 +103,7 @@ pub enum AgentRoute {
 
 impl AgentRoute {
     /// Every route, in the order of the route table.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Join,
         Self::Challenge,
         Self::Session,
@@ -109,6 +111,7 @@ impl AgentRoute {
         Self::Work,
         Self::Claim,
         Self::Ready,
+        Self::Pin,
         Self::Inbox,
         Self::Ack,
         Self::Ask,
@@ -126,6 +129,7 @@ impl AgentRoute {
             Self::Work => "work",
             Self::Claim => "claim",
             Self::Ready => "ready",
+            Self::Pin => "pin",
             Self::Inbox => "inbox",
             Self::Ack => "ack",
             Self::Ask => "ask",
@@ -137,7 +141,7 @@ impl AgentRoute {
     #[must_use]
     pub const fn method(self) -> Method {
         match self {
-            Self::Status | Self::Inbox | Self::Question => Method::Get,
+            Self::Status | Self::Pin | Self::Inbox | Self::Question => Method::Get,
             Self::Join
             | Self::Challenge
             | Self::Session
@@ -160,6 +164,7 @@ impl AgentRoute {
             Self::Work => "/work",
             Self::Claim => "/claims",
             Self::Ready => "/claims/{claimId}/ready",
+            Self::Pin => "/pin",
             Self::Inbox => "/inbox",
             Self::Ack => "/inbox/{item}/ack",
             Self::Ask => "/claims/{claimId}/questions",
@@ -176,6 +181,7 @@ impl AgentRoute {
             | Self::Work
             | Self::Claim
             | Self::Ready
+            | Self::Pin
             | Self::Inbox
             | Self::Ack
             | Self::Ask
@@ -194,7 +200,7 @@ impl AgentRoute {
             | Self::Ready
             | Self::Ack
             | Self::Ask => true,
-            Self::Status | Self::Work | Self::Inbox | Self::Question => false,
+            Self::Status | Self::Work | Self::Pin | Self::Inbox | Self::Question => false,
         }
     }
 }
@@ -785,6 +791,102 @@ pub struct ReadyResult {
     pub claim: ClaimView,
     /// `true` when this exact pin was already recorded.
     pub repeated: bool,
+}
+
+/// Where a batch holding a pin stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinBatchState {
+    /// The batch is being composed on main.
+    Forming,
+    /// The batch's candidate is being checked.
+    Checking,
+    /// The candidate edits protected check paths and waits for a person.
+    Held,
+    /// The check passed; the merge is being authorized and main moved.
+    Landing,
+}
+
+/// Why the train took a pin out of its queue without landing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinLeaveReason {
+    /// The claim's current pin is no longer this generation and commit.
+    PinChanged,
+    /// The claim's decision requirements could not be read.
+    RequirementsRefused,
+    /// The change failed its check when checked alone.
+    CheckFailed,
+    /// The change could not be composed alone.
+    ComposeFailed,
+    /// The pin's batches failed for reasons outside it too many times.
+    RetriesExhausted,
+    /// The change conflicts with another claim's.
+    Conflict,
+    /// Checked alone, the change edits protected check paths and waits for a person.
+    CheckHeld,
+}
+
+/// Where a pin stands on the train.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PinTrainState {
+    /// Waiting for a batch.
+    Queued {
+        /// The place in the queue, counting from 1, the next pin a batch takes.
+        position: SafeInteger,
+    },
+    /// In the active batch.
+    Batched {
+        /// The batch.
+        batch_id: SafeInteger,
+        /// Where the batch stands.
+        batch: PinBatchState,
+        /// The `chk_` check run, once one is recorded.
+        #[serde(deserialize_with = "nullable")]
+        check_run_id: Option<String>,
+    },
+    /// Merged to main.
+    Landed,
+    /// Removed from the train; a new `ready` queues the claim again.
+    Dropped {
+        /// Why.
+        reason: PinLeaveReason,
+    },
+    /// Out of the queue until a person or a new push returns it.
+    Parked {
+        /// Why.
+        reason: PinLeaveReason,
+    },
+}
+
+/// The train's view of the calling agent's pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinView {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The ownership generation the pin was recorded under.
+    pub generation: SafeInteger,
+    /// The commit the train holds.
+    pub commit: String,
+    /// A newer pinned commit waiting for the batch holding `commit` to settle.
+    #[serde(deserialize_with = "nullable")]
+    pub next_commit: Option<String>,
+    /// Where it stands.
+    pub state: PinTrainState,
+}
+
+/// `pin` result: only the calling agent's active claim at its current generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinResult {
+    /// The pin, or `None` when the agent has no ready claim or the train holds no pin for it.
+    #[serde(deserialize_with = "nullable")]
+    pub pin: Option<PinView>,
 }
 
 /// `inbox` result.
