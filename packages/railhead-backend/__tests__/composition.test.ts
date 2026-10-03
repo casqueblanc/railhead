@@ -135,7 +135,7 @@ describe("Repo Durable Object", () => {
     const again = repoStub("acme", name);
 
     expect(await again.describe()).toEqual({ repoId, org: "acme", name });
-    const page = await again.readEvents(0, 10);
+    const page = await again.readEvents(0, 10, null);
     if (!page.ok) throw new Error(page.code);
     expect(page.value.events.map((event) => event.seq)).toEqual([1, 2]);
     expect(page.value).toMatchObject({ repo: repoId, cursor: 2, head: 2 });
@@ -151,7 +151,7 @@ describe("Repo Durable Object", () => {
     const stub = repoStub("acme", uniqueName());
 
     expect(await stub.describe()).toBeNull();
-    expect(await stub.readEvents(0, 1)).toMatchObject({ ok: false, code: "not_found" });
+    expect(await stub.readEvents(0, 1, null)).toMatchObject({ ok: false, code: "not_found" });
     expect(await stub.pendingJoins()).toMatchObject({ ok: false, code: "not_found" });
     const tables = await runInDurableObject(stub, (_instance, state) =>
       state.storage.sql
@@ -161,6 +161,43 @@ describe("Repo Durable Object", () => {
         .filter((table) => !table.startsWith("_cf")),
     );
     expect(tables).toEqual([]);
+  });
+
+  it("gives a repository recorded before histories existed a history of its own", async () => {
+    const name = uniqueName();
+    const stub = repoStub("acme", name);
+    const repoId = `rep_${"c".repeat(64)}`;
+    // The repo table and row as the first schema step left them.
+    await runInDurableObject(stub, (_instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec(
+        "CREATE TABLE railhead_migrations (owner TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT",
+      );
+      sql.exec(
+        `CREATE TABLE repo (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          repo_id TEXT NOT NULL,
+          org TEXT NOT NULL,
+          name TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        ) STRICT`,
+      );
+      sql.exec("INSERT INTO railhead_migrations (owner, version) VALUES ('repo', 1)");
+      sql.exec("INSERT INTO repo VALUES (1, ?, 'acme', ?, 0)", repoId, name);
+    });
+    await evictDurableObject(stub);
+
+    const again = repoStub("acme", name);
+    const page = await again.readEvents(0, 1, null);
+    if (!page.ok) throw new Error(page.code);
+    expect(page.value).toMatchObject({ repo: repoId, head: 0 });
+    expect(page.value.history).toMatch(/^[0-9a-f]{32}$/);
+    // The migration ran once: a restart keeps the history it gave.
+    await evictDurableObject(again);
+    expect(await repoStub("acme", name).readEvents(0, 1, page.value.history)).toMatchObject({
+      ok: true,
+      value: { history: page.value.history },
+    });
   });
 
   it("refuses to initialize under another name or with invalid segments", async () => {
@@ -190,11 +227,17 @@ describe("Repo Durable Object", () => {
     const { stub, repoId } = await freshRepo();
     await appendIssues(stub, repoId, 1);
 
-    expect(await stub.readEvents(0, 0)).toMatchObject({ ok: false, code: "invalid_request" });
-    expect(await stub.readEvents(0, 257)).toMatchObject({ ok: false, code: "invalid_request" });
-    expect(await stub.readEvents(-1, 1)).toMatchObject({ ok: false, code: "invalid_request" });
-    expect(await stub.readEvents(2, 1)).toMatchObject({ ok: false, code: "cursor_ahead" });
-    expect(await stub.readEvents(1, 256)).toMatchObject({
+    expect(await stub.readEvents(0, 0, null)).toMatchObject({ ok: false, code: "invalid_request" });
+    expect(await stub.readEvents(0, 257, null)).toMatchObject({
+      ok: false,
+      code: "invalid_request",
+    });
+    expect(await stub.readEvents(-1, 1, null)).toMatchObject({
+      ok: false,
+      code: "invalid_request",
+    });
+    expect(await stub.readEvents(2, 1, null)).toMatchObject({ ok: false, code: "cursor_ahead" });
+    expect(await stub.readEvents(1, 256, null)).toMatchObject({
       ok: true,
       value: { events: [], cursor: 1, head: 1 },
     });
@@ -713,6 +756,34 @@ describe("board RPC lifecycle", () => {
     const resumed = value(await board.readEvents(cursor, 256));
     expect(resumed.events.map((event: RailheadEvent) => event.seq)).toEqual([4]);
     expect(await board.readEvents(5, 1)).toMatchObject({ ok: false, code: "cursor_ahead" });
+  });
+
+  it("pages only under the history the cursor was read in", async () => {
+    const { name, stub, repoId } = await freshRepo();
+    await appendIssues(stub, repoId, 2);
+
+    let history: string;
+    {
+      using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+      using board = value(await api.openBoard("acme", name));
+      const page = value(await board.readEvents(0, 1));
+      expect(page.history).toMatch(/^[0-9a-f]{32}$/);
+      history = page.history;
+    }
+    await evictDurableObject(stub);
+
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using board = value(await api.openBoard("acme", name));
+    const resumed = value(await board.readEvents(1, 256, history));
+    expect(resumed).toMatchObject({ cursor: 2, head: 2, history });
+
+    // Another repository's history, or one this repository no longer holds.
+    const other = "0".repeat(32);
+    expect(await board.readEvents(1, 256, other)).toMatchObject({
+      ok: false,
+      code: "cursor_ahead",
+    });
+    expect(await board.readEvents(0, 1, "")).toMatchObject({ ok: false, code: "cursor_ahead" });
   });
 
   it("answers the module-backed calls with unavailable", async () => {

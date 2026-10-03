@@ -21,6 +21,10 @@ import type {
   BoardListener,
   BoardResult,
   BoardSubscription,
+  DemoSeedAction,
+  DemoSeedApi,
+  DemoSeedResult,
+  DemoSeedState,
   EnrollmentChallenge,
   EventPage,
   OwnerAction,
@@ -35,6 +39,7 @@ import type {
 import type { RailheadEvent, UserId } from "@railhead/shared/events";
 import type { PortResult } from "../contracts/result";
 import { parseEvent } from "../contracts/wireShape";
+import { demoSeedPort, type DemoSeedPort } from "../modules/demoSeed/entry";
 import { ownerEnrollment, type OwnerEnrollmentPort } from "../modules/owner/entry";
 import {
   DELIVERY_TIMEOUT_MS,
@@ -71,6 +76,10 @@ export class RailheadApiImpl extends RpcTarget implements RailheadApi {
   async ownerEnrollment(): Promise<OwnerEnrollmentApi> {
     return new OwnerEnrollmentApiImpl(ownerEnrollment(this.#env));
   }
+
+  async demoSeed(): Promise<DemoSeedApi> {
+    return new DemoSeedApiImpl(demoSeedPort(this.#env));
+  }
 }
 
 /** Read access to one repository's log, and the entry point for its owner's actions. */
@@ -83,8 +92,12 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
     this.#repo = repo;
   }
 
-  async readEvents(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
-    const result = await this.#repo.readEvents(cursor, limit);
+  async readEvents(
+    cursor: number,
+    limit: number,
+    history?: string,
+  ): Promise<BoardResult<EventPage>> {
+    const result = await this.#repo.readEvents(cursor, limit, history ?? null);
     if (!result.ok) return toBoard(result);
     // Workers RPC widens tuple types in transit, so each event's shape is established again.
     const page = result.value;
@@ -95,6 +108,7 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
         events: page.events.map(parseEvent),
         cursor: page.cursor,
         head: page.head,
+        history: page.history,
       },
     };
   }
@@ -102,11 +116,12 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
   async subscribe(
     cursor: number,
     listener: RpcStub<BoardListener>,
+    history?: string,
   ): Promise<BoardResult<BoardSubscription>> {
     // The listener stub is released when this call returns unless it is kept, so the bridge keeps
     // its own duplicate and releases it when the subscription ends.
     const bridge = new ListenerBridge(listener.dup());
-    const result = await this.#repo.subscribe(cursor, bridge);
+    const result = await this.#repo.subscribe(cursor, bridge, history ?? null);
     if (!result.ok) {
       bridge.end();
       return toBoard(result);
@@ -142,6 +157,33 @@ class OwnerApiImpl extends RpcTarget implements OwnerApi {
     assertion: PasskeyAssertion,
   ): Promise<BoardResult<OwnerActionResult>> {
     return toBoard(await this.#repo.performOwnerAction(challengeId, assertion));
+  }
+}
+
+/** The owner's seed and reset of the demo repository. */
+@validateRpc<DemoSeedApi>()
+class DemoSeedApiImpl extends RpcTarget implements DemoSeedApi {
+  readonly #port: DemoSeedPort;
+
+  constructor(port: DemoSeedPort) {
+    super();
+    this.#port = port;
+  }
+
+  async read(): Promise<BoardResult<DemoSeedState | null>> {
+    return toBoard(await this.#port.read());
+  }
+
+  async prepare(action: DemoSeedAction): Promise<BoardResult<ActionChallenge>> {
+    return toBoard(await this.#port.prepare(action));
+  }
+
+  async perform(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+    bundle: Uint8Array | null,
+  ): Promise<BoardResult<DemoSeedResult>> {
+    return toBoard(await this.#port.perform(challengeId, assertion, bundle));
   }
 }
 
@@ -311,6 +353,7 @@ const BOARD_ERROR_CODES = {
   action_stale: true,
   bootstrap_closed: true,
   quota_exceeded: true,
+  busy: true,
   unavailable: true,
   internal: true,
 } as const satisfies Record<BoardErrorCode, true>;
