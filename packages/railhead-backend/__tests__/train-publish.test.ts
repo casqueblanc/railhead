@@ -148,6 +148,8 @@ interface Harness {
    * the next drive.
    */
   queue(pin: ClaimPin): PortResult<{ queued: boolean }>;
+  /** How many of the next composes refuse as `unavailable`. */
+  composeFailures: number;
 }
 
 /**
@@ -213,8 +215,13 @@ function withRepo<R>(
       },
       decisions: { ...real.decisions, requirements: async () => ok([]), currentVersions },
       merge: {
-        compose: async (main, composed) =>
-          ok({ kind: "clean", candidate: candidateOf(main, composed) }),
+        compose: async (main, composed) => {
+          if (harness.composeFailures > 0) {
+            harness.composeFailures -= 1;
+            return fail("unavailable", "The merge service is down.");
+          }
+          return ok({ kind: "clean", candidate: candidateOf(main, composed) });
+        },
         discard: async () => ok({ removed: 1 }),
       },
       checks: {
@@ -235,7 +242,7 @@ function withRepo<R>(
       createTrain(context, () => ports),
       log,
     );
-    return body({
+    const harness: Harness = {
       get train() {
         return train;
       },
@@ -264,7 +271,9 @@ function withRepo<R>(
         return train;
       },
       queue: (queued) => log.transaction((tx) => train.queue(tx, queued, 1)).value,
-    });
+      composeFailures: 0,
+    };
+    return body(harness);
   });
 }
 
@@ -695,6 +704,46 @@ describe("the train's settle wake", () => {
       await h.alarm();
       expect(batchStates(h.train)).toEqual([["landed", null]]);
       expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(readWake(h.sql)).toBeNull();
+    });
+  });
+
+  it("gives the next batch a fresh budget once a settle drive lands the stranded one", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withRepo(ref, [pin(1), pin(2)], async (h) => {
+      await h.train.enqueue(pin(1));
+      ref.down = true;
+      const first = await pass(h);
+      // Claim 2's pin waits behind the active batch while the retries run out.
+      expect(h.queue(pin(2))).toEqual(ok({ queued: true }));
+      await exhaust(h);
+      expect(readWake(h.sql)?.failures).toBe(EXHAUSTED_FAILURES);
+
+      // Git recovers: the settle drive lands batch A, forms batch B, and its compose fails once.
+      ref.down = false;
+      h.composeFailures = 1;
+      const asked = h.wakes.length;
+      await h.alarm();
+      expect(ref.main).toBe(first.candidate);
+      expect(batchStates(h.train)).toEqual([
+        ["landed", null],
+        ["composing", null],
+      ]);
+      const retry = readWake(h.sql);
+      expect(retry?.failures).toBe(1);
+      // The retry asked for the alarm; batch A's discard asked for its own.
+      expect(h.wakes.slice(asked)).toContain(retry?.dueAt);
+
+      // The alarm alone retries batch B, with no further call, and it lands.
+      await h.alarm();
+      expect(h.started.at(-1)?.pins).toEqual([pin(2)]);
+      const second = await pass(h);
+      expect(ref.main).toBe(second.candidate);
+      expect(batchStates(h.train)).toEqual([
+        ["landed", null],
+        ["landed", null],
+      ]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed", clm_claim002: "landed" });
       expect(readWake(h.sql)).toBeNull();
     });
   });

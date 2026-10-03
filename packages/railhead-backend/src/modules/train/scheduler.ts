@@ -30,6 +30,7 @@
 // write attempt counted, or settled without the batch recording it: that write may have moved main
 // unheard, and no call may come to read main back or record the outcome. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
 // exhausted, so the intent settles once Git answers or the write's outcome window has passed.
+// Settling any batch restores a fresh count, so the work that settlement exposes has its own retries.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
 // exhausted one only while such an intent is unsettled.
@@ -840,7 +841,7 @@ export function createTrain(
         }
       }
       requeueFront(sql, unchecked.map(asFreshWork), now);
-      settleBatch(sql, batch.batchId, { state: "landed" }, now);
+      closeBatch(batch.batchId, { state: "landed" }, now);
       promoteDeferred(sql, now);
       // The adaptation is owed in the landing's own transaction, so neither commits without the
       // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
@@ -881,10 +882,25 @@ export function createTrain(
     promoteDeferred(sql, now);
   }
 
+  /**
+   * Settles the active batch inside the caller's transaction. The failures counted so far belonged
+   * to that batch, so the wake keeps its due time with a fresh count: work the settlement exposes
+   * gets its own retries, even in a settle drive that started exhausted.
+   */
+  function closeBatch(
+    batchId: number,
+    outcome: { state: "landed" } | { state: "failed"; failure: BatchFailure },
+    now: number,
+  ): void {
+    settleBatch(sql, batchId, outcome, now);
+    const wake = readWake(sql);
+    if (wake !== null && wake.failures !== 0) writeWake(sql, { dueAt: wake.dueAt, failures: 0 });
+  }
+
   /** Settles a failed batch's entries, before any newer commit they held is queued. */
   function requeueFailed(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
-    settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
+    closeBatch(batch.batchId, { state: "failed", failure }, now);
     const held = failure === "check_held";
     const definitive = isDefinitive(failure);
     const returned: Returned[] = [];
@@ -940,7 +956,7 @@ export function createTrain(
     log.transaction((tx) => {
       if (!holds(generation)) throw new DriveSuperseded();
       const entries = orderAsBatch(batch, batchedEntries(sql));
-      settleBatch(sql, batch.batchId, { state: "failed", failure: "conflict" }, now);
+      closeBatch(batch.batchId, { state: "failed", failure: "conflict" }, now);
       const parked = (entry: QueueEntry) =>
         !renewed(entry) && (samePin(entry.pin, first) || samePin(entry.pin, second));
       for (const entry of entries.filter(parked)) {
