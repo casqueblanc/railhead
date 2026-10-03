@@ -183,6 +183,7 @@ function withRepo<R>(
       merge: {
         compose: async (main, composed) =>
           ok({ kind: "clean", candidate: candidateOf(main, composed) }),
+        discard: async () => ok({ removed: 1 }),
       },
       checks: {
         definitions: async (main) =>
