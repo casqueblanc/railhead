@@ -921,10 +921,7 @@ async function startedRepository(): Promise<{
   stub: DurableObjectStub<Repo>;
   params: CheckRunParams;
 }> {
-  const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
-  const stub = env.REPO.getByName(repoObjectName("acme", name));
-  const summary = await stub.initialize("acme", name);
-  if (!summary.ok) throw new Error(summary.code);
+  const { stub, repoId } = await initializedRepository();
   const attemptId = `chk_${crypto.randomUUID().replaceAll("-", "")}`;
   const digest = "d".repeat(64);
   await runInDurableObject(stub, async (_instance, state) => {
@@ -935,26 +932,12 @@ async function startedRepository(): Promise<{
       now + 60_000,
       now,
     );
-    // The train asked for this attempt's run and waits for its report, as `startCheck` leaves it.
-    const { sql } = state.storage;
-    const batchId = insertBatch(
-      sql,
-      {
-        expectedMain: MAIN,
-        pins: [{ claimId: "clm_pinned01", generation: 1, commit: OTHER }],
-        decisions: [],
-        definition: { name: "test", source: MAIN, digest, acceptance: null },
-      },
-      now,
-    );
-    recordCandidate(sql, batchId, CANDIDATE, attemptId, now);
-    requestCheck(sql, batchId, now + CHECK_DEADLINE_MS, now);
-    markCheckStarted(sql, batchId, now);
+    waitingBatch(state.storage.sql, attemptId, digest, now);
   });
   return {
     stub,
     params: {
-      repoId: summary.value.repoId,
+      repoId,
       attemptId,
       candidate: CANDIDATE,
       digest,
@@ -967,9 +950,35 @@ async function startedRepository(): Promise<{
   };
 }
 
+/** A fresh, initialized repository. */
+async function initializedRepository(): Promise<{ stub: DurableObjectStub<Repo>; repoId: string }> {
+  const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+  const stub = env.REPO.getByName(repoObjectName("acme", name));
+  const summary = await stub.initialize("acme", name);
+  if (!summary.ok) throw new Error(summary.code);
+  return { stub, repoId: summary.value.repoId };
+}
+
+/** The train's batch waiting for `attemptId`'s report, as its `startCheck` leaves it. */
+function waitingBatch(sql: SqlStorage, attemptId: string, digest: string, now: number): void {
+  const batchId = insertBatch(
+    sql,
+    {
+      expectedMain: MAIN,
+      pins: [{ claimId: "clm_pinned01", generation: 1, commit: OTHER }],
+      decisions: [],
+      definition: { name: "test", source: MAIN, digest, acceptance: null },
+    },
+    now,
+  );
+  recordCandidate(sql, batchId, CANDIDATE, attemptId, now);
+  requestCheck(sql, batchId, now + CHECK_DEADLINE_MS, now);
+  markCheckStarted(sql, batchId, now);
+}
+
 /** The results the train recorded for `attemptId` on the candidate, from `stub`'s event log. */
 async function trainResults(stub: DurableObjectStub<Repo>, attemptId: string): Promise<string[]> {
-  const page = await stub.readEvents(0, 100);
+  const page = await stub.readEvents(0, 100, null);
   if (!page.ok) throw new Error(page.code);
   return page.value.events.flatMap((event) =>
     event.type === "train.check" &&
@@ -1076,5 +1085,126 @@ describe("a check run at the real Workflows step boundary", () => {
     );
     expect(await trainResults(stub, params.attemptId)).toEqual([]);
     consoleError.mockRestore();
+  });
+});
+
+describe("the checks module as the Repo composes it", () => {
+  it("starts one run through its entry, and a repeat after a lost create answer starts no other", async () => {
+    const { stub, repoId } = await initializedRepository();
+    const attemptId = `chk_${crypto.randomUUID().replaceAll("-", "")}`;
+    const repository = new FakeRepository();
+    const text = definitionText();
+    repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: text });
+    repository.commit(CANDIDATE, { [CHECK_DEFINITION_PATH]: text, "src/app.ts": "candidate" });
+    const check = await parseTrustedCheck(encoder.encode(text), MAIN);
+    if (check === null) throw new Error("invalid fixture");
+
+    // Artifacts serves the fake repository under whatever name the entry derives.
+    const opened: string[] = [];
+    const artifacts = {
+      get: async (name: string) => {
+        opened.push(name);
+        return {
+          readFile: async ({ ref, path }: { ref: string; path: string }) => {
+            const bytes = await repository.readFile(ref, path, MAX_DEFINITION_BYTES);
+            return bytes === null ? null : new Blob([bytes]);
+          },
+          readCommit: async (hash: string) => {
+            const treeHash = await repository.rootTree(hash);
+            return treeHash === null ? null : { treeHash };
+          },
+          readTree: (hash: string) => repository.readTree(hash),
+          [Symbol.dispose]: () => {},
+        };
+      },
+    };
+    // Each sandbox the admission starts, through the sandbox module's real driver.
+    const starts: { name: string; deadline: number }[] = [];
+    const sandboxes = {
+      idFromName: (name: string) => name,
+      get: (name: string) => ({
+        railheadStart: async (_policy: unknown, deadline: number) => {
+          starts.push({ name, deadline });
+        },
+        railheadRetire: async () => {},
+      }),
+    };
+    // The first create reaches Workflows, but its answer is lost.
+    let creates = 0;
+    const checks = {
+      createBatch: async (batch: WorkflowInstanceCreateOptions[]) => {
+        creates += 1;
+        const created = await env.CHECKS.createBatch(batch);
+        if (creates === 1) throw new Error("the answer was lost");
+        return created;
+      },
+    };
+    const configured: Env = { ...env, CLOUDFLARE_ACCOUNT_ID: "0".repeat(32) };
+    Reflect.set(configured, "ARTIFACTS", artifacts);
+    Reflect.set(configured, "SANDBOX", sandboxes);
+    Reflect.set(configured, "CHECKS", checks);
+
+    await using instance = await introspectWorkflowInstance(env.CHECKS, attemptId);
+    await instance.modify(async (m) => {
+      await m.mockStepResult(
+        { name: CHECK_RUNNER },
+        { exitCode: 0, logs: { stdout: "12 passed", stderr: "" } },
+      );
+    });
+    const attemptFor = (definition: CheckAttempt["definition"]): CheckAttempt => ({
+      attemptId,
+      expectedMain: MAIN,
+      candidate: CANDIDATE,
+      pins: [],
+      definition,
+      decisions: [],
+      createdAt: Date.now(),
+    });
+    const results = await runInDurableObject(stub, async (_instance, state) => {
+      waitingBatch(state.storage.sql, attemptId, check.definition.digest, Date.now());
+      const ports = composeRepo({
+        repoId,
+        storage: state.storage,
+        log: EventLog.open(state.storage, repoId),
+        clock: Date.now,
+        env: configured,
+        wake: () => {},
+      });
+      const definitions = await ports.checks.definitions(MAIN);
+      const first = await ports.checks.start(attemptFor(check.definition));
+      const second = await ports.checks.start(attemptFor(check.definition));
+      return { definitions, first, second };
+    });
+
+    expect(results.definitions).toEqual(ok([check.definition]));
+    expect(results.first).toEqual(
+      fail("unavailable", "The check run could not be started; ask again."),
+    );
+    expect(results.second).toEqual(ok({ attemptId }));
+    // One slot admitted and started; the repeat asked Workflows again, which ran one instance.
+    expect(starts).toHaveLength(1);
+    expect(starts[0]?.name).toMatch(/^sbx-[0-9a-f]{32}$/);
+    expect(creates).toBe(2);
+    expect(new Set(opened).size).toBe(1);
+    await instance.waitForStatus("complete");
+    expect(await instance.waitForStepResult({ name: REPORT_STEP })).toEqual({ refused: null });
+    expect(await trainResults(stub, attemptId)).toEqual(["pass"]);
+  });
+
+  it("refuses to start anything while the Worker has no account configured", async () => {
+    const { stub, repoId } = await initializedRepository();
+    const result = await runInDurableObject(stub, async (_instance, state) => {
+      const ports = composeRepo({
+        repoId,
+        storage: state.storage,
+        log: EventLog.open(state.storage, repoId),
+        clock: Date.now,
+        env,
+        wake: () => {},
+      });
+      return ports.checks.start(await attempt());
+    });
+
+    expect(result).toEqual(fail("unavailable", "Checks have no Artifacts repository."));
   });
 });
