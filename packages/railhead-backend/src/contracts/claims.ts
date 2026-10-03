@@ -25,6 +25,16 @@ export interface ClaimPin {
   commit: CommitSha;
 }
 
+/**
+ * A pin with the ready episode it was batched in: what a check attempt and a merge intent rest on.
+ * A claim reopened and readied again with the same commit is a new episode, which a check of the
+ * earlier one does not cover.
+ */
+export interface EpisodePin extends ClaimPin {
+  /** The claim's ready episode the pin was batched in. */
+  episode: number;
+}
+
 /** A ready claim's stored pin, as `ClaimsPort.readyPin` reads it. */
 export interface ReadyPin {
   /** The pin at the claim's current generation. */

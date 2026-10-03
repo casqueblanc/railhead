@@ -87,7 +87,7 @@ import {
   type DecisionRef,
   type IntentId,
 } from "@railhead/shared/events";
-import type { ClaimPin } from "../../contracts/claims";
+import type { ClaimPin, EpisodePin } from "../../contracts/claims";
 import {
   fail,
   ok,
@@ -628,7 +628,7 @@ export function createTrain(
       return blocked(null, "definition_invalid", null);
     }
 
-    const pins = members.map((entry) => entry.pin);
+    const pins = members.map((entry) => ({ ...entry.pin, episode: entry.episode }));
     const now = clock();
     const formed = fenced(generation, (): "formed" | "moved" | "unknown" => {
       // A pin queued during the reads above may have settled an entry or queued a newer episode of
@@ -689,7 +689,7 @@ export function createTrain(
     const attempt = `mrg_${crypto.randomUUID().replaceAll("-", "")}`;
     fenced(generation, () => recordMergeAttempt(sql, batch.batchId, attempt, clock()));
     const result = await bounded(generation, "merge", () =>
-      ports().merge.compose(batch.expectedMain, batch.pins, attempt),
+      ports().merge.compose(batch.expectedMain, batch.pins.map(claimPinOf), attempt),
     );
     if (!result.ok) return blocked(batch.batchId, "merge_unavailable", result.code);
     const outcome = result.value;
@@ -1452,6 +1452,11 @@ function isTransient(code: PortErrorCode): boolean {
     code === "rate_limited" ||
     code === "quota_exceeded"
   );
+}
+
+/** The pin alone, without the episode the train fences it to; merging needs only the commit. */
+function claimPinOf({ claimId, generation, commit }: EpisodePin): ClaimPin {
+  return { claimId, generation, commit };
 }
 
 function samePin(left: ClaimPin, right: ClaimPin): boolean {

@@ -1139,7 +1139,7 @@ function waitingBatch(sql: SqlStorage, attemptId: string, digest: string, now: n
     sql,
     {
       expectedMain: MAIN,
-      pins: [{ claimId: "clm_pinned01", generation: 1, commit: OTHER }],
+      pins: [{ claimId: "clm_pinned01", generation: 1, commit: OTHER, episode: 1 }],
       decisions: [],
       definition: { name: "test", source: MAIN, digest, acceptance: null },
     },

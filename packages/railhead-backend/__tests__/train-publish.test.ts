@@ -48,6 +48,11 @@ const ELSEWHERE = "e".repeat(40);
 /** Short enough for a test to wait out. */
 const REF_TIMEOUT_MS = 50;
 
+/** An attempt's pins without the ready episodes they are fenced to. */
+function pinsOf(attempt: { pins: readonly ClaimPin[] } | undefined): ClaimPin[] | undefined {
+  return attempt?.pins.map(({ claimId, generation, commit }) => ({ claimId, generation, commit }));
+}
+
 function pin(n: number): ClaimPin {
   return { claimId: `clm_claim${String(n).padStart(3, "0")}`, generation: 1, commit: sha(n) };
 }
@@ -810,7 +815,7 @@ describe("the train's settle wake", () => {
       await h.train.enqueue(pin(2));
       const first = await pass(h);
       ref.down = true;
-      expect(first.pins).toEqual([pin(1), pin(2)]);
+      expect(pinsOf(first)).toEqual([pin(1), pin(2)]);
       const intentId = latestIntent(h.train);
       const attemptAt = h.authorization.record(intentId)?.updatedAt ?? 0;
       await exhaust(h);
@@ -833,7 +838,7 @@ describe("the train's settle wake", () => {
       expect(states(h.train)).toEqual({ clm_claim001: "dropped", clm_claim002: "batched" });
       const second = h.started.at(-1);
       expect(second?.expectedMain).toBe(MAIN);
-      expect(second?.pins).toEqual([pin(2)]);
+      expect(pinsOf(second)).toEqual([pin(2)]);
       // The wake left exhaustion: it is armed for the new attempt, and clears once it lands. The
       // failed batch also asked the alarm for its candidate's discard.
       const wake = readWake(h.sql);
@@ -1033,7 +1038,7 @@ describe("the train's settle wake", () => {
 
       // The alarm alone retries batch B, with no further call, and it lands.
       await h.alarm();
-      expect(h.started.at(-1)?.pins).toEqual([pin(2)]);
+      expect(pinsOf(h.started.at(-1))).toEqual([pin(2)]);
       const second = await pass(h);
       expect(ref.main).toBe(second.candidate);
       expect(batchStates(h.train)).toEqual([

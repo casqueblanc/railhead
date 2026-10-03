@@ -175,7 +175,7 @@ describe("pin", () => {
         sql,
         {
           expectedMain: MAIN,
-          pins: [pinOf("clm_atlas01")],
+          pins: [{ ...pinOf("clm_atlas01"), episode: 1 }],
           decisions: [],
           definition: { name: "test", source: MAIN, digest: "e".repeat(64), acceptance: null },
         },

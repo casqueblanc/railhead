@@ -1407,6 +1407,76 @@ describe("a ready claim reopened for rework", () => {
     });
   });
 
+  it("never lands a same-commit re-ready on the check of the episode the reopening ended", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      const episode = episodeOf(setup, pin);
+      expect(setup.started).toHaveLength(1);
+      expect(setup.started[0]?.pins).toEqual([{ ...pin, episode }]);
+
+      // Reopened while its check runs, then readied again with the same commit: a new episode.
+      expect(reopenLost(setup, pin, episode)).toBe(true);
+      expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+        ok: true,
+        value: { repeated: false },
+      });
+      const renewed = episodeOf(setup, pin);
+      expect(renewed).toBeGreaterThan(episode);
+
+      // The old episode's check passes: nothing is authorized or published on it, and the new
+      // episode gets a check of its own.
+      const old = await pass(setup);
+      const types = () => setup.log.replay(0, 128).events.map((event) => event.type);
+      expect(types()).not.toContain("train.intent");
+      expect(setup.published).toEqual([]);
+      expect(setup.main()).toBe(MAIN);
+      expect(setup.train.attemptOutcome(old.attemptId)).not.toBeNull();
+      expect(setup.started).toHaveLength(2);
+      expect(setup.started[1]?.pins).toEqual([{ ...pin, episode: renewed }]);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+
+      // Only that check lands it.
+      const attempt = await pass(setup);
+      expect(attempt.attemptId).not.toBe(old.attemptId);
+      expect(types().filter((type) => type === "train.intent")).toHaveLength(1);
+      expect(setup.published).toHaveLength(1);
+      expect(setup.main()).toBe(attempt.candidate);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
+    });
+  });
+
+  it("checks again a batch formed before its pins carried episodes, publishing nothing on it", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      const episode = episodeOf(setup, pin);
+      // The batch row as it was stored before pins carried their episode.
+      setup.sql.exec("UPDATE train_batches SET pins = json_remove(pins, '$[0].episode')");
+      const old = setup.started.at(-1);
+      if (old === undefined) throw new Error("no check was started");
+      expect(setup.train.attemptOutcome(old.attemptId)?.attempt.pins).toEqual([
+        { ...pin, episode: 0 },
+      ]);
+
+      await pass(setup);
+      expect(setup.published).toEqual([]);
+      expect(setup.main()).toBe(MAIN);
+      expect(setup.started).toHaveLength(2);
+      expect(setup.started[1]?.pins).toEqual([{ ...pin, episode }]);
+
+      const attempt = await pass(setup);
+      expect(setup.main()).toBe(attempt.candidate);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
+    });
+  });
+
   it("reopens only the exact pin and episode it is given, once", async () => {
     await withHandoff(async (setup) => {
       const { loser } = await losePair(setup);
