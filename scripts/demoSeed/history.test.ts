@@ -58,6 +58,11 @@ test("the import keeps every commit that changed the directory, rooted at it", (
   const history = writeHistoryBundle(source, "HEAD", "apps/demo", bundle);
 
   assert.equal(history.commits, 3);
+  // Every Git version checks out a bundle that records HEAD; some check out nothing without it.
+  assert.deepEqual(
+    execFileSync("git", ["bundle", "list-heads", bundle], { encoding: "utf8" }),
+    `${history.head} HEAD\n${history.head} refs/heads/main\n`,
+  );
   const clone = join(scratch, "normal-clone");
   execFileSync("git", ["clone", "--quiet", bundle, clone]);
   assert.equal(git(clone, ["rev-parse", "HEAD"]), history.head);

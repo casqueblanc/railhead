@@ -59,7 +59,8 @@ export function writeHistoryBundle(
   return withScratch(sourceRoot, (scratch) => {
     const history = rewrite(sourceRoot, scratch, revision, directory);
     git(scratch, ["update-ref", `refs/heads/${MAIN_BRANCH}`, history.head]);
-    git(scratch, ["bundle", "create", bundlePath, `refs/heads/${MAIN_BRANCH}`]);
+    // `HEAD` too: without it some Git versions clone the bundle but check nothing out.
+    git(scratch, ["bundle", "create", bundlePath, "HEAD", `refs/heads/${MAIN_BRANCH}`]);
     return history;
   });
 }
