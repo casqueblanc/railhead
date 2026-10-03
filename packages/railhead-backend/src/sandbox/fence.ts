@@ -13,7 +13,16 @@
 // the SDK's streaming exec does not: at the timeout it aborts the command's output stream and the
 // command fails. A start or command that fails, or times out, may have left a process running, so
 // the fence retires the incarnation before it reports the failure; the repository holds a slot
-// whose start or command failed as uncertain and never runs another command in it. The grant also ends at retirement: the gateway asks
+// whose start or command failed as uncertain and never runs another command in it.
+//
+// A command abandoned at its timeout is still an SDK call in flight: the SDK retries a container
+// that is starting for up to two minutes and may start it after the fence destroyed it. The fence
+// keeps every such call tracked until it settles. While one is pending no destroy confirms
+// retirement and `retire` rejects after `RETIRE_SETTLE_MS`, so the repository keeps the slot
+// uncertain; when it settles, success or failure, the fence destroys the container again at once.
+// Route, wake-up and destroy calls are never abandoned: the operation that made them awaits them.
+//
+// The grant also ends at retirement: the gateway asks
 // `grantCurrent` before it uses it, and that is false from the moment retirement is recorded. A
 // wake-up that arrives early schedules itself again, so a scheduler that runs callbacks before their
 // time cannot consume the deadline.
@@ -53,6 +62,13 @@ export interface FencedContainer {
   wake(at: number): Promise<void>;
 }
 
+/**
+ * How long `retire` waits for a start or command already under way to settle before it reports the
+ * teardown unconfirmed. Shorter than the repository's `DESTROY_TIMEOUT_MS`, so the fence answers
+ * first.
+ */
+export const RETIRE_SETTLE_MS = 20_000;
+
 /** How many destroys the fence attempts on its own before leaving teardown to the repository. */
 export const MAX_TEARDOWN_ATTEMPTS = 8;
 
@@ -62,9 +78,18 @@ export function teardownRetryDelay(attempts: number): number {
 }
 
 /** Why the fence refused an operation. */
-export type FenceRefusal = "retired" | "expired" | "not_started" | "probe_failed" | "timed_out";
+export type FenceRefusal =
+  | "retired"
+  | "expired"
+  | "not_started"
+  | "probe_failed"
+  | "timed_out"
+  | "unsettled";
 
-/** A refused or failed start or command. It left nothing running. */
+/**
+ * A refused or failed operation. A start or command left nothing running; `unsettled`, from
+ * `retire`, means an earlier command may still start the container, so retirement is unconfirmed.
+ */
 export class SandboxFenceError extends Error {
   readonly code: FenceRefusal;
 
@@ -92,16 +117,21 @@ export class SandboxFence {
   readonly #storage: Pick<DurableObjectStorage, "kv">;
   readonly #container: FencedContainer;
   readonly #clock: () => number;
+  readonly #settleMs: number;
   readonly #inflight = new Set<Promise<unknown>>();
+  // Container commands not yet settled, including those whose caller stopped waiting at a timeout.
+  readonly #effects = new Set<Promise<unknown>>();
 
   constructor(
     storage: Pick<DurableObjectStorage, "kv">,
     container: FencedContainer,
     clock: () => number,
+    settleMs = RETIRE_SETTLE_MS,
   ) {
     this.#storage = storage;
     this.#container = container;
     this.#clock = clock;
+    this.#settleMs = settleMs;
   }
 
   /** Starts the incarnation under `policy` until `deadline` and confirms it answers. */
@@ -165,17 +195,19 @@ export class SandboxFence {
 
   /**
    * Retires the incarnation for good and destroys its container. Returns once the container is
-   * destroyed and every start or command that was running here has settled; each of those destroys
-   * the container again when it resumes, so none can leave it running. A failed destroy rejects and
-   * leaves a retry scheduled.
+   * destroyed and every start, command and container call that was running here has settled; each
+   * of those destroys the container again when it settles, so none can leave it running. Rejects
+   * with `unsettled` when one is still pending after `RETIRE_SETTLE_MS`, and with the failure when a
+   * destroy fails; either way a retry is left scheduled.
    */
   async retire(): Promise<void> {
     const deadline = this.#read()?.deadline ?? 0;
-    const outstanding = [...this.#inflight];
+    const outstanding = [...this.#inflight, ...this.#effects];
     await this.#destroy(deadline);
     if (outstanding.length === 0) return;
-    await Promise.allSettled(outstanding);
+    const settled = await this.#quiet(outstanding);
     await this.#destroy(deadline);
+    if (!settled || this.#effects.size > 0) throw new SandboxFenceError("unsettled");
   }
 
   /**
@@ -214,24 +246,59 @@ export class SandboxFence {
   }
 
   // Runs one command, aborting it at its timeout: the SDK does not stop a streaming command itself.
-  // A container that ignores the abort is not waited for.
+  // A container that ignores the abort is not waited for, but its call stays tracked until it
+  // settles, and if it settles after its caller gave up the container is destroyed again.
   async #run(
     command: string,
     options: { timeoutMs: number; env?: Record<string, string>; cwd?: string },
   ): Promise<BoundedOutput> {
     const abort = new AbortController();
+    const effect = this.#container.exec(command, { ...options, signal: abort.signal });
+    let abandoned = false;
+    this.#effects.add(effect);
+    const settled = () => {
+      this.#effects.delete(effect);
+      if (abandoned) this.#reconcile();
+    };
+    // Registered before the race below, so the effect is forgotten before its caller resumes.
+    effect.then(settled, settled);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        abandoned = true;
         abort.abort();
         reject(new SandboxFenceError("timed_out"));
       }, options.timeoutMs);
     });
     try {
-      return await Promise.race([
-        this.#container.exec(command, { ...options, signal: abort.signal }),
-        timedOut,
-      ]);
+      return await Promise.race([effect, timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // A command abandoned at its timeout settled. The start or command that ran it retired the
+  // incarnation, but the call may have started the container since: destroy it again now. A failed
+  // destroy stays recorded as retiring, with its retry scheduled, for the next wake-up or release.
+  #reconcile(): void {
+    const state = this.#read();
+    if (state === null || state.phase === "live") return;
+    this.#destroy(state.deadline).catch((error: unknown) => {
+      console.error(
+        "sandbox teardown after a late command failed",
+        error instanceof Error ? error.name : "unknown",
+      );
+    });
+  }
+
+  // Waits up to `#settleMs` for `work` to settle; false when some of it has not.
+  async #quiet(work: Promise<unknown>[]): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.#settleMs);
+    });
+    try {
+      return await Promise.race([Promise.allSettled(work).then(() => true), timeout]);
     } finally {
       clearTimeout(timer);
     }
@@ -298,7 +365,9 @@ export class SandboxFence {
         { cause: error },
       );
     }
-    this.#write({ phase: "retired", deadline });
+    // A command still in flight may start the container after this destroy: the incarnation stays
+    // retiring until it settles and the destroy that follows confirms.
+    if (this.#effects.size === 0) this.#write({ phase: "retired", deadline });
   }
 
   // Records one more unconfirmed destroy and returns how many there have been in a row.

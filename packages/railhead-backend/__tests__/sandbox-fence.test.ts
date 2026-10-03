@@ -26,6 +26,9 @@ const POLICY: SandboxPolicy = {
 const START = 1_000_900;
 const DEADLINE = START + 60_000;
 
+// How long a test fence's `retire` waits for operations under way, in real milliseconds.
+const SETTLE_MS = 60;
+
 function noop(): void {}
 
 /** A promise the test settles by hand. */
@@ -135,13 +138,13 @@ function withFence(body: (harness: Harness) => Promise<void>): Promise<void> {
     let now = START;
     const clock = () => now;
     const fake = new FakeContainer();
-    const reopen = () => new SandboxFence(state.storage, fake.container, clock);
+    const reopen = () => new SandboxFence(state.storage, fake.container, clock, SETTLE_MS);
     await body({
       fence: reopen(),
       fake,
       advance: (ms) => (now += ms),
       reopen,
-      over: (container) => new SandboxFence(state.storage, container, clock),
+      over: (container) => new SandboxFence(state.storage, container, clock, SETTLE_MS),
       phase: () => {
         const stored: unknown = state.storage.kv.get("railhead:fence");
         if (typeof stored !== "object" || stored === null || !("phase" in stored)) return null;
@@ -558,7 +561,8 @@ describe("sandbox fence failures", () => {
 
       expect(await refusal(fence.exec({ command: "sleep 600", timeoutMs: 20 }))).toBe("timed_out");
       expect(fake.running).toBe(false);
-      expect(phase()).toBe("retired");
+      // The abandoned command never settles, so retirement never confirms.
+      expect(phase()).toBe("retiring");
     });
   });
 
@@ -690,6 +694,102 @@ describe("sandbox command timeout over the output reader", () => {
       expect(streamCancelled).toBe(true);
       expect(processRunning).toBe(false);
       expect(phase()).toBe("retired");
+    });
+  });
+});
+
+describe("sandbox command settling after its timeout", () => {
+  it("keeps retirement unconfirmed until a late command settles, then destroys what it started", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      // The command is still starting the container when its timeout fires.
+      const resume = fake.hold("exec");
+      expect(await refusal(fence.exec({ command: "make", timeoutMs: 20 }))).toBe("timed_out");
+      expect(phase()).toBe("retiring");
+
+      // The release cannot confirm while the command may still start the container.
+      expect(await refusal(fence.retire())).toBe("unsettled");
+      expect(phase()).toBe("retiring");
+      expect(fence.grantCurrent(DEADLINE)).toBe(false);
+
+      const destroysBefore = fake.destroys;
+      resume();
+      await flush();
+      expect(fake.destroys).toBe(destroysBefore + 1);
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+      await fence.retire();
+      expect(fake.running).toBe(false);
+    });
+  });
+
+  it("confirms a release that was waiting once the late command settles within the bound", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      const resume = fake.hold("exec");
+      expect(await refusal(fence.exec({ command: "make", timeoutMs: 20 }))).toBe("timed_out");
+
+      let confirmed = false;
+      const retire = fence.retire().then(() => {
+        confirmed = true;
+      });
+      await flush();
+      expect(confirmed).toBe(false);
+
+      resume();
+      await retire;
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("destroys the container a late command started though the command then failed", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      const resume = fake.hold("exec");
+      expect(await refusal(fence.exec({ command: "make", timeoutMs: 20 }))).toBe("timed_out");
+      expect(await refusal(fence.retire())).toBe("unsettled");
+
+      // As the SDK driver's reader does: the container starts, then the aborted read rejects.
+      fake.nextExec = "fails";
+      resume();
+      await flush();
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+      await fence.retire();
+    });
+  });
+
+  it("destroys the container a start's late probe started", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      const resume = fake.hold("exec");
+      // Twenty milliseconds of lifetime is the probe's timeout.
+      expect(await refusal(fence.start(POLICY, START + 20))).toBe("timed_out");
+      expect(await refusal(fence.retire())).toBe("unsettled");
+      expect(await refusal(fence.start(POLICY, START + 20))).toBe("retired");
+
+      resume();
+      await flush();
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("never confirms retirement, on release or at a wake-up, while a late command never settles", async () => {
+    await withFence(async ({ fence, fake, phase, advance }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.nextExec = "ignores_timeout";
+      expect(await refusal(fence.exec({ command: "make", timeoutMs: 20 }))).toBe("timed_out");
+
+      expect(await refusal(fence.retire())).toBe("unsettled");
+      // The wake-up runs in the same object, where the command is still in flight.
+      advance(60_000);
+      expect(await refusal(fence.expire())).toBe("unsettled");
+      expect(phase()).toBe("retiring");
+      expect(await refusal(fence.retire())).toBe("unsettled");
+      expect(phase()).toBe("retiring");
+      // Each attempt left its retry scheduled.
+      expect(fake.scheduled.length).toBeGreaterThan(0);
     });
   });
 });
