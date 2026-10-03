@@ -1,9 +1,9 @@
 // Merge authorization: the durable record a write to main rests on.
 //
 // `authorize` runs one Repo transaction. Inside it, it reads the persisted check attempt and its
-// report, every pin's current claim generation and ready pin, and the current version of every
-// decision the pins must satisfy, through synchronous readers the train, claims and decisions
-// modules supply. If all still hold, it writes the `MergeIntentRecord` and appends `train.intent`
+// report, every pin's current claim generation, ready pin and inbox ready gate, and the current
+// version of every decision the pins must satisfy, through synchronous readers the train, claims,
+// inbox and decisions modules supply. If all still hold, it writes the `MergeIntentRecord` and appends `train.intent`
 // in the same transaction, before anything tries to move main. If any reader's answer has moved,
 // nothing is written.
 //
@@ -22,6 +22,7 @@ import {
   type IntentId,
 } from "@railhead/shared/events";
 import type { ClaimPin, ReadyPin } from "../contracts/claims";
+import type { ReadyGate } from "../contracts/inbox";
 import { sameVersions } from "../modules/claims/module";
 import { fail, ok, type PortFailure, type PortResult } from "../contracts/result";
 import type {
@@ -74,6 +75,8 @@ export interface AuthorizationReaders {
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
   /** The ready claim's stored pin and the versions it was recorded under, or `null` when not ready. */
   readyPin(claimId: ClaimId): ReadyPin | null;
+  /** The claim's inbox ready gate at a generation, or `null` when the inbox cannot answer. */
+  readyGateNow(claimId: ClaimId, generation: number): ReadyGate | null;
 }
 
 /** What the authorization module needs from its Repo. */
@@ -264,21 +267,21 @@ function verify(readers: AuthorizationReaders, attemptId: CheckRunId): PortResul
 }
 
 /**
- * What a merge fence reads: each claim's generation and ready pin, and the decisions its work must
- * satisfy.
+ * What a merge fence reads: each claim's generation, ready pin and inbox ready gate, and the
+ * decisions its work must satisfy.
  */
 export type FenceReaders = Pick<
   AuthorizationReaders,
-  "currentGeneration" | "currentVersions" | "readyPin"
+  "currentGeneration" | "currentVersions" | "readyPin" | "readyGateNow"
 >;
 
 /**
  * The fence a merge rests on, shared by the train, authorization and the main writer so the rule
- * has one copy. Every pin's claim must still be at its pinned generation and still ready with
- * exactly that commit, recorded under the decision versions current now; every decision the pins must
- * satisfy now must be at the version in `required`, with no two pins reporting different versions
- * of one decision; and `acceptance`, the decision a passing acceptance check proves, must be among
- * them. Returns the decision versions current now. Reads only: call it inside the transaction whose
+ * has one copy. Every pin's claim must still be at its pinned generation, with every inbox item
+ * affecting it acknowledged, and still ready with exactly that commit, recorded under the decision
+ * versions current now; every decision the pins must satisfy now must be at the version in
+ * `required`, with no two pins reporting different versions of one decision; and `acceptance`, the
+ * decision a passing acceptance check proves, must be among them. Returns the decision versions current now. Reads only: call it inside the transaction whose
  * write relies on its answer.
  */
 export function checkFence(
@@ -313,6 +316,13 @@ export function checkFence(
       if (expected.get(ref.decisionId) !== ref.version) {
         return superseded("A decision changed since the check was scheduled.");
       }
+    }
+    // An obligation queued after the batch formed, such as rework under the same decision
+    // version, changes neither the pin nor its versions; only the gate shows it.
+    const gate = readers.readyGateNow(pin.claimId, pin.generation);
+    if (gate === null) return fail("unavailable", "The inbox cannot confirm acknowledgements.");
+    if (gate.kind === "blocked") {
+      return fail("unacked_decision", "An inbox item affecting a claim is not acknowledged.");
     }
   }
   if (acceptance !== null && current.get(acceptance.decisionId) !== acceptance.version) {

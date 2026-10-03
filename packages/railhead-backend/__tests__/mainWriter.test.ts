@@ -9,6 +9,7 @@ import {
   type MainOutcome,
 } from "@railhead/shared/events";
 import type { ReadyPin } from "../src/contracts/claims";
+import type { ReadyGate } from "../src/contracts/inbox";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -147,6 +148,16 @@ class World {
     [CLAIM_C, "3".repeat(40)],
   ]);
 
+  /** Each claim's ready gate; a claim missing here is clear. */
+  gates = new Map<ClaimId, ReadyGate | null>();
+
+  /** The claim's ready gate at `generation`, or `null` for another generation. */
+  readyGateNow(claimId: ClaimId, generation: number): ReadyGate | null {
+    if (this.generations.get(claimId) !== generation) return null;
+    const gate = this.gates.get(claimId);
+    return gate === undefined ? { kind: "clear" } : gate;
+  }
+
   /** The claim's ready pin, recorded under the versions current now. */
   readyPin(claimId: ClaimId): ReadyPin | null {
     const commit = this.ready.get(claimId);
@@ -236,6 +247,7 @@ function harness(
     currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
     currentVersions: (claimId) => world.versions.get(claimId) ?? null,
     readyPin: (claimId) => world.readyPin(claimId),
+    readyGateNow: (claimId, generation) => world.readyGateNow(claimId, generation),
   };
   const authorization: AuthorizationPort = createAuthorization(
     { storage, log, clock },
@@ -402,6 +414,7 @@ describe("publish refuses invalid input", () => {
           currentGeneration: () => null,
           currentVersions: () => null,
           readyPin: () => null,
+          readyGateNow: () => null,
         }),
         ref,
       );
@@ -611,6 +624,33 @@ describe("publish fences claims and decisions", () => {
         });
         expect(ref.updates).toHaveLength(0);
         expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+      },
+      world,
+    );
+  });
+
+  it("writes nothing while an item affecting a claim is unacknowledged, then publishes", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "unacked_decision",
+        });
+        world.gates.set(CLAIM_B, null);
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+
+        world.gates.delete(CLAIM_B);
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("updated", 1, CANDIDATE),
+        });
+        expect(ref.main).toBe(CANDIDATE);
       },
       world,
     );
