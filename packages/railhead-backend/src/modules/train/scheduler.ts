@@ -905,11 +905,14 @@ export function createTrain(
         const result = await withTimeout("merge", () =>
           ports().merge.discard(discard.attempt),
         ).catch(() => fail("internal", "The merge module failed while discarding."));
-        if (result.ok) {
-          completeDiscard(sql, discard.attempt);
-        } else {
-          const failures = discard.failures + 1;
-          retryDiscard(sql, { ...discard, dueAt: clock() + discardDelay(failures), failures });
+        const failures = discard.failures + 1;
+        // Each row change commits with the wake it needs, as every other write here does.
+        context.storage.transactionSync(() => {
+          if (result.ok) completeDiscard(sql, discard.attempt);
+          else retryDiscard(sql, { ...discard, dueAt: clock() + discardDelay(failures), failures });
+          wakeForDiscards();
+        });
+        if (!result.ok) {
           console.error(
             JSON.stringify({
               event: "train.discard_failed",
@@ -922,7 +925,7 @@ export function createTrain(
         }
       }
     } finally {
-      wakeForDiscards();
+      context.storage.transactionSync(() => wakeForDiscards());
     }
   }
 
