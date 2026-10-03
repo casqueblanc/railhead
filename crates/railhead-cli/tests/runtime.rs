@@ -66,7 +66,12 @@ fn world(origin: &str) -> anyhow::Result<World> {
         let dir = home.path().join("agents").join(name);
         fs::create_dir_all(&dir)?;
         #[cfg(unix)]
-        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        for private in [home.path().join("agents"), dir.clone()] {
+            fs::set_permissions(
+                &private,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
+        }
         let record =
             json!({"name": name, "agentId": id, "origin": origin, "repo": "casqueblanc/demo"});
         write_private(&dir.join("identity.json"), &record.to_string())?;

@@ -38,9 +38,15 @@ pub enum Error {
     /// A stored file is not what the store wrote.
     #[error("{} is damaged; remove it and join again", .0.display())]
     Damaged(PathBuf),
-    /// A secret file can be read by other users.
-    #[error("{} can be read by other users; restrict it to mode 600", .0.display())]
+    /// A store file or directory is open to other users.
+    #[error(
+        "{} is open to other users; restrict it to mode 700 for a directory or 600 for a file",
+        .0.display()
+    )]
     InsecurePermissions(PathBuf),
+    /// A store file or directory belongs to another user.
+    #[error("{} belongs to another user; the store must be yours alone", .0.display())]
+    NotOwned(PathBuf),
     /// A secret that must not be overwritten already exists.
     #[error("{} already exists and is never overwritten", .0.display())]
     AlreadyExists(PathBuf),
@@ -323,6 +329,11 @@ pub trait SecretStore {
 }
 
 /// The file store: one directory per agent, mode 700, and files of mode 600.
+///
+/// Every directory from the root down is checked before the store reads or writes in it: a real
+/// directory, not a link, owned by the current user. The root may be readable by others, since it
+/// is often a shared config directory, but never writable; `agents/` and each agent's directory
+/// must be private. An existing directory that fails is refused, never repaired.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     root: PathBuf,
@@ -377,6 +388,9 @@ impl FileStore {
     ///
     /// When the store cannot be read, a record is damaged, or it holds too many identities.
     pub fn list(&self) -> Result<Vec<Identity>> {
+        if !self.check_dirs(None)? {
+            return Ok(Vec::new());
+        }
         let dir = self.agents_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -406,6 +420,9 @@ impl FileStore {
     }
 
     fn load_identity(&self, name: &AgentName) -> Result<Option<Identity>> {
+        if !self.check_dirs(Some(name))? {
+            return Ok(None);
+        }
         let path = self.agent_dir(name).join("identity.json");
         let Some(bytes) = read_private(&path)? else {
             return Ok(None);
@@ -419,18 +436,56 @@ impl FileStore {
         }
     }
 
+    /// Checks the store's directories down to `agent`'s, or down to `agents/` without one.
+    /// Returns `false` when one of them does not exist yet.
+    fn check_dirs(&self, agent: Option<&AgentName>) -> Result<bool> {
+        if !check_dir(&self.root, 0o022)? || !check_dir(&self.agents_dir(), 0o077)? {
+            return Ok(false);
+        }
+        match agent {
+            Some(agent) => check_dir(&self.agent_dir(agent), 0o077),
+            None => Ok(true),
+        }
+    }
+
     fn ensure_agent_dir(&self, agent: &AgentName) -> Result<PathBuf> {
         let dir = self.agent_dir(agent);
         create_private_dir(&dir)?;
-        Ok(dir)
+        // Creation leaves an existing directory as it was, so check the whole path afterwards.
+        if self.check_dirs(Some(agent))? {
+            Ok(dir)
+        } else {
+            Err(Error::Damaged(dir))
+        }
     }
 
     fn write_atomic(&self, agent: &AgentName, path: &Path, bytes: &[u8]) -> Result<()> {
         self.stage(agent, bytes)?.publish(path)
     }
 
+    /// Stores a secret that must not exist yet, written by `write`. The secret appears at its
+    /// path complete or not at all, so a failed attempt never blocks the next one.
+    fn create_with(
+        &self,
+        agent: &AgentName,
+        kind: SecretKind,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<()> {
+        let path = self.agent_dir(agent).join(kind.file_name());
+        self.stage_with(agent, write)?.publish_new(&path)
+    }
+
     /// Writes `bytes` to a temporary file in the agent's directory that no other write uses.
     fn stage(&self, agent: &AgentName, bytes: &[u8]) -> Result<Staged> {
+        self.stage_with(agent, |file| file.write_all(bytes))
+    }
+
+    /// Stages the bytes `write` produces, as [`FileStore::stage`] does.
+    fn stage_with(
+        &self,
+        agent: &AgentName,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> Result<Staged> {
         let dir = self.ensure_agent_dir(agent)?;
         let mut attempt = 0;
         let (temp, mut file) = loop {
@@ -444,10 +499,11 @@ impl FileStore {
             }
         };
         let staged = Staged {
+            dir,
             temp,
             published: false,
         };
-        file.write_all(bytes)
+        write(&mut file)
             .and_then(|()| file.sync_all())
             .map_err(|source| io_error("writing", &staged.temp, source))?;
         Ok(staged)
@@ -458,6 +514,7 @@ impl FileStore {
 /// Dropping it unpublished removes it.
 #[derive(Debug)]
 struct Staged {
+    dir: PathBuf,
     temp: PathBuf,
     published: bool,
 }
@@ -467,7 +524,20 @@ impl Staged {
     fn publish(mut self, path: &Path) -> Result<()> {
         fs::rename(&self.temp, path).map_err(|source| io_error("replacing", path, source))?;
         self.published = true;
-        Ok(())
+        sync_dir(&self.dir)
+    }
+
+    /// Links the file at `path` only if nothing is there, so `path` then holds exactly the staged
+    /// bytes and an existing file is never touched. The temporary name is removed on drop.
+    fn publish_new(self, path: &Path) -> Result<()> {
+        fs::hard_link(&self.temp, path).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                Error::AlreadyExists(path.to_owned())
+            } else {
+                io_error("creating", path, source)
+            }
+        })?;
+        sync_dir(&self.dir)
     }
 }
 
@@ -482,6 +552,9 @@ impl Drop for Staged {
 
 impl SecretStore for FileStore {
     fn read(&self, agent: &AgentName, kind: SecretKind) -> Result<Option<Secret>> {
+        if !self.check_dirs(Some(agent))? {
+            return Ok(None);
+        }
         let path = self.agent_dir(agent).join(kind.file_name());
         let Some(bytes) = read_private(&path)? else {
             return Ok(None);
@@ -492,11 +565,9 @@ impl SecretStore for FileStore {
     }
 
     fn create(&self, agent: &AgentName, kind: SecretKind, secret: &Secret) -> Result<()> {
-        let path = self.ensure_agent_dir(agent)?.join(kind.file_name());
-        let mut file = create_private_file(&path)?;
-        file.write_all(secret.expose().as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|source| io_error("writing", &path, source))
+        self.create_with(agent, kind, |file| {
+            file.write_all(secret.expose().as_bytes())
+        })
     }
 
     fn replace(&self, agent: &AgentName, kind: SecretKind, secret: &Secret) -> Result<()> {
@@ -510,6 +581,9 @@ impl SecretStore for FileStore {
     }
 
     fn remove(&self, agent: &AgentName, kind: SecretKind) -> Result<()> {
+        if !self.check_dirs(Some(agent))? {
+            return Ok(());
+        }
         remove_if_present(&self.agent_dir(agent).join(kind.file_name()))
     }
 }
@@ -540,6 +614,49 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         .map_err(|source| io_error("creating", dir, source))
 }
 
+/// Checks a store directory: a real directory, not a link, owned by the current user, with none
+/// of the `forbidden` mode bits. Returns `false` when it does not exist.
+fn check_dir(dir: &Path, forbidden: u32) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error("reading", dir, source)),
+    };
+    if !metadata.is_dir() {
+        return Err(Error::Damaged(dir.to_owned()));
+    }
+    check_owner(dir, &metadata, forbidden)?;
+    Ok(true)
+}
+
+/// Refuses a store entry another user owns, or one with any of the `forbidden` mode bits.
+fn check_owner(path: &Path, metadata: &fs::Metadata, forbidden: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(Error::NotOwned(path.to_owned()));
+        }
+        if metadata.mode() & forbidden != 0 {
+            return Err(Error::InsecurePermissions(path.to_owned()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, metadata, forbidden);
+    Ok(())
+}
+
+/// Makes a rename or link in `dir` survive a crash.
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| io_error("syncing", dir, source))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn create_private_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -554,7 +671,7 @@ fn create_private_file(path: &Path) -> Result<File> {
     })
 }
 
-/// Reads a store file, refusing a link, an oversized file and one other users can read.
+/// Reads a store file, refusing a link, an oversized file, and one another user owns or can read.
 ///
 /// The path is checked without following a link, then every check is repeated on the opened
 /// handle, so a path swapped for a link between the two is refused rather than followed.
@@ -576,7 +693,8 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// Checks the file a handle actually opened: the one checked at `path`, regular, small and private.
+/// Checks the file a handle actually opened: the one checked at `path`, regular, small, owned by
+/// the current user and private.
 fn check_opened(path: &Path, checked: &fs::Metadata, file: &File) -> Result<()> {
     let opened = file
         .metadata()
@@ -593,11 +711,7 @@ fn check_opened(path: &Path, checked: &fs::Metadata, file: &File) -> Result<()> 
     if !opened.is_file() || opened.len() > MAX_STORED_BYTES {
         return Err(Error::Damaged(path.to_owned()));
     }
-    #[cfg(unix)]
-    if std::os::unix::fs::PermissionsExt::mode(&opened.permissions()) & 0o077 != 0 {
-        return Err(Error::InsecurePermissions(path.to_owned()));
-    }
-    Ok(())
+    check_owner(path, &opened, 0o077)
 }
 
 #[cfg(test)]
@@ -777,7 +891,7 @@ mod tests {
         let store = FileStore::new(home.path());
         let atlas = AgentName::new("atlas")?;
         let dir = home.path().join("agents/atlas");
-        fs::create_dir_all(&dir)?;
+        create_private_dir(&dir)?;
         let next = NEXT_TEMP.load(Ordering::Relaxed);
         // Fewer leftovers than attempts, at the names this process takes next; concurrent tests can
         // only move the counter past them.
@@ -886,6 +1000,155 @@ mod tests {
         let checked = fs::symlink_metadata(&unchanged)?;
         check_opened(&unchanged, &checked, &File::open(&unchanged)?)?;
         Ok(())
+    }
+
+    #[test]
+    fn a_failed_key_write_leaves_no_key_and_a_retry_succeeds() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+
+        // A write that runs out of space halfway through.
+        let failed = store.create_with(&atlas, SecretKind::SigningKey, |file| {
+            file.write_all(b"half a k")?;
+            Err(io::Error::other("no space left on device"))
+        });
+        assert!(matches!(failed, Err(Error::Io { .. })));
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, None);
+        assert_eq!(atlas_files(home.path())?, Vec::<String>::new());
+
+        // A process killed mid-write leaves only a temporary file, which is never read as the key.
+        fs::write(dir.join(".tmp-999999-0"), b"half a k")?;
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, None);
+
+        let key = Secret::new("whole key".to_owned());
+        store.create(&atlas, SecretKind::SigningKey, &key)?;
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, Some(key));
+        assert_eq!(atlas_files(home.path())?, [".tmp-999999-0", "key"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_key_publication_leaves_no_key_and_a_retry_succeeds() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+
+        let staged = store.stage(&atlas, b"whole key")?;
+        let failed = staged.publish_new(&dir.join("missing/key"));
+        assert!(matches!(failed, Err(Error::Io { .. })));
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, None);
+        assert_eq!(atlas_files(home.path())?, Vec::<String>::new());
+
+        let key = Secret::new("whole key".to_owned());
+        store.replace(&atlas, SecretKind::SigningKey, &key)?;
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, Some(key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_key_leaves_the_existing_one_and_no_temporary_file() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let first = Secret::new("first key".to_owned());
+        store.create(&atlas, SecretKind::SigningKey, &first)?;
+        let refused = store.create(
+            &atlas,
+            SecretKind::SigningKey,
+            &Secret::new("second key, longer".to_owned()),
+        );
+        assert!(matches!(refused, Err(Error::AlreadyExists(_))));
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, Some(first));
+        assert_eq!(atlas_files(home.path())?, ["key"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_agent_directory_open_to_others_is_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+        create_private_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777))?;
+
+        let key = Secret::new("key".to_owned());
+        let created = store.create(&atlas, SecretKind::SigningKey, &key);
+        assert!(matches!(created, Err(Error::InsecurePermissions(path)) if path == dir));
+        let saved = store.save_identity(&identity("atlas", "agt_atlas01")?);
+        assert!(matches!(saved, Err(Error::InsecurePermissions(_))));
+        assert_eq!(atlas_files(home.path())?, Vec::<String>::new());
+
+        // A record planted while the directory was open is not selected.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        store.save_identity(&identity("atlas", "agt_atlas01")?)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o730))?;
+        let found = store.find(&"atlas".parse()?).err();
+        assert!(matches!(found, Some(Error::InsecurePermissions(_))));
+        let listed = store.list().err();
+        assert!(matches!(listed, Some(Error::InsecurePermissions(_))));
+        let read = store.read(&atlas, SecretKind::SessionToken).err();
+        assert!(matches!(read, Some(Error::InsecurePermissions(_))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_others_can_read_is_accepted_but_one_they_can_write_is_refused() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o755))?;
+        store.save_identity(&atlas)?;
+        assert_eq!(store.list()?, vec![atlas]);
+
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o775))?;
+        let listed = store.list().err();
+        assert!(matches!(listed, Some(Error::InsecurePermissions(path)) if path == home.path()));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_store_directory_is_refused() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join("agents"))?;
+
+        let key = Secret::new("key".to_owned());
+        let created = store.create(&atlas, SecretKind::SigningKey, &key);
+        assert!(matches!(created, Err(Error::Damaged(_))));
+        assert_eq!(fs::read_dir(elsewhere.path().join("atlas"))?.count(), 0);
+        assert!(matches!(store.list(), Err(Error::Damaged(_))));
+        assert!(matches!(
+            store.read(&atlas, SecretKind::SigningKey),
+            Err(Error::Damaged(_))
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_another_user_owns_is_refused() {
+        // `/` belongs to root and others cannot write it, so only its owner can fail the check.
+        let store = FileStore::new("/");
+        let listed = store.list();
+        if rustix::process::geteuid().is_root() {
+            assert!(listed.is_ok());
+        } else {
+            assert!(matches!(listed, Err(Error::NotOwned(path)) if path == Path::new("/")));
+        }
     }
 
     #[test]

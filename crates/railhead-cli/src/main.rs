@@ -242,6 +242,7 @@ fn identity_failure(error: &identity::Error, whole: &Error) -> Failure {
         ),
         identity::Error::Damaged(_)
         | identity::Error::InsecurePermissions(_)
+        | identity::Error::NotOwned(_)
         | identity::Error::AlreadyExists(_)
         | identity::Error::TooMany
         | identity::Error::Io { .. } => (LocalCode::Store, None),
