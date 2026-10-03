@@ -614,7 +614,10 @@ describe("a push larger than Git's post buffer", () => {
       expect(await bytesOf(pushed)).toEqual(PUSH_RESULT);
 
       expect(world.seen).toHaveLength(1);
-      expect(world.seen[0]?.body).toEqual(large);
+      // A digest, since comparing 1.5 MiB element by element outlasts the test timeout on CI.
+      const forwarded = world.seen[0]?.body ?? new Uint8Array(0);
+      expect(forwarded.length).toBe(large.length);
+      expect(await sha256(forwarded)).toBe(await sha256(large));
       expect(pushedEvents(world)).toMatchObject([
         { data: { ref: "refs/heads/feature", from: null, to: PUSHED } },
       ]);
@@ -622,6 +625,11 @@ describe("a push larger than Git's post buffer", () => {
     });
   });
 });
+
+async function sha256(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 function concatAll(chunks: readonly Uint8Array[]): Uint8Array {
   const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
