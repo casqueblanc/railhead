@@ -180,6 +180,9 @@ function claimsFor(world: World): ClaimsPort {
           return world.claim.state satisfies never;
       }
     },
+    workingGeneration(claimId) {
+      return claimId === CLAIM && world.claim.state === "working" ? world.claim.generation : null;
+    },
   };
 }
 
@@ -737,6 +740,85 @@ describe("a push decided again after it was admitted", () => {
     });
   });
 
+  it("records nothing when the claim expires, changes hands or goes ready while the upstream answers", async () => {
+    const changes: [string, (world: World) => void][] = [
+      [
+        "expired",
+        (world) => {
+          world.claim.state = "expired";
+        },
+      ],
+      [
+        "reassigned",
+        (world) => {
+          world.claim.agentId = OTHER.agentId;
+          world.claim.generation += 1;
+        },
+      ],
+      [
+        "ready",
+        (world) => {
+          world.claim.state = "ready";
+        },
+      ],
+    ];
+    for (const [label, change] of changes) {
+      await withGateway(async (world) => {
+        // The upstream has the whole push and has accepted it; the claim changes before it answers.
+        world.respond = () => {
+          change(world);
+          return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+        };
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", PUSH_REQUEST),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status, label).toBe(200);
+        expect(await bytesOf(response), label).toEqual(PUSH_RESULT);
+        expect(world.seen, label).toHaveLength(1);
+        expect(world.authorizations, label).toHaveLength(3);
+        expect(pushedEvents(world), label).toEqual([]);
+        expect(world.events(), label).toEqual([]);
+        expect(logged, label).toContain(
+          JSON.stringify({ event: "git_push_unrecorded", outcome: "claim_changed" }),
+        );
+      });
+    }
+  });
+
+  it("records nothing when the claim changes while the response is still streaming", async () => {
+    await withGateway(async (world) => {
+      let finish: (() => void) | undefined;
+      const [first, rest] = [PUSH_RESULT.slice(0, 8), PUSH_RESULT.slice(8)];
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(first);
+              finish = () => {
+                controller.enqueue(rest);
+                controller.close();
+              };
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      const reading = bytesOf(response);
+      await until(() => finish !== undefined);
+      world.claim.generation += 1;
+      finish?.();
+      expect(await reading).toEqual(PUSH_RESULT);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
   it("answers 503 and sends nothing when the claims module is down at the second decision", async () => {
     await withGateway(async (world) => {
       const { body, resume } = pausedPush(10);
@@ -833,6 +915,63 @@ describe("bounds", () => {
         expect(world.seen, state).toEqual([]);
         expect(pushedEvents(world), state).toEqual([]);
       });
+    }
+  });
+
+  it("answers a client whose body fails inside the push head, and leaves no time limit armed", async () => {
+    const slow: GitGatewayLimits = { ...FAST, maxDurationMs: 60_000 };
+    const cases: [ClaimState, number][] = [
+      ["working", 400],
+      ["expired", 403],
+    ];
+    for (const [state, status] of cases) {
+      const armed = new Set<unknown>();
+      const cleared = new Set<unknown>();
+      const setTimer = globalThis.setTimeout;
+      const clearTimer = globalThis.clearTimeout;
+      const setSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        ms?: number,
+      ) => {
+        const id = setTimer(handler, ms);
+        if (ms === slow.maxDurationMs) armed.add(id);
+        return id;
+      }) as typeof setTimeout);
+      const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
+        id?: Parameters<typeof clearTimeout>[0],
+      ) => {
+        cleared.add(id);
+        clearTimer(id);
+      }) as typeof clearTimeout);
+      try {
+        await withGateway(async (world) => {
+          world.claim.state = state;
+          // Half a command, then the client goes away.
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(`00b9${ZERO} ${HEAD} refs/he`));
+              controller.error(new Error("the client disconnected"));
+            },
+          });
+          const response = await world.gateway.serve(
+            rpc("git-receive-pack", body),
+            FORK,
+            "/git-receive-pack",
+          );
+          expect(response.status, state).toBe(status);
+          expect(world.minted(), state).toBe(0);
+          expect(world.seen, state).toEqual([]);
+          expect(pushedEvents(world), state).toEqual([]);
+        }, slow);
+      } finally {
+        setSpy.mockRestore();
+        clearSpy.mockRestore();
+      }
+      expect(armed.size, state).toBe(1);
+      expect(
+        [...armed].every((id) => cleared.has(id)),
+        state,
+      ).toBe(true);
     }
   });
 

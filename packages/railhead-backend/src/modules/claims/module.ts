@@ -213,6 +213,11 @@ export function createClaims(
       }
     },
 
+    workingGeneration(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      return row?.state === "working" ? row.generation : null;
+    },
+
     ready: unavailableClaims.ready,
     pin: unavailableClaims.pin,
     authorizeGit: unavailableClaims.authorizeGit,

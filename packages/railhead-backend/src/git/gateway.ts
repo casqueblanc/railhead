@@ -17,7 +17,8 @@
 // own time limit; a client that stalls inside it is cut off and its body released.
 //
 // A push is recorded as `claim.pushed` only for the refs the upstream itself reported updated, once
-// its response has ended. A refused, failed, cut-off or unreadable push records nothing.
+// its response has ended, and only if the claim is still working at the push's generation then. A
+// refused, failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -190,6 +191,10 @@ class GitGateway implements GitPort {
       deadline.clear();
       return text(408, "railhead: the push's command list did not arrive in time");
     }
+    if (parsed.kind === "broken") {
+      deadline.clear();
+      return text(400, "railhead: the push's body failed before its command list arrived");
+    }
     if (parsed.kind === "refused") {
       deadline.clear();
       return text(400, `railhead: ${describeHeadFailure(parsed.reason)}`);
@@ -268,12 +273,13 @@ class GitGateway implements GitPort {
   /**
    * Reads a push's head within the head time limit and `deadline`. Once either passes, the client's
    * body is cancelled, so a client that stalls inside its head holds nothing open. After the head,
-   * the deadline ends the upload through the forwarding pipe instead.
+   * the deadline ends the upload through the forwarding pipe instead. A body that errors first,
+   * such as a client that disconnected, is `broken`.
    */
   async #readHead(
     body: ReadableStream<Uint8Array>,
     deadline: Deadline,
-  ): Promise<PushHead | { readonly kind: "late" }> {
+  ): Promise<PushHead | { readonly kind: "late" } | { readonly kind: "broken" }> {
     const reading = new AbortController();
     const stop = (): void => {
       reading.abort(deadline.signal.reason);
@@ -285,9 +291,8 @@ class GitGateway implements GitPort {
     }, this.#limits.headTimeoutMs);
     try {
       return await readReceivePackHead(cancelledOnAbort(body, reading.signal));
-    } catch (error) {
-      if (deadline.expired) return { kind: "late" };
-      throw error;
+    } catch {
+      return deadline.expired ? { kind: "late" } : { kind: "broken" };
     } finally {
       clearTimeout(headTimer);
       deadline.signal.removeEventListener("abort", stop);
@@ -426,7 +431,12 @@ class GitGateway implements GitPort {
     });
   }
 
-  /** Records each ref the upstream reported updated; a deleted ref names no commit and is skipped. */
+  /**
+   * Records each ref the upstream reported updated; a deleted ref names no commit and is skipped.
+   * Nothing is recorded unless the claim is still working at the push's generation when the record
+   * is written: a claim that expired, changed hands or went ready while the push was in flight
+   * keeps its own history, and the push's fact is left for reconciliation from the fork.
+   */
   #recordPush(
     principal: AgentPrincipal,
     fence: { claimId: string; generation: number },
@@ -437,7 +447,10 @@ class GitGateway implements GitPort {
       (update) => update.kind !== "delete" && updated.has(update.ref),
     );
     if (pushed.length === 0) return;
-    this.#context.log.transaction((tx) => {
+    const recorded = this.#context.log.transaction((tx) => {
+      if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
+        return false;
+      }
       for (const update of pushed) {
         tx.append(
           { kind: "agent", id: principal.agentId },
@@ -453,7 +466,12 @@ class GitGateway implements GitPort {
           },
         );
       }
-    });
+      return true;
+    }).value;
+    if (!recorded) {
+      // Codes only: never the claim, a ref or a commit.
+      console.warn(JSON.stringify({ event: "git_push_unrecorded", outcome: "claim_changed" }));
+    }
   }
 }
 
