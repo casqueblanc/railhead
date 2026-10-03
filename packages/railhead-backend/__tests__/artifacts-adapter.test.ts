@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ARTIFACTS_LIMITS,
   createArtifactsAdapter,
+  MINT_CLOCK_SKEW_MS,
   forkRepoName,
   mainRepoName,
   type ArtifactsAdapterLimits,
@@ -59,6 +60,10 @@ function forkRows(
       "SELECT claim_id, state, head FROM artifacts_forks ORDER BY claim_id",
     )
     .toArray();
+}
+
+function mintRows(storage: RepoStorage): number {
+  return storage.sql.exec("SELECT 1 FROM artifacts_mints").toArray().length;
 }
 
 /** Forks `CLAIM` and returns the fork's name. */
@@ -490,7 +495,7 @@ describe("revokeTokens", () => {
   });
 
   it("revokes a token whose mint answered after its timeout, and holds revocation until then", async () => {
-    await withArtifacts(async ({ fake, adapter }) => {
+    await withArtifacts(async ({ fake, adapter, storage }) => {
       const port = adapter();
       const repo = await forkClaim(port);
 
@@ -502,12 +507,17 @@ describe("revokeTokens", () => {
       // The timed-out mint created a token Artifacts may still return.
       expect(fake.liveTokens(repo)).toHaveLength(1);
       expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      // This incarnation's mint can still answer, so time alone does not settle it.
+      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS);
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
 
       paused.release();
       await vi.waitFor(() => {
-        expect(fake.liveTokens(repo)).toEqual([]);
+        expect(mintRows(storage)).toBe(0);
         expect(fake.openHandles).toBe(0);
       });
+      // Expired by now, and revoked as well once the late answer arrived.
+      expect(fake.repos.get(repo)?.tokens.map((token) => token.revoked)).toEqual([true, true]);
       expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
       const retried = await tokenValue(port, repo, "write");
       expect(fake.accepts(retried)).toBe(true);
@@ -532,28 +542,71 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("holds revocation after a restart until a mint whose effect is delayed answers", async () => {
-    await withArtifacts(async ({ fake, adapter }) => {
+  it("holds revocation after a restart until the old mint's token must have expired", async () => {
+    await withArtifacts(async ({ fake, adapter, storage }) => {
       const before = adapter();
       const repo = await forkClaim(before);
-      const paused = fake.pauseNext("createTokenBeforeMint");
+      const paused = fake.pauseNext("createToken");
       expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(fake.repos.get(repo)?.tokens).toHaveLength(1);
+      const [minted] = fake.liveTokens(repo);
+      if (minted === undefined) throw new Error("the paused mint created no token");
 
-      // A fresh adapter on the same storage, as after the Durable Object restarts. However long the
-      // old request stays unanswered, revocation must not report success while it may mint.
+      // A fresh adapter on the same storage, as after the Durable Object restarts. The old request
+      // cannot answer it, so only the token's lifetime bounds how long revocation stays busy.
       const after = adapter();
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
-      fake.advance(60 * MINUTE);
+      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
       expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(mintRows(storage)).toBe(1);
 
-      // The delayed request now mints; its answer is what settles the record.
+      fake.advance(1);
+      expect(fake.accepts(minted.plaintext)).toBe(false);
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(mintRows(storage)).toBe(0);
+
+      // The old request answers after its record was dropped; the new incarnation is unaffected.
       paused.release();
       await vi.waitFor(() => {
         expect(fake.openHandles).toBe(0);
-        expect(fake.tokensMinted).toBe(1);
-        expect(fake.liveTokens(repo)).toEqual([]);
       });
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      const fresh = await tokenValue(after, repo, "write");
+      expect(fake.accepts(fresh)).toBe(true);
+      expect(mintRows(storage)).toBe(0);
+    });
+  });
+
+  it("bounds a previous incarnation's mint by the lifetime it asked for", async () => {
+    await withArtifacts(async ({ fake, adapter, storage }) => {
+      const before = adapter();
+      const repo = await forkClaim(before);
+      const short = fake.pauseNext("createToken");
+      expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      fake.advance(MINUTE);
+      const long = fake.pauseNext("createToken");
+      expect(await before.token(repo, "read", 60 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(mintRows(storage)).toBe(2);
+
+      const after = adapter();
+      // Past the shorter mint's bound, the longer one still holds revocation.
+      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS);
+      expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(mintRows(storage)).toBe(1);
+      fake.advance(50 * MINUTE);
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(mintRows(storage)).toBe(0);
+
+      expect(fake.liveTokens(repo)).toEqual([]);
+
+      // The old calls answer at last. Their records are gone, and nothing the new incarnation holds
+      // changes.
+      short.release();
+      long.release();
+      await vi.waitFor(() => {
+        expect(fake.openHandles).toBe(0);
+      });
+      expect(mintRows(storage)).toBe(0);
       expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
     });
   });

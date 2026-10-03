@@ -4,7 +4,8 @@
 // A fork whose response was lost is recorded as pending before the call and reconciled on the next
 // request, and the token Artifacts returns with a new fork is revoked before the fork is used. A
 // fork's token mint is recorded before the call too, so a revocation never reports success while a
-// mint that started before it may still create a token.
+// mint that started before it may still create a token. A record left by a previous incarnation of
+// the Durable Object is dropped once any token its mint could have created has expired.
 //
 // Tokens never leave this module except through `token`, whose caller streams them to Artifacts.
 // Nothing here logs a token, a repository name or a binding error's message.
@@ -66,6 +67,11 @@ export const ARTIFACTS_LIMITS: ArtifactsAdapterLimits = {
 export const MIN_TOKEN_TTL_MS = 60_000;
 /** The longest token lifetime this adapter mints. Artifacts allows a year; Railhead never needs it. */
 export const MAX_TOKEN_TTL_MS = 3_600_000;
+/**
+ * How far Artifacts' clock may run ahead of ours when it sets a token's expiry. A design margin, not
+ * a measured bound.
+ */
+export const MINT_CLOCK_SKEW_MS = 300_000;
 /** How many list-and-revoke rounds `revokeTokens` makes before reporting the repository busy. */
 const MAX_REVOKE_ROUNDS = 5;
 
@@ -81,7 +87,8 @@ const MIGRATIONS = [
   `CREATE TABLE artifacts_mints (
     id TEXT PRIMARY KEY,
     repo TEXT NOT NULL,
-    started_at INTEGER NOT NULL
+    started_at INTEGER NOT NULL,
+    ttl_ms INTEGER NOT NULL
   ) STRICT`,
 ];
 
@@ -152,6 +159,8 @@ class ArtifactsAdapter implements ArtifactsPort {
   readonly #revoking = new Map<ArtifactsRepoName, number>();
   // The latest mint per cache key, so concurrent misses for one key mint one token at a time.
   readonly #minting = new Map<string, Promise<void>>();
+  // The mint records this incarnation wrote. Only these can still be settled by their call's answer.
+  readonly #ownMints = new Set<string>();
   #mainName: Promise<ArtifactsRepoName> | null = null;
 
   constructor(context: ArtifactsAdapterContext, limits: ArtifactsAdapterLimits) {
@@ -241,11 +250,12 @@ class ArtifactsAdapter implements ArtifactsPort {
     }
     const epoch = this.#epoch(repo);
     // Recorded in the same step as the fence check above, so a revocation that starts later sees it.
-    const mint = target.kind === "fork" ? this.#recordMint(repo) : null;
+    const ttlSeconds = Math.ceil(ttlMs / 1000);
+    const mint = target.kind === "fork" ? this.#recordMint(repo, ttlSeconds * 1000) : null;
     let settled = true;
     try {
       using handle = await this.#open(repo);
-      const created = await this.#bounded(handle.createToken(scope, Math.ceil(ttlMs / 1000)), {
+      const created = await this.#bounded(handle.createToken(scope, ttlSeconds), {
         late: (pending) => {
           settled = false;
           void this.#discardLate(repo, pending, mint);
@@ -310,32 +320,53 @@ class ArtifactsAdapter implements ArtifactsPort {
     }
   }
 
-  #recordMint(repo: ArtifactsRepoName): string {
+  #recordMint(repo: ArtifactsRepoName, ttlMs: number): string {
     const id = crypto.randomUUID();
     atomically(this.#context.storage, () => {
       this.#context.storage.sql.exec(
-        "INSERT INTO artifacts_mints (id, repo, started_at) VALUES (?, ?, ?)",
+        "INSERT INTO artifacts_mints (id, repo, started_at, ttl_ms) VALUES (?, ?, ?, ?)",
         id,
         repo,
         this.#context.clock(),
+        ttlMs,
       );
     });
+    this.#ownMints.add(id);
     return id;
   }
 
   #forgetMint(id: string): void {
+    this.#ownMints.delete(id);
     atomically(this.#context.storage, () => {
       this.#context.storage.sql.exec("DELETE FROM artifacts_mints WHERE id = ?", id);
     });
   }
 
   /**
-   * Whether a mint for `repo` may still create a token. Only the call's answer settles a mint: its
-   * record outlives a restart, and Artifacts documents no time after which an unanswered request
-   * can no longer take effect, so a mint started before a restart keeps revocation busy.
+   * Whether a mint for `repo` may still create a usable token. A mint of this incarnation is
+   * settled only by its call's answer. A mint of a previous incarnation can no longer answer, so its
+   * record is dropped once its start, the lifetime it asked for and the clock skew have passed: any
+   * token it created by then has expired. Until then it keeps revocation busy.
    */
   #mintsRunning(repo: ArtifactsRepoName): boolean {
-    const rows = this.#context.storage.sql
+    const storage = this.#context.storage;
+    const expiredBefore = this.#context.clock() - MINT_CLOCK_SKEW_MS;
+    const stale = storage.sql
+      .exec<{ id: string }>(
+        "SELECT id FROM artifacts_mints WHERE repo = ? AND started_at + ttl_ms <= ?",
+        repo,
+        expiredBefore,
+      )
+      .toArray()
+      .filter((row) => !this.#ownMints.has(row.id));
+    if (stale.length > 0) {
+      atomically(storage, () => {
+        for (const row of stale) {
+          storage.sql.exec("DELETE FROM artifacts_mints WHERE id = ?", row.id);
+        }
+      });
+    }
+    const rows = storage.sql
       .exec("SELECT 1 FROM artifacts_mints WHERE repo = ? LIMIT 1", repo)
       .toArray();
     return rows.length > 0;
