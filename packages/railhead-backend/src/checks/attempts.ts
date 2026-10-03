@@ -9,7 +9,9 @@
 // at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones going first. A started attempt counts
 // as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its run cannot still be
 // running, and the train no longer accepts its report. A report for an attempt removed this way
-// finds no row and is refused, so an abandoned run can neither grow the table nor pass late.
+// finds no row and is refused, so an abandoned run can neither grow the table nor pass late. The
+// command the trusted definition gave the run is kept with the attempt so the board can show what
+// ran; a row written before commands were kept has none.
 
 import type { CheckResult, CheckRunId, CommitSha } from "@railhead/shared/events";
 import { CHECK_DEADLINE_MS } from "../modules/train/scheduler";
@@ -48,6 +50,7 @@ const MIGRATIONS: readonly string[] = [
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   ) STRICT`,
+  "ALTER TABLE check_attempts ADD COLUMN command TEXT",
 ];
 
 /** What identifies an attempt: fixed when it is first written. */
@@ -79,6 +82,11 @@ export type AttemptState =
 
 /** One stored attempt. */
 export interface AttemptRecord extends AttemptIdentity {
+  /**
+   * The command the trusted definition gave the run, or `null` for a row written before commands
+   * were kept. Repository content.
+   */
+  command: string | null;
   /** Where it stands. */
   state: AttemptState;
 }
@@ -96,6 +104,7 @@ interface AttemptRow extends Record<string, SqlStorageValue> {
   log: string | null;
   log_digest: string | null;
   finished_at: number | null;
+  command: string | null;
 }
 
 /** The attempts of one repository, in its storage. */
@@ -119,13 +128,19 @@ export class AttemptTable {
    * Records a held attempt, unless the attempt is already stored. Returns the stored attempt, which
    * may be another state or identity if one was recorded first.
    */
-  hold(identity: AttemptIdentity, paths: string[], now: number): AttemptRecord {
-    return this.#insert(identity, now, "held", JSON.stringify(paths), null, null);
+  hold(identity: AttemptIdentity, command: string, paths: string[], now: number): AttemptRecord {
+    return this.#insert(identity, command, now, "held", JSON.stringify(paths), null, null);
   }
 
   /** Records a started attempt in `sandbox` until `deadline`, unless the attempt is already stored. */
-  start(identity: AttemptIdentity, sandbox: string, deadline: number, now: number): AttemptRecord {
-    return this.#insert(identity, now, "started", null, sandbox, deadline);
+  start(
+    identity: AttemptIdentity,
+    command: string,
+    sandbox: string,
+    deadline: number,
+    now: number,
+  ): AttemptRecord {
+    return this.#insert(identity, command, now, "started", null, sandbox, deadline);
   }
 
   /**
@@ -160,6 +175,7 @@ export class AttemptTable {
 
   #insert(
     identity: AttemptIdentity,
+    command: string,
     now: number,
     state: "held" | "started",
     heldPaths: string | null,
@@ -173,8 +189,8 @@ export class AttemptTable {
       this.#storage.sql.exec(
         `INSERT INTO check_attempts
            (attempt_id, candidate, expected_main, digest, state, held_paths, sandbox, deadline,
-            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            created_at, updated_at, command)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         identity.attemptId,
         identity.candidate,
         identity.expectedMain,
@@ -185,6 +201,7 @@ export class AttemptTable {
         deadline,
         now,
         now,
+        command,
       );
       const inserted = this.get(identity.attemptId);
       if (inserted === null) throw new Error("inserted check attempt is missing");
@@ -212,13 +229,13 @@ export class AttemptTable {
 }
 
 /**
- * `log` cut to at most its last `MAX_CHECK_LOG_BYTES` bytes of UTF-8. A character split at the cut
- * is left out whole, so the result never grows past the cap by decoding its remains.
+ * `log` cut to at most its last `maxBytes` bytes of UTF-8. A character split at the cut is left out
+ * whole, so the result never grows past the cap by decoding its remains.
  */
-export function boundedLog(log: string): string {
+export function boundedLog(log: string, maxBytes: number = MAX_CHECK_LOG_BYTES): string {
   const bytes = new TextEncoder().encode(log);
-  if (bytes.byteLength <= MAX_CHECK_LOG_BYTES) return log;
-  let start = bytes.byteLength - MAX_CHECK_LOG_BYTES;
+  if (bytes.byteLength <= maxBytes) return log;
+  let start = bytes.byteLength - maxBytes;
   // Continuation bytes (0b10xxxxxx) at the cut belong to a character that starts before it.
   while (((bytes[start] ?? 0) & 0xc0) === 0x80) start += 1;
   return new TextDecoder().decode(bytes.subarray(start));
@@ -230,6 +247,7 @@ function toRecord(row: AttemptRow): AttemptRecord {
     candidate: row.candidate,
     expectedMain: row.expected_main,
     digest: row.digest,
+    command: row.command,
     state: toState(row),
   };
 }
