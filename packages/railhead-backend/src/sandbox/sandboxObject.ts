@@ -102,15 +102,24 @@ export class RailheadSandbox extends Sandbox<Env> {
     await this.#fence.expire();
   }
 
-  // The SDK operations a CI run issues on this object run inside the fence's live incarnation, so
-  // its retirement waits for them and none starts, or reports, after it.
+  // The SDK calls a CI run issues on this object, each run through `fenceSandbox`.
+  readonly #sdk = fenceSandbox(this.#fence, {
+    restoreBackup: (backup) => super.restoreBackup(backup),
+    createBackup: (options) => super.createBackup(options),
+    execWithSessionToken: (command, sessionId, options) =>
+      super.execWithSessionToken(command, sessionId, options),
+    listFiles: (path, options) => super.listFiles(path, options),
+    startProcess: (command, options, sessionId) => super.startProcess(command, options, sessionId),
+    containerFetch: (requestOrUrl, portOrInit, portParam) =>
+      super.containerFetch(requestOrUrl, portOrInit, portParam),
+  });
 
   override restoreBackup(backup: DirectoryBackup): Promise<RestoreBackupResult> {
-    return this.#fence.operate(() => super.restoreBackup(backup));
+    return this.#sdk.restoreBackup(backup);
   }
 
   override createBackup(options: BackupOptions): Promise<DirectoryBackup> {
-    return this.#fence.operate(() => super.createBackup(options));
+    return this.#sdk.createBackup(options);
   }
 
   override execWithSessionToken(
@@ -118,38 +127,80 @@ export class RailheadSandbox extends Sandbox<Env> {
     sessionId: string,
     options?: ExecOptions,
   ): Promise<ExecResult> {
-    return this.#fence.operate(() => super.execWithSessionToken(command, sessionId, options));
+    return this.#sdk.execWithSessionToken(command, sessionId, options);
   }
 
   override listFiles(path: string, options?: ListFilesOptions): ReturnType<Sandbox["listFiles"]> {
-    return this.#fence.operate(() => super.listFiles(path, options));
+    return this.#sdk.listFiles(path, options);
   }
 
-  override async startProcess(
+  override startProcess(
     command: string,
     options?: ProcessOptions,
     sessionId?: string,
   ): Promise<Process> {
-    const started = await this.#fence.operate(() =>
-      super.startProcess(command, options, sessionId),
-    );
-    return {
-      ...started,
-      waitForExit: (timeout) => this.#fence.operate(() => started.waitForExit(timeout)),
-    };
+    return this.#sdk.startProcess(command, options, sessionId);
   }
 
-  // Every SDK call that reaches or starts the container passes here: one that resumes after
-  // retirement, such as a restore whose archive read outlived the deadline, is refused before it
-  // can restart the container the fence destroyed.
-  override async containerFetch(
+  override containerFetch(
     requestOrUrl: Request | string | URL,
     portOrInit?: number | RequestInit,
     portParam?: number,
   ): Promise<Response> {
-    this.#fence.admit();
-    return super.containerFetch(requestOrUrl, portOrInit, portParam);
+    return this.#sdk.containerFetch(requestOrUrl, portOrInit, portParam);
   }
+}
+
+/**
+ * The Sandbox SDK methods through which the patched CI runner reaches a sandbox's container, either
+ * by calling them or, for `containerFetch`, through the SDK's own transport. `RailheadSandbox`
+ * overrides each one to run through `fenceSandbox`.
+ */
+export const FENCED_SANDBOX_METHODS = [
+  "restoreBackup",
+  "createBackup",
+  "execWithSessionToken",
+  "listFiles",
+  "startProcess",
+  "containerFetch",
+] as const satisfies readonly (keyof Sandbox)[];
+
+/** The SDK calls `fenceSandbox` wraps. */
+export type FencedSandboxCalls = Pick<Sandbox, (typeof FENCED_SANDBOX_METHODS)[number]>;
+
+/**
+ * Wraps `base`'s SDK calls so each runs inside `fence`'s live incarnation: retirement waits for it,
+ * and none starts, or reports, after it. A started process's own calls, such as its exit wait, run
+ * the same way. `containerFetch` is the path every SDK call takes to reach or start the container,
+ * so one that resumes after retirement, such as a restore whose archive read outlived the deadline,
+ * is refused before it can restart the container the fence destroyed.
+ */
+export function fenceSandbox(
+  fence: Pick<SandboxFence, "operate" | "admit">,
+  base: FencedSandboxCalls,
+): FencedSandboxCalls {
+  const fenceProcess = (process: Process): Process => ({
+    ...process,
+    kill: (signal) => fence.operate(() => process.kill(signal)),
+    getStatus: () => fence.operate(() => process.getStatus()),
+    getLogs: () => fence.operate(() => process.getLogs()),
+    waitForLog: (pattern, timeout) => fence.operate(() => process.waitForLog(pattern, timeout)),
+    waitForPort: (port, options) => fence.operate(() => process.waitForPort(port, options)),
+    waitForExit: (timeout) => fence.operate(() => process.waitForExit(timeout)),
+  });
+  return {
+    restoreBackup: (backup) => fence.operate(() => base.restoreBackup(backup)),
+    createBackup: (options) => fence.operate(() => base.createBackup(options)),
+    execWithSessionToken: (command, sessionId, options) =>
+      fence.operate(() => base.execWithSessionToken(command, sessionId, options)),
+    listFiles: (path, options) => fence.operate(() => base.listFiles(path, options)),
+    startProcess: async (command, options, sessionId) =>
+      fenceProcess(await fence.operate(() => base.startProcess(command, options, sessionId))),
+    containerFetch: async (requestOrUrl, portOrInit, portParam) => {
+      fence.admit();
+      return base.containerFetch(requestOrUrl, portOrInit, portParam);
+    },
+  };
 }
 
 // Until a policy selects the gateway, every request is refused.

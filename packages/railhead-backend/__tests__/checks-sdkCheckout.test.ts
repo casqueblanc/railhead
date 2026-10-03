@@ -7,6 +7,15 @@ import {
 } from "@cloudflare/ci";
 import type { CiBindings } from "@cloudflare/ci/worker";
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
+import type {
+  BackupOptions,
+  DirectoryBackup,
+  ExecOptions,
+  ExecResult,
+  ListFilesOptions,
+  Process,
+  ProcessOptions,
+} from "@cloudflare/sandbox";
 import { runInDurableObject } from "cloudflare:test";
 import { env, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +28,12 @@ import {
 import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
 import { SandboxFence } from "../src/sandbox/fence";
 import { parseSandboxGrant, type SandboxGrant } from "../src/sandbox/policy";
-import { RailheadSandbox } from "../src/sandbox/sandboxObject";
+import {
+  FENCED_SANDBOX_METHODS,
+  RailheadSandbox,
+  fenceSandbox,
+  type FencedSandboxCalls,
+} from "../src/sandbox/sandboxObject";
 
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
 const HOST = `${ACCOUNT}.artifacts.cloudflare.net`;
@@ -309,6 +323,167 @@ describe("the checkout's grant at the registered Git gateway", () => {
   });
 });
 
+type FencedMethod = (typeof FENCED_SANDBOX_METHODS)[number];
+
+/** SDK calls that record each time they reach the container; with `fail`, every one rejects. */
+function recordingSdk(reached: string[], fail = false): FencedSandboxCalls {
+  const reach = async (name: string) => {
+    reached.push(name);
+    if (fail) throw new Error(`${name} failed`);
+  };
+  return {
+    restoreBackup: async (backup) => {
+      await reach("restoreBackup");
+      return { success: true, dir: backup.dir, id: backup.id };
+    },
+    createBackup: async (options) => {
+      await reach("createBackup");
+      return { id: BACKUP_ID, dir: options.dir };
+    },
+    execWithSessionToken: async (command) => {
+      await reach("execWithSessionToken");
+      return execResult(command, { exitCode: 3, stdout: "out" });
+    },
+    listFiles: async (path) => {
+      await reach("listFiles");
+      return { success: true, path, files: [logFile("/tmp/a.out", 5)], count: 1, timestamp: "" };
+    },
+    startProcess: async (command) => {
+      await reach("startProcess");
+      return scriptedProcess(command, 7, () => reach("process"));
+    },
+    containerFetch: async () => {
+      await reach("containerFetch");
+      return new Response("container");
+    },
+  };
+}
+
+/** One call of each fenced method; the key type makes a newly fenced method need an entry. */
+const CALL_EACH: Record<FencedMethod, (sdk: FencedSandboxCalls) => Promise<unknown>> = {
+  restoreBackup: (sdk) => sdk.restoreBackup({ id: BACKUP_ID, dir: "/workspace" }),
+  createBackup: (sdk) => sdk.createBackup({ dir: "/workspace" }),
+  execWithSessionToken: (sdk) => sdk.execWithSessionToken("true", "s"),
+  listFiles: (sdk) => sdk.listFiles("/tmp"),
+  startProcess: (sdk) => sdk.startProcess("npm test"),
+  containerFetch: (sdk) => sdk.containerFetch("http://container/"),
+};
+
+describe("fenceSandbox, the wrapping RailheadSandbox applies to its SDK calls", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("runs every call in the live incarnation and returns the SDK's result", async () => {
+    const { fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence, recorder) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const reached: string[] = [];
+      const sdk = fenceSandbox(fence, recordingSdk(reached));
+
+      expect(await sdk.restoreBackup({ id: BACKUP_ID, dir: "/workspace" })).toEqual({
+        success: true,
+        dir: "/workspace",
+        id: BACKUP_ID,
+      });
+      expect(await sdk.createBackup({ dir: "/workspace" })).toEqual({
+        id: BACKUP_ID,
+        dir: "/workspace",
+      });
+      expect(await sdk.execWithSessionToken("true", "s")).toMatchObject({
+        exitCode: 3,
+        stdout: "out",
+      });
+      expect((await sdk.listFiles("/tmp")).files.map((file) => file.absolutePath)).toEqual([
+        "/tmp/a.out",
+      ]);
+      const process = await sdk.startProcess("npm test");
+      expect(process.command).toBe("npm test");
+      expect(await process.waitForExit()).toEqual({ exitCode: 7 });
+      expect(await (await sdk.containerFetch("http://container/")).text()).toBe("container");
+
+      expect(reached).toEqual([
+        "restoreBackup",
+        "createBackup",
+        "execWithSessionToken",
+        "listFiles",
+        "startProcess",
+        "process",
+        "containerFetch",
+      ]);
+      expect(recorder.destroys).toBe(0);
+    });
+  });
+
+  it.each(FENCED_SANDBOX_METHODS)(
+    "refuses %s before the fence starts, without reaching the container",
+    async (method) => {
+      await withFence(async (fence) => {
+        const reached: string[] = [];
+        const sdk = fenceSandbox(fence, recordingSdk(reached));
+
+        await expect(CALL_EACH[method](sdk)).rejects.toThrow("refused: not_started");
+        expect(reached).toEqual([]);
+      });
+    },
+  );
+
+  it.each(FENCED_SANDBOX_METHODS)(
+    "refuses %s once the incarnation is retired, without reaching the container",
+    async (method) => {
+      const { fence: grant } = checkoutAt(NOW);
+      await withFence(async (fence) => {
+        await fence.start(grant.policy, grant.expiresAt);
+        await fence.retire();
+        const reached: string[] = [];
+        const sdk = fenceSandbox(fence, recordingSdk(reached));
+
+        await expect(CALL_EACH[method](sdk)).rejects.toThrow("refused: retired");
+        expect(reached).toEqual([]);
+      });
+    },
+  );
+
+  it("refuses a process started while live once the incarnation is retired", async () => {
+    const { fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const reached: string[] = [];
+      const process = await fenceSandbox(fence, recordingSdk(reached)).startProcess("npm test");
+      await fence.retire();
+
+      await expect(process.waitForExit()).rejects.toThrow("refused: retired");
+      await expect(process.getLogs()).rejects.toThrow("refused: retired");
+      await expect(process.kill()).rejects.toThrow("refused: retired");
+      await expect(process.waitForPort(8080)).rejects.toThrow("refused: retired");
+      expect(reached).toEqual(["startProcess"]);
+    });
+  });
+
+  it("destroys the container and ends the grant when a call fails", async () => {
+    const { fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence, recorder) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const sdk = fenceSandbox(fence, recordingSdk([], true));
+
+      await expect(sdk.restoreBackup({ id: BACKUP_ID, dir: "/workspace" })).rejects.toThrow(
+        "restoreBackup failed",
+      );
+      expect(recorder.destroys).toBe(1);
+      expect(fence.grantCurrent(grant.expiresAt)).toBe(false);
+    });
+  });
+
+  it("is applied by a RailheadSandbox override of every fenced method", () => {
+    const overridden = FENCED_SANDBOX_METHODS.filter((method) =>
+      Object.hasOwn(RailheadSandbox.prototype, method),
+    );
+
+    expect(overridden).toEqual([...FENCED_SANDBOX_METHODS]);
+  });
+});
+
 function noop(): void {}
 
 /** A promise the test settles by hand. */
@@ -318,6 +493,56 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+/** The SDK's result for a command that ran with `scripted`'s outcome. */
+function execResult(command: string, scripted: Scripted): ExecResult {
+  return {
+    success: scripted.exitCode === 0,
+    exitCode: scripted.exitCode,
+    stdout: scripted.stdout ?? "",
+    stderr: "",
+    command,
+    duration: 0,
+    timestamp: "",
+  };
+}
+
+/** A started process that exits with `exitCode`; every call reaches the container first. */
+function scriptedProcess(command: string, exitCode: number, reach: () => Promise<void>): Process {
+  const unscripted = async (): Promise<never> => {
+    await reach();
+    throw new Error("the runner made a process call the test does not script");
+  };
+  return {
+    id: "proc_1",
+    command,
+    status: "running",
+    startTime: new Date(0),
+    kill: unscripted,
+    getStatus: unscripted,
+    getLogs: unscripted,
+    waitForLog: unscripted,
+    waitForPort: unscripted,
+    waitForExit: async () => {
+      await reach();
+      return { exitCode };
+    },
+  };
+}
+
+/** One log file as the SDK lists it. */
+function logFile(absolutePath: string, size: number) {
+  return {
+    name: absolutePath.slice(absolutePath.lastIndexOf("/") + 1),
+    absolutePath,
+    relativePath: absolutePath,
+    type: "file" as const,
+    size,
+    modifiedAt: "",
+    mode: "0644",
+    permissions: { readable: true, writable: true, executable: false },
+  };
 }
 
 /** What one scripted sandbox command returns. */
@@ -333,12 +558,12 @@ type ScriptedCommand = (command: string, workspace: ReadonlySet<string>) => Scri
  * A Sandbox Durable Object stub that records every call and answers from a script. It models the
  * workspace as a set of paths: a fresh checkout replaces it with the fetched commit's tree, an
  * overlay adds that tree without deleting anything, and a backup restores the paths it captured.
- * Given a fence, it runs each SDK operation through `operate` and reaches the container through
- * `admit`, as `RailheadSandbox`'s overrides and its `containerFetch` do.
+ * Given a fence, its SDK calls pass through `fenceSandbox`, as `RailheadSandbox`'s do, and each
+ * scripted call reaches the container through the fenced `containerFetch`, as the SDK's do.
  */
 class ScriptedSandbox {
   readonly calls: string[] = [];
-  readonly envs: Record<string, string>[] = [];
+  readonly envs: Record<string, string | undefined>[] = [];
   readonly backups: { localBucket: unknown }[] = [];
   readonly restored: unknown[] = [];
   readonly scripts: string[] = [];
@@ -364,7 +589,9 @@ class ScriptedSandbox {
     private readonly trees: Readonly<Record<string, readonly string[]>>,
     private readonly saved: Map<string, ReadonlySet<string>>,
     private readonly fence: SandboxFence | null,
-  ) {}
+  ) {
+    this.sdk = fence === null ? this.scripted() : fenceSandbox(fence, this.scripted());
+  }
 
   /** `RailheadSandbox.railheadStart`, through `fence` when the test gives one. */
   async railheadStart(policy: unknown, expiresAt: unknown) {
@@ -375,27 +602,90 @@ class ScriptedSandbox {
     await this.fence?.start(grant.policy, grant.expiresAt);
   }
 
-  /** Runs `operation` as `RailheadSandbox` does: inside the fence's incarnation when there is one. */
-  private fenced<T>(operation: () => Promise<T>): Promise<T> {
-    return this.fence === null ? operation() : this.fence.operate(operation);
+  /**
+   * The SDK calls the runner makes. With a fence they pass through `fenceSandbox`, the wrapping
+   * `RailheadSandbox` applies, over the scripted calls; without one they reach the script directly.
+   */
+  private readonly sdk: FencedSandboxCalls;
+
+  execWithSessionToken(command: string, session: string, options?: ExecOptions) {
+    return this.sdk.execWithSessionToken(command, session, options);
   }
 
-  /** Reaches the container, as the SDK does through `RailheadSandbox.containerFetch`. */
-  private reach(): void {
-    this.fence?.admit();
+  startProcess(command: string, options?: ProcessOptions, sessionId?: string) {
+    return this.sdk.startProcess(command, options, sessionId);
   }
 
-  execWithSessionToken(command: string, session: string, options?: { env?: object }) {
-    return this.fenced(async () => this.execScripted(command, session, options));
+  createBackup(options: BackupOptions) {
+    return this.sdk.createBackup(options);
   }
 
-  private execScripted(command: string, _session: string, options?: { env?: object }) {
-    this.reach();
+  restoreBackup(backup: DirectoryBackup) {
+    this.onRestore();
+    return this.sdk.restoreBackup(backup);
+  }
+
+  listFiles(path: string, options?: ListFilesOptions) {
+    return this.sdk.listFiles(path, options);
+  }
+
+  /** Reaches the container as the SDK does, through the (fenced) `containerFetch`. */
+  private async reach(): Promise<void> {
+    await this.sdk.containerFetch("http://container/");
+  }
+
+  private scripted(): FencedSandboxCalls {
+    return {
+      execWithSessionToken: async (command, session, options) => {
+        await this.reach();
+        return execResult(command, this.execScripted(command, session, options));
+      },
+      startProcess: async (command, options) => {
+        await this.reach();
+        this.calls.push(`command:${command}`);
+        this.envs.push({ ...options?.env });
+        this.lastCommand = this.command(command, this.workspace);
+        return scriptedProcess(command, this.lastCommand.exitCode, () => this.reach());
+      },
+      createBackup: async (options) => {
+        await this.reach();
+        this.calls.push("backup");
+        this.backups.push({ localBucket: options.localBucket });
+        const id = crypto.randomUUID();
+        this.saved.set(id, new Set(this.workspace));
+        return { id, dir: "/workspace", localBucket: options.localBucket ?? false };
+      },
+      restoreBackup: async (backup) => {
+        if (this.restoreWaits !== null) {
+          this.onRestoreWaiting();
+          await this.restoreWaits;
+        }
+        await this.reach();
+        this.calls.push("restore");
+        this.restored.push(backup);
+        this.workspace = new Set(this.saved.get(backup.id));
+        return { success: true, dir: backup.dir, id: backup.id };
+      },
+      listFiles: async (path) => {
+        await this.reach();
+        const files =
+          this.logBytes === 0
+            ? []
+            : ["/tmp/ci-step.out", "/tmp/ci-step.err"].map((absolutePath) =>
+                logFile(absolutePath, this.logBytes),
+              );
+        return { success: true, path, files, count: files.length, timestamp: "" };
+      },
+      containerFetch: async () => new Response(null, { status: 204 }),
+    };
+  }
+
+  private execScripted(command: string, _session: string, options?: ExecOptions): Scripted {
     this.envs.push({ ...options?.env });
     if (command.startsWith(`tail -c ${INLINE_LOG_BYTES} `)) {
       // Labelled by the log's size: a read above the inline limit keeps only the tail.
       this.calls.push(this.logBytes > INLINE_LOG_BYTES ? "log:tail" : "log:read");
-      return { exitCode: this.tailFails ? 1 : 0, stdout: "last lines", stderr: "" };
+      return { exitCode: this.tailFails ? 1 : 0, stdout: "last lines" };
     }
     if (command.startsWith("tail -c")) {
       return {
@@ -413,70 +703,10 @@ class ScriptedSandbox {
         const sha = /fetch --depth=1 origin '([0-9a-f]{40})'/.exec(command)?.[1] ?? "";
         for (const path of this.trees[sha] ?? []) this.workspace.add(path);
       }
-      return { stdout: "", stderr: "", ...result };
+      return result;
     }
     this.calls.push(`exec:${command}`);
-    return { exitCode: 0, stdout: "", stderr: "" };
-  }
-
-  async startProcess(command: string, options?: { env?: Record<string, string> }) {
-    const exitCode = await this.fenced(async () => {
-      this.reach();
-      this.calls.push(`command:${command}`);
-      this.envs.push({ ...options?.env });
-      this.lastCommand = this.command(command, this.workspace);
-      return this.lastCommand.exitCode;
-    });
-    return {
-      waitForExit: () =>
-        this.fenced(async () => {
-          this.reach();
-          return { exitCode };
-        }),
-    };
-  }
-
-  createBackup(options: { localBucket?: unknown }) {
-    return this.fenced(async () => this.backupScripted(options));
-  }
-
-  private backupScripted(options: { localBucket?: unknown }) {
-    this.reach();
-    this.calls.push("backup");
-    this.backups.push({ localBucket: options.localBucket });
-    const id = crypto.randomUUID();
-    this.saved.set(id, new Set(this.workspace));
-    return { id, dir: "/workspace", localBucket: options.localBucket };
-  }
-
-  restoreBackup(backup: { id: string }) {
-    this.onRestore();
-    return this.fenced(async () => {
-      if (this.restoreWaits !== null) {
-        this.onRestoreWaiting();
-        await this.restoreWaits;
-      }
-      this.reach();
-      this.calls.push("restore");
-      this.restored.push(backup);
-      this.workspace = new Set(this.saved.get(backup.id));
-      return { success: true };
-    });
-  }
-
-  listFiles() {
-    return this.fenced(async () => this.listScripted());
-  }
-
-  private listScripted() {
-    this.reach();
-    if (this.logBytes === 0) return { files: [] };
-    return {
-      files: ["/tmp/ci-step.out", "/tmp/ci-step.err"].map((absolutePath) => ({
-        absolutePath,
-        size: this.logBytes,
-      })),
-    };
+    return { exitCode: 0 };
   }
 
   /** `RailheadSandbox.railheadRetire`, through `fence` when the test gives one. */
@@ -625,6 +855,16 @@ async function run(options: {
   sandbox.onRestore = options.onRestore ?? noop;
   sandbox.restoreWaits = options.restoreWaits ?? null;
   sandbox.onRestoreWaiting = options.onRestoreWaiting ?? noop;
+  // Every method the runner calls on the sandbox object, whatever path it takes.
+  const runnerCalls = new Set<string>();
+  const observed = new Proxy(sandbox, {
+    get(target, key) {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== "function") return value;
+      if (typeof key === "string") runnerCalls.add(key);
+      return value.bind(target);
+    },
+  });
   const artifacts = new RecordingArtifacts();
   const bindings = {
     CF_TOKEN: "cf-secret-token",
@@ -634,7 +874,7 @@ async function run(options: {
     BACKUP_BUCKET: new CacheBucket(cachedBy, (call) => sandbox.calls.push(call)),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-    SANDBOX: { idFromName: (name: string) => name, get: () => sandbox },
+    SANDBOX: { idFromName: (name: string) => name, get: () => observed },
     CI_WORKFLOW: {},
   };
   // Workerd constructs a Workflow only for a real instance, so the test builds one from the
@@ -668,7 +908,7 @@ async function run(options: {
   };
   // The fakes implement only what the engine calls, not the SDK's full binding and step types.
   await Reflect.apply(CheckRun.prototype.run, workflow, [event, step]);
-  return { outcome: workflow.outcome, output: workflow.output, sandbox, artifacts };
+  return { outcome: workflow.outcome, output: workflow.output, sandbox, artifacts, runnerCalls };
 }
 
 const SECRETS = [
@@ -717,6 +957,33 @@ describe("a check run through the patched SDK", () => {
     expect(artifacts.calls).toEqual([]);
     // Backups stay on the R2 binding: the container has no route to presigned URLs.
     expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
+  });
+
+  it("calls no sandbox method that bypasses the fence", async () => {
+    const runs = await Promise.all([
+      run({}),
+      run({ cached: true, logBytes: INLINE_LOG_BYTES + 1 }),
+      run({ command: { exitCode: 1 } }),
+      run({ checkout: () => ({ exitCode: 128 }) }),
+    ]);
+    const called = [...new Set(runs.flatMap((result) => [...result.runnerCalls]))].toSorted();
+    // The sandbox module's own fenced entry points, and the SDK calls RailheadSandbox fences.
+    const fenced: readonly string[] = [
+      "railheadRetire",
+      "railheadStart",
+      ...FENCED_SANDBOX_METHODS,
+    ];
+
+    expect(called.filter((method) => !fenced.includes(method))).toEqual([]);
+    expect(called).toEqual([
+      "createBackup",
+      "execWithSessionToken",
+      "listFiles",
+      "railheadRetire",
+      "railheadStart",
+      "restoreBackup",
+      "startProcess",
+    ]);
   });
 
   it("serves the checkout's grant while the check runs and retires the fence when it ends", async () => {
