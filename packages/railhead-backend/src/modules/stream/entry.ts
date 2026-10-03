@@ -40,6 +40,8 @@ export interface StreamSubscription {
 export interface StreamPort {
   /** Delivers every event after `cursor` to `listener` until cancelled or ended. */
   subscribe(cursor: number, listener: StreamListener): Promise<PortResult<StreamSubscription>>;
+  /** Ends every live subscription with `reason`, as when the history they follow is deleted. */
+  endAll(reason: SubscriptionEnd): void;
 }
 
 /**
@@ -67,7 +69,10 @@ export const stream: ModuleFactory<StreamPort> = (context) => streamPort(context
 /** The stream port over `log`. */
 export function streamPort(log: EventLog, options: StreamOptions = {}): StreamPort {
   const hub = new Hub(log, options.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS);
-  return { subscribe: async (cursor, listener) => hub.subscribe(cursor, listener) };
+  return {
+    subscribe: async (cursor, listener) => hub.subscribe(cursor, listener),
+    endAll: (reason) => hub.endAll(reason),
+  };
 }
 
 class Hub {
@@ -104,6 +109,13 @@ class Hub {
     });
     subscription.wake(this.#log.head());
     return ok(new SubscriptionHandle(subscription));
+  }
+
+  endAll(reason: SubscriptionEnd): void {
+    for (const live of this.#live) live.end(reason);
+    // Ended subscriptions ignore wakes, so the log need not be watched while their slots drain.
+    this.#stopObserving?.();
+    this.#stopObserving = null;
   }
 
   #remove(subscription: Subscription): void {
