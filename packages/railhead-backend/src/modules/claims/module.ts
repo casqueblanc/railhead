@@ -346,9 +346,10 @@ export function createClaims(
           if (row.readyCommit !== commit) {
             return refuse(tx, { kind: "refused", reason: "after_ready", row });
           }
-          // A pin that never reached the train is queued now, under the same gate and versions. A
-          // train that cannot say whether it holds the pin refuses the repeat, so the agent retries.
-          const entered = ports().train.hasEntry(claimId, generation);
+          // A pin the train no longer holds, because it never reached the train or its entry was
+          // dropped, is queued now, under the same gate and versions. A train that cannot say
+          // whether it holds the pin refuses the repeat, so the agent retries.
+          const entered = ports().train.holdsLiveEntry(claimId, generation);
           if (entered === null) return unavailable("train");
           if (!entered) {
             const queued = ports().train.queue(tx, { claimId, generation, commit }, row.episode);

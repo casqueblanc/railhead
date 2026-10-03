@@ -27,7 +27,7 @@ import {
   MAX_WAKE_FAILURES,
   type Train,
 } from "../src/modules/train/scheduler";
-import { insertEntry, readWake } from "../src/modules/train/store";
+import { insertEntry, readWake, settleEntry } from "../src/modules/train/store";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm } from "../src/repo/storage";
@@ -472,6 +472,64 @@ describe("ready hands its pin to the train", () => {
     });
   });
 
+  it("queues a pin again on a repeated ready once a late obligation that dropped it is acknowledged", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const first = await setup.decide(claim.claimId);
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      await setup.ackAll();
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+
+      // Work that relied on the replaced version lands: rework is owed under the current version,
+      // so the gate blocks without a new decision version.
+      setup.log.transaction((tx) =>
+        setup.decisions.relied(tx, claim.claimId, 1, [
+          { decisionId: first.decisionId, version: 1 },
+        ]),
+      );
+      expect(setup.decisions.currentVersions(claim.claimId)).toEqual([second]);
+      await setup.train.resume();
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
+      expect(setup.composed).toEqual([]);
+
+      await setup.ackAll();
+      const head = setup.log.head();
+      const repaired = await setup.claims.ready(agent(1), claim.claimId, request);
+      const again = await setup.claims.ready(agent(1), claim.claimId, request);
+
+      expect(repaired).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(again).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(setup.log.head()).toBe(head);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.composed).toEqual([[pin]]);
+      expect(setup.started).toHaveLength(1);
+      expect(setup.started[0]).toMatchObject({ pins: [pin], decisions: [second] });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+    });
+  });
+
+  it("leaves a parked pin held on a repeated ready", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      settleEntry(setup.sql, pin, "parked", "conflict", setup.now());
+      setup.sql.exec("DELETE FROM train_wake");
+
+      const again = await setup.claims.ready(agent(1), claim.claimId, request);
+
+      expect(again).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "parked", next: null }]);
+      expect(readWake(setup.sql)).toBeNull();
+    });
+  });
+
   it("queues nothing for a repeated ready whose pin a newer decision superseded", async () => {
     await withHandoff(async (setup) => {
       const { claim, first } = await readyUnderFirst(setup);
@@ -529,10 +587,10 @@ describe("ready hands its pin to the train", () => {
       },
       (train) => ({
         ...train,
-        hasEntry: (claimId, generation) =>
+        holdsLiveEntry: (claimId, generation) =>
           missing
-            ? unavailableTrain.hasEntry(claimId, generation)
-            : train.hasEntry(claimId, generation),
+            ? unavailableTrain.holdsLiveEntry(claimId, generation)
+            : train.holdsLiveEntry(claimId, generation),
         queue: (tx, pin, episode) =>
           missing ? unavailableTrain.queue(tx, pin, episode) : train.queue(tx, pin, episode),
       }),
