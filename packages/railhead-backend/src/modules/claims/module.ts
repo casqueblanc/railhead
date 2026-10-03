@@ -50,9 +50,9 @@
 // the former holder had in flight can still move the fork's branch, but the successor's pin names
 // its own commit. An allocation whose holder's lease lapsed before the fork opened passes to the
 // successor at the next generation with no event, and the successor finishes the same fork intent.
-// While an expired claim's revocation is pending, `work` answers `busy` to every agent but its
-// former holder rather than hand out a newer issue, so the claim stays first in line. No claim on a
-// newer issue is taken over, by `work` or `claim`, until every older revocation is settled.
+// While an expired claim's revocation is pending, no agent, its former holder included, is given a
+// newer issue by `work` or `claim`, and no claim on a newer issue is taken over: each answers
+// `busy` until every older revocation is settled, so the expired claim stays first in line.
 //
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
@@ -153,8 +153,15 @@ export function createClaims(
       ? null
       : fail("unauthenticated", "The session is not for this repository.");
 
-  /** Records a new claim on `issueId` for `agent`, after the per-owner limit. Runs in a transaction. */
+  /**
+   * Records a new claim on `issueId` for `agent`, after the per-owner limit. Every allocation of a
+   * new issue passes here, so an older expired claim still owed a revocation keeps every agent,
+   * its former holder included, off a newer issue. Runs in a transaction.
+   */
   const intend = (sql: SqlStorage, agent: AgentPrincipal, issueId: IssueId): Chosen => {
+    if (releasePendingBefore(sql, issueId)) {
+      return fail("busy", "An older expired claim is still being released; repeat later.");
+    }
     if (activeClaimsOfOwner(sql, agent.ownerId) >= limits.maxActiveClaimsPerOwner) {
       return fail("quota_exceeded", "This person's agents hold as many claims as allowed.");
     }

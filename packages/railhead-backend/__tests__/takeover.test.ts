@@ -165,6 +165,14 @@ async function fireAlarm(setup: Setup): Promise<void> {
   throw new Error("the alarm kept asking to fire at once");
 }
 
+/** How many claims, of any state, the issue has. */
+function claimsOn(setup: Setup, issueId: string): number {
+  const [row] = setup.sql
+    .exec<{ n: number }>("SELECT COUNT(*) AS n FROM claims_claims WHERE issue_id = ?", issueId)
+    .toArray();
+  return row?.n ?? 0;
+}
+
 function types(events: RailheadEvent[]): string[] {
   return events.map((event) => event.type);
 }
@@ -705,7 +713,7 @@ describe("takeover", () => {
     });
   });
 
-  it("lets the former holder take a newer issue while its own expired claim is released", async () => {
+  it("keeps the former holder off a newer issue until its own expired claim is released", async () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
       const newer = await setup.file("Add downloads");
@@ -713,16 +721,67 @@ describe("takeover", () => {
       setup.fake.pageTokens(1, "creation");
       setup.fake.advance(CLAIM_LEASE_MS);
 
-      // Its own expired claim is never offered back, so it does not wait on it.
+      // Its own expired claim is never offered back, but it still waits rather than skip ahead.
+      expectFailure(await setup.port.work(agent(1)), "busy");
+      expectFailure(await setup.port.claim(agent(1), newer), "busy");
+      expectFailure(await setup.port.work(agent(2)), "busy");
+      expect(claimsOn(setup, newer)).toBe(0);
+
+      // Once a sweep settles, the former holder gets the newer issue and a successor the old claim.
+      setup.fake.pageTokens(null);
+      await fireAlarm(setup);
       expect(await setup.port.work(agent(1))).toMatchObject({
         ok: true,
         value: { claim: { issueId: newer, generation: 1 } },
       });
-      expect(stored(setup.sql, claim.claimId)).toMatchObject({
-        agent_id: "agt_agent0001",
-        state: "expired",
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2 } },
       });
-      expectFailure(await setup.port.work(agent(2)), "busy");
+    });
+  });
+
+  it("refuses a named claim on a newer issue while an older revocation is pending", async () => {
+    await withTakeover(async (setup) => {
+      const older = await setup.file("Add previews");
+      const pendingIssue = await setup.file("Add uploads");
+      const newer = await setup.file("Add downloads");
+      const opened = await setup.port.claim(agent(1), pendingIssue);
+      if (!opened.ok) throw new Error(`claim refused: ${opened.code}`);
+      const fork = await forkRepoName(REPO, opened.value.claim.claimId);
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      // Every revocation call fails, so the expired claim stays owed.
+      setup.fake.failRevocations(Number.MAX_SAFE_INTEGER);
+      setup.fake.advance(CLAIM_LEASE_MS);
+
+      expectFailure(await setup.port.claim(agent(2), newer), "busy");
+      expectFailure(await setup.port.claim(agent(3), newer), "busy");
+      expect(claimsOn(setup, newer)).toBe(0);
+      expect(setup.fake.accepts(former.plaintext)).toBe(true);
+      expect(stored(setup.sql, opened.value.claim.claimId)).toMatchObject({ state: "expired" });
+
+      // The next sweep reaches Artifacts but lists the tokens only in part, so the claim stays owed.
+      setup.fake.failRevocations(0);
+      setup.fake.pageTokens(1, "creation");
+      await fireAlarm(setup);
+      expect(stored(setup.sql, opened.value.claim.claimId).revoke_due).not.toBeNull();
+      expectFailure(await setup.port.claim(agent(2), newer), "busy");
+      expect(claimsOn(setup, newer)).toBe(0);
+
+      // An issue filed before the expired one is not behind it, so it can still be claimed.
+      expect(await setup.port.claim(agent(2), older)).toMatchObject({
+        ok: true,
+        value: { claim: { issueId: older, generation: 1 }, resumed: false },
+      });
+
+      // Once a sweep settles, the newer issue is free to claim.
+      setup.fake.pageTokens(null);
+      await fireAlarm(setup);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+      expect(await setup.port.claim(agent(3), newer)).toMatchObject({
+        ok: true,
+        value: { claim: { issueId: newer, generation: 1 }, resumed: false },
+      });
     });
   });
 
