@@ -1,5 +1,14 @@
-// Git: the smart-HTTP gateway between agents' Git clients and Artifacts. Until its task installs
-// the module, every request is answered 503 without reading its body or reaching Artifacts.
+// Git: the smart-HTTP gateway between agents' Git clients and Artifacts, implemented by
+// `createGitGateway` in `src/git/`. It streams to Artifacts remotes, and the Worker has no
+// `ARTIFACTS` binding yet, so this slot still answers every request 503 without reading its body or
+// reaching Artifacts. Once the binding is declared, the factory becomes:
+//
+//   (context, ports) => createGitGateway({
+//     log: context.log,
+//     ports,
+//     remote: artifactsRemotes(context.env.ARTIFACTS),
+//     upstream: (request) => fetch(request),
+//   })
 
 import type { GitAccess } from "../../contracts/claims";
 import type { ModuleFactory } from "../../repo/composeRepo";

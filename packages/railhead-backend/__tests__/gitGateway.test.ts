@@ -1,0 +1,938 @@
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { RailheadEvent } from "@railhead/shared/events";
+import {
+  ARTIFACTS_LIMITS,
+  createArtifactsAdapter,
+  forkRepoName,
+  mainRepoName,
+} from "../src/artifacts/adapter";
+import { FakeArtifacts, type FakeToken } from "../src/artifacts/fake";
+import type { ArtifactsPort } from "../src/contracts/artifacts";
+import type { ClaimsPort, GitAccess } from "../src/contracts/claims";
+import type { SessionsPort } from "../src/contracts/identity";
+import type { AgentPrincipal } from "../src/contracts/principals";
+import { fail, ok } from "../src/contracts/result";
+import { unavailableClaims, unavailableSessions } from "../src/contracts/unavailable";
+import {
+  GIT_GATEWAY_LIMITS,
+  createGitGateway,
+  type GitGatewayLimits,
+  type RemoteResolver,
+  type Upstream,
+} from "../src/git/gateway";
+import { artifactsRemotes } from "../src/git/remotes";
+import { PushReportReader } from "../src/git/reportStatus";
+import type { GitPort, GitTarget } from "../src/modules/git/entry";
+import { EventLog } from "../src/repo/eventLog";
+
+// Request and response bodies recorded from stock Git 2.50.1 against `git http-backend`: a
+// protocol v2 `git clone --depth 1`, then a push of one new commit from that shallow clone to a new
+// branch, whose head starts with a `shallow` line and whose report is report-status-v2 over
+// side-band-64k.
+const STOCK = {
+  shallowFetchRequest: `
+MDAxMWNvbW1hbmQ9ZmV0Y2gwMDFiYWdlbnQ9Z2l0LzIuNTAuMS1EYXJ3aW4wMDE2b2JqZWN0LWZvcm1hdD1zaGExMDAwMTAw
+MGR0aGluLXBhY2swMDBmbm8tcHJvZ3Jlc3MwMDBmaW5jbHVkZS10YWcwMDBkb2ZzLWRlbHRhMDAwY2RlZXBlbiAxMDAzMndh
+bnQgNzc2NjU4NTE2MTgyZjg1OGZiYTkyZjA4NDY2NDI4N2FkNDhiZDBiNAowMDMyd2FudCA3NzY2NTg1MTYxODJmODU4ZmJh
+OTJmMDg0NjY0Mjg3YWQ0OGJkMGI0CjAwMDlkb25lCjAwMDA=`,
+  shallowFetchResult: `
+MDAxMXNoYWxsb3ctaW5mbwowMDM0c2hhbGxvdyA3NzY2NTg1MTYxODJmODU4ZmJhOTJmMDg0NjY0Mjg3YWQ0OGJkMGI0MDAw
+MTAwMGRwYWNrZmlsZQowMzdjAVBBQ0sAAAACAAAAA5lBeJyNk0mvo1YQhff8CvZWwmUGqV8rzPgxz+AdXLgYg5mMbexf306i
+7HqRszylOqqSzretTYPTJN1UJVWTnABrxDV1wyIRlqXAQxGRFYt4SNc0YLC5XJtxwwFdsRxAnFhxTMVwLAQVgnTF8wBBHjUI
+NFRJshWDlfftPK24hP8o/2r28joPzZ/d+CiHrv6JkzzHU9QniMQP4CMMTtdrt23N/15o5/bWtfgff0vWjKOL+4aPR0fDleIk
+1P7xMRzDu+D4liVJViSp1jtNO2/tXA8rHRmM7koO8gl+7mXHfPU3XbquUi4CSWn74D8fwz+TErUEAbPV1rKWdTLnoj+bdKz9
+aaudvsuO/vaaMzA4ht8e4lguell/KlAcZMFkPAzfnbyZuG16B9mdoUPFDQwGvE/Pwd8mlmf2MLrnyQMyQo48VqADVIaRXEfZ
+6OT7OXYvGH7xWkS1wkUjDD4quOv76cLjOHb7o9vsqvHEvWeAOLwNx9WrKir0x2vzBcplJ9NsGe+O4TZKffo19mND3Rtu9Mzy
+4OWwGx7FXDkBzAESOOQp5NW7BqNH7ogMjlaJ2F4K7V4NPl+khjU5yKtvzuxPyi4p2T3lAkY8F7VlAHeH14N54trTFNJKEomq
+uai08urqaUwVWtg/N+hCJtEDgP0NHF4P8hTXLNqs+aQyXkFkbKmFYzAQLfPu0gPNQ6sT/Ia9kTFbrnF8Hr8x3JPXKlXO4M2U
+EtXd8ltnZeGTvEpnvhWVowyozRqKRj/lizXeA/VM2Me95Q9EPx2DwbcwnHgs35G6qBf7lUSghROt1qwt0dA+qHFIxvcchBOn
+pUsiBPt3oSfNg5z0Du08dZosJ/704T10MKka2RZQ7X56WQy+v8WNQ24w3trCoBl9Fa0kM7R1vy/p4L9dwpMH9cLK3Pz9SaBj
+KtoPuTIPpkQug+OZIOFppvhAxUg+XE5kuaKySKtlh8McLhfNhONCeuYrHs0RJRiedebYevPASFlKWTkKxsTS7SUHhMY/U/+i
+cXRCmGfpWkcplRm9XUtfGP71cO4a9i8zmqv+jhhse07YL4wNR+2hAnicMzQwMDMxUUjUK6koYfgu+f6KwVXt8yfCspw3vU4N
+67jcUQgAz5cOiDR4nCspz+cCAAQhAWWsC+OubwoJiLWMB9sY8c4ylPgbMDAwNgFYMDAwMA==`,
+  pushRequest: `
+MDAzNXNoYWxsb3cgNzc2NjU4NTE2MTgyZjg1OGZiYTkyZjA4NDY2NDI4N2FkNDhiZDBiNAowMGI5MDAwMDAwMDAwMDAwMDAw
+MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCA2Mzg3ZWE3NzY1NGJjZmZmMDUyMTEzMGYyMmYzNjkxYzQwZGViOGFiIHJlZnMv
+aGVhZHMvZmVhdHVyZQAgcmVwb3J0LXN0YXR1cy12MiBzaWRlLWJhbmQtNjRrIHF1aWV0IG9iamVjdC1mb3JtYXQ9c2hhMSBh
+Z2VudD1naXQvMi41MC4xLURhcndpbjAwMDBQQUNLAAAAAgAAAAObQXicjZTHzqtWAIT3PMXZowQ4YA5IuVehG1NMccH/jt6L
+6fjp8ydRdneRWY40mxl9M49pCkg6ZckTolASntgUIjZLEjqh4QmFGUPTER8nLMNCFhvCMe1mgBDLnrgTxVIczLgTl0UhDzOS
+Y1iWgRwKE4aLEjJisHCZi34EAvgj/DPdw3Zo0t/Lbg2bMvkJKMQiCE8sCQFOfguL+7Yt5zn934F8yKcyB7/9LVHRdBs4mgN8
+XbOF291T/vExgIHS1T+iIIiSICRqqSjFnA9JM9K+xqi2YGUOgYZatM5HPalCOwoBbglSXrv/+Rg46iXTNwJ3hLR9nSEdBHTw
+XPalcfrAduPlqY/k4byv+3rR9cpAfUlLZM9oPKNkRRaTGCia4uGaxBn6eI5ThiMhVEWtuzh0oCIpT5P48/qSp3HUiH0upLjJ
+V8178ZNUJ9VF8k4YSHSJMWJ2FOGUFzbd2tdop5X8kVZ+Sy3wfk7l6OBU+aKvc0HOh7dOzHXdcbcrmTBUYwzQde8Y2eK16WvP
+ac+72KUDl1p9F1LXvd9wH7q3eLjNp+1vFBLS0ibsHrHPCI0aO5EbBkg3ioOPl+NEeDSZHHeKz+3Vl+AxH9UXOB/1kBeVtTLg
+fH/ysfK2Ukcy8ddD1tpMXwYMwKykccOMMlzTg6lBN0aGseOQ1Co0154I3vHRVNM53/XnFmqWY5rsxTglN5rbO1bvKQxsVZRc
+0XuqxIRXQzeAgyZor9Ci8teQrq5Y2O1LIRe8WqXG5zZ9CCDV6DhvfhZt2w8fA+ocJeXmdx53KXeqZgnrs1DmiW3uh4XLN8ha
+Y5udC9rhnSdnmLerJhr9NtVrTKUbYyvfW2zt20XnmpT3B39OpbU8V4antG1SlaXF3OJ9JlMhvgXE5xmle6B0ofDA01keA/vl
+hd9NNi1sb7g4HN2qTk7fvsQbIz3wwnxq8iS9A9+EX7442tt4FGPF42V2EPfoaj/kggn8uMWApH1mgkno5h5Y+teCqC5ftHtX
+lo5X76uNZ5rXGOFDvOilYSTobDnCDwz8aAwbYv8yo9jyr4jB5uL7FbC/AGkvSTqhAnicMzQwMDMxUUjUK6koYdC+n756Y/KS
+/5uuf/7QwTP/KVvP8yYA1yIPkTZ4nCvJKEpN5QIACJECIwYQdo7yybVE9ehjEN/gKUrqxXTf`,
+  pushResult: `
+MDAzMQEwMDBldW5wYWNrIG9rCjAwMWFvayByZWZzL2hlYWRzL2ZlYXR1cmUKMDAwMDAwMDA=`,
+};
+
+function decode(base64: string): Uint8Array {
+  return Uint8Array.from(atob(base64.replace(/\s/g, "")), (character) => character.charCodeAt(0));
+}
+
+const SHALLOW_FETCH_REQUEST = decode(STOCK.shallowFetchRequest);
+const SHALLOW_FETCH_RESULT = decode(STOCK.shallowFetchResult);
+const PUSH_REQUEST = decode(STOCK.pushRequest);
+const PUSH_RESULT = decode(STOCK.pushResult);
+const PUSHED = "6387ea77654bcfff0521130f22f3691c40deb8ab";
+
+const REPO = "rep_gitgateway01";
+const ROOT = "1".repeat(40);
+const HEAD = "2".repeat(40);
+const ZERO = "0".repeat(40);
+const CLAIM = "clm_gitclaim0001";
+const AGENT: AgentPrincipal = {
+  kind: "agent",
+  agentId: "agt_gitagent0001",
+  ownerId: "usr_owner0001",
+  repoId: REPO,
+};
+const OTHER: AgentPrincipal = { ...AGENT, agentId: "agt_gitagent0002" };
+const SESSION = "session-token-of-agent-one";
+const OTHER_SESSION = "session-token-of-agent-two";
+const FORK: GitTarget = { kind: "fork", claimId: CLAIM };
+const MAIN: GitTarget = { kind: "main" };
+const FAST: GitGatewayLimits = { ...GIT_GATEWAY_LIMITS, headersTimeoutMs: 100, maxDurationMs: 300 };
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+type ClaimState = "working" | "ready" | "expired";
+
+interface Seen {
+  url: string;
+  method: string;
+  headers: Headers;
+  body: Uint8Array;
+}
+
+interface World {
+  gateway: GitPort;
+  fake: FakeArtifacts;
+  claim: { agentId: string; generation: number; state: ClaimState };
+  authorizations: GitAccess[];
+  /** The requests the default upstream received, with their bodies. */
+  seen: Seen[];
+  /** What the default upstream answers once it has read a request carrying a live token. */
+  respond: (request: Request, body: Uint8Array) => Promise<Response> | Response;
+  /** The outbound call; replace it to observe a request as it streams. */
+  upstream: Upstream;
+  remote: RemoteResolver;
+  events: () => RailheadEvent[];
+  forkName: string;
+  mainName: string;
+  /** Every token Artifacts minted for this world, revoked or not. */
+  tokens: () => string[];
+  /** The tokens still live, across main and the fork. */
+  live: () => FakeToken[];
+}
+
+/** A `ClaimsPort` whose `authorizeGit` follows the A21 contract over one mutable claim. */
+function claimsFor(world: World): ClaimsPort {
+  return {
+    ...unavailableClaims,
+    async authorizeGit(access) {
+      world.authorizations.push(access);
+      const { principal, target, operation } = access;
+      if (principal === null || principal.repoId !== REPO) {
+        return fail("unauthenticated", "A Git request needs a session for this repository.");
+      }
+      if (target.kind === "main") {
+        if (operation === "push")
+          return fail("invalid_request", "Main is written only by the train.");
+        return ok({ repo: world.mainName, scope: "read", fence: null });
+      }
+      if (target.claimId !== CLAIM) return fail("not_found", "The claim has no fork.");
+      if (operation === "fetch") return ok({ repo: world.forkName, scope: "read", fence: null });
+      if (world.claim.agentId !== principal.agentId) {
+        return fail("stale_generation", "This agent does not hold the claim.");
+      }
+      switch (world.claim.state) {
+        case "working":
+          return ok({
+            repo: world.forkName,
+            scope: "write",
+            fence: { claimId: CLAIM, generation: world.claim.generation },
+          });
+        case "ready":
+          return fail("after_ready", "The claim is ready, so its fork takes no more pushes.");
+        case "expired":
+          return fail("claim_closed", "The claim is closed.");
+        default:
+          return world.claim.state satisfies never;
+      }
+    },
+  };
+}
+
+const sessions: SessionsPort = {
+  ...unavailableSessions,
+  async authenticate(token) {
+    if (token === SESSION) return ok(AGENT);
+    if (token === OTHER_SESSION) return ok(OTHER);
+    return fail("unauthenticated", "The session is not valid.");
+  },
+};
+
+/** Runs `body` against a gateway over real storage, the real Artifacts adapter and a fake upstream. */
+function withGateway(
+  body: (world: World) => Promise<void>,
+  limits: GitGatewayLimits = FAST,
+  wrapArtifacts: (base: ArtifactsPort) => ArtifactsPort = (base) => base,
+): Promise<void> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const fake = new FakeArtifacts();
+    const mainName = await mainRepoName(REPO);
+    fake.seed(mainName, [ROOT, HEAD]);
+    const adapter = createArtifactsAdapter(
+      { repoId: REPO, storage: state.storage, clock: fake.clock, namespace: fake },
+      { ...ARTIFACTS_LIMITS, callTimeoutMs: 100 },
+    );
+    const forked = await adapter.forkForClaim(CLAIM, HEAD);
+    if (!forked.ok) throw new Error(`fork failed: ${forked.code}`);
+    const artifacts = wrapArtifacts(adapter);
+    const log = EventLog.open(state.storage, REPO, fake.clock);
+    const forkName = await forkRepoName(REPO, CLAIM);
+    const world: World = {
+      gateway: { serve: () => Promise.reject(new Error("not built")) },
+      fake,
+      mainName,
+      forkName,
+      claim: { agentId: AGENT.agentId, generation: 3, state: "working" },
+      authorizations: [],
+      seen: [],
+      respond: () => new Response(null, { status: 500 }),
+      upstream: async (request) => {
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        world.seen.push({
+          url: request.url,
+          method: request.method,
+          headers: request.headers,
+          body: bytes,
+        });
+        // The fake Git endpoint refuses any token Artifacts would refuse.
+        const bearer = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+        if (!fake.accepts(bearer)) return new Response("bad token", { status: 401 });
+        return world.respond(request, bytes);
+      },
+      remote: async (repo) => ok(`https://fake.artifacts.invalid/${repo}.git`),
+      events: () => log.replay(0, 100).events,
+      tokens: () =>
+        [...fake.repos.values()].flatMap((repo) => repo.tokens.map((token) => token.plaintext)),
+      live: () => [...fake.liveTokens(mainName), ...fake.liveTokens(forkName)],
+    };
+    const claims = claimsFor(world);
+    world.gateway = createGitGateway(
+      {
+        log,
+        ports: () => ({ sessions, claims, artifacts }),
+        remote: (repo) => world.remote(repo),
+        upstream: (request) => world.upstream(request),
+      },
+      limits,
+    );
+    await body(world);
+  });
+}
+
+function basic(username: string, password: string): string {
+  return `Basic ${btoa(`${username}:${password}`)}`;
+}
+
+function advertise(service: string, auth: string | null = basic(AGENT.agentId, SESSION)): Request {
+  const headers = new Headers();
+  if (auth !== null) headers.set("authorization", auth);
+  return new Request(`https://railhead.test/git/acme/demo.git/info/refs?service=${service}`, {
+    headers,
+  });
+}
+
+function rpc(
+  service: "git-upload-pack" | "git-receive-pack",
+  body: BodyInit,
+  extra: Record<string, string> = {},
+): Request {
+  return new Request(`https://railhead.test/git/acme/demo.git/${service}`, {
+    method: "POST",
+    headers: {
+      authorization: basic(AGENT.agentId, SESSION),
+      "content-type": `application/x-${service}-request`,
+      ...extra,
+    },
+    body,
+  });
+}
+
+function gitResponse(service: string, kind: "advertisement" | "result", body: BodyInit): Response {
+  return new Response(body, { headers: { "content-type": `application/x-${service}-${kind}` } });
+}
+
+/** A pkt-line, written by hand so the tests do not reuse the subject's encoder. */
+function pkt(payload: string): string {
+  return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
+}
+
+function pushBody(lines: string[], caps = "report-status side-band-64k"): Uint8Array {
+  const [first = "", ...rest] = lines;
+  return encoder.encode(
+    `${pkt(`${first}\0${caps}\n`)}${rest.map((line) => pkt(`${line}\n`)).join("")}0000PACK`,
+  );
+}
+
+function sideBand(report: string): string {
+  return `${pkt(`\u0001${report}`)}0000`;
+}
+
+function bytesOf(response: Response): Promise<Uint8Array> {
+  return response.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+}
+
+function pushedEvents(world: World): RailheadEvent[] {
+  return world.events().filter((event) => event.type === "claim.pushed");
+}
+
+let logged: string[] = [];
+
+beforeEach(() => {
+  logged = [];
+  for (const level of ["log", "info", "warn", "error", "debug"] as const) {
+    vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    });
+  }
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+/** Asserts that no minted token appears in the client's view or in any log line. */
+function expectNoTokenLeak(world: World, clientView: string): void {
+  const tokens = world.tokens();
+  expect(tokens.length).toBeGreaterThan(0);
+  for (const token of tokens) {
+    expect(clientView).not.toContain(token);
+    for (const line of logged) expect(line).not.toContain(token);
+  }
+  for (const line of logged) expect(line).not.toContain(SESSION);
+}
+
+describe("stock Git through the gateway", () => {
+  it("serves a shallow protocol v2 clone of a fork byte for byte", async () => {
+    await withGateway(async (world) => {
+      world.respond = (request) =>
+        request.method === "GET"
+          ? gitResponse("git-upload-pack", "advertisement", "000eversion 2\n0000")
+          : gitResponse("git-upload-pack", "result", SHALLOW_FETCH_RESULT);
+
+      const advertised = await world.gateway.serve(
+        advertise("git-upload-pack"),
+        FORK,
+        "/info/refs",
+      );
+      expect(advertised.status).toBe(200);
+      expect(advertised.headers.get("content-type")).toBe(
+        "application/x-git-upload-pack-advertisement",
+      );
+      expect(await advertised.text()).toBe("000eversion 2\n0000");
+
+      const fetched = await world.gateway.serve(
+        rpc("git-upload-pack", SHALLOW_FETCH_REQUEST, { "git-protocol": "version=2" }),
+        FORK,
+        "/git-upload-pack",
+      );
+      expect(fetched.status).toBe(200);
+      expect(await bytesOf(fetched)).toEqual(SHALLOW_FETCH_RESULT);
+
+      const [get, post] = world.seen;
+      expect(get?.url).toBe(
+        `https://fake.artifacts.invalid/${world.forkName}.git/info/refs?service=git-upload-pack`,
+      );
+      expect(post?.url).toBe(
+        `https://fake.artifacts.invalid/${world.forkName}.git/git-upload-pack`,
+      );
+      expect(post?.body).toEqual(SHALLOW_FETCH_REQUEST);
+      expect(post?.headers.get("git-protocol")).toBe("version=2");
+      // The client's session never reaches Artifacts; a read token minted here does.
+      const [read] = world.live();
+      expect(read?.scope).toBe("read");
+      expect(post?.headers.get("authorization")).toBe(`Bearer ${read?.plaintext}`);
+      expect(world.authorizations.map((access) => access.operation)).toEqual(["fetch", "fetch"]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
+  it("forwards a shallow clone's push untouched and records the branch it reported updated", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+
+      expect(world.seen[0]?.body).toEqual(PUSH_REQUEST);
+      expect(world.fake.liveTokens(world.forkName).map((token) => token.scope)).toEqual(["write"]);
+      expect(pushedEvents(world)).toMatchObject([
+        {
+          actor: { kind: "agent", id: AGENT.agentId },
+          data: {
+            claimId: CLAIM,
+            generation: 3,
+            ref: "refs/heads/feature",
+            from: null,
+            to: PUSHED,
+          },
+        },
+      ]);
+    });
+  });
+
+  it("streams a push to the upstream before the client has finished sending it", async () => {
+    await withGateway(async (world) => {
+      let release: (() => void) | undefined;
+      const upstreamStarted = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = (): void => {
+        release?.();
+      };
+      const received: Uint8Array[] = [];
+      world.upstream = async (request) => {
+        const reader = request.body?.getReader();
+        if (reader === undefined) throw new Error("no body");
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          received.push(value);
+          started();
+        }
+        return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      };
+      const half = PUSH_REQUEST.length >> 1;
+      // The second half is sent only once the upstream has read some of the first: a gateway that
+      // buffered the whole body would wait forever.
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(PUSH_REQUEST.slice(0, half));
+          await upstreamStarted;
+          controller.enqueue(PUSH_REQUEST.slice(half));
+          controller.close();
+        },
+      });
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", body),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(concatAll(received)).toEqual(PUSH_REQUEST);
+      expect(pushedEvents(world)).toHaveLength(1);
+    });
+  });
+});
+
+function concatAll(chunks: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+describe("authority", () => {
+  it("never lets a push reach main, without asking anyone", async () => {
+    await withGateway(async (world) => {
+      const advertised = await world.gateway.serve(
+        advertise("git-receive-pack"),
+        MAIN,
+        "/info/refs",
+      );
+      expect(advertised.status).toBe(403);
+      expect(await advertised.text()).toContain("main is read-only");
+      const pushed = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        MAIN,
+        "/git-receive-pack",
+      );
+      expect(pushed.status).toBe(403);
+      expect(world.authorizations).toEqual([]);
+      expect(world.seen).toEqual([]);
+      expect(world.live()).toEqual([]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
+  it("lets an agent fetch main with a read token", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-upload-pack", "advertisement", "0000");
+      const response = await world.gateway.serve(advertise("git-upload-pack"), MAIN, "/info/refs");
+      expect(response.status).toBe(200);
+      expect(world.seen[0]?.url).toContain(`/${world.mainName}.git/info/refs`);
+      expect(world.fake.liveTokens(world.mainName).map((token) => token.scope)).toEqual(["read"]);
+    });
+  });
+
+  it("asks for credentials when none, bad ones or another agent's are sent", async () => {
+    await withGateway(async (world) => {
+      for (const auth of [
+        null,
+        "Bearer something",
+        basic(AGENT.agentId, "not-a-session"),
+        basic(AGENT.agentId, OTHER_SESSION),
+        "Basic !!!",
+      ]) {
+        const response = await world.gateway.serve(
+          advertise("git-upload-pack", auth),
+          FORK,
+          "/info/refs",
+        );
+        expect(response.status).toBe(401);
+        expect(response.headers.get("www-authenticate")).toContain("Basic");
+      }
+      expect(world.seen).toEqual([]);
+      expect(world.live()).toEqual([]);
+    });
+  });
+
+  it("refuses a push by an agent that no longer holds the claim, at both steps", async () => {
+    await withGateway(async (world) => {
+      world.claim.agentId = OTHER.agentId;
+      const advertised = await world.gateway.serve(
+        advertise("git-receive-pack"),
+        FORK,
+        "/info/refs",
+      );
+      expect(advertised.status).toBe(403);
+      expect(await advertised.text()).toContain("does not hold the claim");
+
+      const pushed = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      // Git prints the reason beside the ref.
+      expect(pushed.status).toBe(200);
+      expect(decoder.decode(await bytesOf(pushed))).toContain(
+        "ng refs/heads/feature This agent does not hold the claim.",
+      );
+      expect(world.seen).toEqual([]);
+      expect(world.live()).toEqual([]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
+  it("asks the claims module again on every request, even with a token cached", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "advertisement", "0000");
+      const first = await world.gateway.serve(advertise("git-receive-pack"), FORK, "/info/refs");
+      expect(first.status).toBe(200);
+      await first.body?.cancel();
+
+      world.claim.state = "ready";
+      const second = await world.gateway.serve(advertise("git-receive-pack"), FORK, "/info/refs");
+      expect(second.status).toBe(403);
+      expect(await second.text()).toContain("ready");
+      expect(world.authorizations).toHaveLength(2);
+      expect(world.seen).toHaveLength(1);
+      // One write token was minted for the first request; the second minted none.
+      expect(world.fake.liveTokens(world.forkName)).toHaveLength(1);
+    });
+  });
+
+  it("refuses a whole push when one of its refs is not a branch", async () => {
+    await withGateway(async (world) => {
+      const body = pushBody([`${ZERO} ${HEAD} refs/heads/topic`, `${ZERO} ${HEAD} refs/tags/v1`]);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", body),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      const report = decoder.decode(await bytesOf(response));
+      expect(report).toContain("ng refs/tags/v1 only branches under refs/heads/ can be pushed");
+      expect(report).toContain("ng refs/heads/topic refused with the rest of this push");
+      expect(world.seen).toEqual([]);
+      expect(world.live()).toEqual([]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
+describe("invalid requests", () => {
+  it("refuses dumb HTTP, wrong methods, wrong types and unknown paths before any authority", async () => {
+    await withGateway(async (world) => {
+      const cases: [Request, string, number][] = [
+        [new Request("https://railhead.test/x/info/refs"), "/info/refs", 403],
+        [
+          new Request("https://railhead.test/x/info/refs?service=git-upload-pack", {
+            method: "POST",
+            body: "x",
+          }),
+          "/info/refs",
+          405,
+        ],
+        [new Request("https://railhead.test/x/git-upload-pack"), "/git-upload-pack", 405],
+        [new Request("https://railhead.test/x/HEAD"), "/HEAD", 404],
+        [rpc("git-upload-pack", "0000", { "content-type": "text/plain" }), "/git-upload-pack", 415],
+      ];
+      for (const [request, path, status] of cases) {
+        expect((await world.gateway.serve(request, FORK, path)).status).toBe(status);
+      }
+      expect(world.authorizations).toEqual([]);
+      expect(world.seen).toEqual([]);
+    });
+  });
+
+  it("refuses a malformed or compressed push without reaching the upstream", async () => {
+    await withGateway(async (world) => {
+      const malformed = await world.gateway.serve(
+        rpc("git-receive-pack", "zzzz"),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(malformed.status).toBe(400);
+      expect(await malformed.text()).toContain("malformed pkt-line length");
+      const compressed = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST, { "content-encoding": "gzip" }),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(compressed.status).toBe(415);
+      expect(world.seen).toEqual([]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
+describe("bounds", () => {
+  it("refuses a body declared or found larger than the limit", async () => {
+    await withGateway(
+      async (world) => {
+        world.respond = () => gitResponse("git-upload-pack", "result", "0000");
+        const declared = await world.gateway.serve(
+          rpc("git-receive-pack", PUSH_REQUEST, { "content-length": String(PUSH_REQUEST.length) }),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(declared.status).toBe(413);
+
+        const atLimit = await world.gateway.serve(
+          rpc("git-upload-pack", new Uint8Array(64)),
+          FORK,
+          "/git-upload-pack",
+        );
+        expect(atLimit.status).toBe(200);
+        await atLimit.body?.cancel();
+
+        const streamed = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(40));
+            controller.enqueue(new Uint8Array(40));
+            controller.close();
+          },
+        });
+        const found = await world.gateway.serve(
+          rpc("git-upload-pack", streamed),
+          FORK,
+          "/git-upload-pack",
+        );
+        expect(found.status).toBe(413);
+        expect(world.seen).toHaveLength(1);
+      },
+      { ...FAST, maxFetchRequestBytes: 64, maxPushBytes: 64 },
+    );
+  });
+
+  it("cuts off a response larger than the limit", async () => {
+    await withGateway(
+      async (world) => {
+        world.respond = () => gitResponse("git-upload-pack", "result", new Uint8Array(65));
+        const response = await world.gateway.serve(
+          rpc("git-upload-pack", "0000"),
+          FORK,
+          "/git-upload-pack",
+        );
+        expect(response.status).toBe(200);
+        await expect(response.arrayBuffer()).rejects.toThrow();
+      },
+      { ...FAST, maxResponseBytes: 64 },
+    );
+  });
+
+  it("answers 504 when the upstream does not answer in time, and logs no token", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => new Promise<Response>(() => undefined);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(504);
+      const text = await response.text();
+      expect(pushedEvents(world)).toEqual([]);
+      expect(logged.some((line) => line.includes("timeout"))).toBe(true);
+      expectNoTokenLeak(world, text);
+    });
+  });
+
+  it("errors a response that outlives the time limit, and records no push", async () => {
+    await withGateway(async (world) => {
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(pkt("\u0002progress\n")));
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await expect(response.arrayBuffer()).rejects.toThrow();
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
+describe("upstream responses", () => {
+  it("never passes on a redirect, a refusal or an error page", async () => {
+    await withGateway(async (world) => {
+      for (const make of [
+        (token: string) =>
+          new Response(null, {
+            status: 302,
+            headers: { location: `https://elsewhere.invalid/?t=${token}` },
+          }),
+        (token: string) => new Response(`denied ${token}`, { status: 403 }),
+        (token: string) =>
+          new Response(`<html>${token}</html>`, { headers: { "content-type": "text/html" } }),
+      ]) {
+        world.respond = (request) =>
+          make(request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "");
+        const response = await world.gateway.serve(
+          advertise("git-upload-pack"),
+          FORK,
+          "/info/refs",
+        );
+        expect(response.status).toBe(502);
+        expect(response.headers.get("location")).toBeNull();
+        expectNoTokenLeak(world, `${[...response.headers].join()} ${await response.text()}`);
+      }
+    });
+  });
+
+  it("masks the token if the upstream echoes it in a Git result", async () => {
+    await withGateway(async (world) => {
+      world.respond = (request) => {
+        const token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+        const line = pkt(`ERR token ${token} rejected\n`);
+        // Split mid-token, so the mask has to hold bytes across chunks.
+        const cut = line.length - 12;
+        return gitResponse(
+          "git-upload-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(line.slice(0, cut)));
+              controller.enqueue(encoder.encode(line.slice(cut)));
+              controller.close();
+            },
+          }),
+        );
+      };
+      const response = await world.gateway.serve(
+        rpc("git-upload-pack", "0000"),
+        FORK,
+        "/git-upload-pack",
+      );
+      const body = await response.text();
+      const [token] = world.tokens();
+      expect(body).toBe(pkt(`ERR token ${"*".repeat(token?.length ?? 0)} rejected\n`));
+      expectNoTokenLeak(world, body);
+    });
+  });
+
+  it("records only the refs the upstream reported updated", async () => {
+    await withGateway(async (world) => {
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          sideBand(
+            `${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${pkt("ng refs/heads/b non-fast-forward\n")}0000`,
+          ),
+        );
+      const response = await world.gateway.serve(
+        rpc(
+          "git-receive-pack",
+          pushBody([`${ROOT} ${HEAD} refs/heads/a`, `${ROOT} ${HEAD} refs/heads/b`]),
+        ),
+        FORK,
+        "/git-receive-pack",
+      );
+      await response.arrayBuffer();
+      expect(pushedEvents(world).map((event) => event.data)).toEqual([
+        { claimId: CLAIM, generation: 3, ref: "refs/heads/a", from: ROOT, to: HEAD },
+      ]);
+    });
+  });
+
+  it("records nothing for a failed unpack, a fatal side band, a cut-off report or a refusal", async () => {
+    await withGateway(async (world) => {
+      const update = pushBody([`${ROOT} ${HEAD} refs/heads/a`]);
+      for (const answer of [
+        sideBand(
+          `${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/a unpacker error\n")}0000`,
+        ),
+        `${pkt("\u0003fatal: out of space\n")}0000`,
+        `${pkt(`\u0001${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}`)}0000`,
+        pkt("\u0001garbage"),
+      ]) {
+        world.respond = () => gitResponse("git-receive-pack", "result", answer);
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", update),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+      }
+      world.respond = () => new Response("nope", { status: 500 });
+      const failed = await world.gateway.serve(
+        rpc("git-receive-pack", update),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(failed.status).toBe(502);
+      expect(world.seen).toHaveLength(5);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
+  it("answers 503 and reaches no upstream while Artifacts is busy", async () => {
+    await withGateway(
+      async (world) => {
+        const response = await world.gateway.serve(
+          advertise("git-upload-pack"),
+          FORK,
+          "/info/refs",
+        );
+        expect(response.status).toBe(503);
+        expect(response.headers.get("retry-after")).toBe("5");
+        expect(world.seen).toEqual([]);
+      },
+      FAST,
+      (base) => ({
+        ...base,
+        token: async () => fail("busy", "The repository's tokens are being revoked; try again."),
+      }),
+    );
+  });
+});
+
+describe("push reports", () => {
+  it("reads a plain report-status-v2 report and drops a ref the server rewrote", () => {
+    const reader = new PushReportReader("plain");
+    reader.push(
+      encoder.encode(
+        `${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/b\n")}${pkt("option new-oid 3333\n")}0000`,
+      ),
+    );
+    expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/a"]) });
+  });
+
+  it("reads a report split one byte at a time", () => {
+    const reader = new PushReportReader("side-band");
+    for (const byte of PUSH_RESULT) reader.push(Uint8Array.of(byte));
+    expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/feature"]) });
+  });
+
+  it("knows nothing without a report, or with bytes after it", () => {
+    const none = new PushReportReader("none");
+    none.push(encoder.encode(`${pkt("unpack ok\n")}0000`));
+    expect(none.end()).toEqual({ kind: "unknown" });
+    const trailing = new PushReportReader("plain");
+    trailing.push(encoder.encode(`${pkt("unpack ok\n")}0000${pkt("ok refs/heads/a\n")}`));
+    expect(trailing.end()).toEqual({ kind: "unknown" });
+  });
+});
+
+/** A fake Artifacts binding whose `info` answers with `answer`, counting `get` calls. */
+function namespace(answer: () => Promise<{ remote: string }>): {
+  calls: () => number;
+  get: (name: string) => Promise<Disposable & { info(): Promise<{ remote: string }> }>;
+} {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    get: async () => {
+      calls += 1;
+      return { info: answer, [Symbol.dispose]: () => undefined };
+    },
+  };
+}
+
+describe("artifactsRemotes", () => {
+  it("reads a remote once and keeps it", async () => {
+    const binding = namespace(async () => ({ remote: "https://x.artifacts.cloudflare.net/r.git" }));
+    const resolve = artifactsRemotes(binding);
+    expect(await resolve("r")).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(await resolve("r")).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(binding.calls()).toBe(1);
+  });
+
+  it("maps a missing repository, a failure and a timeout, and keeps none of them", async () => {
+    const missing = namespace(() =>
+      Promise.reject(Object.assign(new Error("r"), { code: "NOT_FOUND" })),
+    );
+    expect(await artifactsRemotes(missing)("r")).toMatchObject({ ok: false, code: "not_found" });
+    const broken = namespace(() => Promise.reject(new Error("secret detail")));
+    const result = await artifactsRemotes(broken)("r");
+    expect(result).toMatchObject({ ok: false, code: "internal" });
+    expect(JSON.stringify(result)).not.toContain("secret detail");
+    const slow = namespace(() => new Promise(() => undefined));
+    const resolveSlow = artifactsRemotes(slow, { timeoutMs: 20, maxCached: 1 });
+    expect(await resolveSlow("r")).toMatchObject({ ok: false, code: "busy" });
+    expect(await resolveSlow("r")).toMatchObject({ ok: false, code: "busy" });
+    expect(slow.calls()).toBe(2);
+  });
+
+  it("is refused by the gateway when it is not plain HTTPS", async () => {
+    await withGateway(async (world) => {
+      for (const remote of [
+        "http://fake.artifacts.invalid/r.git",
+        "https://user:pw@fake.artifacts.invalid/r.git",
+        "https://fake.artifacts.invalid/r.git?x=1",
+        "not a url",
+      ]) {
+        world.remote = async () => ok(remote);
+        const response = await world.gateway.serve(
+          advertise("git-upload-pack"),
+          FORK,
+          "/info/refs",
+        );
+        expect(response.status).toBe(502);
+      }
+      expect(world.seen).toEqual([]);
+    });
+  });
+});
