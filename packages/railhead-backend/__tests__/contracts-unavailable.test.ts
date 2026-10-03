@@ -64,7 +64,7 @@ const SYNC = new Map<string, unknown>([
 ]);
 
 /** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */
-const RESUMERS = new Set(["train.resume"]);
+const RESUMERS = new Set(["claims.resume", "train.resume"]);
 
 /** The methods that confirm a wake, which report it unconfirmed while their module is missing. */
 const CONFIRMERS = new Set(["train.armWake"]);

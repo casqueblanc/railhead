@@ -41,7 +41,7 @@ export const unavailableSessions: SessionsPort = {
   authenticate: refuse("sessions"),
 };
 
-/** Claims while its module is missing: no Git request is authorized. */
+/** Claims while its module is missing: no Git request is authorized, and nothing is owed. */
 export const unavailableClaims: ClaimsPort = {
   activeClaim: refuse("claims"),
   work: refuse("claims"),
@@ -55,6 +55,7 @@ export const unavailableClaims: ClaimsPort = {
   holder: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
+  resume: async () => {},
 };
 
 /** Inbox while its module is missing: the ready gate is never clear. */
