@@ -1,0 +1,52 @@
+# Deploying Railhead for qualification
+
+The **Deploy** workflow (`.github/workflows/deploy.yml`) deploys the `railhead` Worker to its workers.dev host. It exists to qualify Railhead against real Cloudflare services, such as Artifacts, before any demo: there is no custom domain and no demo enrollment. Secrets live in GitHub and reach the Worker only at deploy time, so nobody pastes one into a terminal.
+
+The workflow runs only when started by hand. Every pull request instead dry-runs the same deploy in CI's **Build and test** job, with placeholder secrets: it builds the board, the Worker bundle, its config and the sandbox image, and uploads nothing.
+
+## Secrets
+
+Set these in the repository's `qualification` environment (**Settings → Environments → qualification → Environment secrets**). The workflow fails before deploying when any of them is missing or empty, and names the missing ones.
+
+| Secret                   | What it is                                                                                                      |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_API_TOKEN`   | The API token Wrangler deploys with (permissions below).                                                        |
+| `CLOUDFLARE_ACCOUNT_ID`  | The Cloudflare account that holds the Worker.                                                                   |
+| `SESSION_SIGNING_SECRET` | Worker secret: at least 32 random characters. Agent login keys derive from it; replacing it ends every session. |
+| `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: the one-time token that opens enrollment of the first owner passkey.                             |
+
+The Worker secrets are exactly the `secrets.required` list in `packages/railhead-backend/cloudflare.config.ts`. A secret added there must also be added to the environment and to the deploy step's `env` in the workflow; until it is, the deploy fails naming it, and CI's dry run fails until its placeholder is added too.
+
+They are uploaded with the new version through `wrangler deploy --secrets-file`, not set afterwards with `wrangler secret bulk`: Wrangler refuses to create a Worker whose required secrets are not supplied in the same deploy. The file is written with mode 600 under the runner's temporary directory and deleted when the job ends, whether it succeeded or not.
+
+### API token permissions
+
+Create an account API token for the account above with:
+
+- Workers Scripts: Edit
+- Containers: Edit
+- Artifacts, with write access
+- Workers R2 Storage: Edit, once the checks that use R2 land
+
+If the token lacks a permission, the deploy step fails with Cloudflare's error for the request that needed it.
+
+## Running a deploy
+
+1. Open **Actions → Deploy → Run workflow**.
+2. Enter the Git ref to deploy: a branch, tag or commit. It defaults to `main`.
+3. If the `qualification` environment has required reviewers, a reviewer approves the run.
+
+The job checks that the generated `wrangler.jsonc` matches `cloudflare.config.ts`, builds the board, then runs `wrangler deploy`, which builds and pushes the sandbox image with the runner's Docker. Its summary shows the deployed version ID and URL, and the run links the URL from the environment.
+
+Only one deploy runs at a time, and a running one is never cancelled. GitHub keeps at most one more run waiting; starting another replaces the waiting one.
+
+## Rolling back
+
+To return to an earlier commit, run the workflow again with that commit's SHA as the ref. This rebuilds and redeploys it through the same checks.
+
+To return to an earlier Worker version without rebuilding, use **Workers & Pages → railhead → Deployments** in the dashboard, or, logged in to the account, from `packages/railhead-backend`:
+
+```sh
+pnpm exec wrangler deployments list
+pnpm exec wrangler rollback <version-id> --message "<reason>"
+```
