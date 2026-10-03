@@ -63,6 +63,7 @@ import {
   type RefusalReason,
 } from "@railhead/shared/events";
 import { forkRepoName, mainRepoName } from "../../artifacts/adapter";
+import type { TokenRevocation } from "../../contracts/artifacts";
 import type { ClaimPin, ClaimsPort, GitAccess, GitGrant } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, type PortFailure, type PortResult } from "../../contracts/result";
@@ -593,11 +594,19 @@ function takeable(row: ClaimRow, now: number): boolean {
 }
 
 /**
- * Whether a revocation is settled. A failure is not, and neither is the adapter's `pending_debt`,
- * which means a partial token listing may still hide a live token.
+ * Whether a revocation is settled: only an explicit `revoked`. A failure is not, and neither is
+ * `pending_debt`, which means a partial token listing may still hide a live token.
  */
-function revocationSettled(result: PortResult<unknown>): boolean {
-  return result.ok && result.value !== "pending_debt";
+function revocationSettled(result: PortResult<TokenRevocation>): boolean {
+  if (!result.ok) return false;
+  switch (result.value) {
+    case "revoked":
+      return true;
+    case "pending_debt":
+      return false;
+    default:
+      return result.value satisfies never;
+  }
 }
 
 /** Who records a refusal: the claims module, never the agent it refuses. */

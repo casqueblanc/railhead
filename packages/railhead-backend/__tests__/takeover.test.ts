@@ -10,7 +10,7 @@ import {
   mainRepoName,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
-import type { ArtifactsRepoName, TokenRevocation } from "../src/contracts/artifacts";
+import type { ArtifactsRepoName } from "../src/contracts/artifacts";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort } from "../src/contracts/inbox";
@@ -59,12 +59,6 @@ interface Setup {
   open: () => Promise<{ claim: ClaimView; fork: string }>;
   /** Adds `commit` to the fork, as a push would. */
   push: (fork: string, commit: string) => void;
-  /**
-   * What the Artifacts double's `revokeTokens` answers. `null` passes the call to the adapter;
-   * `pending_debt` answers it without a sweep, as a partial token listing that may hide a live
-   * token; `revoked` sweeps through the adapter and reports the result as `revoked`.
-   */
-  revocation: TokenRevocation | null;
   /** Every repository `revokeTokens` was called for, in order. */
   revoked: ArtifactsRepoName[];
   /** Every repository a token was minted for through the port, in order. */
@@ -101,20 +95,9 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
         setup.minted.push(repo);
         return adapter.token(repo, scope, ttlMs);
       },
-      async revokeTokens(repo) {
+      revokeTokens(repo) {
         setup.revoked.push(repo);
-        switch (setup.revocation) {
-          case null:
-            return adapter.revokeTokens(repo);
-          case "pending_debt":
-            return ok("pending_debt");
-          case "revoked": {
-            const swept = await adapter.revokeTokens(repo);
-            return swept.ok ? ok("revoked") : swept;
-          }
-          default:
-            return setup.revocation satisfies never;
-        }
+        return adapter.revokeTokens(repo);
       },
     };
     const decisions = createDecisions(context, () => ports);
@@ -153,7 +136,6 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
         if (repo === undefined) throw new Error("no such fork");
         repo.commits.push(commit);
       },
-      revocation: null,
       revoked: [],
       minted: [],
     };
@@ -615,10 +597,11 @@ describe("takeover", () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
       const former = setup.fake.mintFor(fork, "write", 3600);
-      setup.revocation = "pending_debt";
+      // Each listing page holds only the fork's revoked initial token and hides the former holder's.
+      setup.fake.pageTokens(1, "creation");
       setup.fake.advance(CLAIM_LEASE_MS);
 
-      // The sweep reports a debt: the former holder's token may still be live, so nobody may write.
+      // The adapter reports a debt: the former holder's token is still live, so nobody may write.
       expectFailure(await setup.port.work(agent(2)), "busy");
       expectFailure(await setup.port.claim(agent(2), claim.issueId), "busy");
       expectFailure(
@@ -645,8 +628,9 @@ describe("takeover", () => {
       expect(types(setup.events())).not.toContain("claim.reassigned");
       expect(setup.minted).toEqual([]);
 
-      // The next alarm's sweep is complete; only now does the successor get the claim and a write grant.
-      setup.revocation = "revoked";
+      // The next alarm's listing covers every token; only now does the successor get the claim and
+      // a write grant.
+      setup.fake.pageTokens(null);
       await fireAlarm(setup);
       expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
       expect(setup.fake.accepts(former.plaintext)).toBe(false);
@@ -665,7 +649,8 @@ describe("takeover", () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
       const newer = await setup.file("Add downloads");
-      setup.revocation = "pending_debt";
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.pageTokens(1, "creation");
       setup.fake.advance(CLAIM_LEASE_MS);
 
       // While the release is pending, another agent is told to wait rather than handed the newer issue.
@@ -676,10 +661,12 @@ describe("takeover", () => {
         .toArray()[0];
       expect(claimed?.n).toBe(0);
       expect(setup.revoked).toEqual([fork]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(true);
 
       // Once a sweep settles, the expired claim goes first and the newer issue to the next agent.
-      setup.revocation = "revoked";
+      setup.fake.pageTokens(null);
       await fireAlarm(setup);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
       expect(await setup.port.work(agent(2))).toMatchObject({
         ok: true,
         value: { claim: { claimId: claim.claimId, generation: 2 } },
@@ -693,9 +680,10 @@ describe("takeover", () => {
 
   it("lets the former holder take a newer issue while its own expired claim is released", async () => {
     await withTakeover(async (setup) => {
-      const { claim } = await setup.open();
+      const { claim, fork } = await setup.open();
       const newer = await setup.file("Add downloads");
-      setup.revocation = "pending_debt";
+      setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.pageTokens(1, "creation");
       setup.fake.advance(CLAIM_LEASE_MS);
 
       // Its own expired claim is never offered back, so it does not wait on it.
