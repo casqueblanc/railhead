@@ -25,8 +25,12 @@ import { OWNER_OBJECT_NAME } from "../owner/OwnerObject";
 import { createSeedControl, type SeedControl } from "./control";
 import { artifactsBinding, createSeedTarget, type SeedTarget } from "./target";
 
-/** The `Repo` object that holds the demo seed's passkey authority. It never becomes a repository. */
-export const DEMO_SEED_CONTROL = "railhead-seed/demo";
+/**
+ * The `Repo` object that holds the demo seed's passkey authority. The colon is outside the
+ * repository segment grammar, so no `org/name` route reaches this object and `initialize` refuses
+ * every repository name on it: it never becomes a repository.
+ */
+export const DEMO_SEED_CONTROL = "railhead:demo-seed";
 
 /** The `Repo` object name of the demo repository. */
 export const DEMO_OBJECT_NAME = `${DEMO_ORG}/${DEMO_REPO}`;

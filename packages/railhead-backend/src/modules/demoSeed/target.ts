@@ -25,7 +25,14 @@
 
 import type { DemoSeedResult, DemoSeedState } from "@railhead/shared/board-api";
 import { isCommitSha, type CommitSha, type RepoId } from "@railhead/shared/events";
-import { mainRepoName } from "../../artifacts/adapter";
+import {
+  ARTIFACTS_LIMITS,
+  boundedCall,
+  MINT_CLOCK_SKEW_MS,
+  mainRepoName,
+  revokeActiveTokens,
+  type TokenSweepLimits,
+} from "../../artifacts/adapter";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import { migrate, type RepoStorage } from "../../repo/storage";
 import { pushMain, type PushOutcome } from "./receivePack";
@@ -64,32 +71,30 @@ export interface SeedTargetContext {
   wipe(): Promise<void>;
 }
 
-/** Limits a test may tighten. */
-export interface SeedTargetLimits {
-  /** How long one Artifacts binding call may take before it counts as lost. */
-  readonly callTimeoutMs: number;
+/** Limits a test may tighten. The token sweep is the Artifacts adapter's, with its limits. */
+export interface SeedTargetLimits extends TokenSweepLimits {
   /** How long the push may take. */
   readonly pushTimeoutMs: number;
   /**
    * How long after it started a binding call a previous incarnation left unanswered counts as
-   * settled: the push token's lifetime and a minute of clock skew. How late a call can take effect
-   * is not measured.
+   * settled. How late a call can take effect is not measured.
    */
   readonly orphanSettleMs: number;
 }
 
-/** The production limits. */
-export const SEED_TARGET_LIMITS: SeedTargetLimits = {
-  callTimeoutMs: 10_000,
-  pushTimeoutMs: 60_000,
-  orphanSettleMs: 360_000,
-};
-
 /** The lifetime of the token minted for a push into an existing, empty main repository. */
 const PUSH_TOKEN_TTL_SECONDS = 300;
 
-/** Most tokens one seed revokes on a main that has no history yet. */
-const MAX_SWEPT_TOKENS = 32;
+/** The production limits. */
+export const SEED_TARGET_LIMITS: SeedTargetLimits = {
+  callTimeoutMs: ARTIFACTS_LIMITS.callTimeoutMs,
+  sweepDeadlineMs: ARTIFACTS_LIMITS.sweepDeadlineMs,
+  maxRevokesPerSweep: ARTIFACTS_LIMITS.maxRevokesPerSweep,
+  pushTimeoutMs: 60_000,
+  // The adapter's rule for a mint a previous incarnation never saw answered: its requested lifetime
+  // and the clock skew.
+  orphanSettleMs: PUSH_TOKEN_TTL_SECONDS * 1000 + MINT_CLOCK_SKEW_MS,
+};
 
 /** The demo repository's seed and reset. */
 export interface SeedTarget {
@@ -143,57 +148,16 @@ export function createSeedTarget(
 
   /** Bounds one binding call that changes nothing; a late answer is dropped. */
   function bounded<T>(work: Promise<T>): Promise<T> {
-    return within(work, limits.callTimeoutMs);
+    return boundedCall(work, limits.callTimeoutMs);
   }
 
   /** Opens `name`, bounded; a handle that opens after its timeout is disposed. */
   function opened(artifacts: SeedArtifacts, name: string): Promise<SeedArtifactsRepo> {
-    return answered(
-      () => artifacts.get(name),
-      (late) => {
-        late[Symbol.dispose]();
-      },
-    );
-  }
-
-  /** Settles with `call`'s answer, or rejects at the timeout; a later answer goes to `late`. */
-  function answered<T>(
-    call: () => Promise<T>,
-    late: (value: T) => void | Promise<void>,
-    settled: () => void = () => undefined,
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      let decided = false;
-      const timer = setTimeout(() => {
-        decided = true;
-        reject(new Error("Artifacts call timed out"));
-      }, limits.callTimeoutMs);
-      Promise.resolve()
-        .then(call)
-        .then(
-          async (value) => {
-            if (!decided) {
-              decided = true;
-              clearTimeout(timer);
-              settled();
-              resolve(value);
-              return;
-            }
-            try {
-              await late(value);
-            } catch {
-              // Nobody waits for a late answer's cleanup; the effect record still demands it.
-            }
-            settled();
-          },
-          (error: unknown) => {
-            settled();
-            if (decided) return;
-            decided = true;
-            clearTimeout(timer);
-            reject(error);
-          },
-        );
+    return boundedCall(artifacts.get(name), limits.callTimeoutMs, (pending) => {
+      void pending.then(
+        (late) => late[Symbol.dispose](),
+        () => undefined,
+      );
     });
   }
 
@@ -217,10 +181,35 @@ export function createSeedTarget(
       )
       .one();
     unanswered.add(id);
-    return answered(call, late, () => {
+    const settle = (): void => {
       unanswered.delete(id);
       if (kind === "delete") sql.exec("DELETE FROM demo_seed_effects WHERE id = ?", id);
       else sql.exec("UPDATE demo_seed_effects SET answered = 1 WHERE id = ?", id);
+    };
+    let timedOut = false;
+    // The record settles before an answer in time reaches the caller, and after a late answer's
+    // cleanup.
+    const tracked = Promise.resolve()
+      .then(call)
+      .then(
+        async (value) => {
+          if (timedOut) {
+            try {
+              await late(value);
+            } catch {
+              // Nobody waits for a late answer's cleanup; the effect record still demands it.
+            }
+          }
+          settle();
+          return value;
+        },
+        (error: unknown) => {
+          settle();
+          throw error;
+        },
+      );
+    return boundedCall(tracked, limits.callTimeoutMs, () => {
+      timedOut = true;
     });
   }
 
@@ -313,20 +302,18 @@ export function createSeedTarget(
   }
 
   /**
-   * Revokes every live token on main, then lists again to confirm none is left. Clears the create
-   * and mint records once main is clean. Tokens are owed only between a seed's create or mint and
-   * the sweep that must precede initialization, and an initialized Repo is never created or minted
-   * on, so while any are owed no other module holds a token on main: every one is the seed's.
+   * Revokes every live token on main with the Artifacts adapter's sweep, which lists until none is
+   * left within its deadline and revocation budget; a sweep that runs out leaves the rest to the
+   * next seed. Clears the create and mint records once main is clean. Tokens are owed only between
+   * a seed's create or mint and the sweep that must precede initialization, and an initialized Repo
+   * is never created or minted on, so while any are owed no other module holds a token on main:
+   * every one is the seed's.
    */
   async function sweepTokens(artifacts: SeedArtifacts, name: string): Promise<boolean> {
     try {
       using repo = await opened(artifacts, name);
-      const live = async () =>
-        (await bounded(repo.listTokens())).tokens.filter((token) => token.state === "active");
-      const before = await live();
-      if (before.length > MAX_SWEPT_TOKENS) return false;
-      for (const token of before) await bounded(repo.revokeToken(token.id));
-      if ((await live()).length > 0) return false;
+      const swept = await revokeActiveTokens(repo, limits);
+      if (!swept.ok) return false;
     } catch (error) {
       // No repository holds no token.
       if (artifactsCode(error) !== "NOT_FOUND") return false;
@@ -459,19 +446,6 @@ function halfReset(): PortResult<never> {
 
 function artifactsFailed(): PortResult<never> {
   return fail("internal", "Artifacts did not answer as expected; try again.");
-}
-
-/** Settles with `work`, or rejects once `ms` milliseconds pass. */
-function within<T>(work: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error("Artifacts call timed out"));
-    }, ms);
-  });
-  return Promise.race([work, timeout]).finally(() => {
-    clearTimeout(timer);
-  });
 }
 
 /** The `ArtifactsError` code of `error`, or `undefined` for any other error. */

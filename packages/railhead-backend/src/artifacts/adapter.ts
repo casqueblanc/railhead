@@ -49,16 +49,20 @@ export interface ArtifactsAdapterContext {
   readonly namespace: ArtifactsNamespace;
 }
 
-/** Limits a test may tighten. */
-export interface ArtifactsAdapterLimits {
+/** The limits of one token sweep, shared by every caller of `revokeActiveTokens`. */
+export interface TokenSweepLimits {
   /** How long one binding call may take before it counts as lost. */
   readonly callTimeoutMs: number;
-  /** How many tokens the cache holds before it drops the oldest. */
-  readonly maxCachedTokens: number;
   /** How long one token sweep may run, across all its calls, before it reports the repository busy. */
   readonly sweepDeadlineMs: number;
   /** How many tokens one sweep revokes before it reports the repository busy. */
   readonly maxRevokesPerSweep: number;
+}
+
+/** Limits a test may tighten. */
+export interface ArtifactsAdapterLimits extends TokenSweepLimits {
+  /** How many tokens the cache holds before it drops the oldest. */
+  readonly maxCachedTokens: number;
   /** How many token requests may wait for a repository's running mint before more are refused. */
   readonly maxWaitingMints: number;
   /** How long a token request waits for its turn before it reports the repository busy. */
@@ -84,7 +88,7 @@ export const MAX_TOKEN_TTL_MS = 3_600_000;
  * keeps sweeping for a token it may still create. A design margin, not a measured bound.
  */
 export const MINT_CLOCK_SKEW_MS = 300_000;
-/** How many list-and-revoke rounds `revokeTokens` makes before reporting the repository busy. */
+/** How many list-and-revoke rounds one token sweep makes before reporting the repository busy. */
 const MAX_REVOKE_ROUNDS = 5;
 
 const MIGRATIONS = [
@@ -512,28 +516,8 @@ class ArtifactsAdapter implements ArtifactsPort {
     return latest.hash;
   }
 
-  /**
-   * Revokes every live token on `handle`'s repository, within a total deadline and revocation
-   * budget. Running out of either reports busy; a repeat continues where this one stopped.
-   */
-  async #revokeActive(handle: ArtifactsRepoHandle): Promise<PortResult<void>> {
-    const unfinished = fail("busy", "The repository still has live tokens; try again.");
-    // Wall time, like the per-call timer; the injected clock need not move while calls run.
-    const deadline = Date.now() + this.#limits.sweepDeadlineMs;
-    const remaining = (): number => Math.min(this.#limits.callTimeoutMs, deadline - Date.now());
-    let budget = this.#limits.maxRevokesPerSweep;
-    for (let round = 0; round < MAX_REVOKE_ROUNDS; round += 1) {
-      if (remaining() <= 0) return unfinished;
-      const listed = await this.#bounded(handle.listTokens(), { timeoutMs: remaining() });
-      const active = listed.tokens.filter((token) => token.state === "active");
-      if (active.length === 0) return ok(undefined);
-      for (const token of active) {
-        if (budget === 0 || remaining() <= 0) return unfinished;
-        budget -= 1;
-        await this.#bounded(handle.revokeToken(token.id), { timeoutMs: remaining() });
-      }
-    }
-    return unfinished;
+  #revokeActive(handle: ArtifactsRepoHandle): Promise<PortResult<void>> {
+    return revokeActiveTokens(handle, this.#limits);
   }
 
   async #resolve(repo: ArtifactsRepoName): Promise<Target | null> {
@@ -616,24 +600,60 @@ class ArtifactsAdapter implements ArtifactsPort {
     }
   }
 
-  /**
-   * Waits for `work` up to the per-call timeout. On timeout the call keeps running, so `late` takes
-   * over any result that holds a resource.
-   */
-  async #bounded<T>(work: Promise<T>, options: BoundedOptions<T> = {}): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        options.late?.(work);
-        reject(new CallTimedOut());
-      }, options.timeoutMs ?? this.#limits.callTimeoutMs);
-    });
-    try {
-      return await Promise.race([work, timeout]);
-    } finally {
-      clearTimeout(timer);
+  #bounded<T>(work: Promise<T>, options: BoundedOptions<T> = {}): Promise<T> {
+    return boundedCall(work, options.timeoutMs ?? this.#limits.callTimeoutMs, options.late);
+  }
+}
+
+/**
+ * Waits for `work` up to `timeoutMs`, then rejects with `CallTimedOut`. The call keeps running, so
+ * `late` takes over any result that holds a resource.
+ */
+export async function boundedCall<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  late?: (pending: Promise<T>) => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      late?.(work);
+      reject(new CallTimedOut());
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Revokes every live token on `handle`'s repository, within a total deadline and revocation
+ * budget. Running out of either reports busy; a repeat continues where this one stopped. A binding
+ * call that fails or times out throws.
+ */
+export async function revokeActiveTokens(
+  handle: Pick<ArtifactsRepo, "listTokens" | "revokeToken">,
+  limits: TokenSweepLimits,
+): Promise<PortResult<void>> {
+  const unfinished = fail("busy", "The repository still has live tokens; try again.");
+  // Wall time, like the per-call timer; an injected clock need not move while calls run.
+  const deadline = Date.now() + limits.sweepDeadlineMs;
+  const remaining = (): number => Math.min(limits.callTimeoutMs, deadline - Date.now());
+  let budget = limits.maxRevokesPerSweep;
+  for (let round = 0; round < MAX_REVOKE_ROUNDS; round += 1) {
+    if (remaining() <= 0) return unfinished;
+    const listed = await boundedCall(handle.listTokens(), remaining());
+    const active = listed.tokens.filter((token) => token.state === "active");
+    if (active.length === 0) return ok(undefined);
+    for (const token of active) {
+      if (budget === 0 || remaining() <= 0) return unfinished;
+      budget -= 1;
+      await boundedCall(handle.revokeToken(token.id), remaining());
     }
   }
+  return unfinished;
 }
 
 /** A promise and the function that resolves it. */

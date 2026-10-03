@@ -8,10 +8,12 @@ import {
   type DemoSeedAction,
   type DemoSeedResult,
   type PasskeyAssertion,
+  type PasskeyRegistration,
 } from "@railhead/shared/board-api";
+import { isRepoSegment } from "@railhead/shared/agent-api";
 import { createArtifactsAdapter, mainRepoName } from "../src/artifacts/adapter";
 import { FakeArtifacts, FakeArtifactsError } from "../src/artifacts/fake";
-import { relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
+import { actionChallenge, relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
 import { ok, type PortResult } from "../src/contracts/result";
 import { readBundle } from "../src/modules/demoSeed/bundle";
 import { createSeedControl, type SeedTargetCalls } from "../src/modules/demoSeed/control";
@@ -26,6 +28,8 @@ import {
   type SeedTarget,
 } from "../src/modules/demoSeed/target";
 import type { InstanceOwnerPort } from "../src/modules/owner/entry";
+import { InstanceOwner } from "../src/modules/owner/instance";
+import { OWNER_OBJECT_NAME } from "../src/modules/owner/OwnerObject";
 import type { RepoStorage } from "../src/repo/storage";
 
 const HOST = "railhead.mashin.workers.dev";
@@ -113,6 +117,8 @@ class SeedFake implements SeedArtifacts {
   failNextDelete = false;
   /** A repository whose deletion fails every time, until cleared. */
   failDeleteOf: string | null = null;
+  /** Runs once when the next push reaches the Git endpoint. */
+  onNextPush: (() => void) | null = null;
 
   /** Holds the next `create` before it creates anything, as a request whose effect is delayed. */
   holdNextCreate(): { reached: Promise<void>; release: () => void } {
@@ -188,6 +194,9 @@ class SeedFake implements SeedArtifacts {
     const length = Number.parseInt(new TextDecoder().decode(body.subarray(0, 4)), 16);
     const command = new TextDecoder().decode(body.subarray(4, length));
     this.pushes.push({ url, authorization, command });
+    const hook = this.onNextPush;
+    this.onNextPush = null;
+    hook?.();
     const fault = this.pushFault;
     this.pushFault = "none";
     if (fault === "drop") throw new TypeError("network lost");
@@ -535,6 +544,57 @@ describe("seed target", () => {
       expect(seed.fake.liveTokens(main)).toEqual([holder]);
     }));
 
+  it("revokes more live tokens than one sweep's budget across retries, then initializes", () =>
+    withTarget(
+      async ({ seed, target, host, main }) => {
+        // The create's token and the push token, plus 40 more, all left on main by the seed.
+        seed.onNextPush = () => {
+          for (let i = 0; i < 40; i += 1) seed.fake.mintFor(main, "write", 300);
+        };
+        const unrevoked = {
+          ok: false,
+          code: "internal",
+          message: "Main was imported but its push token was not revoked; try again.",
+        };
+        expect(await target.seed(HEAD, fakePack())).toEqual(unrevoked);
+        expect(seed.fake.liveTokens(main)).toHaveLength(42 - 16);
+        expect(host.initialized).toBe(false);
+        expect(await target.seed(HEAD, fakePack())).toEqual(unrevoked);
+        expect(seed.fake.liveTokens(main)).toHaveLength(42 - 32);
+        expect(await target.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(seed.pushes).toHaveLength(1);
+        expect(host.initialized).toBe(true);
+      },
+      { limits: { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000, maxRevokesPerSweep: 16 } },
+    ));
+
+  it("stops a slow sweep at its total deadline, and the next seed finishes it", () =>
+    withTarget(
+      async ({ seed, target, host, main }) => {
+        seed.onNextPush = () => {
+          for (let i = 0; i < 30; i += 1) seed.fake.mintFor(main, "write", 300);
+        };
+        seed.fake.slowRevocations(40);
+        const started = Date.now();
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        // Thirty-two revocations at 40 ms each would take 1.28 s; the deadline stops it near 200 ms.
+        expect(Date.now() - started).toBeLessThan(1_000);
+        const left = seed.fake.liveTokens(main).length;
+        expect(left).toBeGreaterThan(0);
+        expect(left).toBeLessThan(32);
+        expect(host.initialized).toBe(false);
+
+        seed.fake.slowRevocations(0);
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(host.initialized).toBe(true);
+      },
+      { limits: { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000, sweepDeadlineMs: 200 } },
+    ));
+
   it("resets by deleting the recorded forks and then main by name, and nothing else", () =>
     withTarget(async ({ seed, target, storage, host, main }) => {
       await target.seed(HEAD, fakePack());
@@ -655,12 +715,19 @@ function derInteger(raw: Uint8Array): number[] {
   return [0x02, body.length, ...body];
 }
 
+/** The CBOR text string `text`, shorter than 24 bytes. */
+function cborText(text: string): number[] {
+  const bytes = enc.encode(text);
+  return [0x60 | bytes.length, ...bytes];
+}
+
 class Authenticator {
   #counter = 0;
 
   private constructor(
     readonly privateKey: CryptoKey,
     readonly credential: StoredCredential,
+    readonly idBytes: Uint8Array,
   ) {}
 
   static async create(): Promise<Authenticator> {
@@ -689,15 +756,59 @@ class Authenticator {
       32,
       ...raw.slice(33),
     ]);
-    return new Authenticator(pair.privateKey, {
-      credentialId: b64url(crypto.getRandomValues(new Uint8Array(16))),
-      publicKey: cose,
-      userHandle: b64url(crypto.getRandomValues(new Uint8Array(16))),
-      signCount: 0,
-    });
+    const idBytes = crypto.getRandomValues(new Uint8Array(16));
+    return new Authenticator(
+      pair.privateKey,
+      {
+        credentialId: b64url(idBytes),
+        publicKey: cose,
+        userHandle: b64url(crypto.getRandomValues(new Uint8Array(16))),
+        signCount: 0,
+      },
+      idBytes,
+    );
   }
 
-  async assert(challenge: string): Promise<PasskeyAssertion> {
+  /** A registration of this credential with a `none` attestation, for the enrollment ceremony. */
+  async register(challenge: string): Promise<PasskeyRegistration> {
+    const clientData = enc.encode(
+      JSON.stringify({ type: "webauthn.create", challenge, origin: ORIGIN, crossOrigin: false }),
+    );
+    const authData = Uint8Array.from([
+      ...(await sha256(enc.encode(HOST))),
+      0x45,
+      0,
+      0,
+      0,
+      0,
+      ...new Uint8Array(16),
+      0,
+      this.idBytes.length,
+      ...this.idBytes,
+      ...this.credential.publicKey,
+    ]);
+    const attestation = Uint8Array.from([
+      0xa3,
+      ...cborText("fmt"),
+      ...cborText("none"),
+      ...cborText("attStmt"),
+      0xa0,
+      ...cborText("authData"),
+      0x58,
+      authData.length,
+      ...authData,
+    ]);
+    return {
+      credentialId: this.credential.credentialId,
+      clientDataJson: b64url(clientData),
+      attestationObject: b64url(attestation),
+    };
+  }
+
+  async assert(
+    challenge: string,
+    userHandle: string = this.credential.userHandle,
+  ): Promise<PasskeyAssertion> {
     this.#counter += 1;
     const clientData = enc.encode(
       JSON.stringify({ type: "webauthn.get", challenge, origin: ORIGIN, crossOrigin: false }),
@@ -716,7 +827,7 @@ class Authenticator {
       clientDataJson: b64url(clientData),
       authenticatorData: b64url(authData),
       signature: b64url(Uint8Array.from([0x30, der.length, ...der])),
-      userHandle: this.credential.userHandle,
+      userHandle,
     };
   }
 }
@@ -927,10 +1038,98 @@ describe("demo seed entry", () => {
     expect(await demo.describe()).toBeNull();
   });
 
-  it("binds challenges to the demo repository's own identifier", async () => {
-    const demo = env.REPO.getByName(DEMO_OBJECT_NAME);
-    expect(await demo.initialize("demo", "upload-app")).toEqual(
-      ok({ repoId: demoRepoId(env), org: "demo", name: "upload-app" }),
+  it("keeps the control object out of the repository address space", async () => {
+    // No `org/name` pair of repository segments names the control object, so no route reaches it.
+    const [org, name, ...rest] = DEMO_SEED_CONTROL.split("/");
+    expect(rest.length > 0 || !isRepoSegment(org ?? "") || !isRepoSegment(name ?? "")).toBe(true);
+    const control = env.REPO.getByName(DEMO_SEED_CONTROL);
+    for (const [o, n] of [
+      ["railhead-seed", "demo"],
+      ["railhead", "demo-seed"],
+      ["demo", "upload-app"],
+    ] as const) {
+      expect(await control.initialize(o, n)).toMatchObject({ ok: false, code: "invalid_request" });
+    }
+    expect(await control.describe()).toBeNull();
+    // The name the control once had is an ordinary repository address with no seed authority.
+    const formerName = env.REPO.getByName("railhead-seed/demo");
+    expect(await formerName.prepareDemoSeed({ kind: "demo.reset" })).toMatchObject({
+      ok: false,
+      code: "not_found",
+    });
+  });
+
+  it("performs the owner's reset and a seed near the bundle bound through the session", async () => {
+    const auth = await Authenticator.create();
+    const userHandle = await runInDurableObject(
+      env.OWNER.getByName(OWNER_OBJECT_NAME),
+      async (_instance, state) => {
+        const owner = new InstanceOwner(state.storage, {
+          bootstrapToken: "t".repeat(40),
+          relyingParty: relyingParty(HOST),
+          clock: Date.now,
+        });
+        const challenge = await owner.prepareEnrollment("t".repeat(40));
+        if (!challenge.ok) throw new Error(`enrollment failed: ${challenge.code}`);
+        const done = await owner.completeEnrollment(
+          challenge.value.challengeId,
+          await auth.register(challenge.value.challenge),
+        );
+        if (!done.ok) throw new Error(`enrollment failed: ${done.code}`);
+        return challenge.value.userHandle;
+      },
     );
+    const party = relyingParty(HOST);
+    if (party === undefined) throw new Error("the test host is not a relying party host");
+
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using seed = await api.demoSeed();
+
+    const reset = await seed.prepare({ kind: "demo.reset" });
+    if (!reset.ok) throw new Error(`prepare failed: ${reset.code}`);
+    // The WebAuthn challenge is bound to the demo repository's identifier and the sealed fields.
+    const [challengeId, expiresAt, nonce] = reset.value.challengeId.split(".");
+    const expected = await actionChallenge(party, {
+      repoId: demoRepoId(env),
+      challengeId: challengeId ?? "",
+      nonce: nonce ?? "",
+      expiresAt: Number(expiresAt),
+      action: { kind: "demo.reset" },
+    });
+    expect(expected).toEqual({ ok: true, challenge: reset.value.challenge });
+    expect(reset.value.allowCredentials).toEqual([auth.credential.credentialId]);
+
+    // The proof is spent at the control; without an Artifacts binding the demo repository then
+    // answers `unavailable`, and the same proof cannot be used again.
+    const resetProof = await auth.assert(reset.value.challenge, userHandle);
+    expect(await seed.perform(reset.value.challengeId, resetProof, null)).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+    expect(await seed.perform(reset.value.challengeId, resetProof, null)).toMatchObject({
+      ok: false,
+      code: "proof_expired",
+    });
+
+    // A bundle one byte under the bound crosses Cap'n Web and the Durable Object call intact.
+    const header = enc.encode(`# v2 git bundle\n${HEAD} refs/heads/main\n\n`);
+    const pack = new Uint8Array(MAX_DEMO_BUNDLE_BYTES - 1 - header.length);
+    pack.set(fakePack());
+    const large = new Uint8Array(header.length + pack.length);
+    large.set(header);
+    large.set(pack, header.length);
+    expect(large.length).toBe(MAX_DEMO_BUNDLE_BYTES - 1);
+    const seeded = await seed.prepare({ kind: "demo.seed", head: HEAD });
+    if (!seeded.ok) throw new Error(`prepare failed: ${seeded.code}`);
+    const seedProof = await auth.assert(seeded.value.challenge, userHandle);
+    expect(await seed.perform(seeded.value.challengeId, seedProof, large)).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+    expect(await seed.perform(seeded.value.challengeId, seedProof, large)).toMatchObject({
+      ok: false,
+      code: "proof_expired",
+    });
+    expect(await seed.read()).toEqual({ ok: true, value: null });
   });
 });
