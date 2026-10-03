@@ -24,7 +24,9 @@
 //   holder and queues it the current version of each decision, delivering what was pending.
 // - `relied`, called inside the transaction that authorizes or lands the claim's work, records the
 //   versions that work relied on. A version recorded later, or one already newer, makes the
-//   obligation `rework`: the work cannot follow it any more, so it must be redone.
+//   obligation `rework`: the work cannot follow it any more, so it must be redone. The rework goes
+//   to whoever holds the claim's dependency now, which after a takeover is the successor, even when
+//   the work was done under an earlier generation.
 //
 // One obligation exists per claim, version and kind, so a repeated or restarted fanout never
 // queues an item twice, and a failed one leaves none.
@@ -346,14 +348,12 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
 
   // Records what `ref` asks of the dependency's claim, once per claim, version and kind. It is
   // queued to the dependency's agent when that agent still holds the claim at the dependency's
-  // generation and, for relied work, when `workGeneration` is that generation too. An inbox refusal
-  // throws and rolls back.
+  // generation. An inbox refusal throws and rolls back.
   function owe(
     tx: EventTransaction,
     dependency: DependencyRow,
     ref: DecisionRef,
     kind: DecisionObligation["kind"],
-    workGeneration: number | null,
   ): void {
     const owed = tx.sql
       .exec(
@@ -366,20 +366,18 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       )
       .toArray();
     if (owed.length > 0) return;
-    const held =
-      ports().claims.currentGeneration(dependency.claim_id) === dependency.generation &&
-      (workGeneration === null || workGeneration === dependency.generation);
-    const item = held
-      ? ports().inbox.queue(
-          tx,
-          {
-            agentId: dependency.agent_id,
-            claimId: dependency.claim_id,
-            generation: dependency.generation,
-          },
-          { entry: { kind, decision: ref }, decision: recordedView(ref) },
-        )
-      : null;
+    const item =
+      ports().claims.currentGeneration(dependency.claim_id) === dependency.generation
+        ? ports().inbox.queue(
+            tx,
+            {
+              agentId: dependency.agent_id,
+              claimId: dependency.claim_id,
+              generation: dependency.generation,
+            },
+            { entry: { kind, decision: ref }, decision: recordedView(ref) },
+          )
+        : null;
     tx.sql.exec(
       `INSERT INTO decision_obligations
          (claim_id, decision_id, version, kind, agent_id, item, recorded_at)
@@ -590,7 +588,7 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
               // Work that relied on an older version can no longer follow this one.
               const kind =
                 target.relied !== null && target.relied < version ? "rework" : "decision";
-              owe(tx, target, { decisionId, version }, kind, null);
+              owe(tx, target, { decisionId, version }, kind);
             }
             return ok({ decisionId, version });
           },
@@ -693,6 +691,12 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
     relied(tx, claimId, generation, refs) {
       const invalid = invalidReliance(claimId, generation, refs);
       if (invalid !== null) throw new DecisionsWriteError(invalid);
+      // Work lands under the generation that held the claim or an earlier one, never a later one.
+      // A claim that merged or expired has no current generation to compare against.
+      const current = ports().claims.currentGeneration(claimId);
+      if (current !== null && generation > current) {
+        throw new DecisionsWriteError("the work names a generation newer than the claim's");
+      }
       for (const ref of refs) {
         const dependency = tx.sql
           .exec<DependencyRow>(
@@ -703,8 +707,8 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
           .toArray()[0];
         // Another claim's decision in the same merge.
         if (dependency === undefined) continue;
-        const current = currentVersion(ref.decisionId);
-        if (ref.version > current) {
+        const latest = currentVersion(ref.decisionId);
+        if (ref.version > latest) {
           throw new DecisionsWriteError("a relied version was never recorded");
         }
         if (dependency.relied === null || dependency.relied < ref.version) {
@@ -715,15 +719,10 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             claimId,
           );
         }
-        // The work relied on a version that was already replaced.
-        if (ref.version < current) {
-          owe(
-            tx,
-            dependency,
-            { decisionId: ref.decisionId, version: current },
-            "rework",
-            generation,
-          );
+        // The work relied on a version that was already replaced. Its rework goes to the
+        // dependency's holder, who after a takeover is the successor, not the work's author.
+        if (ref.version < latest) {
+          owe(tx, dependency, { decisionId: ref.decisionId, version: latest }, "rework");
         }
       }
     },

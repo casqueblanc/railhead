@@ -90,8 +90,11 @@ export interface DecisionsPort {
    * Records, inside the caller's transaction, the decision versions the claim's work was authorized
    * or merged under at `generation`. `refs` may name decisions other claims depend on; only the
    * claim's own dependencies are recorded. A relied version older than the current one is a
-   * `rework` obligation at once, and a later version of a relied decision is one too. A repeat
-   * records nothing more. Throws on an invalid argument or a version that was never recorded.
+   * `rework` obligation at once, and a later version of a relied decision is one too. Rework is
+   * queued to the dependency's current holder, so work done before a takeover reaches the
+   * successor, never the former owner. A repeat records nothing more. Throws on an invalid
+   * argument, a `generation` newer than the claim's current one, or a version that was never
+   * recorded.
    */
   relied(tx: EventTransaction, claimId: ClaimId, generation: number, refs: DecisionRef[]): void;
   /**

@@ -467,15 +467,74 @@ describe("relied", () => {
     });
   });
 
-  it("holds a rework item when the work's generation is not the dependency's", async () => {
+  it("sends rework of work landed after a takeover to the successor, once", async () => {
+    const repo = await freshRepo();
+    const decisionId = await withDecisions(async (h) => {
+      const id = await answered(h);
+      // BOREAS takes the claim over at generation 2 before ATLAS's work lands.
+      h.generation(2);
+      h.transfer({ agentId: BOREAS, claimId: CLAIM, generation: 2 });
+      expect(await h.record(id, "reject", 1)).toEqual(ok({ decisionId: id, version: 2 }));
+      // Nothing was relied on yet, so BOREAS gets plain decisions and acknowledges both.
+      expect(await h.entries(BOREAS)).toMatchObject([
+        { item: 1, entry: entry("decision", id, 1) },
+        { item: 2, entry: entry("decision", id, 2) },
+      ]);
+      for (const item of [1, 2]) {
+        expect(await h.inbox.ack(h.agent(BOREAS), item, "Reject uploads.")).toMatchObject({
+          ok: true,
+        });
+      }
+      expect(await h.inbox.readyGate(CLAIM, 2)).toEqual(ok({ kind: "clear" }));
+
+      // ATLAS's work, done under version 1 at generation 1, lands now.
+      const events = h.relied([{ decisionId: id, version: 1 }], 1);
+      expect(events.map((event) => event.data)).toMatchObject([
+        { agentId: BOREAS, claimId: CLAIM, entry: entry("rework", id, 2) },
+      ]);
+      expect(await h.entries(BOREAS)).toMatchObject([{ item: 3, entry: entry("rework", id, 2) }]);
+      expect(await h.entries(ATLAS)).toHaveLength(1);
+      expect(await h.inbox.readyGate(CLAIM, 2)).toEqual(ok({ kind: "blocked", items: [3] }));
+      expect(h.obligations()).toContainEqual(
+        expect.objectContaining({ kind: "rework", delivery: { agentId: BOREAS, item: 3 } }),
+      );
+      // A retried landing owes nothing more.
+      expect(h.relied([{ decisionId: id, version: 1 }], 1)).toEqual([]);
+      return id;
+    }, repo);
+    await evictDurableObject(repo.stub);
+
+    await withDecisions(async (h) => {
+      h.generation(2);
+      expect(h.relied([{ decisionId, version: 1 }], 1)).toEqual([]);
+      expect(h.count("decision_obligations")).toBe(3);
+      expect(await h.entries(BOREAS)).toMatchObject([
+        { item: 3, entry: entry("rework", decisionId, 2) },
+      ]);
+      expect(await h.inbox.ack(h.agent(BOREAS), 3, "Redo it with rejects.")).toMatchObject({
+        ok: true,
+      });
+      expect(await h.inbox.readyGate(CLAIM, 2)).toEqual(ok({ kind: "clear" }));
+      expect(await h.entries(ATLAS)).toHaveLength(1);
+    }, repo);
+  });
+
+  it("holds rework landed before the takeover moves the dependency, for transfer to send", async () => {
     await withDecisions(async (h) => {
       const decisionId = await answered(h);
+      // BOREAS holds generation 2, but the takeover has not moved the dependency yet.
+      h.generation(2);
       expect(await h.record(decisionId, "reject", 1)).toEqual(ok({ decisionId, version: 2 }));
-      // Generation 1 holds the claim, but the landed work names generation 2.
-      expect(h.relied([{ decisionId, version: 1 }], 2)).toEqual([]);
+      expect(h.relied([{ decisionId, version: 1 }], 1)).toEqual([]);
       expect(h.obligations()).toContainEqual(
         expect.objectContaining({ kind: "rework", delivery: null }),
       );
+
+      const events = h.transfer({ agentId: BOREAS, claimId: CLAIM, generation: 2 });
+      expect(events.map((event) => event.data)).toMatchObject([
+        { agentId: BOREAS, entry: entry("rework", decisionId, 2) },
+      ]);
+      expect(await h.entries(ATLAS)).toHaveLength(1);
     });
   });
 
@@ -501,6 +560,8 @@ describe("relied", () => {
           CLAIM,
         ],
         [tooMany, 1, CLAIM],
+        // The claim is held at generation 1; work cannot land under generation 2.
+        [[{ decisionId, version: 1 }], 2, CLAIM],
         // Version 2 was never recorded.
         [[{ decisionId, version: 2 }], 1, CLAIM],
       ];
