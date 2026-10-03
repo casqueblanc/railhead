@@ -9,8 +9,9 @@
 // another action or head is refused there, never here.
 //
 // Every backend call is bounded by a timeout. A write whose answer times out or is lost is not
-// repeated here: the next run reads the target first, so an uncertain write is reconciled before
-// anything is written a second time.
+// repeated here. The next seed reads the target first, so an uncertain seed is reconciled before
+// anything is written a second time; a reset reads nothing first, so the owner inspects the
+// instance before approving another.
 //
 // The types come from `@railhead/shared` by relative path and type only: `@railhead/shared` already
 // depends on `@railhead/scripts`, and the workspace task graph refuses a cycle. The two runtime
@@ -105,8 +106,8 @@ export class ApprovalNeeded extends Error {
 }
 
 /**
- * The backend failed or did not answer: the call may be repeated once the cause is fixed. Its
- * message is the backend's own sentence or the timeout, never a stack.
+ * The backend failed or did not answer, so a write may or may not have happened. Its message is the
+ * backend's own sentence or the timeout, never a stack.
  */
 export class BackendFailure extends Error {
   override readonly name = "BackendFailure";

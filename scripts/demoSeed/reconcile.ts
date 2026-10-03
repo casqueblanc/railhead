@@ -4,8 +4,9 @@
 // `seed` creates the repository and imports main in one action, and `reset` deletes it. A plan
 // compares what the manifest wants with what the target reports and lists each step with whether
 // it is already in place, so a repeat after success writes nothing. A step whose write failed is
-// not retried here: the next run reads the target again first, so an uncertain write is reconciled
-// before anything is written a second time.
+// not retried here: the next seed reads the target again first, so an uncertain seed is reconciled
+// before anything is written a second time. Reset reads nothing first (see below), so an uncertain
+// reset is the owner's to inspect before approving another.
 //
 // Each backend write needs its own owner passkey assertion. The live adapter, `liveTarget.ts`,
 // holds it; the port does not carry one.
