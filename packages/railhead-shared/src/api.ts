@@ -1,6 +1,6 @@
 import type { RpcTarget } from "capnweb";
-import type { RepoSegment } from "./agent-api";
-import type { BoardApi, BoardResult, DemoSeedApi, OwnerEnrollmentApi } from "./board-api";
+import type { RepoSegment } from "./agent-api.ts";
+import type { BoardApi, BoardResult, DemoSeedApi, OwnerEnrollmentApi } from "./board-api.ts";
 
 /** Path on the backend origin where the Cap'n Web session is served. */
 export const API_PATH = "/api";

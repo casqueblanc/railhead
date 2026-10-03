@@ -12,6 +12,7 @@ import {
   planSeed,
   reset,
   seed,
+  type BoardIssues,
 } from "./reconcile.ts";
 
 const manifest = loadManifest(
@@ -415,4 +416,36 @@ test("a dry run names every target", async () => {
     'todo owner files issue demo/upload-app#seed-2: "Let people upload files larger than 10 MB"',
     'todo owner files issue demo/upload-app#seed-3: "Let people delete an upload"',
   ]);
+});
+
+test("a plan refuses a board reset and seeded again at the same main after its scan", async () => {
+  const target = new MemoryTarget();
+  await target.seed(demo, history);
+  fileSeededIssues(target);
+  // Another operator resets and seeds the same head between the scan and the second reads, so the
+  // issues scanned belong to a board that no longer exists.
+  const board: BoardIssues = {
+    async scan(ref, titles) {
+      const scanned = await target.scan(ref, titles);
+      await target.reset(demo);
+      await target.seed(demo, history);
+      return scanned;
+    },
+    history: (ref) => target.history(ref),
+  };
+  await assert.rejects(
+    planSeed(manifest, history, target, board),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message === "The repository demo/upload-app changed during planning; run again.",
+  );
+  assert.deepEqual(await target.read(demo), { main: history.head });
+  assert.deepEqual(await target.issues(demo), []);
+
+  // Undisturbed, the same board plans with every issue to file and no refusal.
+  const plan = await planSeed(manifest, history, target, target);
+  assert.deepEqual(
+    plan.map((step) => step.status),
+    ["done", "missing", "missing", "missing"],
+  );
 });

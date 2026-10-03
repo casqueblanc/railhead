@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   cpSync,
@@ -11,12 +11,21 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
-import { run } from "./cli.ts";
+import { failureReport, run } from "./cli.ts";
+import { FakeBackend, issueEvent, otherEvent, sessionWith, signedFor } from "./fakeBackend.ts";
 import { MAX_BUNDLE_BYTES } from "./history.ts";
+import {
+  ApprovalNeeded,
+  LIVE_LIMITS,
+  WriteUncertain,
+  type LiveLimits,
+  type LiveSession,
+} from "./liveTarget.ts";
 import { loadManifest, SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
@@ -102,14 +111,14 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
   assert.equal(lines.filter((line) => line.startsWith("--- end issue")).length, 3);
   assert.deepEqual(lines.slice(-2), [
     "note decision upload-size-limit (a, b) is opened by an agent's question, not seeded",
-    "note planned against an empty instance: no live target exists yet",
+    "note planned against an empty instance, so every issue shows as still to file: plan with --target ORIGIN before filing any",
   ]);
 });
 
 test("reset --dry-run names only the demo repository", async () => {
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", source]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -125,8 +134,8 @@ test("another organisation or repository is refused before anything is planned",
 });
 
 test("seed and reset without --dry-run, and unknown commands, are refused", async () => {
-  await assert.rejects(run(["seed", "--source-root", source]), /no live target yet/);
-  await assert.rejects(run(["reset", "--source-root", source]), /no live target yet/);
+  await assert.rejects(run(["seed", "--source-root", source]), /writes only with --target ORIGIN/);
+  await assert.rejects(run(["reset", "--source-root", source]), /writes only with --target ORIGIN/);
   await assert.rejects(run(["deploy", "--source-root", source]), /Usage/);
   await assert.rejects(run(["seed", "extra", "--dry-run", "--source-root", source]), SeedRefusal);
   await assert.rejects(run(["bundle", "--source-root", source]), /needs --out/);
@@ -288,7 +297,7 @@ test("the manifest is read from the selected commit, never the working tree", as
   // Reset reads no manifest, so a broken one does not block it.
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -320,7 +329,7 @@ test("a decision scope or issue path the app lacks at the selected commit is ref
   // Reset reads no manifest, so a missing path does not block it.
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -366,7 +375,10 @@ test("reset still plans when the committed checks or the source do not match the
   const repo = sourceRepo("reset-checks");
   writeFileSync(join(repo, CHECKS), otherDecision());
   git(repo, ["commit", "--quiet", "--all", "-m", "chore: rename the decision"]);
-  const expected = ["todo delete repository demo/upload-app", "note no live target exists yet"];
+  const expected = [
+    "todo delete repository demo/upload-app",
+    "note planned without a target: pass --target ORIGIN to run it",
+  ];
 
   // Seed is refused at this commit; reset, the way out, is not.
   await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), /different decision/);
@@ -381,7 +393,10 @@ test("reset still plans when the committed checks or the source do not match the
     run(["reset", "--dry-run", "--source-root", scratch, "--org", "acme"]),
     /refusing "acme\/upload-app"/,
   );
-  await assert.rejects(run(["reset", "--source-root", scratch]), /no live target yet/);
+  await assert.rejects(
+    run(["reset", "--source-root", scratch]),
+    /writes only with --target ORIGIN/,
+  );
 });
 
 test("the bundle is a repository that installs and runs its checks on its own", async () => {
@@ -429,4 +444,341 @@ test("the bundle is a repository that installs and runs its checks on its own", 
   const tests = stripVTControlCharacters(pnpm(["run", "test:run", "--reporter=default"]));
   assert.match(tests, /✓ acceptance\/option-a\.test\.ts/);
   assert.match(tests, /Test Files {2}\d+ passed \(\d+\)\n/);
+});
+
+test("the CLI seeds through --target and stops after prepare without --assertion", async () => {
+  const backend = new FakeBackend();
+  const open = (origin: string): LiveSession => {
+    assert.equal(origin, "https://railhead.dev");
+    return sessionWith(backend);
+  };
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const needed = await run(args, open).then(
+    () => assert.fail("the seed should stop after prepare"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(needed instanceof ApprovalNeeded);
+  assert.equal(needed.action.kind, "demo.seed");
+  assert.equal(backend.exists, false);
+
+  const file = join(scratch, "assertion.json");
+  const { challengeId } = needed.challenge;
+  writeFileSync(file, JSON.stringify({ challengeId, assertion: signedFor(challengeId) }));
+  const lines = await run([...args, "--assertion", file], open);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} /);
+  assert.match(lines[1] ?? "", /^ok {3}seed repository demo\/upload-app@main = [0-9a-f]{40}$/);
+  assert.equal(backend.main, needed.action.kind === "demo.seed" ? needed.action.head : null);
+  assert.equal(lines.filter((line) => line.startsWith("todo owner files issue")).length, 3);
+  assert.equal(
+    lines.at(-1),
+    "note the plan is a best-effort snapshot, so run one operator at a time against this instance",
+  );
+
+  // The dry run reads the live target and writes nothing.
+  const planned = await run(
+    ["seed", "--dry-run", "--source-root", source, "--target", "https://railhead.dev"],
+    open,
+  );
+  assert.deepEqual(planned.slice(-2), [
+    "note planned against https://railhead.dev",
+    "note the plan is a best-effort snapshot, so run one operator at a time against this instance",
+  ]);
+  assert.equal(backend.prepared.length, 1);
+});
+
+test("the CLI refuses an assertion without a target or with a dry run, and a plain-text host", async () => {
+  const backend = new FakeBackend();
+  const file = join(scratch, "unused.json");
+  writeFileSync(file, JSON.stringify({ challengeId: "dsc_1", assertion: signedFor("dsc_1") }));
+  const open = (): LiveSession => sessionWith(backend);
+  await assert.rejects(run(["reset", "--assertion", file], open), /needs --target/);
+  await assert.rejects(
+    run(["reset", "--dry-run", "--target", "https://railhead.dev", "--assertion", file], open),
+    /a dry run has none/,
+  );
+  await assert.rejects(
+    run(
+      ["reset", "--target", "https://railhead.dev", "--assertion", join(scratch, "none.json")],
+      open,
+    ),
+    /not a readable JSON file/,
+  );
+  await assert.rejects(
+    run(["reset", "--target", "http://railhead.dev"], (origin) => {
+      throw new SeedRefusal(`opened ${origin}`);
+    }),
+    /https origin/,
+  );
+  assert.equal(backend.prepared.length, 0);
+});
+
+/** Runs `args` until it stops after prepare, and writes the owner's assertion for that challenge. */
+async function approve(
+  args: readonly string[],
+  open: () => LiveSession,
+  name: string,
+): Promise<string> {
+  const needed = await run(args, open).then(
+    () => assert.fail("the write should stop after prepare"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(needed instanceof ApprovalNeeded);
+  const file = join(scratch, name);
+  const { challengeId } = needed.challenge;
+  writeFileSync(file, JSON.stringify({ challengeId, assertion: signedFor(challengeId) }));
+  return file;
+}
+
+/** A write timeout short enough that a withheld answer fails the run at once. */
+const SHORT: LiveLimits = { ...LIVE_LIMITS, writeMs: 50 };
+
+test("a seed whose answer is lost exits 4, and the next run reads main in place and writes nothing", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "lost-seed.json");
+
+  backend.withholdNextAnswer = true;
+  const lost = await run([...args, "--assertion", file], open, SHORT).then(
+    () => assert.fail("the seed should fail without an answer"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(lost instanceof WriteUncertain);
+  const report = failureReport(lost);
+  assert.equal(report.exitCode, 4);
+  assert.deepEqual(report.stdout, []);
+  assert.equal(report.stderr[0], "demoSeed.perform did not answer within 50 ms.");
+  assert.match(
+    report.stderr[1] ?? "",
+    /^the seed of main [0-9a-f]{40} may have happened and was not repeated; run the same seed again: it reads the target first/,
+  );
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  const head = backend.main;
+  assert.ok(head !== null);
+
+  // The operator reruns the same command: it reads main in place and spends nothing.
+  const lines = await run([...args, "--assertion", file], open, SHORT);
+  assert.equal(lines[1], `ok   seed repository demo/upload-app@main = ${head}`);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  assert.equal(backend.received.length, 1);
+  assert.equal(backend.prepared.length, 1);
+});
+
+test("a reset whose answer is lost exits 4, tells the owner to inspect, and is never repeated", async () => {
+  const backend = new FakeBackend();
+  backend.exists = true;
+  backend.main = "a".repeat(40);
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["reset", "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "lost-reset.json");
+
+  backend.withholdNextAnswer = true;
+  const lost = await run([...args, "--assertion", file], open, SHORT).then(
+    () => assert.fail("the reset should fail without an answer"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(lost instanceof WriteUncertain);
+  assert.deepEqual(failureReport(lost), {
+    stdout: [],
+    stderr: [
+      "demoSeed.perform did not answer within 50 ms.",
+      "the reset may have happened and was not repeated; inspect the instance with seed --dry-run --target ORIGIN or on the board before approving another reset",
+    ],
+    exitCode: 4,
+  });
+  assert.deepEqual(backend.performed, ["demo.reset"]);
+  assert.equal(backend.exists, false);
+
+  // Rerunning with the same assertion does not delete again: the challenge is spent.
+  await assert.rejects(run([...args, "--assertion", file], open, SHORT), /proof_expired/);
+  assert.deepEqual(backend.performed, ["demo.reset"]);
+});
+
+test("a dry run whose repository is reset while it plans fails and reports nothing done", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "concurrent-seed.json");
+  await run([...args, "--assertion", file], open);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+
+  // Another operator's reset lands after the plan reads main and before it reads the board.
+  backend.onOpenBoard = () => {
+    backend.exists = false;
+    backend.main = null;
+  };
+  const changed = await run(["seed", "--dry-run", ...args.slice(1)], open).then(
+    () => assert.fail("the plan should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(changed), {
+    stdout: [],
+    stderr: [
+      "demo/upload-app changed during planning: it was read, then the board did not find it; run again.",
+    ],
+    exitCode: 2,
+  });
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+});
+
+test("a reset that deletes some forks and then answers internal exits 4 and says to inspect", async () => {
+  const backend = new FakeBackend();
+  backend.exists = true;
+  backend.main = "a".repeat(40);
+  backend.forks = ["fork-1", "fork-2"];
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["reset", "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "partial-reset.json");
+
+  backend.failResetAfterForks = 1;
+  const failed = await run([...args, "--assertion", file], open).then(
+    () => assert.fail("the reset should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(failed), {
+    stdout: [],
+    stderr: [
+      "demo.reset failed with internal: The fake backend refused with internal.",
+      "the reset may have happened and was not repeated; inspect the instance with seed --dry-run --target ORIGIN or on the board before approving another reset",
+    ],
+    exitCode: 4,
+  });
+  // One fork went; the repository and the other fork are still there for the owner to inspect.
+  assert.deepEqual(backend.forks, ["fork-2"]);
+  assert.equal(backend.exists, true);
+});
+
+test("a dry run whose repository is reset and reseeded at another head while it plans exits 2", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "reseeded-seed.json");
+  await run([...args, "--assertion", file], open);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+
+  // Another operator resets and seeds another head after the plan reads main, before the board.
+  const other = "b".repeat(40);
+  backend.onOpenBoard = () => {
+    backend.onOpenBoard = null;
+    backend.main = other;
+    backend.events = [];
+  };
+  const changed = await run(["seed", "--dry-run", ...args.slice(1)], open).then(
+    () => assert.fail("the plan should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(changed), {
+    stdout: [],
+    stderr: ["The repository demo/upload-app changed during planning; run again."],
+    exitCode: 2,
+  });
+  assert.equal(backend.main, other);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+});
+
+test("a targeted reset dry run reads the instance first and names what it reports", async () => {
+  const backend = new FakeBackend();
+  const open = (origin: string): LiveSession => {
+    assert.equal(origin, "https://railhead.dev");
+    return sessionWith(backend);
+  };
+  const args = ["reset", "--dry-run", "--target", "https://railhead.dev"];
+  const plan = "todo delete repository demo/upload-app";
+  assert.deepEqual(await run(args, open), [
+    plan,
+    "note planned for https://railhead.dev, which reports demo/upload-app not initialized",
+  ]);
+
+  // Seeded or not, the plan still deletes; the read only shows what the instance reports.
+  backend.exists = true;
+  backend.main = "a".repeat(40);
+  assert.deepEqual(await run(args, open), [
+    plan,
+    `note planned for https://railhead.dev, which reports demo/upload-app at main ${"a".repeat(40)}`,
+  ]);
+  backend.main = null;
+  assert.deepEqual(await run(args, open), [
+    plan,
+    "note planned for https://railhead.dev, which reports demo/upload-app without a main",
+  ]);
+  assert.deepEqual(backend.prepared, []);
+  assert.deepEqual(backend.performed, []);
+  assert.equal(backend.exists, true);
+});
+
+test("a targeted reset dry run against an instance that refuses the connection prints no plan and exits 1", async () => {
+  // A port that was just free: nothing listens on it.
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  await new Promise((done) => server.close(done));
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(import.meta.dirname, "cli.ts"),
+      "reset",
+      "--dry-run",
+      "--target",
+      `http://127.0.0.1:${address.port}`,
+    ],
+    { encoding: "utf8", timeout: 60_000 },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "demoSeed failed: WebSocket connection failed.\n");
+});
+
+test("a board log that stops advancing fails the plan in one line with exit 1", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "stalled-seed.json");
+  await run([...args, "--assertion", file], open);
+  backend.events = [otherEvent(1), otherEvent(2)];
+  backend.stall = true;
+  const failed = await run(["seed", "--dry-run", ...args.slice(1)], open).then(
+    () => assert.fail("the plan should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(failed), {
+    stdout: [],
+    stderr: ["readEvents stopped at cursor 0 before the log's head 2."],
+    exitCode: 1,
+  });
+});
+
+test("a dry run whose repository is reset and reseeded at the same head while it plans exits 2", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "same-head-seed.json");
+  await run([...args, "--assertion", file], open);
+  const head = backend.main;
+  assert.ok(head !== null);
+  const [task] = manifest.issues;
+  assert.ok(task !== undefined);
+  backend.events = [issueEvent(1, task.title, task.body)];
+
+  // The plan scans the board, then another operator resets and seeds the same head before the plan
+  // reads the board's history again: main is unchanged, the scanned issue is gone.
+  let opened = 0;
+  backend.onOpenBoard = () => {
+    opened += 1;
+    if (opened !== 2) return;
+    backend.events = [];
+    backend.startHistory();
+  };
+  const changed = await run(["seed", "--dry-run", ...args.slice(1)], open).then(
+    () => assert.fail("the plan should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(changed), {
+    stdout: [],
+    stderr: ["The repository demo/upload-app changed during planning; run again."],
+    exitCode: 2,
+  });
+  assert.equal(backend.main, head);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
 });
