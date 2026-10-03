@@ -7,8 +7,9 @@
 // the sandbox's deadline or its retirement, whichever comes first: before it mints a token and again
 // before it forwards, the gateway asks this object whether the incarnation is still live. No token is
 // ever placed in the container; the gateway adds one to each request it forwards. Each object serves
-// one incarnation behind a `SandboxFence` (see `fence.ts`). Command output is read as a stream and
-// bounded here, before it crosses RPC (see `output.ts`).
+// one incarnation behind a `SandboxFence` (see `fence.ts`), which also enforces each command's
+// timeout. Command output is read as a stream and bounded here, before it crosses RPC (see
+// `output.ts`).
 //
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
@@ -47,12 +48,14 @@ export class RailheadSandbox extends Sandbox<Env> {
     {
       route: (grant) => this.setOutboundHandler(GIT_GATEWAY, grant),
       exec: async (command, options) => {
+        // The SDK checks `signal` only before the command starts; the reader stops on it after.
         const stream = await this.execStreamWithSessionToken(command, SESSIONLESS, {
           timeout: options.timeoutMs,
+          signal: options.signal,
           ...(options.env === undefined ? {} : { env: options.env }),
           ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
         });
-        return readBoundedExec(stream, MAX_OUTPUT_BYTES);
+        return readBoundedExec(stream, MAX_OUTPUT_BYTES, options.signal);
       },
       destroy: () => this.destroy(),
       wake: async (at) => {

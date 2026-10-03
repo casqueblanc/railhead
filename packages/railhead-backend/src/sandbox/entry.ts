@@ -106,7 +106,8 @@ export interface SandboxDriver {
   start(sandbox: string, policy: SandboxPolicy, deadline: number): Promise<void>;
   /**
    * Runs one command and returns its exit code and output, each stream at most
-   * `MAX_OUTPUT_BYTES`. Refused once destroyed.
+   * `MAX_OUTPUT_BYTES`. Refused once destroyed. A command that fails or outlives its timeout
+   * destroys the sandbox before it rejects.
    */
   exec(sandbox: string, command: SandboxCommand): Promise<BoundedOutput>;
   /**

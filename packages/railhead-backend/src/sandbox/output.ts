@@ -4,15 +4,17 @@
 // without limit would fill the container object's memory and then exceed the RPC limit on its way
 // to the repository. Commands therefore run through the SDK's streaming exec, and this reader keeps
 // at most `limit` bytes of each stream. Output past that is read and dropped until the command
-// completes, so its exit code is still reported; the command's timeout bounds how long that takes.
-// A cut never splits a character, and the result says whether anything was cut.
+// completes, so its exit code is still reported. The SDK does not enforce a streaming command's
+// timeout, so the caller passes a signal that it aborts at the command's deadline; the reader then
+// stops and rejects. A cut never splits a character, and the result says whether anything was cut.
 
 import { parseSSEStream } from "@cloudflare/sandbox";
 
 /**
- * The most bytes one event frame of the command stream may hold. The SDK sends one frame per read
- * from a pipe, at most a pipe's capacity (64 KiB on Linux) escaped as JSON, so a frame this large
- * is not the SDK's and the stream is refused rather than buffered.
+ * The most bytes one event frame of the command stream may hold. The SDK usually sends one frame
+ * per read from a pipe, but its first output frame can carry everything the command wrote before
+ * the stream began, so frame size is not bounded upstream. A larger frame is refused rather than
+ * parsed, and the command fails.
  */
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
@@ -31,15 +33,17 @@ export interface BoundedOutput {
 /**
  * Reads the SDK's event stream for one command until it completes, keeping at most `limit` bytes
  * of each output stream. Rejects when the stream reports an error, ends before the command
- * completes, or sends something that is not one of the SDK's events.
+ * completes, sends something that is not one of the SDK's events, or `signal` aborts; in each case
+ * the stream is cancelled.
  */
 export async function readBoundedExec(
   stream: ReadableStream<Uint8Array>,
   limit: number,
+  signal: AbortSignal,
 ): Promise<BoundedOutput> {
   const stdout = new Retained(limit);
   const stderr = new Retained(limit);
-  for await (const event of parseSSEStream<unknown>(stream.pipeThrough(boundFrames()))) {
+  for await (const event of parseSSEStream<unknown>(stream.pipeThrough(boundFrames()), signal)) {
     if (typeof event !== "object" || event === null || !("type" in event)) {
       throw new Error("the command stream sent an invalid event");
     }
@@ -113,7 +117,9 @@ class Retained {
 
 /**
  * Passes the stream through unchanged, erroring it once a frame, the bytes up to a blank line,
- * grows past `MAX_FRAME_BYTES`, so the event parser never buffers more than that.
+ * grows past `MAX_FRAME_BYTES`, so the event parser never receives more than that. Each byte is
+ * counted as it is read, so a chunk that holds a whole oversized frame, or that ends one, is refused
+ * before it is passed on.
  */
 function boundFrames(): TransformStream<Uint8Array, Uint8Array> {
   let frame = 0;
@@ -127,9 +133,10 @@ function boundFrames(): TransformStream<Uint8Array, Uint8Array> {
         } else if (byte !== 0x0d) {
           line += 1;
           frame += 1;
+          if (frame > MAX_FRAME_BYTES)
+            throw new Error("the command stream sent an oversized frame");
         }
       }
-      if (frame > MAX_FRAME_BYTES) throw new Error("the command stream sent an oversized frame");
       controller.enqueue(chunk);
     },
   });

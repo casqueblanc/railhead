@@ -9,7 +9,9 @@ import {
   teardownRetryDelay,
   type FencedContainer,
 } from "../src/sandbox/fence";
+import { MAX_OUTPUT_BYTES } from "../src/sandbox/entry";
 import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
+import { readBoundedExec } from "../src/sandbox/output";
 import { CANDIDATE_REF_PREFIX, type SandboxGrant, type SandboxPolicy } from "../src/sandbox/policy";
 import { wakeTime } from "../src/sandbox/sandboxObject";
 
@@ -46,6 +48,10 @@ class FakeContainer {
   destroyFails = false;
   /** Whether the next destroy never returns, as when the object restarts during it. */
   destroyHangs = false;
+  /** Whether scheduling a wake-up fails. */
+  wakeFails = false;
+  /** What the next command does instead of succeeding. */
+  nextExec: "fails" | "exits_1" | "ignores_timeout" | null = null;
   grants: SandboxGrant[] = [];
   /** Every wake-up the fence asked for, in milliseconds. */
   wakes: number[] = [];
@@ -72,7 +78,21 @@ class FakeContainer {
       this.commands.push({ command, timeoutMs: options.timeoutMs });
       await this.#held.get("exec");
       this.running = true;
-      return { exitCode: 0, stdout: "ok", stderr: "", truncated: false };
+      const outcome = this.nextExec;
+      this.nextExec = null;
+      switch (outcome) {
+        case "fails":
+          throw new Error("scripted command failure");
+        case "exits_1":
+          return { exitCode: 1, stdout: "", stderr: "", truncated: false };
+        case "ignores_timeout":
+          // Neither the signal nor the timeout stops it, as with the SDK's streaming exec.
+          return new Promise<never>(noop);
+        case null:
+          return { exitCode: 0, stdout: "ok", stderr: "", truncated: false };
+        default:
+          throw new Error(`unknown scripted command: ${outcome satisfies never}`);
+      }
     },
     destroy: async () => {
       this.destroys += 1;
@@ -84,6 +104,7 @@ class FakeContainer {
       this.running = false;
     },
     wake: async (at) => {
+      if (this.wakeFails) throw new Error("scripted wake failure");
       this.wakes.push(at);
       this.scheduled.push({ seconds: Math.floor(at / 1_000) });
     },
@@ -96,6 +117,10 @@ interface Harness {
   advance: (ms: number) => void;
   /** A second fence over the same storage, as after the object restarted. */
   reopen: () => SandboxFence;
+  /** The fence's durable phase. */
+  phase: () => string | null;
+  /** A fence over the same storage that drives `container` instead of the fake. */
+  over: (container: FencedContainer) => SandboxFence;
   /**
    * The object's alarm, as the SDK runs it: every wake-up due now runs once on a fresh fence and is
    * then removed, whether it succeeded or failed. One scheduled while they run waits for the next.
@@ -116,6 +141,12 @@ function withFence(body: (harness: Harness) => Promise<void>): Promise<void> {
       fake,
       advance: (ms) => (now += ms),
       reopen,
+      over: (container) => new SandboxFence(state.storage, container, clock),
+      phase: () => {
+        const stored: unknown = state.storage.kv.get("railhead:fence");
+        if (typeof stored !== "object" || stored === null || !("phase" in stored)) return null;
+        return typeof stored.phase === "string" ? stored.phase : null;
+      },
       alarm: async () => {
         const due = fake.scheduled.filter((wake) => wake.seconds * 1_000 <= now);
         for (const wake of due) {
@@ -486,6 +517,179 @@ describe("sandbox grant at retirement", () => {
         expect(oldGit.forwarded).toEqual([]);
         expect(freshGit.forwarded).toHaveLength(1);
       });
+    });
+  });
+});
+
+describe("sandbox fence failures", () => {
+  it("destroys the container when the start probe fails or exits non-zero", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      fake.nextExec = "exits_1";
+      expect(await refusal(fence.start(POLICY, DEADLINE))).toBe("probe_failed");
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+    await withFence(async ({ fence, fake, phase }) => {
+      fake.nextExec = "fails";
+      await expect(fence.start(POLICY, DEADLINE)).rejects.toThrow("scripted command failure");
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("destroys the container when a command fails, and runs nothing after", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.nextExec = "fails";
+
+      await expect(fence.exec({ command: "make", timeoutMs: 1_000 })).rejects.toThrow(
+        "scripted command failure",
+      );
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+      expect(await refusal(fence.exec({ command: "true", timeoutMs: 1_000 }))).toBe("retired");
+    });
+  });
+
+  it("times out a command the container does not stop and destroys the container", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.nextExec = "ignores_timeout";
+
+      expect(await refusal(fence.exec({ command: "sleep 600", timeoutMs: 20 }))).toBe("timed_out");
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("reports both failures and keeps the container retiring when a failed command's destroy fails", async () => {
+    await withFence(async ({ fence, fake, phase, reopen }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.nextExec = "fails";
+      fake.destroyFails = true;
+
+      const error: unknown = await fence
+        .exec({ command: "make", timeoutMs: 1_000 })
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AggregateError);
+      expect(fake.running).toBe(true);
+      expect(phase()).toBe("retiring");
+
+      fake.destroyFails = false;
+      await reopen().retire();
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("still destroys on release when the retry wake-up cannot be scheduled", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.wakeFails = true;
+
+      await fence.retire();
+
+      expect(fake.destroys).toBe(1);
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("keeps a release whose retry and destroy both fail retiring, and finishes it after a restart", async () => {
+    await withFence(async ({ fence, fake, phase, reopen }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.wakeFails = true;
+      fake.destroyFails = true;
+
+      await expect(fence.retire()).rejects.toThrow(
+        "the sandbox was not destroyed and its retry was not scheduled",
+      );
+      expect(fake.destroys).toBe(1);
+      expect(fake.running).toBe(true);
+      expect(phase()).toBe("retiring");
+      expect(reopen().grantCurrent(DEADLINE)).toBe(false);
+
+      fake.wakeFails = false;
+      fake.destroyFails = false;
+      await reopen().retire();
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("still destroys at the deadline when the retry wake-up cannot be scheduled", async () => {
+    await withFence(async ({ fence, fake, advance, alarm, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.wakeFails = true;
+      fake.destroyFails = true;
+      advance(60_000);
+      await alarm();
+
+      expect(fake.destroys).toBe(1);
+      expect(fake.running).toBe(true);
+      expect(phase()).toBe("retiring");
+      // No retry was scheduled; the deadline's wake-up was consumed.
+      expect(fake.scheduled).toEqual([]);
+
+      // The repository's release, or any later wake-up, finishes the teardown.
+      fake.wakeFails = false;
+      fake.destroyFails = false;
+      await fence.retire();
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+
+  it("retires early rather than lose its deadline when an early wake-up cannot reschedule", async () => {
+    await withFence(async ({ fence, fake, advance, alarm, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.wakeFails = true;
+      advance(59_100);
+      await alarm();
+
+      expect(fake.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+});
+
+describe("sandbox command timeout over the output reader", () => {
+  it("stops reading a command that outlives its timeout and destroys its container", async () => {
+    await withFence(async ({ over, phase }) => {
+      // A container whose command writes until something stops it, read as the SDK driver reads.
+      let processRunning = false;
+      let streamCancelled = false;
+      const container: FencedContainer = {
+        route: async () => undefined,
+        wake: async () => undefined,
+        destroy: async () => {
+          processRunning = false;
+        },
+        exec: async (command, options) => {
+          if (command === START_PROBE) {
+            return { exitCode: 0, stdout: "", stderr: "", truncated: false };
+          }
+          processRunning = true;
+          const frames = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              if (!processRunning) return controller.close();
+              controller.enqueue(encoder.encode(`data: {"type":"stdout","data":"z"}\n\n`));
+              await new Promise((resolve) => setTimeout(resolve, 2));
+            },
+            cancel() {
+              streamCancelled = true;
+            },
+          });
+          return readBoundedExec(frames, MAX_OUTPUT_BYTES, options.signal);
+        },
+      };
+      const fence = over(container);
+      await fence.start(POLICY, DEADLINE);
+
+      expect(await refusal(fence.exec({ command: "sleep 600", timeoutMs: 30 }))).toBe("timed_out");
+      expect(streamCancelled).toBe(true);
+      expect(processRunning).toBe(false);
+      expect(phase()).toBe("retired");
     });
   });
 });
