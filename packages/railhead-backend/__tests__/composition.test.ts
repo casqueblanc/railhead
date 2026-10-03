@@ -274,7 +274,7 @@ describe("unavailable modules", () => {
         ports.authorization.authorize("chk_attempt1"),
         ports.mainWriter.publish("int_intent01"),
         // Claims decide Git access themselves now; the Artifacts module behind them is missing.
-        ports.artifacts.revokeTokens("rh-f-missing"),
+        ports.artifacts.revokeTokens("rh-f-missing", { seq: 0, startedAt: 0 }),
       ]);
     });
 

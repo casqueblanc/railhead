@@ -26,7 +26,8 @@
 // fork is granted: the sweep could still revoke a token minted meanwhile, and a Repo restarted
 // mid-sweep knows of the sweep only through this row. Overlapping sweeps each hold their own. A
 // barrier whose sweep outlived `expires_at` is presumed lost; it keeps refusing grants until a new
-// sweep replaces it and records its outcome.
+// sweep replaces it and records its outcome. Each barrier keeps its attempt's mint cutoff and start,
+// which bound what that sweep may revoke: never a token minted after the attempt began.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -38,6 +39,7 @@ import {
   type IssueId,
   type UserId,
 } from "@railhead/shared/events";
+import type { MintCutoff } from "../../contracts/artifacts";
 import { migrate, type RepoStorage } from "../../repo/storage";
 
 /** Released schema steps. Append a step to change the schema; never edit one. */
@@ -81,6 +83,8 @@ const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (claim_id, attempt)
   ) STRICT`,
   "CREATE INDEX claims_barriers_by_expiry ON claims_revocation_barriers (expires_at)",
+  "ALTER TABLE claims_revocation_barriers ADD COLUMN mint_cutoff INTEGER",
+  "ALTER TABLE claims_revocation_barriers ADD COLUMN started_at INTEGER",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -303,13 +307,14 @@ export function dueRevocations(sql: SqlStorage, now: number, limit: number): Cla
  * Starts a revocation sweep of the claim's fork tokens and returns its attempt, which
  * `recordRevocation` needs to settle it, only while the stored generation, state and due
  * revocation still equal `expected`. In the same step it raises the fork's revocation barrier for
- * that attempt until `barrierUntil`. Returns `"stale"`, and writes nothing, when the claim changed
+ * that attempt until `barrierUntil`, recording the attempt's `cutoff`. Returns `"stale"`, and writes nothing, when the claim changed
  * since the caller read it: a reopened claim owes nothing, and its holder's new tokens must live.
  */
 export function beginRevocation(
   sql: SqlStorage,
   expected: Pick<ClaimRow, "claimId" | "generation" | "state" | "revokeDue">,
   barrierUntil: number,
+  cutoff: MintCutoff,
 ): number | "stale" {
   if (expected.revokeDue === null) return "stale";
   const [row] = sql
@@ -325,13 +330,14 @@ export function beginRevocation(
     )
     .toArray();
   if (row === undefined) return "stale";
-  raiseBarrier(sql, expected.claimId, row.revoke_attempt, barrierUntil);
+  raiseBarrier(sql, expected.claimId, row.revoke_attempt, barrierUntil, cutoff);
   return row.revoke_attempt;
 }
 
 /**
  * Starts a new sweep in place of the one whose barrier at attempt `lost` expired at or before
- * `now`, and returns the new attempt, whose barrier replaces it until `barrierUntil`. Returns
+ * `now`, and returns the new attempt, whose barrier replaces it until `barrierUntil` under the new
+ * attempt's `cutoff`. Returns
  * `"stale"`, and writes nothing, when that barrier was lowered or replaced or has not expired.
  */
 export function replaceLostBarrier(
@@ -340,6 +346,7 @@ export function replaceLostBarrier(
   lost: number,
   now: number,
   barrierUntil: number,
+  cutoff: MintCutoff,
 ): number | "stale" {
   const [row] = sql
     .exec<{ revoke_attempt: number }>(
@@ -358,16 +365,25 @@ export function replaceLostBarrier(
     claimId,
     lost,
   );
-  raiseBarrier(sql, claimId, row.revoke_attempt, barrierUntil);
+  raiseBarrier(sql, claimId, row.revoke_attempt, barrierUntil, cutoff);
   return row.revoke_attempt;
 }
 
-function raiseBarrier(sql: SqlStorage, claimId: ClaimId, attempt: number, until: number): void {
+function raiseBarrier(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  attempt: number,
+  until: number,
+  cutoff: MintCutoff,
+): void {
   sql.exec(
-    "INSERT INTO claims_revocation_barriers (claim_id, attempt, expires_at) VALUES (?, ?, ?)",
+    `INSERT INTO claims_revocation_barriers (claim_id, attempt, expires_at, mint_cutoff, started_at)
+     VALUES (?, ?, ?, ?, ?)`,
     claimId,
     attempt,
     until,
+    cutoff.seq,
+    cutoff.startedAt,
   );
 }
 

@@ -68,7 +68,9 @@
 // outcome nobody gets a write grant on the fork, even from a Repo restarted mid-sweep whose memory
 // holds no running sweep. A barrier that outlives `REVOCATION_BARRIER_MS` keeps refusing grants;
 // the Repo's alarm treats its sweep as lost and sweeps again under a new barrier, and only that
-// sweep's outcome lowers it. The alarm reads each claim of its batch
+// sweep's outcome lowers it. Each attempt also captures a mint cutoff as it begins, and its sweep
+// revokes no token minted after that, so a lost sweep that resumes after a newer one lowered the
+// barrier and a push was granted leaves the new token alone. The alarm reads each claim of its batch
 // again just before that claim's sweep. `ready` answers from the stored claim after its sweep:
 // a pin a newer decision superseded meanwhile is reopened and refused, never reported as pinned.
 //
@@ -86,8 +88,8 @@ import {
   type IssueId,
   type RefusalReason,
 } from "@railhead/shared/events";
-import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName } from "../../artifacts/adapter";
-import type { TokenRevocation } from "../../contracts/artifacts";
+import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName, mintCutoff } from "../../artifacts/adapter";
+import type { MintCutoff, TokenRevocation } from "../../contracts/artifacts";
 import type { ClaimPin, ClaimsPort, GitAccess, GitGrant } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, type PortFailure, type PortResult } from "../../contracts/result";
@@ -290,15 +292,15 @@ export function createClaims(
    */
   const owedBy =
     (row: ClaimRow): BeginSweep =>
-    (sql) => {
-      const attempt = beginRevocation(sql, row, clock() + REVOCATION_BARRIER_MS);
+    (sql, cutoff) => {
+      const attempt = beginRevocation(sql, row, clock() + REVOCATION_BARRIER_MS, cutoff);
       return attempt === "stale" ? attempt : { attempt, generation: row.generation };
     };
 
   /** Starts a sweep in place of the one whose barrier at attempt `lostAttempt` expired. */
   const replacing =
     (claimId: ClaimId, lostAttempt: number): BeginSweep =>
-    (sql) => {
+    (sql, cutoff) => {
       const row = claimById(sql, claimId);
       if (row === null) return "stale";
       const now = clock();
@@ -308,24 +310,30 @@ export function createClaims(
         lostAttempt,
         now,
         now + REVOCATION_BARRIER_MS,
+        cutoff,
       );
       return attempt === "stale" ? attempt : { attempt, generation: row.generation };
     };
 
   /**
    * One revocation sweep under a new attempt. The attempt starts after the fork's name is derived,
-   * the sweep's last await before Artifacts, and is stored with its barrier before Artifacts is
-   * called, so a sweep this one overlaps, after an eviction lost the running one, cannot settle the
-   * claim, and no write is granted on the fork until this sweep records its outcome.
+   * the sweep's last await before Artifacts, and is stored with its barrier and mint cutoff before
+   * Artifacts is called, so a sweep this one overlaps, after an eviction lost the running one,
+   * cannot settle the claim, no write is granted on the fork until this sweep records its outcome,
+   * and the sweep never revokes a token minted after it began, however late it runs.
    */
   const sweepTokens = async (claimId: ClaimId, begin: BeginSweep): Promise<Sweep> => {
     const repo = await forkRepoName(repoId, claimId);
-    const started = log.transaction((tx) => begin(tx.sql)).value;
+    const started = log.transaction((tx) => {
+      const cutoff = mintCutoff(context.storage, clock());
+      const begun = begin(tx.sql, cutoff);
+      return begun === "stale" ? begun : { ...begun, cutoff };
+    }).value;
     if (started === "stale") return { kind: "stale" };
-    const { attempt, generation } = started;
+    const { attempt, generation, cutoff } = started;
     let revoked: PortResult<TokenRevocation>;
     try {
-      revoked = await ports().artifacts.revokeTokens(repo);
+      revoked = await ports().artifacts.revokeTokens(repo, cutoff);
     } catch (error) {
       // A revocation that throws is retried like a failed one, rather than at once by every wake.
       log.transaction((tx) => {
@@ -861,10 +869,13 @@ function revocationSettled(result: PortResult<TokenRevocation>): boolean {
 }
 
 /**
- * Starts a sweep's attempt and raises its barrier, in the caller's transaction, answering the
- * attempt and the claim's generation, or `"stale"` when no sweep is owed any more.
+ * Starts a sweep's attempt and raises its barrier under `cutoff`, in the caller's transaction,
+ * answering the attempt and the claim's generation, or `"stale"` when no sweep is owed any more.
  */
-type BeginSweep = (sql: SqlStorage) => { attempt: number; generation: number } | "stale";
+type BeginSweep = (
+  sql: SqlStorage,
+  cutoff: MintCutoff,
+) => { attempt: number; generation: number } | "stale";
 
 /** How one call to revoke a claim's fork tokens ended. */
 type Sweep =

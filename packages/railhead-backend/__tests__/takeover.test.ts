@@ -161,10 +161,10 @@ function withTakeover<T>(
         setup.minted.push(repo);
         return adapter.token(repo, scope, ttlMs);
       },
-      async revokeTokens(repo) {
+      async revokeTokens(repo, cutoff) {
         setup.revoked.push(repo);
         await setup.holdRevocation?.();
-        return adapter.revokeTokens(repo);
+        return adapter.revokeTokens(repo, cutoff);
       },
     };
     const decisions = createDecisions(context, () => ports);
@@ -244,10 +244,10 @@ function withTakeover<T>(
             setup.minted.push(repo);
             return fresh.token(repo, scope, ttlMs);
           },
-          async revokeTokens(repo) {
+          async revokeTokens(repo, cutoff) {
             setup.revoked.push(repo);
             await holdRevocation?.();
-            return fresh.revokeTokens(repo);
+            return fresh.revokeTokens(repo, cutoff);
           },
         };
         // The module reads its ports only when called, never while it is built.
@@ -1872,6 +1872,64 @@ describe("revocation at ready", () => {
     });
   });
 
+  it("keeps a new holder's token when a lost sweep resumes after the replacing sweep lowered its barrier", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      // Sweep A begins, recording its barrier and cutoff, then stalls before reaching Artifacts.
+      const stalled = deferred();
+      setup.holdRevocation = () => stalled.promise;
+      const pending = setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+
+      // The Repo restarts, a newer decision reopens the claim, and the barrier refuses the push.
+      const rebooted = setup.rebooted();
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+
+      // A's barrier expires; the alarm's sweep B replaces it, revokes the former token and lowers it.
+      setup.fake.advance(REVOCATION_BARRIER_MS);
+      await rebooted.claims.resume();
+      expect(setup.revoked).toEqual([fork, fork]);
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+
+      // The push is granted and a token minted for it.
+      expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+      const token = await rebooted.artifacts.token(fork, "write", 120_000);
+      if (!token.ok) throw new Error(`token refused: ${token.code}`);
+
+      // A resumes and sweeps under its own cutoff, which the new token's mint is after.
+      const listed = setup.fake.listTokensCalls;
+      stalled.resolve();
+      expectFailure(await pending, "busy");
+      expect(setup.fake.listTokensCalls).toBeGreaterThan(listed);
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+      // A's outcome changes nothing: no barrier, nothing owed, and the push is still granted.
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+      expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+      });
+
+      // Neither Repo's alarm sweeps again later.
+      setup.fake.advance(REVOCATION_BARRIER_MS);
+      await rebooted.claims.resume();
+      await setup.port.resume();
+      expect(setup.revoked).toEqual([fork, fork]);
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+    });
+  });
+
   it("lowers a lost sweep's barrier when the new sweep fails, leaving the adapter to refuse the mint", async () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
@@ -1967,6 +2025,7 @@ describe("revocation at ready", () => {
           .one().n;
       const before = attempts();
       const until = setup.fake.clock() + REVOCATION_BARRIER_MS;
+      const CUTOFF = { seq: 7, startedAt: setup.fake.clock() };
 
       for (const changed of [
         { generation: 2 },
@@ -1974,17 +2033,21 @@ describe("revocation at ready", () => {
         { revokeDue: owedAt - 1 },
         { revokeDue: null },
       ] as const) {
-        expect(beginRevocation(setup.sql, { ...read, ...changed }, until)).toBe("stale");
+        expect(beginRevocation(setup.sql, { ...read, ...changed }, until, CUTOFF)).toBe("stale");
       }
       expect(
-        beginRevocation(setup.sql, { ...read, claimId: "clm_unknown00000000001" }, until),
+        beginRevocation(setup.sql, { ...read, claimId: "clm_unknown00000000001" }, until, CUTOFF),
       ).toBe("stale");
       expect(attempts()).toBe(before);
       expect(barriers(setup.sql)).toEqual([]);
-      expect(beginRevocation(setup.sql, read, until)).toBe(before + 1);
+      expect(beginRevocation(setup.sql, read, until, CUTOFF)).toBe(before + 1);
       expect(barriers(setup.sql)).toEqual([
         { claim_id: claim.claimId, attempt: before + 1, expires_at: until },
       ]);
+      // The barrier keeps the attempt's cutoff, which bounds what its sweep may revoke.
+      expect(
+        setup.sql.exec("SELECT mint_cutoff, started_at FROM claims_revocation_barriers").toArray(),
+      ).toEqual([{ mint_cutoff: 7, started_at: CUTOFF.startedAt }]);
     });
   });
 

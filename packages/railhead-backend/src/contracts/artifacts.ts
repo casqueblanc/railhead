@@ -22,6 +22,18 @@ export interface ArtifactsToken {
 /** The outcome of `ArtifactsPort.revokeTokens`; only `revoked` ends a holder's access. */
 export type TokenRevocation = "revoked" | "pending_debt";
 
+/**
+ * Which tokens one revocation attempt may revoke, captured when the attempt begins: those of mints
+ * recorded at or before `seq`, and those of no recorded mint created before `startedAt` less the
+ * clock skew. A token minted after the attempt began is never among them.
+ */
+export interface MintCutoff {
+  /** The latest mint record when the attempt began; later records are never swept by it. */
+  readonly seq: number;
+  /** When the attempt began, in milliseconds since the Unix epoch. */
+  readonly startedAt: number;
+}
+
 /** Fork, read and token operations. There is no main-write token here; see `MainRefPort`. */
 export interface ArtifactsPort {
   /**
@@ -44,14 +56,16 @@ export interface ArtifactsPort {
     ttlMs: number,
   ): Promise<PortResult<ArtifactsToken>>;
   /**
-   * Revokes every token for `repo`, as `ready` and lease expiry require. `revoked` means no token
-   * minted for `repo` before the call can still be used: the listing covered every token and each
-   * live one was revoked, or every token the fork may hold has expired.
+   * Revokes the tokens for `repo` that `cutoff` covers, as `ready` and lease expiry require, and
+   * never a token minted after the attempt began, so a late sweep cannot end a newer holder's
+   * access. `revoked` means no covered token can still be used: the listing covered every token and
+   * each covered live one was revoked, or every token the fork may hold has expired.
    *
-   * `pending_debt` means the listing could not cover every token, so an earlier token may still be
-   * live. It is not a revocation: a caller must not grant a new holder write access to `repo` until
-   * a later call returns `revoked`. Meanwhile `token` refuses `repo`, and the debt ends by itself at
-   * most `MAX_TOKEN_TTL_MS` plus clock skew after it was first recorded.
+   * `pending_debt` means a covered token may still be live: the listing could not cover every
+   * token, or a token of no recorded mint is too recent to place before the cutoff while a later
+   * mint has not answered. It is not a revocation: a caller must not grant a new holder write access
+   * to `repo` until a later call returns `revoked`. After a partial listing `token` refuses `repo`,
+   * and that debt ends by itself at most `MAX_TOKEN_TTL_MS` plus clock skew after it was recorded.
    */
-  revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<TokenRevocation>>;
+  revokeTokens(repo: ArtifactsRepoName, cutoff: MintCutoff): Promise<PortResult<TokenRevocation>>;
 }
