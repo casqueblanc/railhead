@@ -37,6 +37,13 @@ struct World {
     outside: tempfile::TempDir,
 }
 
+/// `atlas`'s stored session record: [`TOKEN`], issued by `origin` and valid until 2100.
+fn session_record(origin: &str) -> String {
+    json!({"agentId": "agt_atlas01", "origin": origin, "repo": "casqueblanc/demo",
+        "token": TOKEN, "expiresAt": 4_102_444_800_000_u64})
+    .to_string()
+}
+
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -78,7 +85,7 @@ fn world(origin: &str) -> anyhow::Result<World> {
     }
     let atlas = home.path().join("agents/atlas");
     write_private(&atlas.join("key"), KEY)?;
-    write_private(&atlas.join("session"), TOKEN)?;
+    write_private(&atlas.join("session"), &session_record(origin))?;
 
     let clone = tempfile::tempdir()?;
     git(clone.path(), &["init", "--quiet"])?;

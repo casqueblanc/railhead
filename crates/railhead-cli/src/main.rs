@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::context::{AGENT_ENV, Context, HOME_ENV};
-use crate::identity::{AgentSelector, Identity, SecretKind, SecretStore as _, SessionToken};
+use crate::identity::{AgentSelector, Identity, SessionToken};
 use crate::output::{Code, Failure, LocalCode, Mode, Output, Render};
 
 /// Join a Railhead repository, claim work and answer its decisions.
@@ -293,18 +293,21 @@ impl Agent<'_> {
         )?)
     }
 
-    /// The agent's stored session token, or `None` when it has none or it is not a token.
+    /// The agent's stored session token, or `None` when it has none, or the stored session was
+    /// issued to another identity or has expired. Such a token is never sent.
     ///
     /// # Errors
     ///
     /// When the store cannot be read safely.
     pub fn stored_session(&self) -> Result<Option<SessionToken>> {
-        let secret = self
+        let session = self
             .invocation
             .context
             .store()
-            .read(&self.identity.name, SecretKind::SessionToken)?;
-        Ok(secret.and_then(|secret| SessionToken::new(secret.expose().to_owned())))
+            .load_session(&self.identity.name)?;
+        Ok(session
+            .filter(|session| session.usable_for(&self.identity, identity::now_ms()))
+            .map(|session| session.token))
     }
 }
 

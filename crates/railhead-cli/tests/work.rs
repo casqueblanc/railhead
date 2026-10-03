@@ -50,6 +50,13 @@ fn git_in(world: &World, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
 }
 
+/// `atlas`'s stored session record: [`TOKEN`], issued by `origin` and valid until 2100.
+fn session_record(origin: &str) -> String {
+    json!({"agentId": "agt_atlas01", "origin": origin, "repo": "casqueblanc/demo",
+        "token": TOKEN, "expiresAt": 4_102_444_800_000_u64})
+    .to_string()
+}
+
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -78,7 +85,10 @@ async fn world() -> anyhow::Result<World> {
             "repo": "casqueblanc/demo"});
         write_private(&dir.join("identity.json"), &record.to_string())?;
     }
-    write_private(&home.path().join("agents/atlas/session"), TOKEN)?;
+    write_private(
+        &home.path().join("agents/atlas/session"),
+        &session_record(&server.uri()),
+    )?;
 
     let work = tempfile::tempdir()?;
     let fork = work.path().join("fork.git");

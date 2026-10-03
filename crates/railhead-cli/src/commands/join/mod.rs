@@ -6,6 +6,9 @@
 //! on the board and asks again, within `--wait`. Once confirmed it logs in by signing a challenge
 //! and stores the session; until then the identity holds no session and every other command
 //! refuses to act for it.
+//!
+//! One join enrolls a name at a time: it holds the name's enrollment lock from reading the stored
+//! identity to storing the session, and a second join for the name stops before sending anything.
 
 pub mod invite;
 pub mod key;
@@ -24,8 +27,8 @@ use tokio::time::Instant;
 
 use crate::http::{self, Endpoint};
 use crate::identity::{
-    self, AgentId, AgentName, AgentSelector, FileStore, Identity, Secret, SecretKind,
-    SecretStore as _, SessionToken,
+    self, AgentId, AgentName, AgentSelector, FileStore, Identity, LockKind, SecretKind,
+    SecretStore as _, Session, SessionToken,
 };
 use crate::output::{LocalCode, Output, Render, inert};
 use crate::{Error, Invocation, Result};
@@ -69,9 +72,9 @@ fn parse_name(value: &str) -> std::result::Result<AgentName, String> {
 ///
 /// # Errors
 ///
-/// When the invite is malformed, the name is taken by another enrollment, the store fails, the
-/// backend refuses or answers for another key, the owner does not confirm within `--wait`, or the
-/// login fails.
+/// When the invite is malformed, the name is taken by another enrollment or another join is
+/// enrolling it, the store fails, the backend refuses or answers for another key, the owner does
+/// not confirm within `--wait`, or the login fails.
 pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
     let arg = match &args.invite {
         Some(arg) => arg.clone(),
@@ -92,6 +95,17 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
         None => default_name(&invite.id)?,
     };
     let store = invocation.context.store();
+    // Held until the command ends, so no other join reads, records or cleans up this name meanwhile.
+    let _enrolling = store
+        .try_lock(&name, LockKind::Enrollment)?
+        .ok_or_else(|| Error::Local {
+            code: LocalCode::Store,
+            message: format!(
+                "another rh join is enrolling {name}; run rh join again once it finishes"
+            ),
+            retryable: true,
+            next: Some(NextCommand::Join),
+        })?;
     let existing = existing_identity(store, &name, &invite)?;
     let client = http::Client::new(&invite.origin, &invite.repo)?;
     let (key, made) = SigningKey::load_or_create(store, &name)?;
@@ -131,6 +145,8 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
             out.notice(&enrollment.waiting(&identity, args.wait))
                 .map_err(Error::Output)?;
         }
+        // The first ask is always sent, even with `--wait 0`; every later one starts and ends
+        // within the wait, and an answer it would bring after the deadline is not waited for.
         while result.agent.state == EnrollmentState::Pending {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -138,18 +154,19 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
             }
             let asked = Duration::from_millis(result.poll_after_ms.get());
             tokio::time::sleep(asked.clamp(MIN_POLL, MAX_POLL).min(left)).await;
-            result = client
-                .send::<_, JoinResult>(&Endpoint::Join, None, &request)
-                .await?
-                .data;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(enrollment.still_pending(&identity));
+            }
+            let ask = client.send::<_, JoinResult>(&Endpoint::Join, None, &request);
+            result = match tokio::time::timeout(left, ask).await {
+                Ok(answer) => answer?.data,
+                Err(_elapsed) => return Err(enrollment.still_pending(&identity)),
+            };
             enrollment.check(&identity, &result)?;
         }
-        let token = login(&client, &identity, &key).await?;
-        store.replace(
-            &name,
-            SecretKind::SessionToken,
-            &Secret::new(token.expose().to_owned()),
-        )?;
+        let session = login(&client, &identity, &key).await?;
+        store.save_session(&name, &session)?;
         let joined = Joined {
             name: name.to_string(),
             agent_id: identity.agent_id.to_string(),
@@ -165,7 +182,7 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
 }
 
 /// Logs in as `identity`: asks for a challenge, signs it when it is exactly the message `rh`
-/// builds, and redeems it for a session token.
+/// builds, and redeems it for a session bound to `identity` with the expiry the backend gave.
 ///
 /// # Errors
 ///
@@ -175,7 +192,7 @@ pub async fn login(
     client: &http::Client,
     identity: &Identity,
     key: &SigningKey,
-) -> Result<SessionToken> {
+) -> Result<Session> {
     let agent_id = identity.agent_id.to_string();
     let challenge = client
         .send::<_, ChallengeResult>(
@@ -221,8 +238,9 @@ pub async fn login(
             "the session names another agent; it was not stored",
         ));
     }
-    SessionToken::new(session.token)
-        .ok_or_else(|| malformed("the session token is malformed; it was not stored"))
+    let token = SessionToken::new(session.token)
+        .ok_or_else(|| malformed("the session token is malformed; it was not stored"))?;
+    Ok(Session::new(identity, token, session.expires_at.get()))
 }
 
 /// `chl_` and 16 to 64 letters or digits.

@@ -7,8 +7,8 @@
 //! agent's origin: the claim's fork and the main repository, which `credential.useHttpPath` lets
 //! it tell apart. Any other protocol, host, path or user is refused with nothing on stdout. The
 //! answer is `username=<agentId>` and `password=<session token>`: the Railhead session, and
-//! nothing else, since the CLI never holds an Artifacts token. When the agent has no session, the
-//! helper logs in with its key first.
+//! nothing else, since the CLI never holds an Artifacts token. When the agent has no current
+//! session, or it is about to expire, the helper logs in with its key first.
 
 use std::convert::Infallible;
 use std::io::{self, Read};
@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 use crate::commands::join::{self, key::SigningKey};
 use crate::context::CloneBinding;
-use crate::identity::{Identity, Secret, SecretKind, SecretStore as _, SessionToken};
+use crate::identity::{Identity, SessionToken};
 use crate::output::{LocalCode, Output};
 use crate::{Agent, Error, Result};
 
@@ -90,16 +90,14 @@ fn answer(
         Operation::Erase => {
             let binding = clone_of(agent)?;
             request.check(&agent.identity, binding)?;
-            // Only the token Git was refused is dropped, so a stale erase cannot drop a fresh one.
-            let refused = request.password.as_deref();
-            if refused.is_some()
-                && agent.stored_session()?.as_ref().map(SessionToken::expose) == refused
-            {
+            // Only the token Git was refused is dropped, compared and removed under the session
+            // lock, so neither a stale erase nor one racing a login can drop a fresh token.
+            if let Some(refused) = request.password.as_deref() {
                 agent
                     .invocation
                     .context
                     .store()
-                    .remove(&agent.identity.name, SecretKind::SessionToken)?;
+                    .remove_session_if(&agent.identity.name, refused)?;
             }
             Ok(())
         }
@@ -119,7 +117,8 @@ fn clone_of<'a>(agent: &'a Agent<'_>) -> Result<&'a CloneBinding> {
         })
 }
 
-/// The agent's stored session, or a new one from a login with its key, stored for the next request.
+/// The agent's stored session while it is current, or a new one from a login with its key, stored
+/// for the next request.
 fn session(agent: &Agent<'_>) -> Result<SessionToken> {
     if let Some(token) = agent.stored_session()? {
         return Ok(token);
@@ -132,16 +131,12 @@ fn session(agent: &Agent<'_>) -> Result<SessionToken> {
         next: Some(railhead_protocol::NextCommand::Join),
     })?;
     let client = agent.client()?;
-    let token = agent
+    let session = agent
         .invocation
         .runtime
         .block_on(join::login(&client, &agent.identity, &key))?;
-    store.replace(
-        &agent.identity.name,
-        SecretKind::SessionToken,
-        &Secret::new(token.expose().to_owned()),
-    )?;
-    Ok(token)
+    store.save_session(&agent.identity.name, &session)?;
+    Ok(session.token)
 }
 
 /// The fields of a Git credential request this helper reads.
