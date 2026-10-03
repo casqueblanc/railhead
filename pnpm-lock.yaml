@@ -365,6 +365,9 @@ importers:
       '@cloudflare/config':
         specifier: 0.22.0
         version: 0.22.0
+      capnweb:
+        specifier: 'catalog:'
+        version: 0.12.0
     devDependencies:
       '@types/node':
         specifier: 24.19.0

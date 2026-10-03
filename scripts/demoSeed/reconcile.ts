@@ -7,8 +7,8 @@
 // not retried here: the next run reads the target again first, so an uncertain write is reconciled
 // before anything is written a second time.
 //
-// Each backend write needs its own owner passkey assertion. The live adapter obtains it (#148); the
-// port does not carry one.
+// Each backend write needs its own owner passkey assertion. The live adapter, `liveTarget.ts`,
+// holds it; the port does not carry one.
 //
 // Issues are read through `BoardIssues`, a separate port: `DemoSeedApi` has no issue read. Filing an
 // issue is an owner action on the board, so neither port can file one. The plan lists each seeded
@@ -24,8 +24,8 @@
 // even when `read` finds nothing: a seed that failed after importing main leaves that main in
 // place behind a repository `read` does not report, and only the target's reset clears it.
 //
-// The live target does not exist yet; until it does the commands only plan, and
-// `docs/demo-seed.md` gives the owner's steps.
+// `liveTarget.ts` implements both ports against a deployed Railhead, and `docs/demo-seed.md`
+// gives the owner's steps.
 
 import {
   assertDemoTarget,

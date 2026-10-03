@@ -16,7 +16,9 @@ import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { run } from "./cli.ts";
+import { FakeBackend, sessionWith, signedFor } from "./fakeBackend.ts";
 import { MAX_BUNDLE_BYTES } from "./history.ts";
+import { ApprovalNeeded, type LiveSession } from "./liveTarget.ts";
 import { loadManifest, SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
@@ -102,14 +104,14 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
   assert.equal(lines.filter((line) => line.startsWith("--- end issue")).length, 3);
   assert.deepEqual(lines.slice(-2), [
     "note decision upload-size-limit (a, b) is opened by an agent's question, not seeded",
-    "note planned against an empty instance: no live target exists yet",
+    "note planned against an empty instance: pass --target ORIGIN to plan against one",
   ]);
 });
 
 test("reset --dry-run names only the demo repository", async () => {
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", source]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -125,8 +127,8 @@ test("another organisation or repository is refused before anything is planned",
 });
 
 test("seed and reset without --dry-run, and unknown commands, are refused", async () => {
-  await assert.rejects(run(["seed", "--source-root", source]), /no live target yet/);
-  await assert.rejects(run(["reset", "--source-root", source]), /no live target yet/);
+  await assert.rejects(run(["seed", "--source-root", source]), /writes only with --target ORIGIN/);
+  await assert.rejects(run(["reset", "--source-root", source]), /writes only with --target ORIGIN/);
   await assert.rejects(run(["deploy", "--source-root", source]), /Usage/);
   await assert.rejects(run(["seed", "extra", "--dry-run", "--source-root", source]), SeedRefusal);
   await assert.rejects(run(["bundle", "--source-root", source]), /needs --out/);
@@ -288,7 +290,7 @@ test("the manifest is read from the selected commit, never the working tree", as
   // Reset reads no manifest, so a broken one does not block it.
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -320,7 +322,7 @@ test("a decision scope or issue path the app lacks at the selected commit is ref
   // Reset reads no manifest, so a missing path does not block it.
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
     "todo delete repository demo/upload-app",
-    "note no live target exists yet",
+    "note planned without a target: pass --target ORIGIN to run it",
   ]);
 });
 
@@ -366,7 +368,10 @@ test("reset still plans when the committed checks or the source do not match the
   const repo = sourceRepo("reset-checks");
   writeFileSync(join(repo, CHECKS), otherDecision());
   git(repo, ["commit", "--quiet", "--all", "-m", "chore: rename the decision"]);
-  const expected = ["todo delete repository demo/upload-app", "note no live target exists yet"];
+  const expected = [
+    "todo delete repository demo/upload-app",
+    "note planned without a target: pass --target ORIGIN to run it",
+  ];
 
   // Seed is refused at this commit; reset, the way out, is not.
   await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), /different decision/);
@@ -381,7 +386,10 @@ test("reset still plans when the committed checks or the source do not match the
     run(["reset", "--dry-run", "--source-root", scratch, "--org", "acme"]),
     /refusing "acme\/upload-app"/,
   );
-  await assert.rejects(run(["reset", "--source-root", scratch]), /no live target yet/);
+  await assert.rejects(
+    run(["reset", "--source-root", scratch]),
+    /writes only with --target ORIGIN/,
+  );
 });
 
 test("the bundle is a repository that installs and runs its checks on its own", async () => {
@@ -429,4 +437,63 @@ test("the bundle is a repository that installs and runs its checks on its own", 
   const tests = stripVTControlCharacters(pnpm(["run", "test:run", "--reporter=default"]));
   assert.match(tests, /✓ acceptance\/option-a\.test\.ts/);
   assert.match(tests, /Test Files {2}\d+ passed \(\d+\)\n/);
+});
+
+test("the CLI seeds through --target and stops after prepare without --assertion", async () => {
+  const backend = new FakeBackend();
+  const open = (origin: string): LiveSession => {
+    assert.equal(origin, "https://railhead.dev");
+    return sessionWith(backend);
+  };
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const needed = await run(args, open).then(
+    () => assert.fail("the seed should stop after prepare"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(needed instanceof ApprovalNeeded);
+  assert.equal(needed.action.kind, "demo.seed");
+  assert.equal(backend.exists, false);
+
+  const file = join(scratch, "assertion.json");
+  const { challengeId } = needed.challenge;
+  writeFileSync(file, JSON.stringify({ challengeId, assertion: signedFor(challengeId) }));
+  const lines = await run([...args, "--assertion", file], open);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} /);
+  assert.match(lines[1] ?? "", /^ok {3}seed repository demo\/upload-app@main = [0-9a-f]{40}$/);
+  assert.equal(backend.main, needed.action.kind === "demo.seed" ? needed.action.head : null);
+  assert.equal(lines.filter((line) => line.startsWith("todo owner files issue")).length, 3);
+
+  // The dry run reads the live target and writes nothing.
+  const planned = await run(
+    ["seed", "--dry-run", "--source-root", source, "--target", "https://railhead.dev"],
+    open,
+  );
+  assert.equal(planned.at(-1), "note planned against https://railhead.dev");
+  assert.equal(backend.prepared.length, 1);
+});
+
+test("the CLI refuses an assertion without a target or with a dry run, and a plain-text host", async () => {
+  const backend = new FakeBackend();
+  const file = join(scratch, "unused.json");
+  writeFileSync(file, JSON.stringify({ challengeId: "dsc_1", assertion: signedFor("dsc_1") }));
+  const open = (): LiveSession => sessionWith(backend);
+  await assert.rejects(run(["reset", "--assertion", file], open), /needs --target/);
+  await assert.rejects(
+    run(["reset", "--dry-run", "--target", "https://railhead.dev", "--assertion", file], open),
+    /a dry run has none/,
+  );
+  await assert.rejects(
+    run(
+      ["reset", "--target", "https://railhead.dev", "--assertion", join(scratch, "none.json")],
+      open,
+    ),
+    /not a readable JSON file/,
+  );
+  await assert.rejects(
+    run(["reset", "--target", "http://railhead.dev"], (origin) => {
+      throw new SeedRefusal(`opened ${origin}`);
+    }),
+    /https origin/,
+  );
+  assert.equal(backend.prepared.length, 0);
 });

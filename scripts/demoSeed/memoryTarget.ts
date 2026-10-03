@@ -1,5 +1,5 @@
 // An in-memory `SeedTarget` and `BoardIssues`: the stand-in for a Railhead instance in the seed's
-// tests, and the empty instance a dry run plans against while no live target exists. It follows
+// tests, and the empty instance a dry run plans against without `--target`. It follows
 // the backend's `demo.seed` and `demo.reset` rules (#149).
 
 import { bundleHead, type MainBundle } from "./history.ts";
