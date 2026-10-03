@@ -17,7 +17,7 @@ export interface SandboxPolicy {
   host: string;
   /** The Artifacts namespace every repository below belongs to. */
   namespace: string;
-  /** Repositories the sandbox may fetch from. */
+  /** The only repositories the sandbox may fetch from, including one it may push to or delete in. */
   read: string[];
   /** The one repository it may push to and the ref prefix it may create or update, or `null`. */
   write: RefGrant | null;

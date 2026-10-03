@@ -51,7 +51,7 @@ type Reply = Partial<BoundedOutput> & { exitCode: number };
 type StepName = "init" | "fetch" | "merge" | "partner" | "binary" | "push" | "discard";
 
 function stepOf(command: string): StepName {
-  if (command.includes("git ls-remote")) return "discard";
+  if (command.includes("git push --porcelain --prune")) return "discard";
   if (command.includes("git init")) return "init";
   if (command.includes("git fetch")) return "fetch";
   if (command.includes("try_partner")) return "partner";
@@ -200,12 +200,12 @@ describe("compose", () => {
 
       expect(result).toEqual(ok({ kind: "clean", candidate: CANDIDATE }));
       expect(fake.steps()).toEqual(["init", "fetch", "merge", "push"]);
-      // The policy reads the forks and writes only the attempt's candidate refs of main.
+      // The policy reads main and the forks and writes only the attempt's candidate refs of main.
       expect(fake.policies).toEqual([
         {
           host: HOST,
           namespace: "railhead",
-          read: ["rh-f-aaaaaa01", "rh-f-bbbbbb02"],
+          read: [MAIN_REPO, "rh-f-aaaaaa01", "rh-f-bbbbbb02"],
           write: { repo: MAIN_REPO, refPrefix: `${CANDIDATE_REF_PREFIX}mrg_attempt001/` },
         },
       ]);
@@ -643,7 +643,7 @@ describe("discard", () => {
 
       expect(await harness.merge.discard("mrg_attempt9")).toEqual(ok({ removed: 1 }));
 
-      // The sandbox reads nothing and holds no write grant: only deletes under this prefix.
+      // The sandbox fetches nothing and holds no write grant: only deletes under this prefix.
       expect(fake.policies).toEqual([
         {
           host: HOST,
@@ -654,8 +654,11 @@ describe("discard", () => {
         },
       ]);
       const [command] = fake.commands.map((c) => c.command);
-      expect(command).toContain(`'${PREFIX}*'`);
-      expect(command).toContain("--delete");
+      expect(command).toContain(`'${PREFIX}*:${PREFIX}*'`);
+      expect(command).toContain("--prune");
+      // Its grant fetches nothing, so the command never lists refs through upload-pack.
+      expect(command).not.toContain("ls-remote");
+      expect(command).not.toContain("fetch");
       expect(command).not.toContain("refs/heads/main");
       await expectReleased(harness);
     });
@@ -734,7 +737,7 @@ describe("discard", () => {
 describe("merge script", () => {
   it("builds a discard only for one candidate prefix", () => {
     const url = remoteUrl(LOCATION, MAIN_REPO);
-    expect(discardCommand(url, `${CANDIDATE_REF_PREFIX}mrg_x1/`, 5)).toContain("--delete");
+    expect(discardCommand(url, `${CANDIDATE_REF_PREFIX}mrg_x1/`, 5)).toContain("--prune");
     for (const prefix of [
       "refs/heads/",
       CANDIDATE_REF_PREFIX,

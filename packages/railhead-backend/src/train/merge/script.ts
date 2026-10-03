@@ -196,24 +196,25 @@ export function pushCommand(url: string, commit: string, ref: string, seconds: n
 
 /**
  * Deletes every ref under the candidate `prefix` of `url`, and prints `discarded <n>` with how many
- * it deleted. It lists the prefix first, so a prefix with nothing left succeeds without pushing.
- * Listed ref names reach `git push` only as quoted arguments, never as shell text. Exits 2 when a
- * step fails or Git lists a ref outside the prefix.
+ * it deleted. It pushes from an empty repository with `--prune`, so Git deletes every remote ref the
+ * prefix pattern matches, and a prefix with nothing left succeeds without a delete. Only
+ * receive-pack is used: the sandbox's grant fetches nothing. Exits 2 when a step fails.
  */
 export function discardCommand(url: string, prefix: string, seconds: number): string {
   if (!PREFIX.test(prefix)) throw new Error("invalid candidate prefix");
+  const pattern = `${prefix}*`;
   return script(seconds, [
-    `refs=$(step git ls-remote --refs ${quote(url)} ${quote(`${prefix}*`)}) || fail 2`,
-    "set --",
+    "rm -rf discard && mkdir discard && cd discard || exit 2",
+    "step git init -q || fail 2",
+    `out=$(step git push --porcelain --prune ${quote(url)} ${quote(`${pattern}:${pattern}`)}) || fail 2`,
+    "n=0",
     "tab=$(printf '\\t')",
-    'while IFS="$tab" read -r oid ref; do',
-    '  [ -n "$oid" ] || continue',
-    `  case "$ref" in ${quote(prefix)}?*) set -- "$@" "$ref" ;; *) exit 2 ;; esac`,
+    "while IFS= read -r line; do",
+    '  case "$line" in "-$tab"*) n=$((n + 1)) ;; esac',
     "done <<EOF",
-    "$refs",
+    "$out",
     "EOF",
-    `[ "$#" -eq 0 ] || step git push -q ${quote(url)} --delete "$@" || fail 2`,
-    'echo "discarded $#"',
+    'echo "discarded $n"',
   ]);
 }
 

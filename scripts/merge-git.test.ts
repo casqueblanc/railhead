@@ -319,6 +319,9 @@ describe("merge commands with real Git", () => {
     for (const ref of [`${prefix}merge`, `${prefix}extra/leaf`, ...kept]) {
       git(remote, "update-ref", ref, main);
     }
+    // The sandbox's grant fetches nothing, so a discard must find its refs through receive-pack.
+    // Hidden from upload-pack, they are invisible to a listing that fetches.
+    git(remote, "config", "uploadpack.hideRefs", "refs/heads/candidate/");
 
     const first = run(discardCommand(mainUrl, prefix, SECONDS));
     assert.equal(first.status, 0);
@@ -326,18 +329,18 @@ describe("merge commands with real Git", () => {
     assert.equal(git(remote, "for-each-ref", "--format=%(refname)", prefix), "");
     for (const ref of kept) assert.equal(git(remote, "rev-parse", ref), main);
 
-    // Nothing is left, so a repeat succeeds without pushing.
-    const again = run(discardCommand(mainUrl, prefix, SECONDS), "push");
+    // Nothing is left, so a repeat succeeds and deletes nothing.
+    const again = run(discardCommand(mainUrl, prefix, SECONDS));
     assert.equal(again.status, 0);
     assert.equal(parseDiscarded(again.stdout), 0);
   });
 
-  test("reports a discard whose listing or push fails as an error", () => {
+  test("reports a discard whose setup or push fails as an error", () => {
     const remote = join(root, "main.git");
     const prefix = "refs/heads/candidate/mrg_failing/";
     git(remote, "update-ref", `${prefix}merge`, main);
 
-    assert.equal(run(discardCommand(mainUrl, prefix, SECONDS), "ls-remote").status, 2);
+    assert.equal(run(discardCommand(mainUrl, prefix, SECONDS), "init").status, 2);
     assert.equal(run(discardCommand(mainUrl, prefix, SECONDS), "push").status, 2);
     const nowhere = `file://${join(root, "absent.git")}`;
     assert.equal(run(discardCommand(nowhere, prefix, SECONDS)).status, 2);

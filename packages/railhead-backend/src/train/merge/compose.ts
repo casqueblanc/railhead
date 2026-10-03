@@ -151,7 +151,7 @@ export function createMerge(deps: MergeDeps): MergePort {
       const policy = parseSandboxPolicy({
         host: location.host,
         namespace: location.namespace,
-        read: [...new Set(forks)],
+        read: [...new Set([main, ...forks])],
         write: { repo: main, refPrefix: prefix },
       });
       if (policy === null) throw new Error("the merge built an invalid sandbox policy");
@@ -192,7 +192,7 @@ export function createMerge(deps: MergeDeps): MergePort {
       }
       const [location, main] = located.value;
       const prefix = `${CANDIDATE_REF_PREFIX}${attemptId}/`;
-      // The sandbox reads and writes nothing else: its one grant deletes under this prefix.
+      // The sandbox fetches nothing and writes nothing else: its one grant deletes under this prefix.
       const policy = parseSandboxPolicy({
         host: location.host,
         namespace: location.namespace,

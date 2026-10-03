@@ -286,6 +286,80 @@ describe("serveGitGateway", () => {
   });
 });
 
+/** An upload-pack request to `repo`: ref discovery, or the POST that fetches objects. */
+function uploadPack(repo: string, kind: "discovery" | "fetch"): Request {
+  return kind === "discovery"
+    ? fetchRefs(repo)
+    : new Request(url(repo, "git-upload-pack"), { method: "POST", body: pkt("want x\n") + "0000" });
+}
+
+describe("serveGitGateway fetch authority", () => {
+  it.each(["discovery", "fetch"] as const)(
+    "forwards a %s from each listed repository with a read token",
+    async (kind) => {
+      const deps = recorder();
+
+      for (const repo of ["main-repo", "fork-a"]) {
+        expect((await serveGitGateway(uploadPack(repo, kind), live(POLICY), deps)).status).toBe(
+          200,
+        );
+      }
+      expect(deps.minted).toEqual([
+        ["main-repo", "read"],
+        ["fork-a", "read"],
+      ]);
+      expect(deps.forwarded.map((request) => request.auth)).toEqual([
+        "Bearer tok-read-main-repo",
+        "Bearer tok-read-fork-a",
+      ]);
+    },
+  );
+
+  it.each(["discovery", "fetch"] as const)(
+    "refuses a %s from a repository not on the read list",
+    async (kind) => {
+      const deps = recorder();
+
+      const response = await serveGitGateway(uploadPack("fork-b", kind), live(POLICY), deps);
+      expect(await refusal(response)).toBe("repository");
+      expect(deps.minted).toEqual([]);
+      expect(deps.forwarded).toEqual([]);
+    },
+  );
+
+  it("refuses a fetch of the repository a grant writes to unless it is also listed", async () => {
+    const deps = recorder();
+    const writeOnly: SandboxPolicy = { ...POLICY, read: ["fork-a"] };
+    const candidate = new Request(url("main-repo", "git-receive-pack"), {
+      method: "POST",
+      body: push(`${ZERO} ${NEW} ${CANDIDATE_REF_PREFIX}chk_attempt1/head`),
+    });
+
+    for (const kind of ["discovery", "fetch"] as const) {
+      const response = await serveGitGateway(uploadPack("main-repo", kind), live(writeOnly), deps);
+      expect(await refusal(response)).toBe("repository");
+    }
+    expect(deps.minted).toEqual([]);
+    // The write grant itself still pushes.
+    expect((await serveGitGateway(candidate, live(writeOnly), deps)).status).toBe(200);
+    expect(deps.minted).toEqual([["main-repo", "write"]]);
+  });
+
+  it("refuses every fetch under an empty read list", async () => {
+    const deps = recorder();
+    const noRead: SandboxPolicy = { ...POLICY, read: [] };
+
+    for (const repo of ["main-repo", "fork-a"]) {
+      for (const kind of ["discovery", "fetch"] as const) {
+        const response = await serveGitGateway(uploadPack(repo, kind), live(noRead), deps);
+        expect(await refusal(response)).toBe("repository");
+      }
+    }
+    expect(deps.minted).toEqual([]);
+    expect(deps.forwarded).toEqual([]);
+  });
+});
+
 /** A push of `commands` with no pack, as Git sends a delete-only push. */
 function deletes(...commands: string[]): string {
   const [first = "", ...rest] = commands;
@@ -371,6 +445,27 @@ describe("serveGitGateway discard grant", () => {
       expect(await refusal(response)).toBe("ref");
     }
     expect(deps.forwarded).toHaveLength(2);
+  });
+
+  it("refuses a discard-only grant's fetch of its own repository but still deletes", async () => {
+    const deps = recorder();
+    const body = deletes(`${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`);
+
+    for (const kind of ["discovery", "fetch"] as const) {
+      const response = await serveGitGateway(uploadPack("main-repo", kind), live(DISCARD), deps);
+      expect(await refusal(response)).toBe("repository");
+    }
+    expect(deps.minted).toEqual([]);
+    expect(deps.forwarded).toEqual([]);
+
+    const discovery = new Request(`${url("main-repo", "info/refs")}?service=git-receive-pack`);
+    expect((await serveGitGateway(discovery, live(DISCARD), deps)).status).toBe(200);
+    expect((await serveGitGateway(receive(body), live(DISCARD), deps)).status).toBe(200);
+    expect(deps.minted).toEqual([
+      ["main-repo", "write"],
+      ["main-repo", "write"],
+    ]);
+    expect(deps.forwarded[1]?.body).toBe(body);
   });
 
   it("refuses a delete grant's push to another repository and a fetch of a fork", async () => {

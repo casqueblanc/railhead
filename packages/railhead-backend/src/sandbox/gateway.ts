@@ -1,6 +1,8 @@
 // The Git gateway: every HTTP and HTTPS request a sandbox sends arrives here, outside the sandbox.
 // It forwards Git smart-HTTP to the Artifacts host for the repositories the sandbox's policy names,
 // adding a freshly minted repository token the sandbox never sees, and refuses everything else.
+// A fetch or clone (upload-pack) reaches only a repository on the policy's read list, even one the
+// policy may push to, so a policy with an empty read list fetches nothing.
 //
 // A push is checked before any of it is forwarded: its ref commands are read with the same
 // receive-pack parser the agent gateway uses, and each must create or update a ref under the
@@ -82,8 +84,10 @@ export async function serveGitGateway(
     update: policy.write?.repo === repo ? policy.write.refPrefix : null,
     delete: policy.discard?.repo === repo ? policy.discard.refPrefix : null,
   };
+  // A fetch needs the repository on the read list; a write or discard grant alone reads nothing.
+  const readable = policy.read.includes(repo);
   const writable = prefixes.update !== null || prefixes.delete !== null;
-  if (!writable && !policy.read.includes(repo)) return refuse("repository");
+  if (!readable && !(write && writable)) return refuse("repository");
   if (write && !writable) return refuse("read-only");
 
   let body: ReadableStream<Uint8Array> | null = null;
