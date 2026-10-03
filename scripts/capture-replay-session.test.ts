@@ -50,6 +50,9 @@ const callable = (value: unknown) => {
   return (...args: unknown[]): unknown => Reflect.apply(value, undefined, args);
 };
 
+/** Text a hostile endpoint sends: a terminal escape sequence and a would-be secret. */
+const HOSTILE = "\u001b]0;pwned\u0007s3cr3t-text";
+
 /** Fewer events per page than the client asks for, so the capture must page. */
 const SERVED_PAGE = 7;
 
@@ -80,11 +83,22 @@ const transportOf = (socket: WebSocket): RpcTransport => {
   };
 };
 
-/** Serves `log` as repository demo/upload-app, as the backend's `openBoard` and `readEvents` do. */
-const startBoard = async (repo: string, log: readonly unknown[]) => {
+/**
+ * Serves `log` as repository demo/upload-app, as the backend's `openBoard` and `readEvents` do.
+ * `refuseOpenWith` and `refuseReadWith` make every `openBoard` or `readEvents` call fail with that
+ * code, as a hostile endpoint might.
+ */
+const startBoard = async (
+  repo: string,
+  log: readonly unknown[],
+  options: { refuseOpenWith?: unknown; refuseReadWith?: unknown } = {},
+) => {
   const pages: number[] = [];
   class Board extends RpcTarget {
     readEvents(cursor: number, limit: number) {
+      if (options.refuseReadWith !== undefined) {
+        return { ok: false, code: options.refuseReadWith, message: HOSTILE };
+      }
       const events = log.slice(cursor, cursor + Math.min(limit, SERVED_PAGE));
       pages.push(cursor);
       return {
@@ -95,9 +109,12 @@ const startBoard = async (repo: string, log: readonly unknown[]) => {
   }
   class Api extends RpcTarget {
     openBoard(org: string, name: string) {
+      if (options.refuseOpenWith !== undefined) {
+        return { ok: false, code: options.refuseOpenWith, message: HOSTILE };
+      }
       return org === "demo" && name === "upload-app"
         ? { ok: true, value: new Board() }
-        : { ok: false, code: "not_found", message: "no such repository" };
+        : { ok: false, code: "not_found", message: HOSTILE };
     }
   }
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: String(API_PATH) });
@@ -221,3 +238,43 @@ test("reports the backend's refusal to open the repository and writes nothing", 
     await board.close();
   }
 });
+
+for (const [label, refusal, expected] of [
+  [
+    "opening",
+    { refuseOpenWith: HOSTILE },
+    "capture-replay: the backend refused to open demo/upload-app (unknown error)\n",
+  ],
+  [
+    "reading",
+    { refuseReadWith: HOSTILE },
+    "capture-replay: The backend refused to read the log (unknown error).\n",
+  ],
+  [
+    "reading with a known code",
+    { refuseReadWith: "internal" },
+    "capture-replay: The backend refused to read the log (internal).\n",
+  ],
+] as const) {
+  test(`prints only a known code when the backend refuses ${label}`, async () => {
+    const board = await startBoard("rep_synthrepo", [], refusal);
+    const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+    try {
+      const out = join(dir, "run.json");
+      const result = await runScript([
+        "--origin",
+        `http://127.0.0.1:${board.port}`,
+        "--repo",
+        "demo/upload-app",
+        "--out",
+        out,
+      ]);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, expected);
+      assert.deepEqual(readdirSync(dir), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      await board.close();
+    }
+  });
+}

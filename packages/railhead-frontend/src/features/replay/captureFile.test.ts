@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
@@ -13,6 +13,7 @@ import {
   CAPTURE_VERSION,
   MAX_CAPTURE_BYTES,
   MAX_CAPTURE_EVENTS,
+  captureErrorText,
   captureLog,
   parseCapture,
   serializeCapture,
@@ -32,6 +33,9 @@ const SOURCE: Extract<CaptureSource, { kind: "captured" }> = {
 };
 
 const SECRET = "rh_session_d0n0tl3ak";
+
+/** A deadline that never passes. */
+const NO_DEADLINE = new AbortController().signal;
 
 /** A board log behind `readEvents`, serving at most `pageSize` events per page. */
 const fakeReader = (
@@ -90,7 +94,7 @@ const parsedError = (text: string) => {
 describe("captureLog", () => {
   it("reads every page up to the head and copies each event exactly", async () => {
     const { reader, calls } = fakeReader(decisionReversal.events, { pageSize: 7 });
-    const result = await captureLog(reader, SOURCE);
+    const result = await captureLog(reader, SOURCE, NO_DEADLINE);
     if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
     expect(result.capture).toEqual({
       format: CAPTURE_FORMAT,
@@ -113,7 +117,7 @@ describe("captureLog", () => {
       actor: { ...event.actor, session: SECRET },
       data: { ...event.data, inviteUrl: `https://railhead.example/join#${SECRET}` },
     }));
-    const result = await captureLog(fakeReader(leaky).reader, SOURCE);
+    const result = await captureLog(fakeReader(leaky).reader, SOURCE, NO_DEADLINE);
     if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
     expect(result.capture.events).toEqual(issues(2));
     const serialized = serializeCapture(result.capture);
@@ -126,7 +130,11 @@ describe("captureLog", () => {
 
   it("stops at the head of the first page when the log grows while capturing", async () => {
     const log = issues(10);
-    const result = await captureLog(fakeReader(log, { pageSize: 3, head: 4 }).reader, SOURCE);
+    const result = await captureLog(
+      fakeReader(log, { pageSize: 3, head: 4 }).reader,
+      SOURCE,
+      NO_DEADLINE,
+    );
     if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
     expect(result.capture.head).toBe(4);
     expect(result.capture.events).toEqual(log.slice(0, 4));
@@ -134,18 +142,21 @@ describe("captureLog", () => {
 
   it("captures a log of exactly the event limit", async () => {
     const log = issues(MAX_CAPTURE_EVENTS);
-    const result = await captureLog(fakeReader(log).reader, SOURCE);
+    const result = await captureLog(fakeReader(log).reader, SOURCE, NO_DEADLINE);
     expect(result.ok && result.capture.head).toBe(MAX_CAPTURE_EVENTS);
   });
 
   it("refuses a log past the event limit before reading any event", async () => {
     const { reader, calls } = fakeReader(issues(1), { head: MAX_CAPTURE_EVENTS + 1 });
-    expect(await captureLog(reader, SOURCE)).toEqual({ ok: false, error: { kind: "too_large" } });
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
+      ok: false,
+      error: { kind: "too_large" },
+    });
     expect(calls).toEqual([0]);
   });
 
   it("refuses an empty log", async () => {
-    expect(await captureLog(fakeReader([]).reader, SOURCE)).toEqual({
+    expect(await captureLog(fakeReader([]).reader, SOURCE, NO_DEADLINE)).toEqual({
       ok: false,
       error: { kind: "empty" },
     });
@@ -153,7 +164,7 @@ describe("captureLog", () => {
 
   it("fails on a page that makes no progress instead of reading forever", async () => {
     const { reader, calls } = fakeReader(issues(2), { head: 5 });
-    expect(await captureLog(reader, SOURCE)).toEqual({
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
       ok: false,
       error: { kind: "gap", expected: 3, found: 0 },
     });
@@ -173,26 +184,88 @@ describe("captureLog", () => {
         },
       }),
     };
-    expect(await captureLog(reader, SOURCE)).toEqual({
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
       ok: false,
       error: { kind: "foreign_repo", seq: 3 },
     });
   });
 
-  it("passes on the backend's refusal code", async () => {
+  it("passes on the backend's refusal code and drops its message", async () => {
     const reader: CaptureReader = {
-      readEvents: async () => ({ ok: false, code: "not_found", message: "No such repository." }),
+      readEvents: async () => ({ ok: false, code: "not_found", message: SECRET }),
     };
-    expect(await captureLog(reader, SOURCE)).toEqual({
+    const result = await captureLog(reader, SOURCE, NO_DEADLINE);
+    expect(result).toEqual({ ok: false, error: { kind: "read_failed", code: "not_found" } });
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+  });
+
+  it.each([
+    ["control characters", `\u001b]8;;https://evil.example\u0007${SECRET}`],
+    ["a code outside the closed set", "not_found_or_worse"],
+    ["an inherited property name", "constructor"],
+    ["a non-string", 404],
+  ])("reports %s as an unknown refusal code", async (_label, code) => {
+    const reader: CaptureReader = { readEvents: async () => ({ ok: false, code }) };
+    const result = await captureLog(reader, SOURCE, NO_DEADLINE);
+    expect(result).toEqual({ ok: false, error: { kind: "read_failed", code: null } });
+    if (result.ok) throw new Error("captured");
+    expect(captureErrorText(result.error)).toBe(
+      "The backend refused to read the log (unknown error).",
+    );
+  });
+
+  it("fails at the deadline while a slow backend is still paging one event at a time", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = issues(MAX_CAPTURE_EVENTS);
+      const calls: number[] = [];
+      // Each page holds one event and arrives a second after it is asked for.
+      const reader: CaptureReader = {
+        readEvents: (cursor) => {
+          calls.push(cursor);
+          return new Promise((resolve) => {
+            setTimeout(
+              () =>
+                resolve({
+                  ok: true,
+                  value: {
+                    repo: SYNTH_REPO,
+                    events: log.slice(cursor, cursor + 1),
+                    cursor,
+                    head: log.length,
+                  },
+                }),
+              1_000,
+            );
+          });
+        },
+      };
+      const deadline = new AbortController();
+      setTimeout(() => deadline.abort(), 10_500);
+      const pending = captureLog(reader, SOURCE, deadline.signal);
+      await vi.advanceTimersByTimeAsync(10_500);
+      expect(await pending).toEqual({ ok: false, error: { kind: "timed_out" } });
+      expect(calls).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(calls).toHaveLength(11);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails at once when the deadline has already passed", async () => {
+    const { reader, calls } = fakeReader(issues(2));
+    expect(await captureLog(reader, SOURCE, AbortSignal.abort())).toEqual({
       ok: false,
-      error: { kind: "read_failed", code: "not_found", message: "No such repository." },
+      error: { kind: "timed_out" },
     });
+    expect(calls).toEqual([]);
   });
 
   it("refuses an event that fails validation", async () => {
     const broken = issues(2);
     broken[1] = { ...issue(2), data: { issueId: "clm_synthwrong", title: "x", body: "" } };
-    const result = await captureLog(fakeReader(broken).reader, SOURCE);
+    const result = await captureLog(fakeReader(broken).reader, SOURCE, NO_DEADLINE);
     expect(result).toEqual({
       ok: false,
       error: {
@@ -204,7 +277,11 @@ describe("captureLog", () => {
   });
 
   it("refuses a source without an origin", async () => {
-    const result = await captureLog(fakeReader(issues(1)).reader, { ...SOURCE, origin: "" });
+    const result = await captureLog(
+      fakeReader(issues(1)).reader,
+      { ...SOURCE, origin: "" },
+      NO_DEADLINE,
+    );
     expect(result).toEqual({ ok: false, error: { kind: "malformed", path: "source.origin" } });
   });
 });

@@ -18,9 +18,10 @@
 // Railhead; `synthetic` means it was built from hand-written development fixtures and must never be
 // presented as a run.
 //
-// This module imports nothing but `@railhead/shared/events`, so the capture script can load it
-// under `node` directly.
+// This module imports nothing at run time but `@railhead/shared/events`, so the capture script can
+// load it under `node` directly.
 
+import type { BoardErrorCode } from "@railhead/shared/board-api";
 import {
   EVENT_SCHEMA_VERSION,
   validateEvent,
@@ -103,8 +104,10 @@ export type CaptureError =
   | { kind: "invalid_event"; seq: number; message: string }
   /** `head` disagrees with the last event. */
   | { kind: "head_mismatch"; head: number; last: number }
-  /** The backend refused a page while capturing. `message` is the backend's text, untrusted. */
-  | { kind: "read_failed"; code: string; message: string };
+  /** The backend refused a page while capturing. `code` is `null` when it is not a known code. */
+  | { kind: "read_failed"; code: BoardErrorCode | null }
+  /** The capture's deadline passed before the whole log was read. */
+  | { kind: "timed_out" };
 
 /** A capture, or why there is none. */
 export type CaptureResult = { ok: true; capture: Capture } | { ok: false; error: CaptureError };
@@ -122,7 +125,32 @@ export interface CaptureReader {
   readEvents(
     cursor: number,
     limit: number,
-  ): PromiseLike<{ ok: true; value: CapturePage } | { ok: false; code: string; message: string }>;
+  ): PromiseLike<{ ok: true; value: CapturePage } | { ok: false; code: unknown }>;
+}
+
+/** Every `BoardErrorCode`. A record, so a code added to the union must be added here. */
+const BOARD_ERROR_CODES: Record<BoardErrorCode, true> = {
+  invalid_request: true,
+  not_found: true,
+  cursor_ahead: true,
+  proof_invalid: true,
+  proof_expired: true,
+  action_stale: true,
+  bootstrap_closed: true,
+  quota_exceeded: true,
+  unavailable: true,
+  internal: true,
+};
+
+/**
+ * Reads a failure code a backend sent. The backend chosen with `--origin` is not trusted, so
+ * anything outside the closed `BoardErrorCode` set is `null` and its text is never shown.
+ */
+export const readBoardErrorCode = (code: unknown): BoardErrorCode | null =>
+  typeof code === "string" && isBoardErrorCode(code) ? code : null;
+
+function isBoardErrorCode(code: string): code is BoardErrorCode {
+  return Object.hasOwn(BOARD_ERROR_CODES, code);
 }
 
 /**
@@ -130,10 +158,15 @@ export interface CaptureReader {
  * head the first page reports, so events appended while capturing are left out rather than mixing
  * two moments. Every event is copied field by field and validated; any page that breaks the gapless
  * log, names another repository or makes no progress fails the capture.
+ *
+ * `deadline` bounds the whole read, however slowly the backend pages: once it aborts, the pending
+ * page is abandoned and the capture fails with `timed_out`. The caller cancels that page's call by
+ * closing its session.
  */
 export const captureLog = async (
   reader: CaptureReader,
   source: Extract<CaptureSource, { kind: "captured" }>,
+  deadline: AbortSignal,
 ): Promise<CaptureResult> => {
   const sourceError = checkCapturedSource(source);
   if (sourceError !== null) return { ok: false, error: sourceError };
@@ -142,9 +175,11 @@ export const captureLog = async (
   let head: number | null = null;
   // Each successful page advances by at least one event, so the loop ends within `head` pages.
   while (head === null || events.length < head) {
-    const read = await reader.readEvents(events.length, CAPTURE_PAGE_SIZE);
+    if (deadline.aborted) return { ok: false, error: { kind: "timed_out" } };
+    const read = await untilAborted(reader.readEvents(events.length, CAPTURE_PAGE_SIZE), deadline);
+    if (read === ABORTED) return { ok: false, error: { kind: "timed_out" } };
     if (!read.ok) {
-      return { ok: false, error: { kind: "read_failed", code: read.code, message: read.message } };
+      return { ok: false, error: { kind: "read_failed", code: readBoardErrorCode(read.code) } };
     }
     const page = read.value;
     if (head === null) {
@@ -173,6 +208,30 @@ export const captureLog = async (
     repo,
     head,
     events,
+  });
+};
+
+const ABORTED = Symbol("aborted");
+
+/** Settles as `promise` does, or with `ABORTED` once `signal` aborts, whichever comes first. */
+const untilAborted = <T>(
+  promise: PromiseLike<T>,
+  signal: AbortSignal,
+): Promise<T | typeof ABORTED> => {
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  return new Promise<T | typeof ABORTED>((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
   });
 };
 
@@ -257,7 +316,9 @@ export const captureErrorText = (error: CaptureError): string => {
     case "head_mismatch":
       return `The capture says it ends at event ${error.head}, but its last event is ${error.last}.`;
     case "read_failed":
-      return `The backend refused to read the log (${error.code}).`;
+      return `The backend refused to read the log (${error.code ?? "unknown error"}).`;
+    case "timed_out":
+      return "The backend did not serve the whole log before the capture's deadline.";
     default:
       return unreachable(error);
   }

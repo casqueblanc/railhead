@@ -25,12 +25,20 @@ import { API_PATH } from "../packages/railhead-shared/src/api.ts";
 import {
   captureErrorText,
   captureLog,
+  readBoardErrorCode,
   serializeCapture,
 } from "../packages/railhead-frontend/src/features/replay/captureFile.ts";
 import { writeNewFile } from "./write-new-file.ts";
 
 /** Longest a single backend call may take before the capture fails, in milliseconds. */
 const CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * Longest reading the whole log may take, in milliseconds. A backend may serve pages of one event,
+ * each just inside `CALL_TIMEOUT_MS`; this keeps such a backend from holding the capture for hours.
+ * A full 2,000-event log is 8 pages of 256.
+ */
+const CAPTURE_DEADLINE_MS = 120_000;
 
 // `isRepoSegment` in `@railhead/shared/agent-api`, which `node` cannot load directly (its imports
 // omit file extensions). The backend checks the names again in `openBoard`.
@@ -113,19 +121,19 @@ const capture = async ({ origin, org, name, out }) => {
   try {
     const opened = await withTimeout(api.openBoard(org, name), "openBoard");
     if (!opened.ok) {
-      throw new CaptureFailure(`the backend refused to open ${org}/${name} (${opened.code})`);
+      const code = readBoardErrorCode(opened.code) ?? "unknown error";
+      throw new CaptureFailure(`the backend refused to open ${org}/${name} (${code})`);
     }
     board = opened.value;
     const reader = {
       readEvents: (cursor, limit) => withTimeout(board.readEvents(cursor, limit), "readEvents"),
     };
-    const result = await captureLog(reader, {
-      kind: "captured",
-      origin,
-      org,
-      name,
-      capturedAt: Date.now(),
-    });
+    // Closing the session in `finally` cancels a page still pending when the deadline passes.
+    const result = await captureLog(
+      reader,
+      { kind: "captured", origin, org, name, capturedAt: Date.now() },
+      AbortSignal.timeout(CAPTURE_DEADLINE_MS),
+    );
     if (!result.ok) throw new CaptureFailure(captureErrorText(result.error));
     const serialized = serializeCapture(result.capture);
     if (!serialized.ok) throw new CaptureFailure(captureErrorText(serialized.error));
