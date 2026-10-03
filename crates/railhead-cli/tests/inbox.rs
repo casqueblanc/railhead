@@ -1148,3 +1148,223 @@ async fn an_interrupted_wait_leaves_the_question_to_resume() -> anyhow::Result<(
     assert_eq!(acks(&world).await, 0);
     Ok(())
 }
+
+/// Waits until the server has received a request on `route`.
+async fn arrived(world: &World, route: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while received(world, route).await.is_empty() {
+        anyhow::ensure!(Instant::now() < deadline, "no request on {route}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_ask_interrupted_in_flight_has_already_named_its_key() -> anyhow::Result<()> {
+    let world = world().await?;
+    let route = "/claims/clm_42abcd/questions";
+    // The first ask is recorded but its answer is held until the process is gone.
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}{route}")))
+        .respond_with(
+            fixture("ask.json", "asks the owner and returns at once")?
+                .set_delay(Duration::from_secs(20)),
+        )
+        .up_to_n_times(1)
+        .mount(&world.server)
+        .await;
+    answer(
+        &world,
+        "POST",
+        route,
+        fixture("ask.json", "asks the owner and returns at once")?,
+    )
+    .await;
+    let child = command(
+        &world,
+        world.clone.path(),
+        None,
+        &ask_args(QUESTION, "src/upload.ts"),
+    )
+    .spawn()?;
+    arrived(&world, route).await?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )?;
+    let run = finish(&child.wait_with_output()?)?;
+    assert_eq!(run.code, None, "the process was not stopped by the signal");
+    assert_eq!(run.stdout, "", "a partial result was printed");
+
+    let sent = received(&world, route).await;
+    let first: Value =
+        serde_json::from_slice(&sent.first().map(|r| r.body.clone()).unwrap_or_default())?;
+    let key = first
+        .pointer("/requestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(key.starts_with("req_"), "{first}");
+    assert!(
+        run.stderr.contains(&format!(
+            "if interrupted, repeat the same rh ask with --request-id {key} "
+        )),
+        "{}",
+        run.stderr
+    );
+
+    // Repeating the ask with that key sends the same key, so the backend finds the question.
+    let mut args = ask_args(QUESTION, "src/upload.ts");
+    args.extend(["--request-id", &key]);
+    let again = rh_in_clone(&world, &args)?;
+    assert_eq!(again.code, Some(0), "{}", again.stdout);
+    assert_eq!(again.at("/data/requestId")?, json!(key));
+    assert!(!again.stderr.contains("asking with"), "{}", again.stderr);
+    let keys: Vec<Value> = received(&world, route)
+        .await
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body.pointer("/requestId").cloned())
+        .collect();
+    assert_eq!(keys, vec![json!(key), json!(key)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/claims/clm_42abcd/questions",
+        fixture("ask.json", "asks the owner and returns at once")?,
+    )
+    .await;
+    // The backend holds every poll far beyond the wait, then answers.
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        fixture("question.json", "an answered question carries the decision")?
+            .set_delay(Duration::from_secs(20)),
+    )
+    .await;
+
+    // Asked and waited on: the wait ends with the question as asked.
+    let mut args = ask_args(QUESTION, "src/upload.ts");
+    args.extend(["--wait", "2"]);
+    let started = Instant::now();
+    let run = rh_in_clone(&world, &args)?;
+    let elapsed = started.elapsed();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
+        "{elapsed:?}"
+    );
+    assert_eq!(run.at("/data/timedOut")?, json!(true));
+    assert_eq!(run.at("/data/question/state")?, json!("open"));
+    assert_eq!(run.at("/next")?, json!("rh ask"));
+    let polls = received(&world, "/questions/qst_upload1").await;
+    assert_eq!(polls.len(), 1);
+    let held = polls
+        .first()
+        .and_then(|poll| poll.url.query_pairs().find(|(key, _)| key == "waitMs"))
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    assert!((1_000..=1_500).contains(&held), "{held}");
+
+    // Resumed: nothing of the question is known, so the timeout says how to wait again.
+    let started = Instant::now();
+    let run = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+    )?;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("timeout"));
+    assert_eq!(run.at("/error/retryable")?, json!(true));
+    assert_eq!(run.at("/error/next")?, json!("rh ask"));
+    let message = run.at("/error/message")?;
+    assert!(
+        message.as_str().is_some_and(
+            |text| text.ends_with("wait again with rh ask --question qst_upload1 --wait 1")
+        ),
+        "{message}"
+    );
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Result<()> {
+    let world = world().await?;
+    let origin = world.server.uri();
+    let atlas = world.home.path().join("agents/atlas");
+    fs::remove_file(atlas.join("session"))?;
+    write_private(&atlas.join("session"), &session_record(&origin, TOKEN, 1))?;
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    write_private(&atlas.join("key"), &key.to_openssh(LineEnding::LF)?)?;
+    let message = format!(
+        "railhead-login-v1\norigin={origin}\nrepo=casqueblanc/demo\nagent=agt_atlas01\nchallenge={CHALLENGE}\nexpires={EXPIRES}\n"
+    );
+    let challenge = json_response(
+        200,
+        &json!({"ok": true, "data": {"challengeId": CHALLENGE, "expiresAt": EXPIRES,
+            "message": message}, "inbox": null, "next": null}),
+    );
+    // The first login's challenge is held far beyond the wait.
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session/challenge")))
+        .respond_with(challenge.clone().set_delay(Duration::from_secs(20)))
+        .up_to_n_times(1)
+        .mount(&world.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session/challenge")))
+        .respond_with(challenge)
+        .mount(&world.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session")))
+        .respond_with(json_response(
+            200,
+            &json!({"ok": true, "data": {"token": FRESH, "expiresAt": 4_102_444_800_000_u64,
+                "agent": {"agentId": "agt_atlas01", "name": "atlas", "ownerId": "usr_lemarier",
+                "state": "confirmed"}, "repoId": "rep_demo0001"}, "inbox": null, "next": null}),
+        ))
+        .mount(&world.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .and(header("authorization", format!("Bearer {FRESH}").as_str()))
+        .respond_with(fixture(
+            "question.json",
+            "an answered question carries the decision",
+        )?)
+        .mount(&world.server)
+        .await;
+
+    let args = ["--json", "ask", "--question", "qst_upload1", "--wait", "2"];
+    let started = Instant::now();
+    let run = rh(&world, &args)?;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("timeout"));
+    assert_eq!(run.at("/error/next")?, json!("rh ask"));
+    // The login stopped at its challenge, and no poll was sent.
+    assert_eq!(received(&world, "/session").await.len(), 0);
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
+
+    // A renewal that answers in time is used for the poll.
+    let run = rh(&world, &args)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.at("/data/question/state")?, json!("answered"));
+    assert_eq!(run.at("/data/timedOut")?, json!(false));
+    let stored: Value = serde_json::from_str(&fs::read_to_string(atlas.join("session"))?)?;
+    assert_eq!(stored.pointer("/token"), Some(&json!(FRESH)));
+    Ok(())
+}

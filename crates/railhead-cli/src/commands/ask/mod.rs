@@ -14,13 +14,14 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use railhead_protocol::{
-    AgentSuccess, AskRequest, IdKind, MAX_LONG_POLL_MS, NextCommand, QuestionOption,
-    QuestionResult, QuestionState, is_id,
+    AGENT_REQUEST_TIMEOUT_MS, AgentSuccess, AskRequest, IdKind, MAX_LONG_POLL_MS, NextCommand,
+    QuestionOption, QuestionResult, QuestionState, is_id,
 };
 use serde::Serialize;
 use ssh_key::rand_core::{OsRng, RngCore};
 
 use crate::commands::claim::{session, workspace};
+use crate::commands::join;
 use crate::commands::sync::{quoted, render_decision};
 use crate::http::{self, Endpoint};
 use crate::output::{LocalCode, Output, Render};
@@ -28,6 +29,9 @@ use crate::{Agent, Error, Result};
 
 /// Longest `--wait`, in seconds.
 pub const MAX_WAIT_SECONDS: u64 = 3600;
+
+/// The part of a poll's time left for the backend's answer to travel back after it holds the poll.
+const POLL_MARGIN: Duration = Duration::from_millis(500);
 
 /// The shortest time between two polls. A backend that answers before the wait it was given is
 /// not polled faster than this.
@@ -93,9 +97,9 @@ fn parse_question(value: &str) -> std::result::Result<String, String> {
 pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
     let wait = args.wait.map(Duration::from_secs);
     let (response, request_id, timed_out) = match (&args.question, wait) {
-        (Some(question_id), None) => (read(agent, question_id, None)?, None, false),
+        (Some(question_id), None) => (read(agent, question_id)?, None, false),
         (Some(question_id), Some(wait)) => {
-            let (response, timed_out) = wait_for(agent, question_id, wait, out)?;
+            let (response, timed_out) = wait_for(agent, question_id, wait, None, out)?;
             (response, None, timed_out)
         }
         (None, wait) => {
@@ -103,7 +107,8 @@ pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
             match wait {
                 Some(wait) if asked.data.state == QuestionState::Open => {
                     let question_id = asked.data.question_id.clone();
-                    let (response, timed_out) = wait_for(agent, &question_id, wait, out)?;
+                    let (response, timed_out) =
+                        wait_for(agent, &question_id, wait, Some(asked), out)?;
                     (response, Some(request_id), timed_out)
                 }
                 Some(_) | None => (asked, Some(request_id), false),
@@ -141,9 +146,9 @@ fn ask(
             retryable: false,
             next: Some(NextCommand::Status),
         })?;
-    let request_id = match &args.request_id {
-        Some(request_id) => request_id.clone(),
-        None => new_request_id()?,
+    let (request_id, generated) = match &args.request_id {
+        Some(request_id) => (request_id.clone(), false),
+        None => (new_request_id()?, true),
     };
     let request = AskRequest {
         generation: workspace::generation(&binding.dir)?,
@@ -158,6 +163,14 @@ fn ask(
         .map_err(|source| Error::Http(http::Error::InvalidRequest { route, source }))?;
     let session = session(agent)?;
     let client = agent.client()?;
+    if generated {
+        // Said before anything is sent: a process stopped while the request is in flight never
+        // reaches the failure handlers below, and the key is the only way to find the question.
+        out.notice(&format!(
+            "asking with --request-id {request_id}; if interrupted, repeat the same rh ask with --request-id {request_id} to find the question without asking twice"
+        ))
+        .map_err(Error::Output)?;
+    }
     let endpoint = Endpoint::Ask {
         claim_id: &binding.claim_id,
     };
@@ -209,12 +222,8 @@ fn ask(
     Ok((response, request_id))
 }
 
-/// Reads a question once, or long-polls it for up to `wait_ms`.
-fn read(
-    agent: &Agent<'_>,
-    question_id: &str,
-    wait_ms: Option<u64>,
-) -> Result<AgentSuccess<QuestionResult>> {
+/// Reads a question once.
+fn read(agent: &Agent<'_>, question_id: &str) -> Result<AgentSuccess<QuestionResult>> {
     let session = session(agent)?;
     let client = agent.client()?;
     let response = agent
@@ -223,7 +232,7 @@ fn read(
         .block_on(client.get::<QuestionResult>(
             &Endpoint::Question {
                 question_id,
-                wait_ms,
+                wait_ms: None,
             },
             Some(&session),
         ))?;
@@ -232,13 +241,21 @@ fn read(
 }
 
 /// Polls until the question is answered or `wait` has passed, after telling a person on stderr how
-/// to resume if the wait is interrupted. Each poll asks the backend to hold
-/// it for the time left, at most [`MAX_LONG_POLL_MS`]; the session is renewed between polls when
-/// it lapses. Returns the last answer and whether the wait ran out.
+/// to resume if the wait is interrupted. `last` is what is already known of the question, such as
+/// the result of asking it. Returns the last answer and whether the wait ran out.
+///
+/// The deadline holds locally: no poll, nor the session renewal before it, runs past it. A poll
+/// still pending then is dropped, and the wait ends with the last known state.
+///
+/// # Errors
+///
+/// When a poll fails as [`read`] does, and [`LocalCode::Timeout`] when the wait ran out before
+/// any state of the question was known.
 fn wait_for(
     agent: &Agent<'_>,
     question_id: &str,
     wait: Duration,
+    mut last: Option<AgentSuccess<QuestionResult>>,
     out: &mut Output<'_>,
 ) -> Result<(AgentSuccess<QuestionResult>, bool)> {
     let seconds = wait.as_secs();
@@ -247,14 +264,15 @@ fn wait_for(
     ))
     .map_err(Error::Output)?;
     let deadline = Instant::now() + wait;
-    let left = || poll_wait_ms(deadline.saturating_duration_since(Instant::now()));
-    // The first poll always runs, so the result is the backend's even when no time is left.
-    let mut started = Instant::now();
-    let mut current = read(agent, question_id, Some(left().unwrap_or(0)))?;
     loop {
+        let started = Instant::now();
+        let Some(current) = poll(agent, question_id, deadline)? else {
+            break;
+        };
         if current.data.state == QuestionState::Answered {
             return Ok((current, false));
         }
+        last = Some(current);
         let early = MIN_POLL_INTERVAL.saturating_sub(started.elapsed());
         let pause = early.min(deadline.saturating_duration_since(Instant::now()));
         if !pause.is_zero() {
@@ -264,18 +282,74 @@ fn wait_for(
                 .runtime
                 .block_on(async { tokio::time::sleep(pause).await });
         }
-        let Some(wait_ms) = left() else {
-            return Ok((current, true));
-        };
-        started = Instant::now();
-        current = read(agent, question_id, Some(wait_ms))?;
     }
+    last.map(|last| (last, true)).ok_or_else(|| Error::Local {
+        code: LocalCode::Timeout,
+        message: format!(
+            "no state of question {question_id} arrived within {seconds} s; wait again with rh ask --question {question_id} --wait {seconds}"
+        ),
+        retryable: true,
+        next: Some(NextCommand::Ask),
+    })
 }
 
-/// How long the next poll may be held, in whole milliseconds, or `None` when no time is left.
-fn poll_wait_ms(left: Duration) -> Option<u64> {
-    let millis = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
-    (millis > 0).then(|| millis.min(MAX_LONG_POLL_MS))
+/// One poll that ends by `deadline`: the backend holds it for the time left less
+/// [`POLL_MARGIN`], at most [`MAX_LONG_POLL_MS`], and a lapsed session is renewed within the same
+/// time. Each request still fails after the protocol's timeout when that comes first. Returns
+/// `None` when the deadline passes first.
+fn poll(
+    agent: &Agent<'_>,
+    question_id: &str,
+    deadline: Instant,
+) -> Result<Option<AgentSuccess<QuestionResult>>> {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let passed =
+        |error: &Error| matches!(error, Error::Http(http::Error::Timeout(_))) && left().is_zero();
+    if left().is_zero() {
+        return Ok(None);
+    }
+    let timeout = left().min(Duration::from_millis(AGENT_REQUEST_TIMEOUT_MS));
+    let client = http::Client::with_timeout(&agent.identity.origin, &agent.identity.repo, timeout)?;
+    let session = match join::session_with(agent, &client) {
+        Ok(session) => session.into_token(),
+        Err(error) if passed(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let budget = left();
+    if budget.is_zero() {
+        return Ok(None);
+    }
+    let endpoint = Endpoint::Question {
+        question_id,
+        wait_ms: Some(hold_ms(budget)),
+    };
+    let response = agent.invocation.runtime.block_on(async {
+        tokio::time::timeout(
+            budget,
+            client.get::<QuestionResult>(&endpoint, Some(&session)),
+        )
+        .await
+    });
+    let response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let error = Error::from(error);
+            if passed(&error) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Err(_elapsed) => return Ok(None),
+    };
+    check(&response.data, Some(question_id))?;
+    Ok(Some(response))
+}
+
+/// How long the backend may hold a poll with `left` to the deadline, in whole milliseconds: the
+/// time left less [`POLL_MARGIN`] for the answer to travel, at most [`MAX_LONG_POLL_MS`].
+fn hold_ms(left: Duration) -> u64 {
+    let millis = u64::try_from(left.saturating_sub(POLL_MARGIN).as_millis()).unwrap_or(u64::MAX);
+    millis.min(MAX_LONG_POLL_MS)
 }
 
 /// Refuses a question result that names another question, or whose state and decision disagree.
@@ -424,15 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn each_poll_is_held_for_the_time_left_up_to_the_protocol_limit() {
-        assert_eq!(
-            poll_wait_ms(Duration::from_secs(3600)),
-            Some(MAX_LONG_POLL_MS)
-        );
-        assert_eq!(poll_wait_ms(Duration::from_millis(25_001)), Some(25_000));
-        assert_eq!(poll_wait_ms(Duration::from_millis(1_500)), Some(1_500));
-        assert_eq!(poll_wait_ms(Duration::from_micros(999)), None);
-        assert_eq!(poll_wait_ms(Duration::ZERO), None);
+    fn each_poll_is_held_for_the_time_left_less_the_margin_up_to_the_protocol_limit() {
+        assert_eq!(hold_ms(Duration::from_secs(3600)), MAX_LONG_POLL_MS);
+        assert_eq!(hold_ms(Duration::from_millis(25_501)), 25_000);
+        assert_eq!(hold_ms(Duration::from_millis(25_499)), 24_999);
+        assert_eq!(hold_ms(Duration::from_millis(1_500)), 1_000);
+        assert_eq!(hold_ms(Duration::from_millis(500)), 0);
+        assert_eq!(hold_ms(Duration::ZERO), 0);
     }
 
     #[test]
