@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +91,8 @@ struct Backend {
     joins: AtomicUsize,
     /// Logins redeemed so far.
     logins: AtomicUsize,
+    /// Whether a join was answered confirmed; until then a login is `identity_pending`.
+    confirmed: AtomicBool,
     /// The `inbox` and `next` every login answer carries; both `null` when unset.
     notices: Mutex<Option<(Value, Value)>>,
 }
@@ -187,6 +189,7 @@ impl Respond for Join {
         let state = if answered < self.pending {
             "pending"
         } else {
+            self.backend.confirmed.store(true, Ordering::SeqCst);
             "confirmed"
         };
         let code = self
@@ -227,7 +230,15 @@ impl Respond for Session {
             .unwrap_or_default();
         let message = login_message(&self.origin);
         match self.backend.key() {
-            Some(key) if verifies(&key, &message, signature) => {
+            Some(key) if !verifies(&key, &message, signature) => {
+                failure(401, "challenge_invalid", "The challenge is invalid.")
+            }
+            Some(_) if !self.backend.confirmed.load(Ordering::SeqCst) => failure(
+                403,
+                "identity_pending",
+                "The owner has not confirmed this agent.",
+            ),
+            Some(_) => {
                 let token = if self.backend.logins.fetch_add(1, Ordering::SeqCst) == 0 {
                     TOKEN
                 } else {
@@ -243,7 +254,7 @@ impl Respond for Session {
                         "inbox": inbox, "next": next}),
                 )
             }
-            _ => failure(401, "challenge_invalid", "The challenge is invalid."),
+            None => failure(401, "challenge_invalid", "The challenge is invalid."),
         }
     }
 }
@@ -579,7 +590,8 @@ async fn a_pending_identity_cannot_work() -> anyhow::Result<()> {
     );
     assert_eq!(world.requests("/session/challenge").await, 0);
 
-    // Every command that acts as the agent stops before sending anything.
+    // Every command that acts as the agent stops at the login the backend refuses, before its own
+    // request.
     for args in [&["--json", "status"][..], &["--json", "work"]] {
         let output = command(&world, world.outside.path(), args)
             .env("RAILHEAD_AGENT", "inv-abc123")
@@ -822,6 +834,43 @@ async fn a_refused_join_keeps_nothing() -> anyhow::Result<()> {
     let dir = world.agent_dir("inv-abc123");
     assert!(!dir.join("key").exists() && !dir.join("identity.json").exists());
     assert!(!dir.join("enrollment.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_rejoin_leaves_a_joined_agent_able_to_log_in() -> anyhow::Result<()> {
+    let world = joined().await?;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/join")))
+        .respond_with(failure(500, "internal", "The backend failed."))
+        .with_priority(1)
+        .mount(&world.server)
+        .await;
+    let rejoin = join(&world, &[])?;
+    assert_eq!(
+        rejoin.json()?.pointer("/error/code"),
+        Some(&json!("internal"))
+    );
+    // The name already held its identity, so the join stored no enrollment to finish.
+    let dir = world.agent_dir("inv-abc123");
+    assert!(!dir.join("enrollment.json").exists());
+    assert!(dir.join("identity.json").exists() && dir.join("key").exists());
+
+    expire(&world, now_ms() - 1)?;
+    let authorized = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/status")))
+        .respond_with(Status {
+            authorized: Arc::clone(&authorized),
+        })
+        .mount(&world.server)
+        .await;
+    let run = status(&world)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        stored(&world, "inv-abc123")?.get("token"),
+        Some(&json!(FRESH))
+    );
     Ok(())
 }
 
@@ -1382,7 +1431,7 @@ async fn a_revoked_unconfirmed_or_failed_login_sends_no_request() -> anyhow::Res
     ] {
         let world = joined().await?;
         Mock::given(method("POST"))
-            .and(path(format!("{PREFIX}/session/challenge")))
+            .and(path(format!("{PREFIX}/session")))
             .respond_with(failure(status_code, code, "No."))
             .with_priority(1)
             .mount(&world.server)
@@ -1406,13 +1455,13 @@ async fn a_revoked_unconfirmed_or_failed_login_sends_no_request() -> anyhow::Res
                 "{code}"
             );
         }
-        // One login attempt, nothing signed, the lapsed session kept and never sent.
+        // One login attempt, the lapsed session kept and never sent.
         assert_eq!(
             world.requests("/session/challenge").await,
             challenges + 1,
             "{code}"
         );
-        assert_eq!(world.requests("/session").await, logins, "{code}");
+        assert_eq!(world.requests("/session").await, logins + 1, "{code}");
         assert_eq!(world.requests("/status").await, 0, "{code}");
         assert_eq!(stored(&world, "inv-abc123")?, lapsed, "{code}");
     }

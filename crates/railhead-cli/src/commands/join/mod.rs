@@ -9,8 +9,9 @@
 //!
 //! One join enrolls a name at a time: it holds the name's enrollment lock from reading the stored
 //! identity to storing the session, and a second join for the name stops before sending anything.
-//! Before its first request a join also stores the enrollment's scope, the origin, repository,
-//! invite and key, and removes it only once it logs in or the backend refuses the join. Until then
+//! Before its first request a join for a name without an identity also stores the enrollment's
+//! scope, the origin, repository, invite and key, and removes it only once it logs in or the
+//! backend refuses the join. Until then
 //! a join with any other invite under the name stops before sending anything, so a response lost
 //! to a crash or a dropped connection leaves an enrollment the same invite resumes.
 //!
@@ -105,7 +106,15 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
     let client = http::Client::new(&invite.origin, &invite.repo)?;
     let (key, made) = SigningKey::load_or_create(store, &name)?;
     let public_key = key.public_key()?;
-    reserve(store, &name, &invite, started.as_ref(), &public_key, made)?;
+    reserve(
+        store,
+        &name,
+        &invite,
+        started.as_ref(),
+        existing.is_some(),
+        &public_key,
+        made,
+    )?;
     let message = key::join_message(&invite.origin, &invite.repo, &invite.id, &public_key);
     let request = JoinRequest {
         invite_id: invite.id.clone(),
@@ -119,10 +128,9 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
         invite: &invite,
         code: key.confirmation_code(&invite.id)?,
     };
-    let wait = Duration::from_secs(args.wait);
 
     invocation.runtime.block_on(async {
-        let deadline = Instant::now() + wait;
+        let deadline = Instant::now() + Duration::from_secs(args.wait);
         let mut answer = match client
             .send::<_, JoinResult>(&Endpoint::Join, None, &request)
             .await
@@ -238,9 +246,8 @@ impl Authenticated {
 ///
 /// The login runs under the session lock, and the stored session is read again once the lock is
 /// held, so processes that find it lapsed together log in once. The agent has no session, and
-/// nothing is sent, when its stored session was issued to another identity, its enrollment is
-/// unfinished or it has no key. When the backend reports it unconfirmed or revoked, the one login
-/// attempt stops with no session too.
+/// nothing is sent, when its stored session was issued to another identity or it has no key. When
+/// the backend reports it unconfirmed or revoked, the one login attempt stops with no session too.
 ///
 /// # Errors
 ///
@@ -263,12 +270,6 @@ pub fn session(agent: &Agent<'_>) -> Result<Authenticated> {
             return Ok(Authenticated::Stored(stored.token));
         }
         Some(_) | None => {}
-    }
-    if store.load_enrollment(&identity.name)?.is_some() {
-        return Err(no_session(
-            identity,
-            "its enrollment is not finished; run rh join to finish it",
-        ));
     }
     let key = SigningKey::load(store, &identity.name)?
         .ok_or_else(|| no_session(identity, "it has no key to log in with"))?;
@@ -425,12 +426,14 @@ fn unfinished(
 }
 
 /// Stores the enrollment's scope before its first request, so a lost answer still leaves it to
-/// resume. A resumed enrollment must still hold the key it registered.
+/// resume. A name that already holds its identity needs none: [`Enrollment::record`] checks every
+/// answer against that identity. A resumed enrollment must still hold the key it registered.
 fn reserve(
     store: &FileStore,
     name: &AgentName,
     invite: &Invite,
     started: Option<&PendingEnrollment>,
+    identified: bool,
     public_key: &str,
     made: KeyOrigin,
 ) -> Result<()> {
@@ -450,6 +453,7 @@ fn reserve(
             })
         }
         Some(_) => Ok(()),
+        None if identified => Ok(()),
         None => Ok(store.save_enrollment(
             name,
             &PendingEnrollment {
