@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { ClaimPin } from "../src/contracts/claims";
 import { fail, ok, type PortResult } from "../src/contracts/result";
-import type { MergePort } from "../src/contracts/train";
+import { MERGE_PUSH_WINDOW_MS, type MergePort } from "../src/contracts/train";
 import { MAX_ACTIVE_SANDBOXES, SlotTable } from "../src/sandbox/admission";
 import {
   createSandboxPort,
@@ -17,13 +17,17 @@ import {
   FETCH_DEPTHS,
   MAX_COMPOSE_PINS,
   MAX_CONFLICT_PATHS,
+  MERGE_SANDBOX_LIFETIME_MS,
+  MERGE_TIMEOUT_MS,
   createMerge,
   type MergeDeps,
 } from "../src/train/merge/compose";
 import {
+  discardCommand,
   fetchCommand,
   parseBinary,
   parseCommit,
+  parseDiscarded,
   parsePartner,
   parseRemote,
   pushCommand,
@@ -44,9 +48,10 @@ const OID = (n: number) => n.toString(16).padStart(40, "0");
 type Reply = Partial<BoundedOutput> & { exitCode: number };
 
 /** Which step a command is, recognized by the Git command it runs. */
-type StepName = "init" | "fetch" | "merge" | "partner" | "binary" | "push";
+type StepName = "init" | "fetch" | "merge" | "partner" | "binary" | "push" | "discard";
 
 function stepOf(command: string): StepName {
+  if (command.includes("git push --porcelain --prune")) return "discard";
   if (command.includes("git init")) return "init";
   if (command.includes("git fetch")) return "fetch";
   if (command.includes("try_partner")) return "partner";
@@ -90,8 +95,16 @@ class ScriptedDriver {
   }
 }
 
+/** The merge port, with each compose given the next attempt `mrg_attempt001`, `002`, … */
+interface TestMerge {
+  compose(main: string, pins: ClaimPin[]): ReturnType<MergePort["compose"]>;
+  discard: MergePort["discard"];
+}
+
 interface Harness {
-  merge: MergePort;
+  merge: TestMerge;
+  /** The merge port itself, for a compose under an attempt the test names. */
+  port: MergePort;
   fake: ScriptedDriver;
   sandbox: SandboxPort;
   advance: (ms: number) => void;
@@ -120,7 +133,7 @@ function withMerge(
     });
     const exists = { calls: [] as string[] };
     let attempts = 0;
-    const merge = createMerge({
+    const port = createMerge({
       sandbox: () => wrap(sandbox),
       locate: async () => LOCATION,
       mainRepo: async () => MAIN_REPO,
@@ -130,11 +143,15 @@ function withMerge(
         return ok(false);
       },
       clock,
-      attemptId: () => `mrg_attempt${String((attempts += 1)).padStart(3, "0")}`,
       limits: { timeoutMs: 15_000, releaseWaitMs: 50 },
       ...overrides,
     });
-    await body({ merge, fake, sandbox, advance: (ms) => (now += ms), exists });
+    const merge: TestMerge = {
+      compose: (main, pins) =>
+        port.compose(main, pins, `mrg_attempt${String((attempts += 1)).padStart(3, "0")}`),
+      discard: (attempt) => port.discard(attempt),
+    };
+    await body({ merge, port, fake, sandbox, advance: (ms) => (now += ms), exists });
   });
 }
 
@@ -183,12 +200,12 @@ describe("compose", () => {
 
       expect(result).toEqual(ok({ kind: "clean", candidate: CANDIDATE }));
       expect(fake.steps()).toEqual(["init", "fetch", "merge", "push"]);
-      // The policy reads the forks and writes only the attempt's candidate refs of main.
+      // The policy reads main and the forks and writes only the attempt's candidate refs of main.
       expect(fake.policies).toEqual([
         {
           host: HOST,
           namespace: "railhead",
-          read: ["rh-f-aaaaaa01", "rh-f-bbbbbb02"],
+          read: [MAIN_REPO, "rh-f-aaaaaa01", "rh-f-bbbbbb02"],
           write: { repo: MAIN_REPO, refPrefix: `${CANDIDATE_REF_PREFIX}mrg_attempt001/` },
         },
       ]);
@@ -568,6 +585,10 @@ describe("compose", () => {
         const result = await harness.merge.compose(main, pins);
         expect(result.ok ? null : result.code).toBe("invalid_request");
       }
+      for (const attempt of ["chk_attempt9", "mrg_a/b", ""]) {
+        const result = await harness.port.compose(MAIN, [PIN_A], attempt);
+        expect(result.ok ? null : result.code).toBe("invalid_request");
+      }
       expect(harness.fake.policies).toEqual([]);
       expect(harness.fake.commands).toEqual([]);
     });
@@ -612,7 +633,130 @@ describe("compose", () => {
   });
 });
 
+describe("discard", () => {
+  const PREFIX = `${CANDIDATE_REF_PREFIX}mrg_attempt9/`;
+
+  it("deletes an attempt's candidate refs from a sandbox that may delete only those", async () => {
+    await withMerge(async (harness) => {
+      const { fake } = harness;
+      fake.replies.discard = [{ exitCode: 0, stdout: "discarded 1\n" }];
+
+      expect(await harness.merge.discard("mrg_attempt9")).toEqual(ok({ removed: 1 }));
+
+      // The sandbox fetches nothing and holds no write grant: only deletes under this prefix.
+      expect(fake.policies).toEqual([
+        {
+          host: HOST,
+          namespace: "railhead",
+          read: [],
+          write: null,
+          discard: { repo: MAIN_REPO, refPrefix: PREFIX },
+        },
+      ]);
+      const [command] = fake.commands.map((c) => c.command);
+      expect(command).toContain(`'${PREFIX}*:${PREFIX}*'`);
+      expect(command).toContain("--prune");
+      // Its grant fetches nothing, so the command never lists refs through upload-pack.
+      expect(command).not.toContain("ls-remote");
+      expect(command).not.toContain("fetch");
+      expect(command).not.toContain("refs/heads/main");
+      await expectReleased(harness);
+    });
+  });
+
+  it("runs beside a compose slot of the same attempt that was never freed", async () => {
+    await withMerge(async (harness) => {
+      // The compose's slot still holds a sandbox under its write grant.
+      const held = await harness.sandbox.admit("mrg_attempt9", otherPolicy(9), 60_000);
+      expect(held.ok).toBe(true);
+      harness.fake.replies.discard = [{ exitCode: 0, stdout: "discarded 1\n" }];
+
+      expect(await harness.merge.discard("mrg_attempt9")).toEqual(ok({ removed: 1 }));
+      const slots = await harness.sandbox.slots();
+      expect(slots.ok && slots.value.map((slot) => slot.attemptId)).toEqual(["mrg_attempt9"]);
+    });
+  });
+
+  it("succeeds with nothing removed when the prefix is already empty", async () => {
+    await withMerge(async (harness) => {
+      harness.fake.replies.discard = [{ exitCode: 0, stdout: "discarded 0\n" }];
+      expect(await harness.merge.discard("mrg_attempt9")).toEqual(ok({ removed: 0 }));
+    });
+  });
+
+  it.each([
+    ["a failed step", { exitCode: 2 }],
+    ["a step cut by its deadline", { exitCode: 124 }],
+    ["output it does not print", { exitCode: 0, stdout: "discarded one\n" }],
+  ])("refuses as unavailable after %s, and releases", async (_name, reply) => {
+    await withMerge(async (harness) => {
+      harness.fake.replies.discard = [reply];
+      const result = await harness.merge.discard("mrg_attempt9");
+      expect(result.ok ? null : result.code).toBe("unavailable");
+      await expectReleased(harness);
+    });
+  });
+
+  it("refuses an attempt that is not a merge attempt before admitting a sandbox", async () => {
+    await withMerge(async (harness) => {
+      for (const attempt of ["chk_attempt9", "mrg_", "mrg_../main", "mrg_a/b", "", "mrg_x"]) {
+        const result = await harness.merge.discard(attempt);
+        expect(result.ok ? null : result.code).toBe("invalid_request");
+      }
+      expect(harness.fake.policies).toEqual([]);
+    });
+  });
+
+  it("refuses without a sandbox when the Git remote cannot be found", async () => {
+    await withMerge(
+      async (harness) => {
+        const result = await harness.merge.discard("mrg_attempt9");
+        expect(result.ok ? null : result.code).toBe("unavailable");
+        expect(harness.fake.policies).toEqual([]);
+      },
+      { locate: async () => null },
+    );
+  });
+
+  it("refuses as busy when every sandbox is taken", async () => {
+    await withMerge(async (harness) => {
+      for (let n = 0; n < MAX_ACTIVE_SANDBOXES; n += 1) {
+        await harness.sandbox.admit(`chk_other${n}00`, otherPolicy(n), 60_000);
+      }
+      const result = await harness.merge.discard("mrg_attempt9");
+      expect(result.ok ? null : result.code).toBe("busy");
+      expect(harness.fake.commands).toEqual([]);
+    });
+  });
+
+  it("stops publishing within the window after which the train discards", () => {
+    expect(MERGE_TIMEOUT_MS + MERGE_SANDBOX_LIFETIME_MS).toBeLessThanOrEqual(MERGE_PUSH_WINDOW_MS);
+  });
+});
+
 describe("merge script", () => {
+  it("builds a discard only for one candidate prefix", () => {
+    const url = remoteUrl(LOCATION, MAIN_REPO);
+    expect(discardCommand(url, `${CANDIDATE_REF_PREFIX}mrg_x1/`, 5)).toContain("--prune");
+    for (const prefix of [
+      "refs/heads/",
+      CANDIDATE_REF_PREFIX,
+      `${CANDIDATE_REF_PREFIX}mrg_x1`,
+      `${CANDIDATE_REF_PREFIX}a/b/`,
+      `${CANDIDATE_REF_PREFIX}x'y/`,
+    ]) {
+      expect(() => discardCommand(url, prefix, 5)).toThrow();
+    }
+  });
+
+  it("reads how many refs a discard deleted", () => {
+    expect(parseDiscarded("discarded 0\n")).toBe(0);
+    expect(parseDiscarded("discarded 12\n")).toBe(12);
+    expect(parseDiscarded("discarded 01\n")).toBeNull();
+    expect(parseDiscarded("discarded 1")).toBeNull();
+    expect(parseDiscarded("")).toBeNull();
+  });
+
   it("builds remotes only from names the policy accepts", () => {
     expect(remoteUrl(LOCATION, "rh-f-x")).toBe(`https://${HOST}/git/railhead/rh-f-x.git`);
     expect(() => remoteUrl(LOCATION, "a b")).toThrow();

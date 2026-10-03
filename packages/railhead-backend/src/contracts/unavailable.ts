@@ -96,6 +96,7 @@ export const unavailableArtifacts: ArtifactsPort = {
 /** Merging while its module is missing. */
 export const unavailableMerge: MergePort = {
   compose: refuse("merge"),
+  discard: refuse("merge"),
 };
 
 /** Checks while their module is missing: nothing runs, so nothing passes. */
