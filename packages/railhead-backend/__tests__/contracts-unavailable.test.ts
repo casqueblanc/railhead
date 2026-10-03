@@ -50,6 +50,7 @@ const SYNC = new Map<string, unknown>([
   ["claims.workingEpisode", null],
   ["claims.readyPin", null],
   ["decisions.currentVersions", null],
+  ["decisions.currentDecision", null],
   ["decisions.transfer", "throws"],
   ["decisions.relied", "throws"],
   ["decisions.obligations", null],

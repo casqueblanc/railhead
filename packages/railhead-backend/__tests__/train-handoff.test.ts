@@ -296,7 +296,7 @@ function withHandoff<T>(
       async fireAlarm() {
         if (!realAlarm) throw new Error("this harness has no storage alarm");
         alarm.fired();
-        await resumeAll(REPO, resumables(ports));
+        await resumeAll(context, resumables(ports));
         await alarm.settle();
       },
     };
