@@ -17,6 +17,7 @@ use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use railhead_protocol::{IdKind, MAX_AGENT_NAME_LENGTH, MAX_SESSION_TOKEN_LENGTH, is_id};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,9 @@ const MAX_TEMP_ATTEMPTS: u32 = 16;
 
 /// The file that holds an agent's unfinished enrollment.
 const ENROLLMENT_FILE: &str = "enrollment.json";
+
+/// How often a wait for a lock with a deadline tries the lock again.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// Distinguishes the temporary files of writes made by this process.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -627,6 +631,33 @@ impl FileStore {
             agent: agent.clone(),
             _lock: self.lock(agent, LockKind::Session)?,
         })
+    }
+
+    /// As [`Self::lock_session`], but stops waiting at `deadline`: `None` when another process
+    /// still holds the lock then.
+    ///
+    /// # Errors
+    ///
+    /// When the lock file cannot be opened or locked.
+    pub fn lock_session_until(
+        &self,
+        agent: &AgentName,
+        deadline: Instant,
+    ) -> Result<Option<SessionLock<'_>>> {
+        loop {
+            if let Some(lock) = self.try_lock(agent, LockKind::Session)? {
+                return Ok(Some(SessionLock {
+                    store: self,
+                    agent: agent.clone(),
+                    _lock: lock,
+                }));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(left.min(LOCK_RETRY));
+        }
     }
 
     /// The enrollment `rh join` started for `agent` and has not finished, if any.
@@ -1715,6 +1746,43 @@ mod tests {
             store.find(&AgentSelector::Name(atlas)),
             Err(Error::NotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_lock_wait_with_a_deadline_gives_up_when_it_passes() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        store.save_session(&atlas.name, &session(&atlas, TOKEN, 1_800_000_000_000)?)?;
+
+        // A free lock is taken at once, even with the deadline already passed.
+        let past = Instant::now();
+        let free = store.lock_session_until(&atlas.name, past)?;
+        let free = free.ok_or_else(|| anyhow::anyhow!("a free lock was not taken"))?;
+        assert!(free.load()?.is_some());
+
+        // Held by another writer, the wait ends at the deadline, not when the lock is released.
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        assert!(store.lock_session_until(&atlas.name, deadline)?.is_none());
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+        assert!(store.lock_session_until(&atlas.name, past)?.is_none());
+
+        // Released within the wait, the lock is taken then.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let taken = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(free);
+            });
+            store.lock_session_until(&atlas.name, deadline)
+        })?;
+        assert!(taken.is_some());
         Ok(())
     }
 
