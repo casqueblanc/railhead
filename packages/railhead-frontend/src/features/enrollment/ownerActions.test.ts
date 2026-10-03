@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ActionChallenge,
   BoardResult,
@@ -41,6 +41,21 @@ const ownerPort = (
   return { owner, prepares, performs };
 };
 
+/** An attempt control no one aborts, which records when the action was sent. */
+const control = (signal: AbortSignal = new AbortController().signal) => {
+  const sent: string[] = [];
+  return { signal, onSent: () => sent.push("sent"), sent };
+};
+
+/** A promise and the function that settles it, for holding a step open. */
+const deferred = <T>() => {
+  let settle: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, resolve: (value: T) => settle?.(value) };
+};
+
 const confirm = { kind: "agent.confirm", agentId: "agt_atlas", code: "123456" } as const;
 
 describe("performOwnerAction", () => {
@@ -51,7 +66,7 @@ describe("performOwnerAction", () => {
     }));
     const { authenticator } = fakeAuthenticator();
 
-    const outcome = await performOwnerAction(owner, authenticator, confirm);
+    const outcome = await performOwnerAction(owner, authenticator, confirm, control());
 
     expect(outcome).toEqual({
       kind: "performed",
@@ -66,7 +81,9 @@ describe("performOwnerAction", () => {
     const { owner, performs } = ownerPort(() => Promise.reject(new Error("must not perform")));
     const { authenticator } = fakeAuthenticator(() => "dismiss");
 
-    expect(await performOwnerAction(owner, authenticator, confirm)).toEqual({ kind: "cancelled" });
+    expect(await performOwnerAction(owner, authenticator, confirm, control())).toEqual({
+      kind: "cancelled",
+    });
     expect(performs).toHaveLength(0);
   });
 
@@ -78,7 +95,7 @@ describe("performOwnerAction", () => {
     }));
     const { authenticator } = fakeAuthenticator();
 
-    expect(await performOwnerAction(owner, authenticator, confirm)).toEqual({
+    expect(await performOwnerAction(owner, authenticator, confirm, control())).toEqual({
       kind: "failed",
       message: "The passkey did not verify for this action. Nothing changed.",
     });
@@ -93,7 +110,7 @@ describe("performOwnerAction", () => {
     for (const answer of answers) {
       const { owner } = ownerPort(async () => ({ ok: true, value: answer }));
       const { authenticator } = fakeAuthenticator();
-      const outcome = await performOwnerAction(owner, authenticator, confirm);
+      const outcome = await performOwnerAction(owner, authenticator, confirm, control());
       expect(outcome.kind).toBe("failed");
     }
   });
@@ -105,7 +122,7 @@ describe("performOwnerAction", () => {
     );
     const { authenticator, requests } = fakeAuthenticator();
 
-    const outcome = await performOwnerAction(owner, authenticator, confirm);
+    const outcome = await performOwnerAction(owner, authenticator, confirm, control());
 
     expect(outcome).toEqual({
       kind: "failed",
@@ -122,7 +139,7 @@ describe("performOwnerAction", () => {
       message: "<b>code mismatch</b>",
     }));
     const { authenticator } = fakeAuthenticator();
-    const outcome = await performOwnerAction(owner, authenticator, confirm);
+    const outcome = await performOwnerAction(owner, authenticator, confirm, control());
     expect(outcome).toEqual({
       kind: "failed",
       message:
@@ -133,7 +150,69 @@ describe("performOwnerAction", () => {
   it("turns a lost session into a failure instead of throwing", async () => {
     const { owner } = ownerPort(() => Promise.reject(new Error("socket closed")));
     const { authenticator } = fakeAuthenticator();
-    const outcome = await performOwnerAction(owner, authenticator, confirm);
+    const outcome = await performOwnerAction(owner, authenticator, confirm, control());
     expect(outcome.kind).toBe("failed");
+  });
+
+  describe("when the board withdraws the action", () => {
+    it("neither prompts nor performs once aborted during prepare", async () => {
+      const preparing = deferred<BoardResult<ActionChallenge>>();
+      const { owner, performs } = ownerPort(
+        () => Promise.reject(new Error("must not perform")),
+        () => preparing.promise,
+      );
+      const { authenticator, requests } = fakeAuthenticator();
+      const controller = new AbortController();
+      const attempt = control(controller.signal);
+
+      const outcome = performOwnerAction(owner, authenticator, confirm, attempt);
+      controller.abort();
+      preparing.resolve({ ok: true, value: challenge() });
+
+      expect(await outcome).toEqual({ kind: "withdrawn", sent: false });
+      expect(requests).toHaveLength(0);
+      expect(performs).toHaveLength(0);
+      expect(attempt.sent).toEqual([]);
+    });
+
+    it("does not perform an assertion signed after the abort", async () => {
+      const signing = deferred<Credential | null>();
+      const { owner, performs } = ownerPort(() => Promise.reject(new Error("must not perform")));
+      const signer = fakeAuthenticator();
+      const prompts: CredentialRequestOptions[] = [];
+      const authenticator = {
+        ...signer.authenticator,
+        get: (options: CredentialRequestOptions) => {
+          prompts.push(options);
+          return signing.promise;
+        },
+      };
+      const controller = new AbortController();
+
+      const outcome = performOwnerAction(owner, authenticator, confirm, control(controller.signal));
+      await vi.waitFor(() => expect(prompts).toHaveLength(1));
+      controller.abort();
+      expect(prompts[0]?.signal?.aborted).toBe(true);
+      signing.resolve(await signer.authenticator.get({}));
+
+      expect(await outcome).toEqual({ kind: "withdrawn", sent: false });
+      expect(performs).toHaveLength(0);
+    });
+
+    it("says the action may have happened when aborted after it was sent", async () => {
+      const performing = deferred<BoardResult<OwnerActionResult>>();
+      const { owner, performs } = ownerPort(() => performing.promise);
+      const { authenticator } = fakeAuthenticator();
+      const controller = new AbortController();
+      const attempt = control(controller.signal);
+
+      const outcome = performOwnerAction(owner, authenticator, confirm, attempt);
+      await vi.waitFor(() => expect(performs).toHaveLength(1));
+      controller.abort();
+      performing.resolve({ ok: true, value: { kind: "agent.confirm", agentId: "agt_atlas" } });
+
+      expect(await outcome).toEqual({ kind: "withdrawn", sent: true });
+      expect(attempt.sent).toEqual(["sent"]);
+    });
   });
 });

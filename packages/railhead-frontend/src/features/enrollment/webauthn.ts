@@ -61,10 +61,14 @@ export const fromBase64Url = (text: string): Uint8Array<ArrayBuffer> | null => {
 /** Milliseconds left until `expiresAt`, never negative. */
 const remaining = (expiresAt: number, now: number): number => Math.max(0, expiresAt - now);
 
-/** Asks the authenticator to sign the challenge the backend bound to one owner action. */
+/**
+ * Asks the authenticator to sign the challenge the backend bound to one owner action. Aborting
+ * `signal` cancels the browser's prompt.
+ */
 export const signAction = async (
   authenticator: Authenticator,
   challenge: ActionChallenge,
+  signal: AbortSignal,
   now: number = Date.now(),
 ): Promise<CeremonyOutcome<PasskeyAssertion>> => {
   const bytes = fromBase64Url(challenge.challenge);
@@ -81,6 +85,7 @@ export const signAction = async (
   return ceremony(
     () =>
       authenticator.get({
+        signal,
         publicKey: {
           challenge: bytes,
           rpId: challenge.rpId,

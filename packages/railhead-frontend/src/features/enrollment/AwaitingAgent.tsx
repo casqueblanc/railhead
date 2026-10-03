@@ -2,6 +2,7 @@ import { Badge, Button, Input, Text } from "@cloudflare/kumo";
 import { useState, type FormEvent } from "react";
 import type { AgentState } from "../board/boardState";
 import { ActionMessage } from "./ActionMessage";
+import { RevokeAgent } from "./RevokeAgent";
 import { codeProblem } from "./roster";
 import { useOwnerAction, type ActionAccess } from "./useOwnerAction";
 
@@ -13,7 +14,8 @@ interface AwaitingAgentProps {
 /**
  * An agent that joined and waits for the owner. The board does not show the confirmation code: the
  * owner types the code the agent's own terminal shows, and the backend refuses one that differs.
- * The agent stays unconfirmed until the log records `agent.confirmed`.
+ * The agent stays unconfirmed until the log records `agent.confirmed`. An agent the owner did not
+ * invite, or whose code does not match, is rejected instead, without ever being confirmed.
  */
 export const AwaitingAgent = ({ agent, access }: AwaitingAgentProps) => {
   const [code, setCode] = useState("");
@@ -74,6 +76,7 @@ export const AwaitingAgent = ({ agent, access }: AwaitingAgentProps) => {
           />
         </div>
       </form>
+      <RevokeAgent agent={agent} access={access} stage="awaiting" />
     </li>
   );
 };

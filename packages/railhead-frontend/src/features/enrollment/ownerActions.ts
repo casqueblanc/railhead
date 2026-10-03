@@ -5,6 +5,10 @@
 // `perform`, so whatever the action would have changed stays as the log last said. A result that
 // names a different action or agent than the one asked for is reported as a failure, not shown as
 // success.
+//
+// The board can stop showing current enrollment, or lose its session, while an action waits on the
+// backend or the passkey. The caller then aborts the attempt: the ceremony is cancelled where the
+// browser allows, and nothing is performed after the abort.
 
 import type {
   BoardErrorCode,
@@ -29,7 +33,20 @@ export type ActionOutcome =
   | { kind: "performed"; result: EnrollmentResult }
   /** The owner dismissed the passkey prompt. Nothing was performed. */
   | { kind: "cancelled" }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; message: string }
+  /**
+   * The board withdrew the action before it finished. `sent` says whether `perform` had already
+   * been called, in which case the backend may still have performed it.
+   */
+  | { kind: "withdrawn"; sent: boolean };
+
+/** How the caller stops an attempt and learns when it reached the backend. */
+export interface AttemptControl {
+  /** Aborted when the board withdraws the action. */
+  signal: AbortSignal;
+  /** Called just before the signed action is sent to be performed. */
+  onSent: () => void;
+}
 
 /** The callbacks of an available owner port. */
 export type AvailableOwnerPort = Extract<OwnerPort, { kind: "available" }>;
@@ -44,16 +61,23 @@ export type EnrollmentBlock =
   /** The board stopped reading the log. */
   | { kind: "halted" };
 
-/** Performs `action` with a fresh passkey assertion. Never throws. */
+/**
+ * Performs `action` with a fresh passkey assertion, unless `control.signal` aborts before it is
+ * sent. Never throws.
+ */
 export const performOwnerAction = async (
   owner: AvailableOwnerPort,
   authenticator: Authenticator,
   action: EnrollmentAction,
+  control: AttemptControl,
 ): Promise<ActionOutcome> => {
+  const { signal } = control;
   try {
     const prepared = await owner.onPrepareAction(action);
+    if (signal.aborted) return { kind: "withdrawn", sent: false };
     if (!prepared.ok) return failed(prepared);
-    const signed = await signAction(authenticator, prepared.value);
+    const signed = await signAction(authenticator, prepared.value, signal);
+    if (signal.aborted) return { kind: "withdrawn", sent: false };
     switch (signed.kind) {
       case "cancelled":
         return signed;
@@ -64,7 +88,9 @@ export const performOwnerAction = async (
       default:
         return unreachable(signed);
     }
+    control.onSent();
     const performed = await owner.onPerformAction(prepared.value.challengeId, signed.value);
+    if (signal.aborted) return { kind: "withdrawn", sent: true };
     if (!performed.ok) return failed(performed);
     const result = matching(action, performed.value);
     if (result === null) {

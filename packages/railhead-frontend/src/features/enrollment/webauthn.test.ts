@@ -5,6 +5,9 @@ import { fromBase64Url, registerPasskey, signAction, toBase64Url } from "./webau
 
 const NOW = Date.UTC(2026, 9, 2, 12);
 
+/** A signal no one aborts. */
+const live = new AbortController().signal;
+
 const actionChallenge = (overrides: Partial<ActionChallenge> = {}): ActionChallenge => ({
   challengeId: "chl_1",
   challenge: "AAECAw",
@@ -48,7 +51,7 @@ describe("base64url", () => {
 describe("signAction", () => {
   it("asks for a user-verified assertion over the challenge and encodes the credential", async () => {
     const { authenticator, requests } = fakeAuthenticator();
-    const outcome = await signAction(authenticator, actionChallenge(), NOW);
+    const outcome = await signAction(authenticator, actionChallenge(), live, NOW);
 
     expect(outcome).toEqual({
       kind: "done",
@@ -70,10 +73,19 @@ describe("signAction", () => {
     ]);
   });
 
+  it("hands the browser the signal that cancels its prompt", async () => {
+    const { authenticator, requests } = fakeAuthenticator();
+    const controller = new AbortController();
+    await signAction(authenticator, actionChallenge(), controller.signal, NOW);
+
+    controller.abort();
+    expect(requests[0]?.signal?.aborted).toBe(true);
+  });
+
   it("reports a dismissed prompt and a missing credential as cancelled", async () => {
     for (const answer of ["dismiss", "none"] as const) {
       const { authenticator } = fakeAuthenticator(() => answer);
-      expect(await signAction(authenticator, actionChallenge(), NOW)).toEqual({
+      expect(await signAction(authenticator, actionChallenge(), live, NOW)).toEqual({
         kind: "cancelled",
       });
     }
@@ -81,13 +93,19 @@ describe("signAction", () => {
 
   it("does not prompt for a challenge it cannot decode or one already expired", async () => {
     const { authenticator, requests } = fakeAuthenticator();
-    const unreadable = await signAction(authenticator, actionChallenge({ challenge: "A=" }), NOW);
+    const unreadable = await signAction(
+      authenticator,
+      actionChallenge({ challenge: "A=" }),
+      live,
+      NOW,
+    );
     const badCredential = await signAction(
       authenticator,
       actionChallenge({ allowCredentials: ["AQID", "not base64!"] }),
+      live,
       NOW,
     );
-    const expired = await signAction(authenticator, actionChallenge({ expiresAt: NOW }), NOW);
+    const expired = await signAction(authenticator, actionChallenge({ expiresAt: NOW }), live, NOW);
 
     expect(unreadable.kind).toBe("failed");
     expect(badCredential.kind).toBe("failed");
@@ -98,7 +116,7 @@ describe("signAction", () => {
   it("fails on a browser error or a credential without a signature", async () => {
     for (const answer of ["error", "malformed"] as const) {
       const { authenticator } = fakeAuthenticator(() => answer);
-      const outcome = await signAction(authenticator, actionChallenge(), NOW);
+      const outcome = await signAction(authenticator, actionChallenge(), live, NOW);
       expect(outcome.kind).toBe("failed");
     }
   });

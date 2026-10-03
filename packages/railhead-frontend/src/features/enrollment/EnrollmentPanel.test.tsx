@@ -51,6 +51,34 @@ const joinedSteps = () => [
 
 const joined = () => fold(syntheticLog("Synthetic join", joinedSteps()).events);
 
+/** The joined board after the log records that dune was revoked. */
+const duneRevoked = () =>
+  fold(
+    syntheticLog("Synthetic rejection", [
+      ...joinedSteps(),
+      { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthdune" } } as const,
+    ]).events,
+  );
+
+/** The joined board with its last event lost, so it is missing events. */
+const behind = () => {
+  const log = syntheticLog("Synthetic gap", [
+    ...joinedSteps(),
+    { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthatlas" } } as const,
+    { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthdune" } } as const,
+  ]);
+  return fold(withLostEvents(log, [log.events.length - 1]));
+};
+
+/** A promise and the function that settles it, for holding a step open. */
+const deferred = <T,>() => {
+  let settle: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, resolve: (value: T) => settle?.(value) };
+};
+
 const live = (board: BoardState): BoardFeed => ({
   kind: "board",
   board,
@@ -288,12 +316,7 @@ describe("EnrollmentPanel", () => {
   });
 
   it("blocks actions while the board is missing events", async () => {
-    const log = syntheticLog("Synthetic gap", [
-      ...joinedSteps(),
-      { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthatlas" } },
-      { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: "agt_synthdune" } },
-    ]);
-    const board = fold(withLostEvents(log, [log.events.length - 1]));
+    const board = behind();
     expect(board.stream.kind).toBe("gap");
     const { owner } = recordingOwner(echo);
     await render(live(board), owner, fakeAuthenticator().authenticator);
@@ -364,6 +387,148 @@ describe("EnrollmentPanel", () => {
     const { owner } = recordingOwner(echo);
     await render(live(fold([])), owner, fakeAuthenticator().authenticator);
     expect(text()).toContain("No agents yet");
+  });
+
+  describe("rejecting an agent that waits for confirmation", () => {
+    it("revokes it with one passkey assertion, and moves it only once the log records it", async () => {
+      const { owner, prepares, performs } = recordingOwner(echo);
+      const authenticator = fakeAuthenticator().authenticator;
+      await render(live(joined()), owner, authenticator);
+
+      await click(button("Reject…"));
+      expect(prepares).toEqual([]);
+      await click(button("Reject dune"));
+
+      expect(prepares).toEqual([{ kind: "agent.revoke", agentId: "agt_synthdune" }]);
+      expect(performs).toEqual(["chl_1"]);
+      expect(text()).toContain("Rejected. dune shows as revoked once the log records it.");
+      expect(text()).toContain("Awaiting confirmation");
+
+      await render(live(duneRevoked()), owner, authenticator);
+      expect(text()).not.toContain("Awaiting confirmation");
+      expect(container.querySelector("input[name=confirmation-code]")).toBeNull();
+      expect(text()).toContain("Revoked");
+    });
+
+    it("rejects nothing when the owner backs out or cancels the passkey prompt", async () => {
+      const { owner, prepares, performs } = recordingOwner(echo);
+      await render(live(joined()), owner, fakeAuthenticator(() => "dismiss").authenticator);
+
+      await click(button("Reject…"));
+      await click(button("Keep"));
+      expect(prepares).toEqual([]);
+
+      await click(button("Reject…"));
+      await click(button("Reject dune"));
+      expect(performs).toEqual([]);
+      expect(text()).toContain("Cancelled. dune still waits for confirmation.");
+      expect(text()).toContain("Awaiting confirmation");
+    });
+
+    it("shows the backend's refusal and keeps the agent waiting", async () => {
+      const { owner } = recordingOwner(() => ({
+        ok: false,
+        code: "action_stale",
+        message: "agent changed",
+      }));
+      await render(live(joined()), owner, fakeAuthenticator().authenticator);
+
+      await click(button("Reject…"));
+      await click(button("Reject dune"));
+
+      expect(text()).toContain("The action no longer applies");
+      expect(text()).toContain("Awaiting confirmation");
+      expect(button("Reject dune").disabled).toBe(false);
+    });
+
+    it("offers no rejection while actions are blocked", async () => {
+      const { owner } = recordingOwner(echo);
+      await render(live(behind()), owner, fakeAuthenticator().authenticator);
+      expect(text()).not.toContain("Reject…");
+    });
+  });
+
+  describe("when actions are withdrawn mid-request", () => {
+    it("does not prompt or perform once the board falls behind during prepare", async () => {
+      const preparing = deferred<BoardResult<ActionChallenge>>();
+      const performs: string[] = [];
+      const owner: OwnerPort = {
+        kind: "available",
+        onPrepareAction: () => preparing.promise,
+        onPerformAction: async (challengeId) => {
+          performs.push(challengeId);
+          return echo({ kind: "invite.create", name: "cedar" });
+        },
+      };
+      const { authenticator, requests } = fakeAuthenticator();
+      await render(live(joined()), owner, authenticator);
+
+      await type(input("Agent name"), "cedar");
+      await click(button("Create invite"));
+      await render(live(behind()), owner, authenticator);
+      await act(async () => preparing.resolve({ ok: true, value: challenge() }));
+
+      expect(requests).toHaveLength(0);
+      expect(performs).toEqual([]);
+      expect(text()).toContain(
+        "Stopped: the board lost its current view before the action was sent.",
+      );
+    });
+
+    it("cancels the passkey prompt and performs nothing once the board halts during signing", async () => {
+      const signing = deferred<Credential | null>();
+      const prompts: CredentialRequestOptions[] = [];
+      const signer = fakeAuthenticator();
+      const authenticator: Authenticator = {
+        ...signer.authenticator,
+        get: (options) => {
+          prompts.push(options);
+          return signing.promise;
+        },
+      };
+      const { owner, performs } = recordingOwner(echo);
+      await render(live(joined()), owner, authenticator);
+
+      await confirmDune("482913");
+      expect(prompts).toHaveLength(1);
+      const halted: BoardState = {
+        ...joined(),
+        stream: { kind: "halted", fault: { kind: "foreign_repo", seq: 99 } },
+      };
+      await render(live(halted), owner, authenticator);
+      expect(prompts[0]?.signal?.aborted).toBe(true);
+      const signed = await signer.authenticator.get({});
+      await act(async () => signing.resolve(signed));
+
+      expect(performs).toEqual([]);
+      expect(text()).toContain("Blocked because the board stopped reading the log.");
+    });
+
+    it("drops a late answer from a replaced session and leaves the new one usable", async () => {
+      const performing = deferred<BoardResult<OwnerActionResult>>();
+      const first: OwnerPort = {
+        kind: "available",
+        onPrepareAction: async () => ({ ok: true, value: challenge() }),
+        onPerformAction: () => performing.promise,
+      };
+      const second = recordingOwner(echo);
+      const { authenticator } = fakeAuthenticator();
+      await render(live(joined()), first, authenticator);
+
+      await type(input("Agent name"), "cedar");
+      await click(button("Create invite"));
+      await render(live(joined()), second.owner, authenticator);
+      await act(async () => performing.resolve(echo({ kind: "invite.create", name: "cedar" })));
+
+      expect(text()).not.toContain("synth-secret");
+      expect(text()).toContain(
+        "The board lost its current view after the action was sent. Check the agents list before retrying.",
+      );
+
+      await click(button("Create invite"));
+      expect(second.prepares).toEqual([{ kind: "invite.create", name: "cedar" }]);
+      expect(text()).toContain("https://railhead.dev/join/synth-secret");
+    });
   });
 
   describe("owner passkey", () => {

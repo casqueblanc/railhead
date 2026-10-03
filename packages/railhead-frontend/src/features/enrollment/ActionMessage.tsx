@@ -27,6 +27,14 @@ export const ActionMessage = ({ state, cancelled, performed }: ActionMessageProp
           {state.message}
         </Text>
       );
+    case "withdrawn":
+      return (
+        <Text variant="error" DANGEROUS_className="break-words">
+          {state.sent
+            ? "The board lost its current view after the action was sent. Check the agents list before retrying."
+            : "Stopped: the board lost its current view before the action was sent. Nothing changed."}
+        </Text>
+      );
     case "performed":
       return performed === undefined ? null : <Text variant="secondary">{performed}</Text>;
     default:
