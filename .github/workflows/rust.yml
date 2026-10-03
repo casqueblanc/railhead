@@ -48,8 +48,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: rust-gate
-          # TEMPORARY for measurement: pull requests save too. Reverted before review.
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run the Rust gate
         if: steps.changes.outputs.run != 'false'
