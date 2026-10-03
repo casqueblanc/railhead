@@ -17,6 +17,7 @@ import { unavailableClaims, unavailableInbox } from "../src/contracts/unavailabl
 import {
   createDecisions,
   MAX_QUESTIONS_PER_CLAIM,
+  MAX_WAITERS,
   type Decisions,
 } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
@@ -177,6 +178,33 @@ async function withDecisions<R>(
 
 function types(events: RailheadEvent[]): string[] {
   return events.map((event) => event.type);
+}
+
+/** A pending call whose settlement the test can observe without awaiting it. */
+interface Tracked<T> {
+  promise: Promise<T>;
+  settled(): boolean;
+}
+
+function track<T>(promise: Promise<T>): Tracked<T> {
+  let done = false;
+  promise.then(
+    () => {
+      done = true;
+    },
+    () => {
+      done = true;
+    },
+  );
+  return { promise, settled: () => done };
+}
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requestId(n: number): string {
+  return `req_poll${String(n).padStart(12, "0")}`;
 }
 
 describe("ask", () => {
@@ -626,6 +654,117 @@ describe("question", () => {
         ok: true,
         value: { questionId, state: "open", decision: null },
       });
+    });
+  });
+
+  it("answers the poll beyond MAX_WAITERS at once and wakes each question's polls alone", async () => {
+    await withDecisions(async (h) => {
+      const first = await h.ask({ requestId: requestId(1) });
+      const second = await h.ask({ requestId: requestId(2) });
+      const third = await h.ask({ requestId: requestId(3) });
+      const half = MAX_WAITERS / 2;
+      const poll = (questionId: string, waitMs = MAX_LONG_POLL_MS) =>
+        track(h.decisions.question(h.agent(), questionId, waitMs));
+      const onFirst = Array.from({ length: half }, () => poll(first.questionId));
+      const onSecond = Array.from({ length: MAX_WAITERS - half }, () => poll(second.questionId));
+
+      // Capacity is full: the next poll returns the open question without waiting.
+      const over = poll(third.questionId);
+      expect(await over.promise).toEqual(
+        ok({
+          questionId: third.questionId,
+          decisionId: third.decisionId,
+          state: "open",
+          decision: null,
+        }),
+      );
+      await pause(10);
+      expect([...onFirst, ...onSecond].filter((p) => p.settled())).toHaveLength(0);
+
+      // Answering the first question wakes its polls only and frees their slots.
+      await h.decisions.record(
+        h.grant({ decisionId: first.decisionId, option: "chunk", expectedVersion: null }),
+      );
+      for (const answered of await Promise.all(onFirst.map((p) => p.promise))) {
+        expect(answered).toMatchObject({
+          ok: true,
+          value: { questionId: first.questionId, state: "answered", decision: { version: 1 } },
+        });
+      }
+      await pause(10);
+      expect(onSecond.filter((p) => p.settled())).toHaveLength(0);
+
+      // A freed slot holds a new poll until its own answer arrives.
+      const waiting = poll(third.questionId);
+      await pause(10);
+      expect(waiting.settled()).toBe(false);
+      await h.decisions.record(
+        h.grant(
+          { decisionId: third.decisionId, option: "reject", expectedVersion: null },
+          "chl_grant0003",
+        ),
+      );
+      expect(await waiting.promise).toMatchObject({
+        ok: true,
+        value: { questionId: third.questionId, state: "answered", decision: { version: 1 } },
+      });
+      expect(onSecond.filter((p) => p.settled())).toHaveLength(0);
+
+      // Drain the second question's polls.
+      await h.decisions.record(
+        h.grant(
+          { decisionId: second.decisionId, option: "reject", expectedVersion: null },
+          "chl_grant0002",
+        ),
+      );
+      for (const answered of await Promise.all(onSecond.map((p) => p.promise))) {
+        expect(answered).toMatchObject({
+          ok: true,
+          value: { questionId: second.questionId, state: "answered" },
+        });
+      }
+    });
+  });
+
+  it("releases every slot when polls time out, so capacity is whole again", async () => {
+    await withDecisions(async (h) => {
+      const first = await h.ask({ requestId: requestId(1) });
+      const second = await h.ask({ requestId: requestId(2) });
+      const poll = (questionId: string, waitMs: number) =>
+        track(h.decisions.question(h.agent(), questionId, waitMs));
+      const fill = (waitMs: number) =>
+        Array.from({ length: MAX_WAITERS }, (_, i) =>
+          poll(i % 2 === 0 ? first.questionId : second.questionId, waitMs),
+        );
+
+      const timed = fill(50);
+      await pause(5);
+      expect(timed.filter((p) => p.settled())).toHaveLength(0);
+      const over = poll(first.questionId, MAX_LONG_POLL_MS);
+      expect(await over.promise).toMatchObject({ ok: true, value: { state: "open" } });
+      for (const result of await Promise.all(timed.map((p) => p.promise))) {
+        expect(result).toMatchObject({ ok: true, value: { state: "open", decision: null } });
+      }
+
+      // Every slot came back: exactly MAX_WAITERS polls wait again and the next is refused.
+      const refilled = fill(MAX_LONG_POLL_MS);
+      const overAgain = poll(second.questionId, MAX_LONG_POLL_MS);
+      expect(await overAgain.promise).toMatchObject({ ok: true, value: { state: "open" } });
+      await pause(10);
+      expect(refilled.filter((p) => p.settled())).toHaveLength(0);
+
+      await h.decisions.record(
+        h.grant({ decisionId: first.decisionId, option: "reject", expectedVersion: null }),
+      );
+      await h.decisions.record(
+        h.grant(
+          { decisionId: second.decisionId, option: "chunk", expectedVersion: null },
+          "chl_grant0002",
+        ),
+      );
+      for (const result of await Promise.all(refilled.map((p) => p.promise))) {
+        expect(result).toMatchObject({ ok: true, value: { state: "answered" } });
+      }
     });
   });
 
