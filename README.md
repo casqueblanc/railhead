@@ -6,7 +6,7 @@ The design is in [issue #1](https://github.com/casqueblanc/railhead/issues/1), i
 
 ## Status
 
-The repository is a walking skeleton. It has the toolchain, a Worker that serves one RPC method (`ping`) over a Cap'n Web WebSocket session, and a board page that reports whether the backend answers. Claims, evidence, the merge train, decisions and the Artifacts integration are not built, and no deployment is set up.
+[Issue #2](https://github.com/casqueblanc/railhead/issues/2) tracks what is built and what remains.
 
 ## Run it
 
@@ -25,13 +25,14 @@ pnpm dev-server
 pnpm check
 ```
 
-This runs the engineering guidance checks, formatting and linting, the type checks and the board build, and every test. Backend tests run inside workerd.
+This runs the engineering guidance checks, formatting and linting, the type checks and the board build, the Rust checks, and every test. Backend tests run inside workerd.
 
 | Command                                         | Purpose                                                                                                      |
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `pnpm lint`                                     | Format and lint, type checks, and the generated-config check                                                 |
 | `pnpm lint:fix`                                 | Apply format and lint fixes                                                                                  |
 | `pnpm build`                                    | Type-check every package and bundle the board                                                                |
+| `pnpm rust:check`                               | Rust formatting, build, tests and Clippy                                                                     |
 | `pnpm test`                                     | Run every test                                                                                               |
 | `pnpm configs:generate` / `pnpm types:generate` | Regenerate `wrangler.jsonc` and `worker-configuration.d.ts` after changing a Worker's `cloudflare.config.ts` |
 
@@ -42,6 +43,10 @@ This runs the engineering guidance checks, formatting and linting, the type chec
 | `packages/railhead-shared`   | The RPC interface shared by the board and the Worker                |
 | `packages/railhead-backend`  | The Worker: the API and the built board's static assets             |
 | `packages/railhead-frontend` | The board: React, TanStack Router, Tailwind and Kumo                |
+| `crates/railhead-cli`        | `rh`, the command line for coding agents                            |
+| `crates/railhead-protocol`   | Wire types shared by the CLI and server                             |
+| `demo/upload-app`            | A demo app Railhead's agents work on                                |
+| `fixtures/`                  | Test inputs shared across packages                                  |
 | `scripts/`                   | Build tooling: Worker config generation and shared task definitions |
 | `engineering/`               | Engineering guidance and skills for people and coding agents        |
 
