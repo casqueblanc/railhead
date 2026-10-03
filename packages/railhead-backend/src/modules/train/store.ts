@@ -330,6 +330,26 @@ export function batchedEntries(sql: SqlStorage): QueueEntry[] {
     .map(toEntry);
 }
 
+/**
+ * The place of a waiting entry in the queue, counting from 1 in the order `waitingEntries` takes
+ * them, or `null` when the entry is not waiting.
+ */
+export function queuePosition(sql: SqlStorage, claimId: string, generation: number): number | null {
+  const row = sql
+    .exec<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM train_queue q,
+         (SELECT position, enqueued_at, claim_id, generation FROM train_queue
+            WHERE claim_id = ? AND generation = ? AND state = 'queued') me
+       WHERE q.state = 'queued'
+         AND (q.position, q.enqueued_at, q.claim_id, q.generation)
+           <= (me.position, me.enqueued_at, me.claim_id, me.generation)`,
+      claimId,
+      generation,
+    )
+    .toArray()[0];
+  return row === undefined || row.n === 0 ? null : row.n;
+}
+
 /** Up to `limit` entries in any state, most recently changed first. */
 export function recentEntries(sql: SqlStorage, limit: number): QueueEntry[] {
   return sql
