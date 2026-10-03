@@ -23,10 +23,10 @@
 // commit by a read that began after its last attempt was that old means the write did not land,
 // and the intent settles `reconciled` at that commit. A read that began earlier proves nothing
 // about that intent, however late it answers: the write may have applied while the read was in
-// flight. When the lifetime ends during a read, the writer reads main again. The writer applies this wherever waiting would otherwise
-// hold the train: to another intent that holds this one back, and to this intent once its fence
-// has moved. An intent whose fence still holds writes again instead, conditionally, which starts
-// a new window.
+// flight. When the lifetime ends during a read, the writer reads main again. The writer applies
+// this wherever waiting would otherwise hold the train: to another intent that holds this one
+// back, and to this intent once its fence has moved. An intent whose fence still holds writes
+// again instead, conditionally, which starts a new window.
 //
 // A claim or decision fence that moves while the intent's own earlier write is unsettled stops any
 // further write, but until the window ends the publication returns `unavailable`, not the fence's
