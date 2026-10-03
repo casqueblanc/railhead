@@ -23,13 +23,10 @@ const AGENT_COMMANDS: [&[&str]; 8] = [
     &["ready"],
     &["status"],
     &["sync"],
-    &["ack"],
-    &["ask"],
+    &["ack", "17", "--plan", "p"],
+    &["ask", "Reject?"],
     &["credential", "get"],
 ];
-
-/// Agent commands whose entry points are stubs. A command leaves this list when it is built.
-const STUBBED_AGENT_COMMANDS: [&str; 3] = ["sync", "ack", "ask"];
 
 struct World {
     home: tempfile::TempDir,
@@ -277,25 +274,67 @@ async fn a_mismatched_agent_in_a_clone_sends_nothing() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result<()> {
+async fn the_clone_identity_reaches_sync_ack_and_ask() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let world = world(&server.uri())?;
+    // rh ask names the claim generation the clone was made for.
+    git(world.clone.path(), &["config", "railhead.generation", "1"])?;
+    let commands: [&[&str]; 3] = [
+        &["--json", "sync"],
+        &["--json", "ack", "17", "--plan", "p"],
+        &[
+            "--json",
+            "ask",
+            "Reject?",
+            "--option",
+            "reject=Reject",
+            "--option",
+            "chunk=Chunk",
+            "--scope",
+            "src",
+        ],
+    ];
     for agent in [None, Some("atlas"), Some("agt_atlas01")] {
-        for command in STUBBED_AGENT_COMMANDS {
-            let argv = ["--json", command];
-            let run = rh(&world, world.clone.path(), agent, &argv, "")?;
-            assert_eq!(run.code, Some(1));
-            let envelope = run.json()?;
-            assert_eq!(
-                envelope.pointer("/error/code"),
-                Some(&json!("command_unavailable")),
-                "{command}"
+        for argv in commands {
+            server.reset().await;
+            let run = rh(&world, world.clone.path(), agent, argv, "")?;
+            // Nothing is mounted, so each command fails on the backend's answer, after sending
+            // its request as atlas.
+            assert_eq!(run.code, Some(1), "{agent:?} {argv:?}: {}", run.stdout);
+            let received = server.received_requests().await.unwrap_or_default();
+            anyhow::ensure!(
+                !received.is_empty(),
+                "{agent:?} {argv:?} sent nothing: {}",
+                run.stdout
             );
-            let message = format!("rh {command} is not available in this build yet");
-            assert_eq!(envelope.pointer("/error/message"), Some(&json!(message)));
+            for request in &received {
+                assert!(
+                    request
+                        .url
+                        .path()
+                        .starts_with("/agent/v1/casqueblanc/demo/"),
+                    "{agent:?} {argv:?}: {}",
+                    request.url.path()
+                );
+                assert_eq!(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(format!("Bearer {TOKEN}").as_str()),
+                    "{agent:?} {argv:?}"
+                );
+            }
         }
     }
-    // Outside the clone, the named agent is used.
+    Ok(())
+}
+
+#[tokio::test]
+async fn outside_a_clone_the_named_agent_is_used() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let world = world(&server.uri())?;
+    // boreas has no session and no key to log in with.
     let outside = rh(
         &world,
         world.outside.path(),
@@ -305,7 +344,15 @@ async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result
     )?;
     assert_eq!(
         outside.json()?.pointer("/error/code"),
-        Some(&json!("command_unavailable"))
+        Some(&json!("no_session"))
+    );
+    let message = outside.json()?.pointer("/error/message").cloned();
+    assert!(
+        message
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("boreas has no session")),
+        "{message:?}"
     );
     let join = rh(&world, world.outside.path(), None, &["--json", "join"], "")?;
     assert_eq!(
