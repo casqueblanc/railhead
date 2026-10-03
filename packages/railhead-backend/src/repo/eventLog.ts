@@ -16,6 +16,7 @@
 import {
   EVENT_SCHEMA_VERSION,
   isId,
+  REOPEN_REASON_BEFORE_REASONS,
   validateEvent,
   type Actor,
   type EventPayload,
@@ -306,7 +307,9 @@ export class EventLog {
 
 /**
  * Reads one stored row. Rows are written only by `EventLog.append`, after `validateEvent`, so a row
- * is trusted as the event it was written as; these checks catch a row this code cannot read.
+ * is trusted as the event it was written as; these checks catch a row this code cannot read. A
+ * `claim.reopened` appended before reopen reasons existed gets `REOPEN_REASON_BEFORE_REASONS`, so
+ * every reader receives the current shape.
  */
 function readStoredEvent(seq: number, body: string): RailheadEvent {
   const event: RailheadEvent = JSON.parse(body);
@@ -318,6 +321,9 @@ function readStoredEvent(seq: number, body: string): RailheadEvent {
       "corrupt_log",
       `the event at sequence ${seq} has unsupported schema version ${event.v}`,
     );
+  }
+  if (event.type === "claim.reopened" && !Object.hasOwn(event.data, "reason")) {
+    return { ...event, data: { ...event.data, reason: REOPEN_REASON_BEFORE_REASONS } };
   }
   return event;
 }

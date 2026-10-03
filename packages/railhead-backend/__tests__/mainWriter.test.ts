@@ -148,6 +148,9 @@ class World {
     [CLAIM_C, "3".repeat(40)],
   ]);
 
+  /** Each claim's ready episode; a claim missing here is in episode 1. */
+  episodes = new Map<ClaimId, number>();
+
   /** Each claim's ready gate; a claim missing here is clear. */
   gates = new Map<ClaimId, ReadyGate | null>();
 
@@ -164,7 +167,11 @@ class World {
     const generation = this.generations.get(claimId);
     const decisions = this.versions.get(claimId) ?? null;
     if (commit === undefined || generation === undefined || decisions === null) return null;
-    return { pin: { claimId, generation, commit }, episode: 1, decisions };
+    return {
+      pin: { claimId, generation, commit },
+      episode: this.episodes.get(claimId) ?? 1,
+      decisions,
+    };
   }
 }
 
@@ -174,7 +181,7 @@ function attemptB(expectedMain: CommitSha): CheckAttempt {
     attemptId: ATTEMPT_B,
     expectedMain,
     candidate: CANDIDATE_B,
-    pins: [{ claimId: CLAIM_C, generation: 1, commit: "3".repeat(40) }],
+    pins: [{ claimId: CLAIM_C, generation: 1, commit: "3".repeat(40), episode: 1 }],
     definition: { name: "upload", source: expectedMain, digest: "d".repeat(64), acceptance: null },
     decisions: [],
     createdAt: NOW - 60_000,
@@ -187,8 +194,8 @@ function attempt(): CheckAttempt {
     expectedMain: MAIN,
     candidate: CANDIDATE,
     pins: [
-      { claimId: CLAIM_A, generation: 1, commit: "1".repeat(40) },
-      { claimId: CLAIM_B, generation: 3, commit: "2".repeat(40) },
+      { claimId: CLAIM_A, generation: 1, commit: "1".repeat(40), episode: 1 },
+      { claimId: CLAIM_B, generation: 3, commit: "2".repeat(40), episode: 1 },
     ],
     definition: { name: "upload", source: MAIN, digest: "d".repeat(64), acceptance: null },
     decisions: [DEC_FORMAT],
@@ -618,6 +625,25 @@ describe("publish fences claims and decisions", () => {
           code: "decision_superseded",
         });
         world.ready.delete(CLAIM_B);
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+      },
+      world,
+    );
+  });
+
+  it("refuses when a claim was readied again with its pinned commit in a later episode", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        // Reopened after authorization and readied again with the same commit.
+        world.episodes.set(CLAIM_B, 2);
         expect(await h.writer.publish(INTENT)).toMatchObject({
           ok: false,
           code: "decision_superseded",
