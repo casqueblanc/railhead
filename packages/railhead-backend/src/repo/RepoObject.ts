@@ -199,7 +199,7 @@ export class Repo extends DurableObject<Env> {
   async agent(call: AgentCall): Promise<AgentReply> {
     const installed = this.#installed;
     if (installed === null) return dispatchAgent(null, call);
-    return dispatchAgent({ repoId: installed.summary.repoId, ports: installed.ports }, call);
+    return dispatchAgent({ ...installed.summary, ports: installed.ports }, call);
   }
 
   /** Answers one Git smart-HTTP request, through the Git module. */

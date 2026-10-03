@@ -27,7 +27,7 @@ import {
 } from "../src/modules/inbox/inbox";
 import { composeRepo } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
-import { repoObjectName, type Repo } from "../src/repo/RepoObject";
+import { repoObjectName, type Repo, type RepoSummary } from "../src/repo/RepoObject";
 
 const NOW = 1_790_000_000_000;
 const CLAIM = "clm_claim001";
@@ -74,20 +74,21 @@ interface Harness {
   dispatch(command: AgentCommand): Promise<{ reply: AgentReply; bytes: number }>;
 }
 
-async function freshRepo(): Promise<{ stub: DurableObjectStub<Repo>; repoId: string }> {
+async function freshRepo(): Promise<{ stub: DurableObjectStub<Repo>; summary: RepoSummary }> {
   const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
   const stub = env.REPO.getByName(repoObjectName("acme", name));
   const summary = await stub.initialize("acme", name);
   if (!summary.ok) throw new Error(summary.code);
-  return { stub, repoId: summary.value.repoId };
+  return { stub, summary: summary.value };
 }
 
 /** Runs `body` against a fresh repository's inbox with a controllable clock. */
 async function withInbox<R>(
   body: (harness: Harness) => Promise<R>,
-  repo?: { stub: DurableObjectStub<Repo>; repoId: string },
+  repo?: { stub: DurableObjectStub<Repo>; summary: RepoSummary },
 ): Promise<R> {
-  const { stub, repoId } = repo ?? (await freshRepo());
+  const { stub, summary } = repo ?? (await freshRepo());
+  const { repoId } = summary;
   return runInDurableObject(stub, async (_instance, state) => {
     let now = NOW;
     const clock = () => now;
@@ -124,7 +125,10 @@ async function withInbox<R>(
         now += ms;
       },
       dispatch: async (command) => {
-        const reply = await dispatchAgent({ repoId, ports }, { command, token: "aaaa.bbbb.cccc" });
+        const reply = await dispatchAgent(
+          { ...summary, ports },
+          { command, token: "aaaa.bbbb.cccc", origin: "https://railhead.invalid" },
+        );
         // What `respond` in agentHttp.ts writes.
         const serialized = JSON.stringify(reply);
         return { reply, bytes: new TextEncoder().encode(serialized).byteLength };

@@ -64,7 +64,7 @@ export async function serveAgent(request: Request, env: Env): Promise<Response> 
   }
 
   const repo = env.REPO.getByName(repoObjectName(match.org, match.repo));
-  const reply: AgentReply = await repo.agent({ command, token });
+  const reply: AgentReply = await repo.agent({ command, token, origin: url.origin });
   return respond(reply);
 }
 
