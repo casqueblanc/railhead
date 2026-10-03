@@ -72,6 +72,7 @@ function recorder(): GatewayDeps & {
       return `tok-${scope}-${repo}`;
     },
     now: Date.now,
+    current: async () => true,
     fetch: async (request) => {
       redirects.push(request.redirect);
       forwarded.push({
@@ -366,6 +367,16 @@ describe("RailheadSandbox outbound handlers", () => {
     expect(await refusal(await gateway(fetchRefs(), env, { ...context, params: POLICY }))).toBe(
       "policy",
     );
+  });
+
+  it("refuses a grant the sending sandbox's object cannot confirm", async () => {
+    const gateway = RailheadSandbox.outboundHandlers?.["gitGateway"];
+    if (gateway === undefined) throw new Error("no git gateway handler");
+    // The pool runs no containers, so no sandbox object can be started here: a sender that names
+    // no object is refused before a token is minted, whose binding `remoteBindings: false` leaves
+    // unusable. The fence tests cover the answers a live and a retired object give.
+    const response = await gateway(fetchRefs(), env, { ...context, params: grant });
+    expect(await refusal(response)).toBe("retired");
   });
 });
 

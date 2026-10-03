@@ -18,6 +18,7 @@ import {
   type SlotRecord,
   type UncertainReason,
 } from "./admission";
+import type { BoundedOutput } from "./output";
 import type { SandboxPolicy } from "./policy";
 import { sdkDriver } from "./sandboxObject";
 
@@ -36,7 +37,10 @@ export const MAX_COMMAND_TIMEOUT_MS = 10 * 60_000;
 /** How much longer than its own timeout a command's answer may take to arrive. */
 export const EXEC_GRACE_MS = 15_000;
 
-/** The most bytes of each output stream returned from one command; the rest is cut. */
+/**
+ * The most bytes of each output stream returned from one command. The container object drops the
+ * rest as it arrives, so no more than this is held or sent over RPC.
+ */
 export const MAX_OUTPUT_BYTES = 64 * 1024;
 
 /** One command to run in an admitted sandbox. */
@@ -100,11 +104,11 @@ export interface SandboxDriver {
    * it answers. Refused once the sandbox was destroyed.
    */
   start(sandbox: string, policy: SandboxPolicy, deadline: number): Promise<void>;
-  /** Runs one command and returns its exit code and full output. Refused once destroyed. */
-  exec(
-    sandbox: string,
-    command: SandboxCommand,
-  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  /**
+   * Runs one command and returns its exit code and output, each stream at most
+   * `MAX_OUTPUT_BYTES`. Refused once destroyed.
+   */
+  exec(sandbox: string, command: SandboxCommand): Promise<BoundedOutput>;
   /**
    * Destroys the named sandbox for good: no later start or command runs in it. Resolves once no
    * start or command already under way can leave it running. Destroying one that never ran, or
@@ -207,7 +211,7 @@ export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxP
         exitCode: outcome.value.exitCode,
         stdout: stdout.text,
         stderr: stderr.text,
-        truncated: stdout.cut || stderr.cut,
+        truncated: outcome.value.truncated || stdout.cut || stderr.cut,
       });
     },
 
@@ -255,6 +259,7 @@ async function settle<T>(work: Promise<T>, ms: number): Promise<Settled<T>> {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+// The driver bounds output already; the port holds it to the same limit whatever a driver returns.
 function cut(text: string): { text: string; cut: boolean } {
   const bytes = encoder.encode(text);
   if (bytes.length <= MAX_OUTPUT_BYTES) return { text, cut: false };

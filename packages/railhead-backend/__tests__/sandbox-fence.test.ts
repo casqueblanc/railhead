@@ -9,6 +9,7 @@ import {
   teardownRetryDelay,
   type FencedContainer,
 } from "../src/sandbox/fence";
+import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import { CANDIDATE_REF_PREFIX, type SandboxGrant, type SandboxPolicy } from "../src/sandbox/policy";
 import { wakeTime } from "../src/sandbox/sandboxObject";
 
@@ -71,7 +72,7 @@ class FakeContainer {
       this.commands.push({ command, timeoutMs: options.timeoutMs });
       await this.#held.get("exec");
       this.running = true;
-      return { exitCode: 0, stdout: "ok", stderr: "" };
+      return { exitCode: 0, stdout: "ok", stderr: "", truncated: false };
     },
     destroy: async () => {
       this.destroys += 1;
@@ -348,6 +349,143 @@ describe("sandbox fence", () => {
     await withFence(async ({ fence, fake }) => {
       expect(await refusal(fence.exec({ command: "true", timeoutMs: 1_000 }))).toBe("not_started");
       expect(fake.commands).toEqual([]);
+    });
+  });
+});
+
+const encoder = new TextEncoder();
+
+/** A candidate push, its pkt-lines written by hand. */
+function candidatePush(): Request {
+  const line = `${"0".repeat(40)} ${"2".repeat(40)} ${CANDIDATE_REF_PREFIX}chk_attempt1/head\u0000report-status\n`;
+  const pkt = (encoder.encode(line).length + 4).toString(16).padStart(4, "0") + line;
+  return new Request(`https://${POLICY.host}/git/railhead/main-repo.git/git-receive-pack`, {
+    method: "POST",
+    body: `${pkt}0000PACKbytes`,
+  });
+}
+
+/**
+ * A gateway over `fence`'s grant check. After `hold`, a mint waits until the test resumes it, and
+ * `minting` settles once one has begun.
+ */
+function gateway(fence: () => SandboxFence, clock: () => number) {
+  const minted: string[] = [];
+  const forwarded: string[] = [];
+  let mintGate: Promise<void> | null = null;
+  const minting = deferred();
+  const deps: GatewayDeps = {
+    mint: async (repo, scope) => {
+      minted.push(`${repo}:${scope}`);
+      minting.resolve();
+      await mintGate;
+      return "token";
+    },
+    fetch: async (request) => {
+      forwarded.push(await request.text());
+      return new Response("upstream");
+    },
+    now: clock,
+    current: async (expiresAt) => fence().grantCurrent(expiresAt),
+  };
+  return {
+    minted,
+    forwarded,
+    minting: minting.promise,
+    hold: () => {
+      const gate = deferred();
+      mintGate = gate.promise;
+      return gate.resolve;
+    },
+    serve: (request: Request) =>
+      serveGitGateway(request, { policy: POLICY, expiresAt: DEADLINE }, deps),
+  };
+}
+
+describe("sandbox grant at retirement", () => {
+  it("holds only for the live incarnation's own deadline, until that deadline", async () => {
+    await withFence(async ({ fence, advance }) => {
+      expect(fence.grantCurrent(DEADLINE)).toBe(false);
+      await fence.start(POLICY, DEADLINE);
+
+      expect(fence.grantCurrent(DEADLINE)).toBe(true);
+      expect(fence.grantCurrent(DEADLINE + 1)).toBe(false);
+      advance(DEADLINE - START - 1);
+      expect(fence.grantCurrent(DEADLINE)).toBe(true);
+      advance(1);
+      expect(fence.grantCurrent(DEADLINE)).toBe(false);
+    });
+  });
+
+  it("forwards nothing from a push whose token mint spans an early retirement", async () => {
+    await withFence(async ({ fence, reopen }) => {
+      let now = START;
+      const git = gateway(reopen, () => now);
+      await fence.start(POLICY, DEADLINE);
+      const resume = git.hold();
+
+      const pending = git.serve(candidatePush());
+      await git.minting;
+      expect(git.minted).toEqual(["main-repo:write"]);
+      // Released well before the deadline, while the token is being minted.
+      now += 1_000;
+      await fence.retire();
+      resume();
+      const response = await pending;
+
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("retired");
+      expect(git.forwarded).toEqual([]);
+    });
+  });
+
+  it("refuses a container whose destroy failed, though its grant has time left", async () => {
+    await withFence(async ({ fence, fake, reopen }) => {
+      const git = gateway(reopen, () => START + 1_000);
+      await fence.start(POLICY, DEADLINE);
+      expect((await git.serve(candidatePush())).status).toBe(200);
+      fake.destroyFails = true;
+
+      await expect(fence.retire()).rejects.toThrow("scripted destroy failure");
+      expect(fake.running).toBe(true);
+      const response = await git.serve(candidatePush());
+
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("retired");
+      // Refused before a token was minted for it.
+      expect(git.minted).toEqual(["main-repo:write"]);
+      expect(git.forwarded).toHaveLength(1);
+    });
+  });
+
+  it("refuses the old sandbox's grant after the same attempt is readmitted in a fresh one", async () => {
+    await withFence(async ({ fence: old }) => {
+      await old.start(POLICY, DEADLINE);
+      await old.retire();
+      // The readmitted attempt runs in another object, under the same policy and candidate prefix.
+      const fresh = env.REPO.getByName(crypto.randomUUID());
+      await runInDurableObject(fresh, async (_instance, state) => {
+        const replacement = new SandboxFence(
+          state.storage,
+          new FakeContainer().container,
+          () => START,
+        );
+        await replacement.start(POLICY, DEADLINE);
+        const oldGit = gateway(
+          () => old,
+          () => START + 1_000,
+        );
+        const freshGit = gateway(
+          () => replacement,
+          () => START + 1_000,
+        );
+
+        expect(await (await oldGit.serve(candidatePush())).text()).toContain("retired");
+        expect((await freshGit.serve(candidatePush())).status).toBe(200);
+        expect(oldGit.minted).toEqual([]);
+        expect(oldGit.forwarded).toEqual([]);
+        expect(freshGit.forwarded).toHaveLength(1);
+      });
     });
   });
 });

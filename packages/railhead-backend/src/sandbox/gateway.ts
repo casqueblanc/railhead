@@ -9,7 +9,11 @@
 // The grant lapses at the sandbox's deadline, and the gateway holds it to that through every await:
 // it checks the grant on arrival, after reading a push's commands and after minting a token, so
 // nothing is forwarded once the grant has lapsed, and at the deadline it stops reading the
-// sandbox's body and aborts the upstream request.
+// sandbox's body and aborts the upstream request. The grant also ends when the sandbox is retired
+// early: before minting a token and again before forwarding, the gateway asks the sandbox's object
+// whether its incarnation is still live, and refuses unless it confirms. A request already
+// forwarded when retirement happens is not recalled; it can only write under the attempt's
+// candidate prefix.
 
 import { ReceivePackHeadParser, type RefUpdate } from "../git/pktLine";
 import type { SandboxGrant } from "./policy";
@@ -25,6 +29,11 @@ export interface GatewayDeps {
   fetch: (request: Request) => Promise<Response>;
   /** The current time, in milliseconds since the Unix epoch, compared with the grant's deadline. */
   now: () => number;
+  /**
+   * Whether the incarnation holding the grant that lapses at `expiresAt` is still live. Anything
+   * but `true`, including a rejection, refuses the request.
+   */
+  current: (expiresAt: number) => Promise<boolean>;
 }
 
 /** Why the gateway refused a request. Sent back to the sandbox as the body of a 403. */
@@ -39,7 +48,8 @@ export type GatewayRefusal =
   | "repository"
   | "read-only"
   | "push"
-  | "ref";
+  | "ref"
+  | "retired";
 
 const GIT_PATH = /^\/git\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
@@ -82,10 +92,12 @@ export async function serveGitGateway(
     body = request.body;
   }
 
+  if (!(await isCurrent(grant, deps))) return refuse("retired");
   // The sandbox's own Authorization header, if any, is dropped: only the minted token goes out.
   const headers = new Headers(request.headers);
   const token = await deps.mint(repo, write ? "write" : "read");
   if (lapsed()) return refuse("policy");
+  if (!(await isCurrent(grant, deps))) return refuse("retired");
   headers.set("Authorization", `Bearer ${token}`);
   // A redirect goes back to the sandbox, so the token never follows it to an unchecked URL and the
   // sandbox's next request passes through these checks again.
@@ -98,6 +110,15 @@ export async function serveGitGateway(
       redirect: "manual",
     }),
   );
+}
+
+// A failed check is a refusal: the grant holds only while the sandbox's object confirms it.
+async function isCurrent(grant: SandboxGrant, deps: GatewayDeps): Promise<boolean> {
+  try {
+    return (await deps.current(grant.expiresAt)) === true;
+  } catch {
+    return false;
+  }
 }
 
 type PushCheck =

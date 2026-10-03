@@ -9,8 +9,10 @@
 //
 // The deadline is enforced here as well as in the repository: `start` schedules `expire` for the
 // deadline in the object's own durable alarm, commands are cut to the remaining lifetime, and the
-// outbound grant lapses at the same moment. A wake-up that arrives early schedules itself again, so
-// a scheduler that runs callbacks before their time cannot consume the deadline.
+// outbound grant lapses at the same moment. The grant also ends at retirement: the gateway asks
+// `grantCurrent` before it uses it, and that is false from the moment retirement is recorded. A
+// wake-up that arrives early schedules itself again, so a scheduler that runs callbacks before their
+// time cannot consume the deadline.
 //
 // Retirement is recorded before the container is destroyed and confirmed after, and every attempt
 // first schedules a retry wake-up, so a failed destroy, or one cut off by a restart, is retried with
@@ -18,6 +20,7 @@
 // the sandbox's slot until it releases the sandbox itself, whatever the fence confirmed.
 
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
+import type { BoundedOutput } from "./output";
 import type { SandboxGrant, SandboxPolicy } from "./policy";
 
 /** The command that confirms a started container answers. */
@@ -27,11 +30,11 @@ export const START_PROBE = "git --version";
 export interface FencedContainer {
   /** Points the container's outbound requests at the Git gateway under `grant`. */
   route(grant: SandboxGrant): Promise<void>;
-  /** Runs one command, starting the container if it is not running. */
+  /** Runs one command, starting the container if it is not running. Its output is bounded. */
   exec(
     command: string,
     options: { timeoutMs: number; env?: Record<string, string>; cwd?: string },
-  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  ): Promise<BoundedOutput>;
   /** Destroys the container. Destroying one that is not running succeeds. */
   destroy(): Promise<void>;
   /**
@@ -112,7 +115,7 @@ export class SandboxFence {
   }
 
   /** Runs one command, cut to the incarnation's remaining lifetime. */
-  exec(command: SandboxCommand): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  exec(command: SandboxCommand): Promise<BoundedOutput> {
     return this.#track(async () => {
       const state = this.#read();
       if (state === null) throw new SandboxFenceError("not_started");
@@ -128,6 +131,20 @@ export class SandboxFence {
       if (this.#clock() >= state.deadline) return this.#expireFrom(state.deadline);
       return result;
     });
+  }
+
+  /**
+   * Whether the outbound grant that lapses at `expiresAt` is still this live incarnation's. False
+   * once retirement is recorded, which happens before the container is touched.
+   */
+  grantCurrent(expiresAt: number): boolean {
+    const state = this.#read();
+    return (
+      state !== null &&
+      state.phase === "live" &&
+      state.deadline === expiresAt &&
+      this.#clock() < state.deadline
+    );
   }
 
   /**

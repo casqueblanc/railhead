@@ -4,16 +4,20 @@
 // The container starts with the internet off and HTTPS intercepted. Every HTTP and HTTPS request it
 // makes goes to an outbound handler running in this Worker, outside the container: before a policy
 // is set that handler refuses everything, and afterwards it is the Git gateway for that policy until
-// the sandbox's deadline. No token is ever placed in the container; the gateway adds one to each
-// request it forwards. Each object serves one incarnation behind a `SandboxFence` (see `fence.ts`).
+// the sandbox's deadline or its retirement, whichever comes first: before it mints a token and again
+// before it forwards, the gateway asks this object whether the incarnation is still live. No token is
+// ever placed in the container; the gateway adds one to each request it forwards. Each object serves
+// one incarnation behind a `SandboxFence` (see `fence.ts`). Command output is read as a stream and
+// bounded here, before it crosses RPC (see `output.ts`).
 //
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
 
 import { ContainerProxy, Sandbox, getSandbox } from "@cloudflare/sandbox";
-import type { SandboxCommand, SandboxDriver } from "./entry";
+import { MAX_OUTPUT_BYTES, type SandboxCommand, type SandboxDriver } from "./entry";
 import { SandboxFence } from "./fence";
 import { serveGitGateway } from "./gateway";
+import { readBoundedExec, type BoundedOutput } from "./output";
 import { parseSandboxGrant, type SandboxPolicy } from "./policy";
 
 export { ContainerProxy };
@@ -42,12 +46,14 @@ export class RailheadSandbox extends Sandbox<Env> {
     this.ctx.storage,
     {
       route: (grant) => this.setOutboundHandler(GIT_GATEWAY, grant),
-      exec: (command, options) =>
-        this.execWithSessionToken(command, SESSIONLESS, {
+      exec: async (command, options) => {
+        const stream = await this.execStreamWithSessionToken(command, SESSIONLESS, {
           timeout: options.timeoutMs,
           ...(options.env === undefined ? {} : { env: options.env }),
           ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-        }),
+        });
+        return readBoundedExec(stream, MAX_OUTPUT_BYTES);
+      },
       destroy: () => this.destroy(),
       wake: async (at) => {
         await this.schedule(wakeTime(at), "railheadExpire");
@@ -62,10 +68,13 @@ export class RailheadSandbox extends Sandbox<Env> {
   }
 
   /** Runs one command in the incarnation, cut to its remaining lifetime. */
-  async railheadExec(
-    command: SandboxCommand,
-  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  async railheadExec(command: SandboxCommand): Promise<BoundedOutput> {
     return this.#fence.exec(command);
+  }
+
+  /** Whether the incarnation whose grant lapses at `expiresAt` may still use it. */
+  async railheadGrantCurrent(expiresAt: number): Promise<boolean> {
+    return this.#fence.grantCurrent(expiresAt);
   }
 
   /** Retires the incarnation for good and destroys its container. */
@@ -84,8 +93,11 @@ RailheadSandbox.outbound = () =>
   new Response("railhead sandbox gateway refused this request: policy\n", { status: 403 });
 
 RailheadSandbox.outboundHandlers = {
-  [GIT_GATEWAY]: (request: Request, env: Env, ctx: { params?: unknown }) =>
+  [GIT_GATEWAY]: (request: Request, env: Env, ctx: { containerId: string; params?: unknown }) =>
     serveGitGateway(request, parseSandboxGrant(ctx.params), {
+      // The object whose container sent the request: its fence says whether the grant still holds.
+      current: (expiresAt) =>
+        env.SANDBOX.get(env.SANDBOX.idFromString(ctx.containerId)).railheadGrantCurrent(expiresAt),
       mint: async (repo, scope) => {
         using handle = await env.ARTIFACTS.get(repo);
         const token = await handle.createToken(scope, TOKEN_TTL_SECONDS);

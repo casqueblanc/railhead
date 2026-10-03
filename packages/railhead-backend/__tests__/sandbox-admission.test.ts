@@ -49,6 +49,7 @@ class FakeDriver {
   destroy: Behaviour = "ok";
   exec: Behaviour = "ok";
   output = "done";
+  truncated = false;
   readonly #paused: (() => void)[] = [];
 
   resume(): void {
@@ -63,7 +64,7 @@ class FakeDriver {
     },
     exec: async (_name, _command: SandboxCommand) => {
       await this.#act(this.exec);
-      return { exitCode: 3, stdout: this.output, stderr: "err" };
+      return { exitCode: 3, stdout: this.output, stderr: "err", truncated: this.truncated };
     },
     destroy: async (name) => {
       await this.#act(this.destroy);
@@ -370,6 +371,22 @@ describe("sandbox lifetime and uncertain slots", () => {
       if (!run.ok) throw new Error("exec failed");
       expect(run.value.stdout).toHaveLength(MAX_OUTPUT_BYTES);
       expect(run.value.truncated).toBe(true);
+    });
+  });
+
+  it("reports output the driver cut and keeps the sandbox running", async () => {
+    await withPort(async ({ port, fake }) => {
+      await admit(port, 1);
+      fake.output = "first 64 KiB";
+      fake.truncated = true;
+
+      const run = await port.exec(attempt(1), { command: "yes", timeoutMs: 1_000 });
+
+      expect(run).toEqual({
+        ok: true,
+        value: { exitCode: 3, stdout: "first 64 KiB", stderr: "err", truncated: true },
+      });
+      expect(await states(port)).toEqual([`${attempt(1)}:running`]);
     });
   });
 });
