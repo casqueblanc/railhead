@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 // `events.ts` has no imports and only erasable syntax, so it loads under plain `node`.
 import * as sharedEvents from "../../packages/railhead-shared/src/events.ts";
+import { parseCheckDefinitions } from "../../demo/upload-app/acceptance/select.ts";
 import {
   assertAskable,
   assertDemoTarget,
@@ -89,15 +90,31 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
     () => assertMatchesChecks(manifest, { decision: "other", current: suite("a", 1), suites: [] }),
     /different decision/,
   );
-  // A suite for an option the decision lacks, an option no suite checks, the wire-refused casing.
+  // A suite for an option the decision lacks, an option no suite checks.
+  const withOptions = (...keys: string[]) => ({
+    ...manifest,
+    decision: {
+      ...manifest.decision,
+      options: keys.map((key) => ({ key, label: `Option ${key}` })),
+    },
+  });
   assert.throws(
     () =>
-      assertMatchesChecks(manifest, {
+      assertMatchesChecks(withOptions("a", "c"), {
         decision: "upload-size-limit",
         current: suite("a", 1),
-        suites: [...both, suite("c", 3)],
+        suites: both,
       }),
-    /suites\[2\] tags an option the decision lacks/,
+    /suites\[1\] tags an option the decision lacks/,
+  );
+  assert.throws(
+    () =>
+      assertMatchesChecks(withOptions("a", "b", "c"), {
+        decision: "upload-size-limit",
+        current: suite("a", 1),
+        suites: both,
+      }),
+    /offers c, which no checks.json suite tags/,
   );
   assert.throws(
     () =>
@@ -108,26 +125,7 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
       }),
     /offers b, which no checks.json suite tags/,
   );
-  assert.throws(
-    () =>
-      assertMatchesChecks(manifest, {
-        decision: "upload-size-limit",
-        current: suite("A", 1),
-        suites: [suite("A", 1), suite("B", 2)],
-      }),
-    /suites\[0\] tags an option the decision lacks/,
-  );
-  assert.throws(
-    () =>
-      assertMatchesChecks(manifest, {
-        decision: "upload-size-limit",
-        current: suite("c", 1),
-        suites: both,
-      }),
-    /current names an option the decision lacks/,
-  );
-  // The option in force at a version no suite carries, or no usable version: the app's checks
-  // could not start.
+  // The option in force at a version no suite carries: the app's checks could not start.
   assert.throws(
     () =>
       assertMatchesChecks(manifest, {
@@ -135,19 +133,10 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
         current: suite("a", 2),
         suites: both,
       }),
-    /no suite tagged a@2, the one in force/,
+    (error) =>
+      error instanceof SeedRefusal &&
+      /app would refuse its checks: No acceptance suite is tagged a@2/.test(error.message),
   );
-  for (const version of [0, 1.5, "1", null]) {
-    assert.throws(
-      () =>
-        assertMatchesChecks(manifest, {
-          decision: "upload-size-limit",
-          current: { option: "a", version },
-          suites: both,
-        }),
-      /current.version must be a positive integer/,
-    );
-  }
   assert.doesNotThrow(() =>
     assertMatchesChecks(manifest, {
       decision: "upload-size-limit",
@@ -155,6 +144,88 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
       suites: both,
     }),
   );
+});
+
+/** The committed checks with `edit` applied to a copy. */
+function committedChecks(edit: (checks: { current: unknown; suites: unknown[] }) => void): unknown {
+  const checks: unknown = JSON.parse(
+    readFileSync(join(root, "demo", "upload-app", "acceptance", "checks.json"), "utf8"),
+  );
+  assert.ok(typeof checks === "object" && checks !== null);
+  assert.ok("current" in checks && "suites" in checks && Array.isArray(checks.suites));
+  const copy = { ...checks, current: checks.current, suites: [...checks.suites] };
+  edit(copy);
+  return copy;
+}
+
+test("the seed accepts exactly the checks the standalone app accepts", () => {
+  const manifest = loadManifest(manifestPath);
+  const both = [suite("a", 1), suite("b", 2)];
+  const near: [string, unknown][] = [
+    // The review's case: the current version is numeric, the suite carrying it a string.
+    [
+      "a string suite version",
+      committedChecks((c) => (c.suites[0] = { ...suite("a", 1), version: "1" })),
+    ],
+    // A malformed version on a suite that is not the one in force.
+    ...[0, -2, 2.5, "2", null, true, 2 ** 53].map((version): [string, unknown] => [
+      `suite version ${JSON.stringify(version)}`,
+      {
+        decision: "upload-size-limit",
+        current: suite("a", 1),
+        suites: [suite("a", 1), { ...suite("b", 2), version }],
+      },
+    ]),
+    ...[0, 1.5, "1", null].map((version): [string, unknown] => [
+      `current version ${JSON.stringify(version)}`,
+      { decision: "upload-size-limit", current: { option: "a", version }, suites: both },
+    ]),
+    [
+      "a missing suite version",
+      {
+        decision: "upload-size-limit",
+        current: suite("a", 1),
+        suites: [suite("a", 1), { option: "b", file: "acceptance/option-b.test.ts" }],
+      },
+    ],
+    [
+      "a duplicate tag",
+      { decision: "upload-size-limit", current: suite("a", 1), suites: [...both, suite("a", 1)] },
+    ],
+    [
+      "a suite file outside acceptance/",
+      {
+        decision: "upload-size-limit",
+        current: suite("a", 1),
+        suites: [suite("a", 1), { ...suite("b", 2), file: "../option-b.test.ts" }],
+      },
+    ],
+    [
+      "an uppercase option",
+      {
+        decision: "upload-size-limit",
+        current: suite("A", 1),
+        suites: [suite("A", 1), suite("B", 2)],
+      },
+    ],
+    ["no suites", { decision: "upload-size-limit", current: suite("a", 1), suites: [] }],
+  ];
+  for (const [name, checks] of near) {
+    assert.throws(() => parseCheckDefinitions(checks), Error, `the app accepts ${name}`);
+    assert.throws(
+      () => assertMatchesChecks(manifest, checks),
+      (error) => error instanceof SeedRefusal && /app would refuse its checks/.test(error.message),
+      `the seed accepts ${name}`,
+    );
+  }
+  // The largest version the app accepts is accepted by the seed as well.
+  const largest = {
+    decision: "upload-size-limit",
+    current: suite("a", Number.MAX_SAFE_INTEGER),
+    suites: [suite("a", Number.MAX_SAFE_INTEGER), suite("b", 2)],
+  };
+  assert.doesNotThrow(() => parseCheckDefinitions(largest));
+  assert.doesNotThrow(() => assertMatchesChecks(manifest, largest));
 });
 
 /** The `ask` route's wire fixture, which the backend and the Rust protocol crate both check. */

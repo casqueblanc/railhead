@@ -191,6 +191,39 @@ test("the acceptance checks are read from the selected commit, never the working
   );
 });
 
+test("checks the standalone app would refuse are refused before any bundle is written", async () => {
+  const repo = sourceRepo("suite-versions");
+  const committed: unknown = JSON.parse(readFileSync(join(repo, CHECKS), "utf8"));
+  assert.ok(typeof committed === "object" && committed !== null);
+  const out = join(scratch, "suite-versions.bundle");
+  // The current suite's version as a string while current.version stays numeric, then a malformed
+  // version on the suite that is not in force.
+  for (const [a, b] of [
+    ["1", 2],
+    [1, 0],
+  ]) {
+    const checks = {
+      ...committed,
+      current: { option: "a", version: 1 },
+      suites: [
+        { option: "a", version: a, file: "acceptance/option-a.test.ts" },
+        { option: "b", version: b, file: "acceptance/option-b.test.ts" },
+      ],
+    };
+    writeFileSync(join(repo, CHECKS), `${JSON.stringify(checks)}\n`);
+    git(repo, ["commit", "--quiet", "--all", "-m", "chore: change a suite version"]);
+    await assert.rejects(
+      run(["bundle", "--out", out, "--source-root", repo]),
+      /app would refuse its checks: checks\.json suites\[[01]\]: version must be a positive integer/,
+    );
+    assert.equal(existsSync(out), false);
+    await assert.rejects(
+      run(["seed", "--dry-run", "--source-root", repo]),
+      /app would refuse its checks/,
+    );
+  }
+});
+
 test("the manifest is read from the selected commit, never the working tree", async () => {
   const repo = sourceRepo("manifest");
   const committed = readFileSync(join(repo, MANIFEST), "utf8");

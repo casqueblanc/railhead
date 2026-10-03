@@ -6,9 +6,13 @@
 // limits restate those of `@railhead/shared/events` and `agent-api`, which this package cannot
 // import under plain `node`. The decision must pass the agent wire's `ask` rules, since an agent
 // opens it by asking; `manifest.test.ts` checks the restated rules against the shared source and
-// the wire fixtures.
+// the wire fixtures. `checks.json` is read by the app's own parser instead, so the seed accepts
+// exactly the checks the standalone app can start with.
 
 import { readFileSync } from "node:fs";
+
+// `select.ts` has no imports and only erasable syntax, so it loads under plain `node`.
+import { parseCheckDefinitions } from "../../demo/upload-app/acceptance/select.ts";
 
 /** The only organisation the seed and reset commands may touch. */
 export const DEMO_ORG = "demo";
@@ -224,45 +228,32 @@ export function assertAskable(ask: Ask): void {
 }
 
 /**
- * Checks the decision against the app's `acceptance/checks.json`: the same decision key, a suite
- * for every option and an option for every suite, and a suite tagged with the option and version
- * in force, so the check the train runs can follow any answer and the current one can start.
+ * Checks the decision against the app's `acceptance/checks.json`: checks the app's own parser
+ * accepts, the same decision key, a suite for every option and an option for every suite, so the
+ * check the train runs can follow any answer and the current one can start.
  */
 export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): void {
-  const root = record(checks, "checks.json");
-  if (root["decision"] !== manifest.decision.key) {
+  if (record(checks, "checks.json")["decision"] !== manifest.decision.key) {
     throw new SeedRefusal("checks.json names a different decision than the manifest.");
   }
+  let definitions: ReturnType<typeof parseCheckDefinitions>;
+  try {
+    definitions = parseCheckDefinitions(checks);
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    throw new SeedRefusal(`The app would refuse its checks: ${error.message}`, { cause: error });
+  }
   const offered = new Set(manifest.decision.options.map((option) => option.key));
-  const tagged = new Set<string>();
-  const versions = new Set<string>();
-  for (const [index, entry] of list(root["suites"], "checks.json suites").entries()) {
-    const suite = record(entry, `checks.json suites[${index}]`);
-    const option = suite["option"];
-    if (typeof option !== "string" || !offered.has(option)) {
+  for (const [index, suite] of definitions.suites.entries()) {
+    if (!offered.has(suite.option)) {
       throw new SeedRefusal(`checks.json suites[${index}] tags an option the decision lacks.`);
     }
-    tagged.add(option);
-    versions.add(`${option}@${String(suite["version"])}`);
   }
+  const tagged = new Set<string>(definitions.suites.map((suite) => suite.option));
   for (const option of offered) {
     if (!tagged.has(option)) {
       throw new SeedRefusal(`The decision offers ${option}, which no checks.json suite tags.`);
     }
-  }
-  const current = record(root["current"], "checks.json current");
-  const option = current["option"];
-  if (typeof option !== "string" || !offered.has(option)) {
-    throw new SeedRefusal("checks.json current names an option the decision lacks.");
-  }
-  const version = current["version"];
-  if (typeof version !== "number" || !Number.isSafeInteger(version) || version <= 0) {
-    throw new SeedRefusal("checks.json current.version must be a positive integer.");
-  }
-  if (!versions.has(`${option}@${version}`)) {
-    throw new SeedRefusal(
-      `checks.json has no suite tagged ${option}@${version}, the one in force.`,
-    );
   }
 }
 
