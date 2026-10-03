@@ -111,6 +111,28 @@ test("seed and reset without --dry-run, and unknown commands, are refused", asyn
   await assert.rejects(run(["seed", "--dry-run", "--source-root", scratch]), /not a commit/);
 });
 
+test("bundle --dry-run is refused and writes nothing", async () => {
+  const absent = join(scratch, "dry-run.bundle");
+  await assert.rejects(
+    run(["bundle", "--dry-run", "--out", absent, "--source-root", source]),
+    /bundle has no dry run/,
+  );
+  assert.equal(existsSync(absent), false);
+
+  // An existing file keeps its bytes, and the refusal comes before any other check fails.
+  const existing = join(scratch, "existing.bundle");
+  writeFileSync(existing, "not a bundle");
+  await assert.rejects(
+    run(["bundle", "--dry-run", "--out", existing, "--source-root", source]),
+    /bundle has no dry run/,
+  );
+  await assert.rejects(
+    run(["bundle", "--dry-run", "--out", existing, "--source-root", scratch]),
+    /bundle has no dry run/,
+  );
+  assert.equal(readFileSync(existing, "utf8"), "not a bundle");
+});
+
 test("the acceptance checks are read from the selected commit, never the working tree", async () => {
   const repo = sourceRepo("checks");
   const compatible = readFileSync(join(repo, CHECKS), "utf8");

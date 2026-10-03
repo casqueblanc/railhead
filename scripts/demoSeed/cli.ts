@@ -2,7 +2,8 @@
 //
 //   seed --dry-run      plan the seed of demo/upload-app and name every target
 //   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else
-//   bundle --out FILE   write the imported main as a Git bundle for the owner to push
+//   bundle --out FILE   write the imported main as a Git bundle for the owner to push; refuses
+//                       --dry-run, since seed --dry-run is the preview
 //
 // `--org` and `--repo` may be given, and anything but demo/upload-app is refused. Seed and reset
 // only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing
@@ -44,6 +45,10 @@ export async function run(argv: readonly string[]): Promise<string[]> {
   });
   const [command, ...extra] = positionals;
   if (extra.length > 0) throw new SeedRefusal(`Unexpected arguments: ${extra.join(" ")}.`);
+  // Refused before any other work: a preview must never leave a bundle behind.
+  if (command === "bundle" && values["dry-run"]) {
+    throw new SeedRefusal("bundle has no dry run; use seed --dry-run to plan the import.");
+  }
 
   const manifest = loadManifest(values.manifest);
   assertDemoTarget(values.org ?? manifest.org, values.repo ?? manifest.repo);
