@@ -77,7 +77,7 @@ const GRANT_ID = /^dsc_[0-9a-f]{32}$/;
 const EXPIRY = /^[1-9][0-9]{0,15}$/;
 
 /** The migration owner name of the control's tables. */
-const CONTROL_OWNER = "demo_seed";
+const CONTROL_OWNER = "demo_seed_control";
 
 /** Released schema steps. Append a step to change it; never edit one. */
 const MIGRATIONS: readonly string[] = [

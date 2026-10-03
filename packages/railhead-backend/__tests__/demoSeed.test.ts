@@ -111,6 +111,8 @@ class SeedFake implements SeedArtifacts {
   /** How the next push misbehaves. */
   pushFault: "none" | "lose-response" | "drop" | "reject" = "none";
   failNextDelete = false;
+  /** A repository whose deletion fails every time, until cleared. */
+  failDeleteOf: string | null = null;
 
   /** Holds the next `create` before it creates anything, as a request whose effect is delayed. */
   holdNextCreate(): { reached: Promise<void>; release: () => void } {
@@ -169,7 +171,7 @@ class SeedFake implements SeedArtifacts {
   }
 
   async delete(name: string): Promise<boolean> {
-    if (this.failNextDelete) {
+    if (this.failNextDelete || this.failDeleteOf === name) {
       this.failNextDelete = false;
       throw new FakeArtifactsError("INTERNAL_ERROR");
     }
@@ -533,7 +535,7 @@ describe("seed target", () => {
       expect(seed.fake.liveTokens(main)).toEqual([holder]);
     }));
 
-  it("resets by deleting main and the recorded forks by name, and nothing else", () =>
+  it("resets by deleting the recorded forks and then main by name, and nothing else", () =>
     withTarget(async ({ seed, target, storage, host, main }) => {
       await target.seed(HEAD, fakePack());
       seed.fake.seed("rh-m-another-repo", [OTHER_HEAD]);
@@ -547,7 +549,7 @@ describe("seed target", () => {
       if (!fork.ok) throw new Error(fork.code);
 
       expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
-      expect(seed.deleted).toEqual([main, fork.value.repo]);
+      expect(seed.deleted).toEqual([fork.value.repo, main]);
       expect([...seed.fake.repos.keys()]).toEqual(["rh-m-another-repo"]);
       expect(host.wipes).toBe(1);
 
@@ -564,6 +566,71 @@ describe("seed target", () => {
       expect(seed.fake.repos.has(main)).toBe(true);
       expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
       expect(host.wipes).toBe(1);
+    }));
+
+  it("keeps main through a reset whose fork deletion failed, so a seed pushes nothing", () =>
+    withTarget(async ({ seed, target, storage, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      const adapter = createArtifactsAdapter({
+        repoId: REPO_ID,
+        storage,
+        clock: seed.fake.clock,
+        namespace: seed.fake,
+      });
+      const fork = await adapter.forkForClaim("clm_claim0001", HEAD);
+      if (!fork.ok) throw new Error(fork.code);
+      const pushes = seed.pushes.length;
+      const mints = seed.fake.createTokenCalls;
+
+      seed.failDeleteOf = fork.value.repo;
+      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      expect(seed.deleted).toEqual([]);
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(host.wipes).toBe(0);
+
+      // Main is still in place, so the seed has nothing to create, mint or push.
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.pushes.length).toBe(pushes);
+      expect(seed.fake.createTokenCalls).toBe(mints);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+
+      seed.failDeleteOf = null;
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(seed.deleted).toEqual([fork.value.repo, main]);
+      expect(host.wipes).toBe(1);
+    }));
+
+  it("refuses to seed an initialized Repo whose main is missing or empty until a reset", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      const pushes = seed.pushes.length;
+      const mints = seed.fake.createTokenCalls;
+
+      // Main lost its history, then the repository itself, under an initialized Repo.
+      seed.fake.repos.get(main)?.commits.splice(0);
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({
+        ok: false,
+        code: "action_stale",
+      });
+      seed.fake.repos.delete(main);
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({
+        ok: false,
+        code: "action_stale",
+      });
+      expect(seed.fake.repos.has(main)).toBe(false);
+      expect(seed.pushes.length).toBe(pushes);
+      expect(seed.fake.createTokenCalls).toBe(mints);
+      expect(host.initializeCalls).toBe(1);
+
+      // A finished reset clears the way, and the seed creates main again and leaves no token.
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
     }));
 });
 

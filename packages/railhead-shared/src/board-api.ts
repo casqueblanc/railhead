@@ -289,7 +289,8 @@ export const MAX_DEMO_BUNDLE_BYTES = 8 * 1024 * 1024;
 export type DemoSeedAction =
   /**
    * Create `demo/upload-app` if it is missing, and import the bundle whose main is `head` as its
-   * main. A repeat with the same head succeeds; a main at another head fails with `action_stale`.
+   * main. A repeat with the same head succeeds. A main at another head, or a missing or empty main
+   * left by a reset that did not finish, fails with `action_stale`.
    */
   | { kind: "demo.seed"; head: CommitSha }
   /** Delete `demo/upload-app` and its Artifacts repositories. Nothing else is touched. */

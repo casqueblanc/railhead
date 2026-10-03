@@ -5,12 +5,14 @@
 // main at any other head is refused, and only a missing main is pushed. A push whose outcome is
 // unknown is settled by reading main again, never by pushing twice. The Repo is initialized last,
 // so the board shows the repository only once its main is in place; a seed that failed partway
-// finishes on the next run.
+// finishes on the next run. An initialized Repo is never pushed to: if its main is missing or
+// empty, a reset failed partway, and the seed is refused until a reset finishes.
 //
-// Reset deletes, by exact name, the repository's main Artifacts repository and every fork its
-// Artifacts table recorded, then the Repo's own storage. It never lists the namespace to choose
-// what to delete. A failed deletion stops the reset before the Repo's storage is wiped, so the fork
-// names stay readable and the next reset finishes the job.
+// Reset deletes, by exact name, every fork the Repo's Artifacts table recorded, then the main
+// Artifacts repository, then the Repo's own storage. It never lists the namespace to choose what to
+// delete. A failed deletion stops the reset before the Repo's storage is wiped, so the fork names
+// stay readable and the next reset finishes the job; since main goes last, a reset that stopped
+// early leaves main in place.
 //
 // One seed or reset runs at a time per object; a second is refused as busy. A binding call that
 // changes Artifacts (create, token mint, delete) is recorded in storage before it starts, and a
@@ -100,7 +102,7 @@ export interface SeedTarget {
 }
 
 /** The migration owner name of the seed's own table. */
-const SEED_OWNER = "demo_seed";
+const SEED_OWNER = "demo_seed_target";
 
 /** Released schema steps of the seed's own table. Append a step to change it; never edit one. */
 const MIGRATIONS: readonly string[] = [
@@ -311,9 +313,10 @@ export function createSeedTarget(
   }
 
   /**
-   * Revokes every live token on main, then lists again to confirm none is left. The Repo is not
-   * initialized yet, so no other module holds a token on main: every one is the seed's. Clears the
-   * create and mint records once main is clean.
+   * Revokes every live token on main, then lists again to confirm none is left. Clears the create
+   * and mint records once main is clean. Tokens are owed only between a seed's create or mint and
+   * the sweep that must precede initialization, and an initialized Repo is never created or minted
+   * on, so while any are owed no other module holds a token on main: every one is the seed's.
    */
   async function sweepTokens(artifacts: SeedArtifacts, name: string): Promise<boolean> {
     try {
@@ -365,6 +368,7 @@ export function createSeedTarget(
         let outcome: PushOutcome | null = null;
         if (before.value !== head) {
           if (before.value !== null && before.value !== "missing") return otherHead();
+          if (context.initialized()) return halfReset();
           const access = await writeAccess(artifacts, name, before.value !== "missing");
           if (!access.ok) return access;
           outcome = await pushMain(
@@ -375,8 +379,7 @@ export function createSeedTarget(
         }
         // Every token a seed asked for is revoked before the Repo opens main to anyone, on a retry
         // that finds main already in place too. The records are cleared only by a clean sweep.
-        const swept =
-          context.initialized() || !tokensOwed() || (await sweepTokens(artifacts, name));
+        const swept = !tokensOwed() || (await sweepTokens(artifacts, name));
         // Whatever the push reported, main as Artifacts now holds it is the answer.
         const after = outcome === null ? before : await readMain(artifacts, name);
         if (!after.ok) return after;
@@ -403,7 +406,8 @@ export function createSeedTarget(
         const { artifacts } = context;
         if (artifacts === undefined) return noArtifacts();
         if (unresolved()) return busy();
-        const names = [await mainRepoName(context.repoId), ...forkNames()];
+        // Main goes last, so a deletion that fails leaves it in place behind the forks.
+        const names = [...forkNames(), await mainRepoName(context.repoId)];
         let deleted = context.initialized();
         for (const name of names) {
           try {
@@ -444,6 +448,13 @@ function busy(): PortResult<never> {
 
 function otherHead(): PortResult<never> {
   return fail("action_stale", "The demo repository's main holds another head. Reset it first.");
+}
+
+function halfReset(): PortResult<never> {
+  return fail(
+    "action_stale",
+    "The demo repository lost its main to a reset that did not finish. Reset it first.",
+  );
 }
 
 function artifactsFailed(): PortResult<never> {
