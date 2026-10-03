@@ -392,3 +392,84 @@ async fn a_damaged_clone_or_store_stops_before_any_request() -> anyhow::Result<(
     assert_eq!(requests(&server).await, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn refused_arguments_print_one_json_failure_and_exit_nonzero() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let world = world(&server.uri())?;
+    let cases: [(&[&str], &str); 6] = [
+        (&["--json", "status", "--agent", "Not Valid"], "'Not Valid'"),
+        (&["status", "--agent", "Not Valid", "--json"], "'Not Valid'"),
+        (&["--json", "status", "--unknown"], "'--unknown'"),
+        (&["--json", "deploy"], "'deploy'"),
+        (&["--json", "status", "--agent"], "--agent"),
+        (&["--json"], "subcommand"),
+    ];
+    for (args, named) in cases {
+        let run = rh(&world, world.clone.path(), None, args, "")?;
+        assert_eq!(run.code, Some(2), "{args:?}");
+        assert_eq!(run.stderr, "", "{args:?}");
+        assert_eq!(run.stdout.lines().count(), 1, "{args:?}: {}", run.stdout);
+        let envelope = run.json()?;
+        assert_eq!(envelope.pointer("/ok"), Some(&json!(false)), "{args:?}");
+        assert_eq!(
+            envelope.pointer("/error/code"),
+            Some(&json!("invalid_input")),
+            "{args:?}"
+        );
+        assert_eq!(envelope.pointer("/error/retryable"), Some(&json!(false)));
+        let message = envelope
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(message.contains(named), "{args:?}: {message}");
+        assert!(!message.contains('\n'), "{args:?}: {message}");
+    }
+    assert_eq!(requests(&server).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn refused_arguments_outside_json_keep_the_parser_output() -> anyhow::Result<()> {
+    let world = world("https://railhead.dev")?;
+    let text = rh(
+        &world,
+        world.outside.path(),
+        None,
+        &["status", "--unknown"],
+        "",
+    )?;
+    assert_eq!((text.code, text.stdout.as_str()), (Some(2), ""));
+    assert!(
+        text.stderr.contains("unexpected argument '--unknown'"),
+        "{}",
+        text.stderr
+    );
+
+    // Git owns stdout in credential mode, even with --json and a refused argument.
+    let credential = rh(
+        &world,
+        world.clone.path(),
+        None,
+        &["credential", "get", "--json", "--bogus"],
+        "",
+    )?;
+    assert_eq!((credential.code, credential.stdout.as_str()), (Some(2), ""));
+    assert!(
+        credential.stderr.contains("'--bogus'"),
+        "{}",
+        credential.stderr
+    );
+
+    // Explicit help and version stay the parser's, on stdout, with success.
+    for flag in ["--help", "--version"] {
+        let run = rh(&world, world.outside.path(), None, &["--json", flag], "")?;
+        assert_eq!(run.code, Some(0), "{flag}");
+        assert!(run.stdout.contains("rh"), "{flag}: {}", run.stdout);
+        assert!(
+            serde_json::from_str::<Value>(&run.stdout).is_err(),
+            "{flag}"
+        );
+    }
+    Ok(())
+}

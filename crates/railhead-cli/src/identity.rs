@@ -605,13 +605,41 @@ fn remove_if_present(path: &Path) -> Result<()> {
 }
 
 fn create_private_dir(dir: &Path) -> Result<()> {
+    create_private_dir_with(dir, sync_dir)
+}
+
+/// Creates `dir` and its missing ancestors, top down, and passes each new directory's parent to
+/// `sync_parent` before creating the next, so a new directory's name survives a crash once this
+/// returns. An existing directory is left as it was and its parent is not synced.
+fn create_private_dir_with(
+    dir: &Path,
+    mut sync_parent: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for path in dir.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+        match fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(path),
+            Err(source) => return Err(io_error("reading", path, source)),
+        }
+    }
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-        .create(dir)
-        .map_err(|source| io_error("creating", dir, source))
+    for path in missing.into_iter().rev() {
+        match builder.create(path) {
+            Ok(()) => {}
+            // Another process created it first; its entry still needs to be durable here.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(io_error("creating", path, source)),
+        }
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        sync_parent(parent)?;
+    }
+    Ok(())
 }
 
 /// Checks a store directory: a real directory, not a link, owned by the current user, with none
@@ -1149,6 +1177,102 @@ mod tests {
         } else {
             assert!(matches!(listed, Err(Error::NotOwned(path)) if path == Path::new("/")));
         }
+    }
+
+    /// Creates `dir` as the store does, recording every directory it syncs.
+    fn create_recording_syncs(dir: &Path) -> (Result<()>, Vec<PathBuf>) {
+        let mut synced = Vec::new();
+        let created = create_private_dir_with(dir, |parent| {
+            synced.push(parent.to_owned());
+            sync_dir(parent)
+        });
+        (created, synced)
+    }
+
+    #[test]
+    fn a_new_store_syncs_every_parent_that_gained_a_directory() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("railhead");
+        let dir = root.join("agents/atlas");
+        let (created, synced) = create_recording_syncs(&dir);
+        created?;
+        assert_eq!(
+            synced,
+            [home.path().to_owned(), root.clone(), root.join("agents")]
+        );
+        assert!(dir.is_dir());
+
+        // The store's first secret write goes through the same creation.
+        let store = FileStore::new(home.path().join("fresh"));
+        let key = Secret::new("key".to_owned());
+        store.create(&AgentName::new("atlas")?, SecretKind::SigningKey, &key)?;
+        assert_eq!(
+            fs::read(home.path().join("fresh/agents/atlas/key"))?,
+            b"key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_agent_syncs_only_agents_and_an_existing_one_syncs_nothing() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        create_private_dir(&home.path().join("agents/atlas"))?;
+        let (created, synced) = create_recording_syncs(&home.path().join("agents/boreas"));
+        created?;
+        assert_eq!(synced, [home.path().join("agents")]);
+
+        let (created, synced) = create_recording_syncs(&home.path().join("agents/boreas"));
+        created?;
+        assert_eq!(synced, Vec::<PathBuf>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_parent_sync_stops_creation_and_is_reported() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("railhead");
+        let mut calls = 0;
+        let created = create_private_dir_with(&root.join("agents/atlas"), |parent| {
+            calls += 1;
+            Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+        });
+        assert!(
+            matches!(created, Err(Error::Io { action: "syncing", path, .. }) if path == home.path())
+        );
+        assert_eq!(calls, 1);
+        assert!(root.is_dir() && !root.join("agents").exists());
+
+        // The last directory's sync failing is reported too, not taken as durable.
+        let mut later_calls = 0;
+        let failed = create_private_dir_with(&root.join("agents/atlas"), |parent| {
+            later_calls += 1;
+            if parent == root.join("agents") {
+                Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(failed, Err(Error::Io { action: "syncing", path, .. }) if path == root.join("agents"))
+        );
+        assert_eq!(later_calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_created_is_reported() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        fs::write(home.path().join("agents"), b"not a directory")?;
+        let (created, synced) = create_recording_syncs(&home.path().join("agents/atlas"));
+        assert!(matches!(
+            created,
+            Err(Error::Io {
+                action: "reading",
+                ..
+            })
+        ));
+        assert_eq!(synced, Vec::<PathBuf>::new());
+        Ok(())
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod commands {
     pub mod work;
 }
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -321,7 +322,11 @@ impl Render for VersionInfo {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => return refuse_arguments(&error, requested_mode(&args)),
+    };
     let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
     let mut out = Output::new(cli.mode(), &mut stdout, &mut stderr);
     match run(&cli, &mut out) {
@@ -332,6 +337,50 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The output mode the arguments ask for, read without parsing them, for reporting a parse failure.
+/// Only global flags precede the command, and `--agent` is the only one that takes a value.
+fn requested_mode(args: &[OsString]) -> Mode {
+    let mut json = false;
+    let mut command = None;
+    let mut rest = args.iter().skip(1).take_while(|arg| *arg != "--");
+    while let Some(arg) = rest.next() {
+        if arg == "--json" {
+            json = true;
+        } else if arg == "--agent" {
+            rest.next();
+        } else if command.is_none() && !arg.to_string_lossy().starts_with('-') {
+            command = Some(arg);
+        }
+    }
+    match (command.is_some_and(|command| command == "credential"), json) {
+        (true, _) => Mode::Credential,
+        (false, true) => Mode::Json,
+        (false, false) => Mode::Text,
+    }
+}
+
+/// Reports arguments the parser refused. JSON mode prints one `invalid_input` envelope on stdout;
+/// help, version and the other modes keep the parser's own output. Either way the exit status is
+/// the parser's, so it does not depend on `--json`.
+fn refuse_arguments(error: &clap::Error, mode: Mode) -> ExitCode {
+    if mode != Mode::Json || !error.use_stderr() {
+        error.exit();
+    }
+    // The parser's first line names the problem; usage and tips follow it.
+    let rendered = error.render().to_string();
+    let first = rendered.lines().next().unwrap_or_default();
+    let message = first.strip_prefix("error: ").unwrap_or(first).to_owned();
+    let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
+    // Nothing is left to report a failure to if printing the failure fails.
+    let _ = Output::new(mode, &mut stdout, &mut stderr).failure(&Failure {
+        code: Code::Local(LocalCode::InvalidInput),
+        message,
+        retryable: false,
+        next: None,
+    });
+    u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 fn run(cli: &Cli, out: &mut Output<'_>) -> Result<()> {
@@ -447,6 +496,36 @@ mod tests {
             kind(&["rh", "credential"]),
             Some(ErrorKind::MissingRequiredArgument)
         );
+    }
+
+    #[test]
+    fn a_refused_command_line_still_names_its_output_mode() {
+        let mode = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            requested_mode(&args)
+        };
+        assert_eq!(mode(&["rh", "--json", "status", "--unknown"]), Mode::Json);
+        assert_eq!(
+            mode(&["rh", "status", "--agent", "Not Valid", "--json"]),
+            Mode::Json
+        );
+        assert_eq!(mode(&["rh", "--json"]), Mode::Json);
+        assert_eq!(
+            mode(&["rh", "credential", "--json", "--bogus"]),
+            Mode::Credential
+        );
+        // `--agent`'s value is not the command, and nothing after `--` is a flag.
+        assert_eq!(
+            mode(&["rh", "--agent", "credential", "--json", "x"]),
+            Mode::Json
+        );
+        assert_eq!(
+            mode(&["rh", "--agent", "atlas", "credential", "--json"]),
+            Mode::Credential
+        );
+        assert_eq!(mode(&["rh", "ask", "--", "--json"]), Mode::Text);
+        assert_eq!(mode(&["rh", "deploy"]), Mode::Text);
+        assert_eq!(mode(&[]), Mode::Text);
     }
 
     #[test]
