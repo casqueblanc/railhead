@@ -22,6 +22,7 @@ vi.mock("../../features/enrollment/entry", () => ({
 }));
 // The page is tested apart from which leaf features are installed.
 vi.mock("../../features/issues/entry", () => ({ issuesEntry: { kind: "unavailable" } }));
+vi.mock("../../features/phone/entry", () => ({ phoneEntry: { kind: "unavailable" } }));
 
 const reversal = foldEvents(emptyBoardState(SYNTH_REPO), decisionReversal.events);
 const openQuestion = foldEvents(
