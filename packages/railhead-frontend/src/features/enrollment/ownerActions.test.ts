@@ -147,6 +147,20 @@ describe("performOwnerAction", () => {
     });
   });
 
+  it("asks the owner to retry shortly when the backend is busy", async () => {
+    const { owner } = ownerPort(async () => ({
+      ok: false,
+      code: "busy",
+      message: "<b>not settled</b>",
+    }));
+    const { authenticator } = fakeAuthenticator();
+    const outcome = await performOwnerAction(owner, authenticator, confirm, control());
+    expect(outcome).toEqual({
+      kind: "failed",
+      message: "The backend is busy. Nothing changed; try again shortly.",
+    });
+  });
+
   it("turns a lost session into a failure instead of throwing", async () => {
     const { owner } = ownerPort(() => Promise.reject(new Error("socket closed")));
     const { authenticator } = fakeAuthenticator();

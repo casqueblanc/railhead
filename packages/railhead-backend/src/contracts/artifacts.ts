@@ -19,6 +19,9 @@ export interface ArtifactsToken {
   expiresAt: number;
 }
 
+/** The outcome of `ArtifactsPort.revokeTokens`; only `revoked` ends a holder's access. */
+export type TokenRevocation = "revoked" | "pending_debt";
+
 /** Fork, read and token operations. There is no main-write token here; see `MainRefPort`. */
 export interface ArtifactsPort {
   /**
@@ -40,6 +43,15 @@ export interface ArtifactsPort {
     scope: "read" | "write",
     ttlMs: number,
   ): Promise<PortResult<ArtifactsToken>>;
-  /** Revokes every token for `repo`, as `ready` and lease expiry require. */
-  revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<void>>;
+  /**
+   * Revokes every token for `repo`, as `ready` and lease expiry require. `revoked` means no token
+   * minted for `repo` before the call can still be used: the listing covered every token and each
+   * live one was revoked, or every token the fork may hold has expired.
+   *
+   * `pending_debt` means the listing could not cover every token, so an earlier token may still be
+   * live. It is not a revocation: a caller must not grant a new holder write access to `repo` until
+   * a later call returns `revoked`. Meanwhile `token` refuses `repo`, and the debt ends by itself at
+   * most `MAX_TOKEN_TTL_MS` plus clock skew after it was first recorded.
+   */
+  revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<TokenRevocation>>;
 }
