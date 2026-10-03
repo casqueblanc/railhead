@@ -318,9 +318,17 @@ function settle(
   return value;
 }
 
-/** A refusal from `begin` because the work the intent rests on is no longer current. */
+/**
+ * A refusal from `begin` because the work the intent rests on is no longer current, or an item
+ * affecting one of its claims now waits for acknowledgement.
+ */
 function isFenceRefusal(code: PortErrorCode): boolean {
-  return code === "stale_generation" || code === "decision_superseded" || code === "check_mismatch";
+  return (
+    code === "stale_generation" ||
+    code === "decision_superseded" ||
+    code === "unacked_decision" ||
+    code === "check_mismatch"
+  );
 }
 
 /** Whether the intent's last attempt was old enough at `at` that it could no longer apply. */
