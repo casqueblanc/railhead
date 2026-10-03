@@ -21,6 +21,7 @@ import type {
   BoardListener,
   BoardResult,
   BoardSubscription,
+  CheckDetail,
   DemoSeedAction,
   DemoSeedApi,
   DemoSeedResult,
@@ -36,7 +37,7 @@ import type {
   PendingJoin,
   SubscriptionEnd,
 } from "@railhead/shared/board-api";
-import type { RailheadEvent, UserId } from "@railhead/shared/events";
+import type { CheckRunId, RailheadEvent, UserId } from "@railhead/shared/events";
 import type { PortResult } from "../contracts/result";
 import { parseEvent } from "../contracts/wireShape";
 import { demoSeedPort, type DemoSeedPort } from "../modules/demoSeed/entry";
@@ -131,6 +132,10 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
 
   async pendingJoins(): Promise<BoardResult<PendingJoin[]>> {
     return toBoard(await this.#repo.pendingJoins());
+  }
+
+  async checkDetail(checkRunId: CheckRunId): Promise<BoardResult<CheckDetail>> {
+    return toBoard(await this.#repo.checkDetail(checkRunId));
   }
 
   async owner(): Promise<OwnerApi> {

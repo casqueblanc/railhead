@@ -17,6 +17,7 @@ import { DurableObject } from "cloudflare:workers";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
 import type {
   ActionChallenge,
+  CheckDetail,
   DemoSeedAction,
   DemoSeedResult,
   DemoSeedState,
@@ -212,6 +213,13 @@ export class Repo extends DurableObject<Env> {
     const ports = this.#ports();
     if (ports === null) return missing();
     return ports.identity.pendingJoins();
+  }
+
+  /** What the checks module recorded for one check run. */
+  async checkDetail(checkRunId: string): Promise<PortResult<CheckDetail>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.checks.detail(checkRunId);
   }
 
   /** Prepares an owner action, through the owner module. */
