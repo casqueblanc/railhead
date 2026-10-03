@@ -92,8 +92,12 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
     this.#repo = repo;
   }
 
-  async readEvents(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
-    const result = await this.#repo.readEvents(cursor, limit);
+  async readEvents(
+    cursor: number,
+    limit: number,
+    history?: string,
+  ): Promise<BoardResult<EventPage>> {
+    const result = await this.#repo.readEvents(cursor, limit, history ?? null);
     if (!result.ok) return toBoard(result);
     // Workers RPC widens tuple types in transit, so each event's shape is established again.
     const page = result.value;
@@ -104,6 +108,7 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
         events: page.events.map(parseEvent),
         cursor: page.cursor,
         head: page.head,
+        history: page.history,
       },
     };
   }
@@ -111,11 +116,12 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
   async subscribe(
     cursor: number,
     listener: RpcStub<BoardListener>,
+    history?: string,
   ): Promise<BoardResult<BoardSubscription>> {
     // The listener stub is released when this call returns unless it is kept, so the bridge keeps
     // its own duplicate and releases it when the subscription ends.
     const bridge = new ListenerBridge(listener.dup());
-    const result = await this.#repo.subscribe(cursor, bridge);
+    const result = await this.#repo.subscribe(cursor, bridge, history ?? null);
     if (!result.ok) {
       bridge.end();
       return toBoard(result);

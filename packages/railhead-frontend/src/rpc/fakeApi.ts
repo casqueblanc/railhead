@@ -207,6 +207,7 @@ export class FakeBoard implements BoardSession {
           events,
           cursor: events.at(-1)?.seq ?? cursor,
           head: this.#log.length,
+          history: "fake",
         },
       };
     });

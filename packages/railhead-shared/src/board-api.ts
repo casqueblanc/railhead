@@ -58,7 +58,10 @@ export type BoardErrorCode =
   | "invalid_request"
   /** No such repository, or it is not visible to this session. */
   | "not_found"
-  /** The cursor is ahead of the log's head, so it belongs to another log. */
+  /**
+   * The cursor belongs to another log: it is ahead of the log's head, or it was read under a
+   * history the owner has since reset.
+   */
   | "cursor_ahead"
   /** The passkey assertion did not verify, or was for another challenge or origin. */
   | "proof_invalid"
@@ -101,6 +104,12 @@ export interface EventPage {
   cursor: number;
   /** The `seq` of the newest event in the log when the page was read, or 0 for an empty log. */
   head: number;
+  /**
+   * The history the log belongs to. A reset of the repository starts a new history whose `seq`
+   * numbers start again at 1, so a cursor is meaningful only together with the history it was
+   * read under.
+   */
+  history: string;
 }
 
 /** Why the backend ended a subscription. After any of these the board pages and resubscribes. */
@@ -150,10 +159,21 @@ export interface BoardSubscription extends RpcTarget {
 
 /** Read access to one repository's log, and the entry point for its owner's actions. */
 export interface BoardApi extends RpcTarget {
-  /** Reads up to `limit` events after `cursor`, with `limit` from 1 to `MAX_EVENT_PAGE`. */
-  readEvents(cursor: number, limit: number): Promise<BoardResult<EventPage>>;
-  /** Delivers every event after `cursor` to `listener` until cancelled or ended. */
-  subscribe(cursor: number, listener: BoardListener): Promise<BoardResult<BoardSubscription>>;
+  /**
+   * Reads up to `limit` events after `cursor`, with `limit` from 1 to `MAX_EVENT_PAGE`. `history`
+   * is the `EventPage.history` the cursor was read under; when it is given and is no longer the
+   * log's history, the call fails with `cursor_ahead`.
+   */
+  readEvents(cursor: number, limit: number, history?: string): Promise<BoardResult<EventPage>>;
+  /**
+   * Delivers every event after `cursor` to `listener` until cancelled or ended. `history` is
+   * checked as `readEvents` checks it.
+   */
+  subscribe(
+    cursor: number,
+    listener: BoardListener,
+    history?: string,
+  ): Promise<BoardResult<BoardSubscription>>;
   /** The joins waiting for the owner, oldest first. */
   pendingJoins(): Promise<BoardResult<PendingJoin[]>>;
   /** The owner's passkey actions for this repository. */

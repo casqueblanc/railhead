@@ -855,7 +855,7 @@ const ARTIFACTS_ERROR_CODES = [
 ] as const satisfies readonly ArtifactsErrorCode[];
 
 /** The `ArtifactsError` code of `error`, or `null` for any other error. */
-function artifactsCode(error: unknown): ArtifactsErrorCode | null {
+export function artifactsCode(error: unknown): ArtifactsErrorCode | null {
   if (!(error instanceof Error) || !("code" in error)) return null;
   const { code } = error;
   return ARTIFACTS_ERROR_CODES.find((known) => known === code) ?? null;

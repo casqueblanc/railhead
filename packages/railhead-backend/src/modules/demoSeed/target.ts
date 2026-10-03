@@ -27,6 +27,7 @@ import type { DemoSeedResult, DemoSeedState } from "@railhead/shared/board-api";
 import { isCommitSha, type CommitSha, type RepoId } from "@railhead/shared/events";
 import {
   ARTIFACTS_LIMITS,
+  artifactsCode,
   boundedCall,
   MINT_CLOCK_SKEW_MS,
   mainRepoName,
@@ -468,11 +469,4 @@ function halfReset(): PortResult<never> {
 
 function artifactsFailed(): PortResult<never> {
   return fail("internal", "Artifacts did not answer as expected; try again.");
-}
-
-/** The `ArtifactsError` code of `error`, or `undefined` for any other error. */
-function artifactsCode(error: unknown): string | undefined {
-  if (!(error instanceof Error)) return undefined;
-  const code: unknown = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
 }

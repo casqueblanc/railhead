@@ -93,7 +93,7 @@ async function until(condition: () => boolean, ms = 5_000): Promise<void> {
 }
 
 describe("demo reset", () => {
-  it("ends live subscriptions, and a new one follows only the new history", async () => {
+  it("ends live subscriptions, and refuses an old cursor once the new log passes it", async () => {
     const stub = env.REPO.getByName(DEMO_OBJECT_NAME);
     const artifacts = new MainOnly();
     const main = await mainRepoName(demoRepoId(env));
@@ -106,9 +106,12 @@ describe("demo reset", () => {
     });
     expect(await stub.seedDemo(HEAD, new Uint8Array(0))).toMatchObject({ ok: true });
     await appendIn(stub, 3);
+    const before = await stub.readEvents(0, 10, null);
+    if (!before.ok) throw new Error(before.code);
+    const oldHistory = before.value.history;
 
     const old = new Recorder();
-    const subscription = await stub.subscribe(0, old);
+    const subscription = await stub.subscribe(0, old, oldHistory);
     if (!subscription.ok) throw new Error(subscription.code);
     await until(() => old.seqs.length === 3);
     expect(old.released).toBe(0);
@@ -118,21 +121,40 @@ describe("demo reset", () => {
     expect(old.ends).toEqual(["revoked"]);
     // The Repo lets go of the listener it held, so nothing keeps the old subscriber's stub alive.
     await until(() => old.released === 1);
-    expect(await stub.subscribe(0, new Recorder())).toMatchObject({ ok: false, code: "not_found" });
+    expect(await stub.subscribe(0, new Recorder(), null)).toMatchObject({
+      ok: false,
+      code: "not_found",
+    });
 
     artifacts.fake.seed(main, [OTHER_HEAD]);
     expect(await stub.seedDemo(OTHER_HEAD, new Uint8Array(0))).toMatchObject({ ok: true });
-    // The old cursor belongs to the deleted history.
-    expect(await stub.subscribe(3, new Recorder())).toMatchObject({
+    // The new log grows past the old cursor, so only the history tells the two logs apart.
+    await appendIn(stub, 5);
+    const stale = new Recorder();
+    expect(await stub.subscribe(3, stale, oldHistory)).toMatchObject({
       ok: false,
       code: "cursor_ahead",
     });
+    expect(await stub.readEvents(3, 10, oldHistory)).toMatchObject({
+      ok: false,
+      code: "cursor_ahead",
+    });
+    expect(await stub.readEvents(0, 10, oldHistory)).toMatchObject({
+      ok: false,
+      code: "cursor_ahead",
+    });
+
+    // A board that reads the new log afresh gets the new history and resumes under it.
+    const page = await stub.readEvents(0, 3, null);
+    if (!page.ok) throw new Error(page.code);
+    expect(page.value.history).not.toBe(oldHistory);
+    expect(page.value).toMatchObject({ cursor: 3, head: 5 });
     const fresh = new Recorder();
-    const renewed = await stub.subscribe(0, fresh);
+    const renewed = await stub.subscribe(3, fresh, page.value.history);
     if (!renewed.ok) throw new Error(renewed.code);
-    await appendIn(stub, 2);
     await until(() => fresh.seqs.length === 2);
-    expect(fresh.seqs).toEqual([1, 2]);
+    expect(fresh.seqs).toEqual([4, 5]);
+    expect(stale.seqs).toEqual([]);
     expect(old.seqs).toEqual([1, 2, 3]);
     expect(old.ends).toEqual(["revoked"]);
 

@@ -63,6 +63,9 @@ const MIGRATIONS: readonly string[] = [
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL
   ) STRICT`,
+  // The history a reset replaces. A repository recorded before this step gets one here.
+  "ALTER TABLE repo ADD COLUMN history TEXT NOT NULL DEFAULT ''",
+  "UPDATE repo SET history = lower(hex(randomblob(16))) WHERE history = ''",
 ];
 
 /** The Durable Object name of the repository `org/name`. */
@@ -72,6 +75,8 @@ export function repoObjectName(org: RepoSegment, name: RepoSegment): string {
 
 interface Installed {
   summary: RepoSummary;
+  /** The history its log belongs to, new each time the repository is recorded. */
+  history: string;
   log: EventLog;
   ports: RepoPorts;
 }
@@ -125,21 +130,29 @@ export class Repo extends DurableObject<Env> {
     }
     migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
     const summary: RepoSummary = { repoId: `rep_${this.ctx.id.toString()}`, org, name };
+    // A repository recorded again after a reset reuses its id and restarts its `seq` numbers, so
+    // only a new history tells a cursor from the deleted log apart from one in the new log.
+    const history = randomHistory();
     this.ctx.storage.sql.exec(
-      "INSERT INTO repo (id, repo_id, org, name, created_at) VALUES (1, ?, ?, ?, ?)",
+      "INSERT INTO repo (id, repo_id, org, name, created_at, history) VALUES (1, ?, ?, ?, ?, ?)",
       summary.repoId,
       org,
       name,
       Date.now(),
+      history,
     );
     this.#installed = this.#install(summary);
     return ok(summary);
   }
 
-  /** Reads up to `limit` events after `cursor`. */
-  readEvents(cursor: number, limit: number): PortResult<EventPage> {
+  /**
+   * Reads up to `limit` events after `cursor`. A `history` other than `null` must be the log's
+   * current history, or the cursor is refused as belonging to another log.
+   */
+  readEvents(cursor: number, limit: number, history: string | null): PortResult<EventPage> {
     const installed = this.#installed;
     if (installed === null) return missing();
+    if (history !== null && history !== installed.history) return replaced();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_PAGE) {
       return fail(
         "invalid_request",
@@ -153,6 +166,7 @@ export class Repo extends DurableObject<Env> {
         events: page.events,
         cursor: page.events.at(-1)?.seq ?? cursor,
         head: page.head,
+        history: installed.history,
       });
     } catch (error) {
       if (!(error instanceof EventLogError)) throw error;
@@ -174,14 +188,19 @@ export class Repo extends DurableObject<Env> {
     }
   }
 
-  /** Subscribes `listener` to events after `cursor`, through the stream module. */
+  /**
+   * Subscribes `listener` to events after `cursor`, through the stream module. `history` is checked
+   * as `readEvents` checks it.
+   */
   async subscribe(
     cursor: number,
     listener: StreamListener,
+    history: string | null,
   ): Promise<PortResult<StreamSubscription>> {
-    const ports = this.#ports();
-    if (ports === null) return missing();
-    return ports.stream.subscribe(cursor, listener);
+    const installed = this.#installed;
+    if (installed === null) return missing();
+    if (history !== null && history !== installed.history) return replaced();
+    return installed.ports.stream.subscribe(cursor, listener);
   }
 
   /** The joins waiting for the owner, through the identity module. */
@@ -324,6 +343,9 @@ export class Repo extends DurableObject<Env> {
 
   #install(summary: RepoSummary): Installed {
     migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
+    const history = this.ctx.storage.sql
+      .exec<{ history: string }>("SELECT history FROM repo WHERE id = 1")
+      .one().history;
     const log = EventLog.open(this.ctx.storage, summary.repoId);
     const ports = composeRepo({
       repoId: summary.repoId,
@@ -333,8 +355,18 @@ export class Repo extends DurableObject<Env> {
       env: this.env,
       wake: (at) => this.#alarm.request(at),
     });
-    return { summary, log, ports };
+    return { summary, history, log, ports };
   }
+}
+
+/** A new history: 128 random bits in lowercase hex. */
+function randomHistory(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function replaced(): PortResult<never> {
+  return fail("cursor_ahead", "The cursor belongs to a history this repository no longer holds.");
 }
 
 function missing(): PortResult<never> {
