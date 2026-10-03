@@ -64,13 +64,23 @@ export const unavailableInbox: InboxPort = {
   readyGate: refuse("inbox"),
 };
 
-/** Decisions while its module is missing: no requirement list, so nothing is authorized. */
+/**
+ * Decisions while its module is missing: no requirement list, so nothing is authorized, and no
+ * dependency is moved or relied on, so its caller's transaction rolls back.
+ */
 export const unavailableDecisions: DecisionsPort = {
   ask: refuse("decisions"),
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  transfer: () => {
+    throw new UnavailableError("decisions");
+  },
+  relied: () => {
+    throw new UnavailableError("decisions");
+  },
+  obligations: () => null,
 };
 
 /** Artifacts while its module is missing. */
