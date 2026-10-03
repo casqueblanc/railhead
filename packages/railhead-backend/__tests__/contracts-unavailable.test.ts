@@ -67,6 +67,9 @@ const RESUMERS = new Set(["train.resume"]);
 /** The methods that confirm a wake, which report it unconfirmed while their module is missing. */
 const CONFIRMERS = new Set(["train.armWake"]);
 
+/** The methods that report a module's start, which owes nothing while the module is missing. */
+const STARTERS = new Set(["train.startup"]);
+
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {
     const sync = new Map<string, unknown>();
@@ -86,6 +89,9 @@ describe("unavailable ports", () => {
           expect(await result, `${port}.${method}`).toBeUndefined();
         } else if (CONFIRMERS.has(`${port}.${method}`)) {
           expect(await result, `${port}.${method}`).toBe(false);
+        } else if (STARTERS.has(`${port}.${method}`)) {
+          // A missing module owes no wake, so it never asks the Repo to reset.
+          expect(await result, `${port}.${method}`).toBe(true);
         } else if (result instanceof Promise) {
           expect(await result, `${port}.${method}`).toEqual(unavailable(port));
         } else {

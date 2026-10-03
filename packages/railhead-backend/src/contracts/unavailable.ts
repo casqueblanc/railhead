@@ -123,6 +123,7 @@ export const unavailableTrain: TrainPort = {
   holdsLiveEntry: () => null,
   armWake: async () => false,
   resume: async () => {},
+  startup: async () => true,
 };
 
 /** Authorization while its module is missing: no intent is authorized. */

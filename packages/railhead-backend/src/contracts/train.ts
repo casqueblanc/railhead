@@ -251,6 +251,14 @@ export interface TrainPort {
    * for the next wake itself. It never throws for a port's failure.
    */
   resume(): Promise<void>;
+  /**
+   * Settles once the train has confirmed the alarm for the wake it found in storage when it was
+   * built: `true` when storage holds that alarm or the train owes none, `false` when every attempt
+   * failed. It never rejects, and every call returns the same answer. The Repo awaits it before
+   * serving anything, and a `false` resets the object, so the next request or alarm builds the
+   * train again and asks again. `true` when the module is missing, which owes nothing.
+   */
+  startup(): Promise<boolean>;
 }
 
 /** What the main writer records about its progress on an intent. */
