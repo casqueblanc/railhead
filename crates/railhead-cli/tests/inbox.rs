@@ -9,13 +9,14 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 const TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLXNlY3JldA";
 /// The token a login during the test issues.
@@ -214,6 +215,48 @@ async fn answer(world: &World, verb: &str, route: &str, response: ResponseTempla
         .respond_with(response)
         .mount(&world.server)
         .await;
+}
+
+/// How long a held response is delayed: far beyond any `--wait` a test passes.
+const HOLD: Duration = Duration::from_secs(20);
+/// Room for process exit after a wait ends. A wait plus this stays well under [`HOLD`], so a CLI
+/// that waited for the held answer still fails.
+const EXIT_SLACK: Duration = Duration::from_secs(10);
+
+/// A response held for [`HOLD`] that records when each request arrived, so a test times the CLI's
+/// wait from the request it held, not from process start, which a loaded machine delays.
+#[derive(Clone)]
+struct Held {
+    response: ResponseTemplate,
+    arrivals: Arc<Mutex<Vec<Instant>>>,
+}
+
+impl Held {
+    fn new(response: ResponseTemplate) -> Self {
+        Self {
+            response: response.set_delay(HOLD),
+            arrivals: Arc::default(),
+        }
+    }
+
+    /// How long the latest held request stayed open before `rh` exited at `exited`.
+    fn open_until(&self, exited: Instant) -> anyhow::Result<Duration> {
+        let arrivals = self.arrivals.lock().unwrap_or_else(PoisonError::into_inner);
+        let arrived = arrivals
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no request was held"))?;
+        Ok(exited.duration_since(*arrived))
+    }
+}
+
+impl Respond for Held {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Instant::now());
+        self.response.clone()
+    }
 }
 
 /// The requests the server received on `route`.
@@ -1499,26 +1542,28 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     )
     .await;
     // The backend holds every poll far beyond the wait, then answers.
-    answer(
-        &world,
-        "GET",
-        "/questions/qst_upload1",
-        fixture("question.json", "an answered question carries the decision")?
-            .set_delay(Duration::from_secs(20)),
-    )
-    .await;
+    let stall = Held::new(fixture(
+        "question.json",
+        "an answered question carries the decision",
+    )?);
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .respond_with(stall.clone())
+        .mount(&world.server)
+        .await;
 
-    // Asked and waited on: the wait ends with the question as asked.
+    // Asked and waited on: the wait ends with the question as asked, before the held answer.
     let mut args = ask_args(QUESTION, "src/upload.ts");
     args.extend(["--wait", "2"]);
     let started = Instant::now();
     let run = rh_in_clone(&world, &args)?;
-    let elapsed = started.elapsed();
+    let exited = Instant::now();
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert!(
-        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
-        "{elapsed:?}"
-    );
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.at("/data/timedOut")?, json!(true));
     assert_eq!(run.at("/data/question/state")?, json!("open"));
     assert_eq!(run.at("/next")?, json!("rh ask"));
@@ -1537,8 +1582,11 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         &world,
         &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
     )?;
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    let exited = Instant::now();
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(1) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/retryable")?, json!(true));
@@ -1573,9 +1621,10 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
             "message": message}, "inbox": null, "next": null}),
     );
     // The first login's challenge is held far beyond the wait.
+    let stall = Held::new(challenge.clone());
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(challenge.clone().set_delay(Duration::from_secs(20)))
+        .respond_with(stall.clone())
         .up_to_n_times(1)
         .mount(&world.server)
         .await;
@@ -1607,8 +1656,11 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
     let args = ["--json", "ask", "--question", "qst_upload1", "--wait", "2"];
     let started = Instant::now();
     let run = rh(&world, &args)?;
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    let exited = Instant::now();
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
