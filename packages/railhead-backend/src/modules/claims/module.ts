@@ -11,12 +11,14 @@
 // `ready` pins an exact commit. The commit's existence in the fork is checked first, since that
 // awaits Artifacts; then one transaction checks that the agent still holds the claim at the
 // generation it sent, that the inbox gate is clear and that the decision versions are known, and
-// records the pin with those versions. Only then are the fork's tokens revoked. A repeat of the
-// same pin passes the same gate and returns it, so a lost response is answered by retrying. `pin`,
-// the train's read, answers only while those versions are still the current ones and the inbox
-// gate is still clear. From the pin on, `authorizeGit` refuses every push to the fork; a push
-// already granted may still move the fork's branch, but never the pin, which names a commit rather
-// than a ref.
+// records the pin with those versions and that the fork's tokens are owed a revocation. Only then
+// are they revoked. Until a revocation reports `revoked`, `ready` answers `busy`, the Repo's alarm
+// retries it and `pin` refuses with `busy`, since a partial token listing may hide a live token. A
+// repeat of the same pin passes the same gate and returns it, revoking again while the revocation
+// is owed, so a lost response is answered by retrying. `pin`, the train's read, answers only while
+// those versions are still the current ones and the inbox gate is still clear. From the pin on,
+// `authorizeGit` refuses every push to the fork; a push already granted may still move the fork's
+// branch, but never the pin, which names a commit rather than a ref.
 //
 // A decision version recorded after ready supersedes the pin: the train must not take it, and the
 // holder must adapt. The first claims call that reads such a claim, whether a `ready`, the holder's
@@ -33,9 +35,12 @@
 // a reopened claim starts a new lease. The lapse is checked at the time of use: a holder call after
 // it, the Repo's alarm or another agent's `work` or `claim` expires the claim and appends
 // `claim.expired`. From then on the former holder is refused, `currentGeneration` reads it as
-// unknown, and the fork's tokens are owed a revocation. The claim stays expired until that
-// revocation is settled; a failed revocation, or one Artifacts reports as `pending_debt`, is
-// retried by the Repo's alarm, and meanwhile nobody gets a write grant on the fork.
+// unknown, and the fork's tokens are owed a revocation. A lease is renewed only before it lapses:
+// a lapsed allocation is no longer its holder's, which sees no active claim and is answered `busy`
+// by `work` and `claim` until another agent takes the allocation over. The claim stays expired
+// until that revocation is settled; a failed revocation, or one Artifacts reports as
+// `pending_debt`, is retried by the Repo's alarm, and meanwhile nobody gets a write grant on the
+// fork.
 //
 // Takeover gives a settled expired claim, before any new issue, to the next agent other than its
 // former holder that asks for work or names its issue. It keeps the claim, its issue's text and
@@ -46,7 +51,8 @@
 // its own commit. An allocation whose holder's lease lapsed before the fork opened passes to the
 // successor at the next generation with no event, and the successor finishes the same fork intent.
 // While an expired claim's revocation is pending, `work` answers `busy` to every agent but its
-// former holder rather than hand out a newer issue, so the claim stays first in line.
+// former holder rather than hand out a newer issue, so the claim stays first in line. No claim on a
+// newer issue is taken over, by `work` or `claim`, until every older revocation is settled.
 //
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
@@ -92,7 +98,7 @@ import {
   reassignClaim,
   recordForkBase,
   recordRevocation,
-  releasePending,
+  releasePendingBefore,
   renewLease,
   reopenReady,
   type ClaimRow,
@@ -161,9 +167,9 @@ export function createClaims(
   };
 
   /**
-   * A call of the claim's holder: expires a working claim whose lease lapsed, and otherwise renews
-   * an allocating or working claim's lease. Answers the claim as it now stands. Runs in the caller's
-   * transaction.
+   * A call of the claim's holder: expires a working claim whose lease lapsed, leaves a lapsed
+   * allocation to a successor, and otherwise renews an allocating or working claim's lease. Answers
+   * the claim as it now stands. Runs in the caller's transaction.
    */
   const hold = (tx: EventTransaction, row: ClaimRow): ClaimRow => {
     const now = clock();
@@ -176,6 +182,7 @@ export function createClaims(
         renewLease(tx.sql, row.claimId, row.generation, now + CLAIM_LEASE_MS);
         break;
       case "allocating":
+        if (lapsedAllocation(row, now)) return row;
         renewLease(tx.sql, row.claimId, row.generation, now + CLAIM_LEASE_MS);
         break;
       case "ready":
@@ -208,18 +215,27 @@ export function createClaims(
   };
 
   /**
-   * Revokes the fork tokens of expired claims whose revocation is due, up to a batch. A revocation
-   * that fails, or that Artifacts reports as `pending_debt`, is not settled and is due again after
+   * Revokes the fork tokens of the claim at `generation` and records the outcome. A revocation that
+   * fails, or that Artifacts reports as `pending_debt`, is not settled and is due again after
    * `REVOKE_RETRY_MS`.
    */
+  const revoke = async (
+    claimId: ClaimId,
+    generation: number,
+  ): Promise<PortResult<TokenRevocation>> => {
+    const revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, claimId));
+    log.transaction((tx) => {
+      const next = revocationSettled(revoked) ? null : clock() + REVOKE_RETRY_MS;
+      recordRevocation(tx.sql, claimId, generation, next);
+      wakeForDeadline(tx.sql);
+    });
+    return revoked;
+  };
+
+  /** Revokes the fork tokens of expired and ready claims whose revocation is due, up to a batch. */
   const releaseDue = async (): Promise<void> => {
     for (const row of dueRevocations(context.storage.sql, clock(), RELEASE_BATCH)) {
-      const revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, row.claimId));
-      log.transaction((tx) => {
-        const next = revocationSettled(revoked) ? null : clock() + REVOKE_RETRY_MS;
-        recordRevocation(tx.sql, row.claimId, row.generation, next);
-        wakeForDeadline(tx.sql);
-      });
+      await revoke(row.claimId, row.generation);
     }
   };
 
@@ -348,7 +364,9 @@ export function createClaims(
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
       const row = holdActive(agent.agentId);
-      if (row === null || row.state === "expired") return ok(null);
+      if (row === null || row.state === "expired" || lapsedAllocation(row, clock())) {
+        return ok(null);
+      }
       const finished = await finish(ok({ row, resumed: true }));
       return finished.ok ? ok(finished.value.claim) : finished;
     },
@@ -361,12 +379,15 @@ export function createClaims(
         const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
         const held = active === null ? null : hold(tx, active);
+        if (held !== null && lapsedAllocation(held, clock())) return lapsedHold();
         if (held !== null && held.state !== "expired") return ok({ row: held, resumed: true });
         const takeover = nextTakeover(sql, agent.agentId, clock());
-        if (takeover !== null) return takeOver(tx, agent, takeover);
-        // An expired claim still being released stays ahead of every new issue.
-        if (releasePending(sql, agent.agentId)) {
-          return fail("busy", "An expired claim is still being released; repeat the request.");
+        if (takeover !== null) {
+          // An expired claim still being released stays ahead of every newer claim and issue.
+          if (takeover.revokeDue !== null || releasePendingBefore(sql, takeover.issueId)) {
+            return fail("busy", "An expired claim is still being released; repeat the request.");
+          }
+          return takeOver(tx, agent, takeover);
         }
         const issueId = nextOpenIssue(sql);
         if (issueId !== null) return intend(sql, agent, issueId);
@@ -384,6 +405,7 @@ export function createClaims(
         const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
         const held = active === null ? null : hold(tx, active);
+        if (held !== null && lapsedAllocation(held, clock())) return lapsedHold();
         if (held !== null && held.state !== "expired") {
           return held.issueId === issueId
             ? ok({ row: held, resumed: true })
@@ -396,7 +418,13 @@ export function createClaims(
             : fail("issue_unavailable", "The issue does not exist or is already claimed.");
         }
         if (existing.agentId !== agent.agentId) {
-          if (takeable(existing, clock())) return takeOver(tx, agent, existing);
+          if (takeable(existing, clock())) {
+            // An older expired claim still being released is handed over first.
+            if (releasePendingBefore(sql, issueId)) {
+              return fail("busy", "An older expired claim is still being released; repeat later.");
+            }
+            return takeOver(tx, agent, existing);
+          }
           if (existing.state === "expired") {
             return fail("busy", "The expired claim is still being released; repeat the request.");
           }
@@ -501,13 +529,15 @@ export function createClaims(
             ? ok({ claim: view(row), repeated: true })
             : refuse(tx, { kind: "refused", reason: "after_ready", row });
         }
-        if (!pinReady(tx.sql, claimId, generation, commit, decisions)) {
+        if (!pinReady(tx.sql, claimId, generation, commit, decisions, clock())) {
           throw new Error("a working claim read in this transaction could not be pinned");
         }
         tx.append(
           { kind: "agent", id: agent.agentId },
           { type: "claim.ready", data: { claimId, generation, commit, decisions } },
         );
+        // The owed revocation is retried by the alarm if this request ends before it settles.
+        wakeForDeadline(tx.sql);
         const pinned = claimById(tx.sql, claimId);
         if (pinned === null) throw new Error("a pinned claim cannot be read back");
         return ok({ claim: view(pinned), repeated: false });
@@ -515,10 +545,14 @@ export function createClaims(
       if (!decided.ok) return decided;
 
       // The fork is read only from the pin on, since `authorizeGit` refuses every later push;
-      // revoking its tokens ends a write already granted. A repeat after a failed revocation
-      // returns the same pin and revokes again.
-      const revoked = await ports().artifacts.revokeTokens(repo);
-      return revoked.ok ? decided : revoked;
+      // revoking its tokens ends a write already granted. Nothing awaits since the transaction, so
+      // this read sees the pin it recorded. A repeat while the revocation is owed revokes again.
+      if (claimById(context.storage.sql, claimId)?.revokeDue === null) return decided;
+      const revoked = await revoke(claimId, request.generation);
+      if (!revoked.ok) return revoked;
+      return revocationSettled(revoked)
+        ? decided
+        : fail("busy", "The fork's tokens are not yet revoked; repeat the request.");
     },
 
     async pin(claimId) {
@@ -541,6 +575,10 @@ export function createClaims(
       }
       if (gate.kind === "blocked") {
         return fail("unacked_decision", "An inbox item affecting the claim is not acknowledged.");
+      }
+      // A token the revocation has not reached could still move the fork after the pin.
+      if (row.revokeDue !== null) {
+        return fail("busy", "The claim's fork tokens are not yet revoked.");
       }
       const pin: ClaimPin = { claimId, generation: row.generation, commit: row.readyCommit };
       return ok(pin);
@@ -577,13 +615,26 @@ function expire(tx: EventTransaction, row: ClaimRow, now: number): void {
   });
 }
 
+/** Whether `row` is an allocation whose lease lapsed at or before `now`, held by nobody. */
+function lapsedAllocation(row: ClaimRow, now: number): boolean {
+  return row.state === "allocating" && row.leaseUntil !== null && row.leaseUntil <= now;
+}
+
+/** The answer to the former holder of a lapsed allocation, which only another agent may take. */
+function lapsedHold(): PortFailure {
+  return fail(
+    "busy",
+    "This agent's claim lapsed before its fork opened; repeat the request later.",
+  );
+}
+
 /** Whether another agent may take `row` over now: a settled expired claim or a lapsed allocation. */
 function takeable(row: ClaimRow, now: number): boolean {
   switch (row.state) {
     case "expired":
       return row.revokeDue === null;
     case "allocating":
-      return row.leaseUntil !== null && row.leaseUntil <= now;
+      return lapsedAllocation(row, now);
     case "working":
     case "ready":
     case "merged":

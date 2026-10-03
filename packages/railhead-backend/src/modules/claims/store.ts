@@ -14,7 +14,8 @@
 //
 // An allocating or working claim holds a lease until `lease_until`. A working claim whose lease
 // lapsed expires; the expiry owes a revocation of its fork's tokens, due at `revoke_due`, and the
-// claim is reassigned only once that revocation is settled and `revoke_due` is cleared.
+// claim is reassigned only once that revocation is settled and `revoke_due` is cleared. A pin owes
+// the same revocation, and a ready claim keeps `revoke_due` until it is settled.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -93,7 +94,10 @@ export interface ClaimRow {
    * module starts.
    */
   leaseUntil: number | null;
-  /** When the expired claim's fork tokens are next revoked; `null` when nothing is owed. */
+  /**
+   * When the fork tokens of an expired or ready claim are next revoked; `null` when nothing is
+   * owed.
+   */
   revokeDue: number | null;
   title: string;
   body: string;
@@ -256,7 +260,7 @@ export function expireClaim(
   return updated.length === 1;
 }
 
-/** Expired claims whose revocation is due at or before `now`, earliest first, at most `limit`. */
+/** Claims whose revocation is due at or before `now`, earliest first, at most `limit`. */
 export function dueRevocations(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
   return rows(
     sql.exec<RawClaim>(
@@ -268,8 +272,8 @@ export function dueRevocations(sql: SqlStorage, now: number, limit: number): Cla
 }
 
 /**
- * Records the outcome of a revocation of an expired claim at `generation`: `null` when it is
- * settled, otherwise when to try again.
+ * Records the outcome of a revocation of an expired or ready claim at `generation`: `null` when it
+ * is settled, otherwise when to try again.
  */
 export function recordRevocation(
   sql: SqlStorage,
@@ -279,7 +283,8 @@ export function recordRevocation(
 ): void {
   sql.exec(
     `UPDATE claims_claims SET revoke_due = ?
-     WHERE claim_id = ? AND generation = ? AND state = 'expired' AND revoke_due IS NOT NULL`,
+     WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')
+       AND revoke_due IS NOT NULL`,
     nextDue,
     claimId,
     generation,
@@ -301,14 +306,15 @@ export function nextClaimsDeadline(sql: SqlStorage): number | null {
 }
 
 /**
- * The claim the agent may take over, in handover order: the expired claim of the oldest issue whose
+ * The claim first in line for the agent: the expired claim of the oldest issue, whether or not its
  * revocation is settled, then the oldest-leased allocation whose lease lapsed at or before `now`.
- * A claim the agent itself held last is never offered back to it.
+ * The caller takes it over only once its revocation, and every older one, is settled. A claim the agent itself held last
+ * is never offered back to it.
  */
 export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): ClaimRow | null {
   const expired = first(
     sql.exec<RawClaim>(
-      `${SELECT_CLAIM} WHERE c.state = 'expired' AND c.revoke_due IS NULL AND c.agent_id != ?
+      `${SELECT_CLAIM} WHERE c.state = 'expired' AND c.agent_id != ?
        ORDER BY i.filed_seq LIMIT 1`,
       agentId,
     ),
@@ -324,13 +330,17 @@ export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): Cl
   );
 }
 
-/** Whether an expired claim another agent held still owes the revocation of its fork's tokens. */
-export function releasePending(sql: SqlStorage, agentId: AgentId): boolean {
+/**
+ * Whether an expired claim on an issue filed before `issueId` still owes the revocation of its
+ * fork's tokens.
+ */
+export function releasePendingBefore(sql: SqlStorage, issueId: IssueId): boolean {
   const [row] = sql
     .exec<{ pending: number }>(
-      `SELECT EXISTS (SELECT 1 FROM claims_claims
-         WHERE state = 'expired' AND revoke_due IS NOT NULL AND agent_id != ?) AS pending`,
-      agentId,
+      `SELECT EXISTS (SELECT 1 FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id
+         WHERE c.state = 'expired' AND c.revoke_due IS NOT NULL
+           AND i.filed_seq < (SELECT filed_seq FROM claims_issues WHERE issue_id = ?)) AS pending`,
+      issueId,
     )
     .toArray();
   return row?.pending === 1;
@@ -411,8 +421,9 @@ export function openClaim(
 
 /**
  * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
- * makes the claim ready, and forgets its last refusal. Returns `false`, and writes nothing, when the
- * claim is no longer working at that generation.
+ * makes the claim ready, records that its fork's tokens are owed a revocation due at `now`, and
+ * forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer working
+ * at that generation.
  */
 export function pinReady(
   sql: SqlStorage,
@@ -420,15 +431,17 @@ export function pinReady(
   generation: number,
   commit: CommitSha,
   decisions: readonly DecisionRef[],
+  now: number,
 ): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
-         last_refusal = NULL
+         last_refusal = NULL, revoke_due = ?
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,
       JSON.stringify(decisions.map(({ decisionId, version }) => ({ decisionId, version }))),
+      now,
       claimId,
       generation,
     )
@@ -438,7 +451,7 @@ export function pinReady(
 
 /**
  * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
- * and forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer
+ * and the revocation the pin owed, since its holder may push again, and forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer
  * ready at that generation.
  */
 export function reopenReady(
@@ -450,7 +463,7 @@ export function reopenReady(
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         last_refusal = NULL, lease_until = ?
+         last_refusal = NULL, lease_until = ?, revoke_due = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
       leaseUntil,

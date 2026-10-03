@@ -217,6 +217,33 @@ async function decideTwice(setup: Setup, claimId: string): Promise<DecisionId> {
   return decisionId;
 }
 
+/** Records `option` as the owner's decision at `expectedVersion`. */
+async function record(
+  setup: Setup,
+  decisionId: DecisionId,
+  option: "reject" | "chunk",
+  expectedVersion: number | null,
+): Promise<void> {
+  const recorded = await setup.decisions.record({
+    kind: "human",
+    userId: "usr_owner0001",
+    repoId: REPO,
+    grantId: crypto.randomUUID(),
+    action: { kind: "decision.record", decisionId, option, expectedVersion },
+  });
+  if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
+}
+
+/** Acknowledges every item delivered to `principal`. */
+async function ackAll(setup: Setup, principal: AgentPrincipal): Promise<void> {
+  const delivered = await setup.inbox.pending(principal, 16);
+  if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
+  for (const { item } of delivered.value.items) {
+    const acked = await setup.inbox.ack(principal, item, "Follow the decision.");
+    if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
+  }
+}
+
 const push = (principal: AgentPrincipal, claimId: string) =>
   ({ principal, target: { kind: "fork", claimId }, operation: "push" }) as const;
 
@@ -699,6 +726,103 @@ describe("takeover", () => {
     });
   });
 
+  it("renews an allocation its holder resumes a millisecond before the lease lapses", async () => {
+    await withTakeover(async (setup) => {
+      await setup.file("Add uploads");
+      setup.fake.failNextFork("lose-response");
+      expect(await setup.port.work(agent(1))).toMatchObject({ ok: false });
+
+      setup.fake.advance(CLAIM_LEASE_MS - 1);
+      expect(await setup.port.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { generation: 1, base: HEAD, state: "working" },
+      });
+      expectFailure(await setup.port.work(agent(2)), "no_work");
+    });
+  });
+
+  it("never renews a lapsed allocation for its former holder, which leaves it to the successor", async () => {
+    await withTakeover(async (setup) => {
+      const issueId = await setup.file("Add uploads");
+      setup.fake.failNextFork("lose-response");
+      expect(await setup.port.work(agent(1))).toMatchObject({ ok: false });
+      const [intent] = setup.sql
+        .exec<{ claim_id: string; lease_until: number }>(
+          "SELECT claim_id, lease_until FROM claims_claims",
+        )
+        .toArray();
+      if (intent === undefined) throw new Error("no fork intent was recorded");
+
+      // At the deadline the former holder calls first: status, work and claim all find it lapsed.
+      setup.fake.advance(CLAIM_LEASE_MS);
+      expect(await setup.port.activeClaim(agent(1))).toEqual(ok(null));
+      expectFailure(await setup.port.work(agent(1)), "busy");
+      expectFailure(await setup.port.claim(agent(1), issueId), "busy");
+      expect(
+        setup.sql
+          .exec<{ lease_until: number; state: string; generation: number }>(
+            "SELECT lease_until, state, generation FROM claims_claims",
+          )
+          .toArray(),
+      ).toEqual([{ lease_until: intent.lease_until, state: "allocating", generation: 1 }]);
+      expect(setup.fake.forkCalls).toBe(1);
+      expect(types(setup.events())).not.toContain("claim.opened");
+
+      // The successor takes it at the next generation; the former holder is then free and idle.
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: intent.claim_id, generation: 2 } },
+      });
+      expect(await setup.port.activeClaim(agent(1))).toEqual(ok(null));
+      expectFailure(await setup.port.work(agent(1)), "no_work");
+    });
+  });
+
+  it("hands over no newer expired claim while an older one's revocation is pending", async () => {
+    await withTakeover(async (setup) => {
+      const older = await setup.open();
+      const newerIssue = await setup.file("Add downloads");
+      const newer = await setup.port.work(agent(2));
+      if (!newer.ok) throw new Error(`claim refused: ${newer.code}`);
+      const newerId = newer.value.claim.claimId;
+      // Only the older fork holds a token the partial listing hides, so only its sweep stays owed.
+      const former = setup.fake.mintFor(older.fork, "write", 3600);
+      setup.fake.pageTokens(1, "creation");
+      setup.fake.advance(CLAIM_LEASE_MS);
+      await setup.port.resume();
+      expect(stored(setup.sql, older.claim.claimId)).toMatchObject({
+        state: "expired",
+        revoke_due: setup.fake.clock() + REVOKE_RETRY_MS,
+      });
+      expect(stored(setup.sql, newerId)).toMatchObject({ state: "expired", revoke_due: null });
+
+      // Neither a new agent nor the older claim's former holder gets the newer settled claim.
+      expectFailure(await setup.port.work(agent(3)), "busy");
+      expectFailure(await setup.port.claim(agent(3), newerIssue), "busy");
+      expectFailure(await setup.port.work(agent(1)), "busy");
+      expect(stored(setup.sql, newerId)).toMatchObject({
+        agent_id: "agt_agent0002",
+        generation: 1,
+        state: "expired",
+      });
+      expect(types(setup.events())).not.toContain("claim.reassigned");
+      expect(setup.fake.accepts(former.plaintext)).toBe(true);
+
+      // Once the older sweep settles, the claims go in issue order.
+      setup.fake.pageTokens(null);
+      await fireAlarm(setup);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+      expect(await setup.port.work(agent(3))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: older.claim.claimId, generation: 2 } },
+      });
+      expect(await setup.port.claim(agent(4), newerIssue)).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: newerId, generation: 2 } },
+      });
+    });
+  });
+
   it("passes a lapsed allocation to the successor, which finishes the same fork intent", async () => {
     await withTakeover(async (setup) => {
       await setup.file("Add uploads");
@@ -726,6 +850,111 @@ describe("takeover", () => {
       });
       expect(types(setup.events())).not.toContain("claim.reassigned");
       expect(await setup.port.activeClaim(agent(1))).toEqual(ok(null));
+    });
+  });
+});
+
+describe("revocation at ready", () => {
+  it("withholds the pin while the revocation is pending and settles it on the alarm", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const live = setup.fake.mintFor(fork, "write", 3600);
+      // The listing hides the live token, so Artifacts reports a debt rather than `revoked`.
+      setup.fake.pageTokens(1, "creation");
+      const ready = { generation: 1, commit: WORK };
+
+      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "busy");
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "ready",
+        revoke_due: setup.fake.clock() + REVOKE_RETRY_MS,
+      });
+      expect(setup.fake.accepts(live.plaintext)).toBe(true);
+      expectFailure(await setup.port.pin(claim.claimId), "busy");
+      expect(setup.wakes).toContain(setup.fake.clock() + REVOKE_RETRY_MS);
+
+      // The holder's repeat revokes again; still partial, it is still refused.
+      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "busy");
+      expect(setup.revoked).toEqual([fork, fork]);
+
+      // The alarm's retry sees every token; only then does the train get the pin.
+      setup.fake.pageTokens(null);
+      await fireAlarm(setup);
+      expect(setup.revoked).toEqual([fork, fork, fork]);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "ready", revoke_due: null });
+      expect(setup.fake.accepts(live.plaintext)).toBe(false);
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
+      );
+
+      // A later repeat answers with the pin and revokes nothing more.
+      expect(await setup.port.ready(agent(1), claim.claimId, ready)).toMatchObject({
+        ok: true,
+        value: { repeated: true, claim: { readyCommit: WORK } },
+      });
+      expect(setup.revoked).toHaveLength(3);
+      expect(types(setup.events()).filter((type) => type === "claim.ready")).toHaveLength(1);
+    });
+  });
+
+  it("drops the pin's pending revocation when a newer decision reopens the claim", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const asked = await setup.decisions.ask(agent(1), claim.claimId, {
+        generation: 1,
+        requestId: "req_upload0000000001",
+        text: "Should uploads above 10 MB be rejected or chunked?",
+        options: [
+          { key: "reject", label: "Reject them" },
+          { key: "chunk", label: "Upload them in chunks" },
+        ],
+        scope: ["src/upload.ts"],
+      });
+      if (!asked.ok) throw new Error(`ask refused: ${asked.code}`);
+      await record(setup, asked.value.decisionId, "chunk", null);
+      await ackAll(setup, agent(1));
+      setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.pageTokens(1, "creation");
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+        "busy",
+      );
+
+      // A newer version supersedes the pin; the holder works again and owes no revocation.
+      await record(setup, asked.value.decisionId, "reject", 1);
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+
+      // The alarm's retry time passes without revoking the holder's new write grant.
+      setup.fake.advance(REVOKE_RETRY_MS);
+      await setup.port.resume();
+      expect(setup.revoked).toEqual([fork]);
+      expect(await setup.port.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+    });
+  });
+
+  it("revokes once and answers the pin when the first revocation settles", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const live = setup.fake.mintFor(fork, "write", 3600);
+
+      expect(
+        await setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+      ).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.revoked).toEqual([fork]);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "ready", revoke_due: null });
+      expect(setup.fake.accepts(live.plaintext)).toBe(false);
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
+      );
     });
   });
 });
