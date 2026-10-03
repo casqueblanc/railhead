@@ -16,6 +16,10 @@
 // lapsed expires; the expiry owes a revocation of its fork's tokens, due at `revoke_due`, and the
 // claim is reassigned only once that revocation is settled and `revoke_due` is cleared. A pin owes
 // the same revocation, and a ready claim keeps `revoke_due` until it is settled.
+//
+// `revoke_attempt` counts the revocation sweeps started for a claim and each new obligation to
+// revoke. Only a `revoked` answer from the latest sweep clears `revoke_due`, so an earlier sweep
+// that answers late cannot settle a debt a later sweep or obligation still owes.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -62,6 +66,7 @@ const MIGRATIONS: readonly string[] = [
   `CREATE INDEX claims_by_lease ON claims_claims (lease_until)
     WHERE state IN ('allocating', 'working')`,
   "CREATE INDEX claims_by_revocation ON claims_claims (revoke_due) WHERE revoke_due IS NOT NULL",
+  "ALTER TABLE claims_claims ADD COLUMN revoke_attempt INTEGER NOT NULL DEFAULT 0",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -254,7 +259,8 @@ export function expireClaim(
 ): boolean {
   const updated = sql
     .exec(
-      `UPDATE claims_claims SET state = 'expired', lease_until = NULL, revoke_due = ?
+      `UPDATE claims_claims SET state = 'expired', lease_until = NULL, revoke_due = ?,
+         revoke_attempt = revoke_attempt + 1
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       now,
@@ -280,23 +286,63 @@ export function dueRevocations(sql: SqlStorage, now: number, limit: number): Cla
 }
 
 /**
- * Records the outcome of a revocation of an expired or ready claim at `generation`: `null` when it
- * is settled, otherwise when to try again.
+ * Starts a revocation sweep of the claim's fork tokens and returns its attempt, which
+ * `recordRevocation` needs to settle it. Returns `null`, and writes nothing, for an unknown claim.
+ */
+export function beginRevocation(sql: SqlStorage, claimId: ClaimId): number | null {
+  const [row] = sql
+    .exec<{ revoke_attempt: number }>(
+      `UPDATE claims_claims SET revoke_attempt = revoke_attempt + 1
+       WHERE claim_id = ?
+       RETURNING revoke_attempt`,
+      claimId,
+    )
+    .toArray();
+  return row?.revoke_attempt ?? null;
+}
+
+/** How a revocation sweep of a claim's fork tokens ended. */
+export type RevocationOutcome =
+  /** Artifacts reported every token revoked. */
+  | { kind: "settled"; attempt: number }
+  /** The sweep failed, threw or reported a debt; the revocation is due again at `retryAt`. */
+  | { kind: "owed"; retryAt: number };
+
+/**
+ * Records the outcome of a revocation of an expired or ready claim at `generation`. A settled
+ * sweep clears `revoke_due` only when it is the latest attempt and nothing newer is owed. An owed
+ * one always keeps the revocation due, even after another sweep cleared it, so a late partial
+ * listing is never lost.
  */
 export function recordRevocation(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
-  nextDue: number | null,
+  outcome: RevocationOutcome,
 ): void {
-  sql.exec(
-    `UPDATE claims_claims SET revoke_due = ?
-     WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')
-       AND revoke_due IS NOT NULL`,
-    nextDue,
-    claimId,
-    generation,
-  );
+  switch (outcome.kind) {
+    case "settled":
+      sql.exec(
+        `UPDATE claims_claims SET revoke_due = NULL
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')
+           AND revoke_attempt = ?`,
+        claimId,
+        generation,
+        outcome.attempt,
+      );
+      return;
+    case "owed":
+      sql.exec(
+        `UPDATE claims_claims SET revoke_due = ?
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')`,
+        outcome.retryAt,
+        claimId,
+        generation,
+      );
+      return;
+    default:
+      outcome satisfies never;
+  }
 }
 
 /** The earliest time a lease lapses or a revocation is due, or `null` when nothing waits. */
@@ -448,7 +494,7 @@ export function pinReady(
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
-         last_refusal = NULL, revoke_due = ?
+         last_refusal = NULL, revoke_due = ?, revoke_attempt = revoke_attempt + 1
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,

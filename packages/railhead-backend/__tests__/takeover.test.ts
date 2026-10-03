@@ -88,6 +88,11 @@ interface Setup {
   storedAlarm: () => number | null;
   /** How many times the alarm reached each module after claims. */
   laterResumes: { git: number; train: number };
+  /**
+   * A second claims module over the same storage and ports, as a Repo restarted after an eviction
+   * would build. It knows nothing of the first module's running sweeps.
+   */
+  restarted: () => ClaimsPort;
 }
 
 /**
@@ -213,6 +218,7 @@ function withTakeover<T>(
       },
       storedAlarm: () => storedAlarm,
       laterResumes,
+      restarted: () => createClaims(context, () => ports, limits),
     };
     const result = await body(setup);
     expect(fake.openHandles).toBe(0);
@@ -944,6 +950,96 @@ describe("takeover", () => {
         value: { scope: "write", fence: { claimId: claim.claimId, generation: 2 } },
       });
     });
+  });
+
+  it("joins the sweep already running for a claim instead of starting another", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.advance(CLAIM_LEASE_MS);
+      const held = deferred();
+      setup.holdRevocation = () => held.promise;
+
+      const alarm = setup.port.resume();
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+      const successor = setup.port.work(agent(2));
+      held.resolve();
+      await alarm;
+
+      expect(await successor).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2 } },
+      });
+      expect(setup.revoked).toEqual([fork]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+    });
+  });
+
+  it("keeps a claim owed when overlapping sweeps answer clean and partial in either order", async () => {
+    // Which sweep lists every token, the one started first or second, and whether it answers first.
+    const cases = [
+      { clean: "earlier", answers: "first" },
+      { clean: "later", answers: "first" },
+      { clean: "earlier", answers: "last" },
+    ] as const;
+    for (const { clean, answers } of cases) {
+      const label = `${clean} clean sweep answers ${answers}`;
+      await withTakeover(async (setup) => {
+        const { claim, fork } = await setup.open();
+        const former = setup.fake.mintFor(fork, "write", 3600);
+        setup.fake.advance(CLAIM_LEASE_MS);
+        const holds = [deferred(), deferred()];
+        setup.holdRevocation = () => holds[setup.revoked.length - 1]?.promise ?? Promise.resolve();
+
+        // The alarm's sweep is running when the Repo restarts and a second module starts another,
+        // so the per-claim join cannot serialize them. Both are held before Artifacts answers.
+        const first = setup.port.resume();
+        await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+        const second = setup.restarted().resume();
+        await vi.waitFor(() => expect(setup.revoked).toEqual([fork, fork]), { timeout: 1000 });
+        const [cleanSweep, partialSweep] = clean === "earlier" ? [first, second] : [second, first];
+        const [cleanHold, partialHold] =
+          clean === "earlier" ? [holds[0], holds[1]] : [holds[1], holds[0]];
+
+        const answer = async (sweep: "clean" | "partial"): Promise<void> => {
+          if (sweep === "clean") setup.fake.pageTokens(null);
+          else setup.fake.pageTokens(1, "creation");
+          (sweep === "clean" ? cleanHold : partialHold)?.resolve();
+          await (sweep === "clean" ? cleanSweep : partialSweep);
+        };
+        const order =
+          answers === "first" ? (["clean", "partial"] as const) : (["partial", "clean"] as const);
+        for (const sweep of order) await answer(sweep);
+
+        const retry = setup.fake.clock() + REVOKE_RETRY_MS;
+        expect(stored(setup.sql, claim.claimId), label).toMatchObject({
+          agent_id: "agt_agent0001",
+          generation: 1,
+          state: "expired",
+          revoke_due: retry,
+        });
+        expectFailure(await setup.port.work(agent(2)), "busy");
+        expectFailure(await setup.port.claim(agent(2), claim.issueId), "busy");
+        expectFailure(
+          await setup.port.authorizeGit(push(agent(2), claim.claimId)),
+          "stale_generation",
+        );
+        expect(types(setup.events())).not.toContain("claim.reassigned");
+        expect(setup.minted).toEqual([]);
+        expect(setup.wakes).toContain(retry);
+
+        // The alarm retries at the retry time; a full listing settles the claim for the successor.
+        setup.fake.pageTokens(null);
+        await fireAlarm(setup);
+        expect(setup.revoked).toEqual([fork, fork, fork]);
+        expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
+        expect(setup.fake.accepts(former.plaintext)).toBe(false);
+        expect(await setup.port.work(agent(2))).toMatchObject({
+          ok: true,
+          value: { claim: { claimId: claim.claimId, generation: 2 } },
+        });
+      });
+    }
   });
 
   it("keeps an expired claim with a pending revocation ahead of a newer open issue", async () => {

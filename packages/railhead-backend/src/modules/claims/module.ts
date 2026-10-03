@@ -85,6 +85,7 @@ import {
   activeClaimOf,
   activeClaimsOfOwner,
   backfillLeases,
+  beginRevocation,
   claimById,
   claimOfIssue,
   dueRevocations,
@@ -108,6 +109,7 @@ import {
   renewLease,
   reopenReady,
   type ClaimRow,
+  type RevocationOutcome,
 } from "./store";
 
 /** Limits a test may tighten. */
@@ -239,29 +241,49 @@ export function createClaims(
     });
   };
 
+  /** A revocation that is not settled, due again after `REVOKE_RETRY_MS`. */
+  const owed = (): RevocationOutcome => ({ kind: "owed", retryAt: clock() + REVOKE_RETRY_MS });
+
+  /** The revocation sweep running for each claim, which a second caller joins. */
+  const revoking = new Map<ClaimId, Promise<PortResult<TokenRevocation>>>();
+
   /**
-   * Revokes the fork tokens of the claim at `generation` and records the outcome. A revocation that
-   * fails, or that Artifacts reports as `pending_debt`, is not settled and is due again after
-   * `REVOKE_RETRY_MS`.
+   * Revokes the fork tokens of the claim at `generation` and records the outcome, joining the sweep
+   * already running for the claim rather than starting another. A revocation that fails, or that
+   * Artifacts reports as `pending_debt`, is not settled and is due again after `REVOKE_RETRY_MS`.
    */
-  const revoke = async (
+  const revoke = (claimId: ClaimId, generation: number): Promise<PortResult<TokenRevocation>> => {
+    const running = revoking.get(claimId);
+    if (running !== undefined) return running;
+    const sweep = sweepTokens(claimId, generation).finally(() => revoking.delete(claimId));
+    revoking.set(claimId, sweep);
+    return sweep;
+  };
+
+  /**
+   * One revocation sweep under a new attempt. The attempt is stored before Artifacts is called, so
+   * a sweep this one overlaps, after an eviction lost the running one, cannot settle the claim.
+   */
+  const sweepTokens = async (
     claimId: ClaimId,
     generation: number,
   ): Promise<PortResult<TokenRevocation>> => {
+    const attempt = log.transaction((tx) => beginRevocation(tx.sql, claimId)).value;
     let revoked: PortResult<TokenRevocation>;
     try {
       revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, claimId));
     } catch (error) {
       // A revocation that throws is retried like a failed one, rather than at once by every wake.
       log.transaction((tx) => {
-        recordRevocation(tx.sql, claimId, generation, clock() + REVOKE_RETRY_MS);
+        recordRevocation(tx.sql, claimId, generation, owed());
         wakeForDeadline(tx.sql);
       });
       throw error;
     }
     log.transaction((tx) => {
-      const next = revocationSettled(revoked) ? null : clock() + REVOKE_RETRY_MS;
-      recordRevocation(tx.sql, claimId, generation, next);
+      const outcome: RevocationOutcome =
+        revocationSettled(revoked) && attempt !== null ? { kind: "settled", attempt } : owed();
+      recordRevocation(tx.sql, claimId, generation, outcome);
       wakeForDeadline(tx.sql);
     });
     return revoked;
@@ -601,7 +623,9 @@ export function createClaims(
       if (claimById(context.storage.sql, claimId)?.revokeDue === null) return decided;
       const revoked = await revoke(claimId, request.generation);
       if (!revoked.ok) return revoked;
-      return revocationSettled(revoked)
+      // The stored claim, not this sweep's answer, says whether the revocation settled: a sweep
+      // overlapped by a later one settles nothing.
+      return claimById(context.storage.sql, claimId)?.revokeDue === null
         ? decided
         : fail("busy", "The fork's tokens are not yet revoked; repeat the request.");
     },
