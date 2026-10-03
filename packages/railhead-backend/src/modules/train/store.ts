@@ -14,7 +14,9 @@
 // of that claim: a claim reopened after a superseded decision keeps its generation, so its next pin
 // reuses the entry. A waiting entry takes the new commit, a settled one is queued again, and a
 // batched one keeps its commit for the active batch and holds the new one in `next_commit` until
-// that batch settles.
+// that batch settles. `episode` records the claim's episode of the pin the entry holds, and
+// `next_episode` that of `next_commit`; a drive that read an entry settles it only while its
+// episode is unchanged, so a ready episode queued during the drive's reads is kept.
 //
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
@@ -78,6 +80,8 @@ const MIGRATIONS: readonly string[] = [
     lease_until INTEGER NOT NULL
   ) STRICT`,
   "ALTER TABLE train_queue ADD COLUMN next_commit TEXT",
+  "ALTER TABLE train_queue ADD COLUMN episode INTEGER NOT NULL DEFAULT 0 CHECK (episode >= 0)",
+  "ALTER TABLE train_queue ADD COLUMN next_episode INTEGER",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -125,6 +129,8 @@ export interface QueueEntry {
   retries: number;
   /** Why it left the queue, or `null`. */
   reason: DropReason | null;
+  /** The claim's ready episode the entry was last queued for. */
+  episode: number;
   /** While batched, the commit of a newer ready episode, queued once the batch settles; or `null`. */
   nextCommit: CommitSha | null;
 }
@@ -205,6 +211,7 @@ type QueueRow = {
   isolate: number;
   retries: number;
   reason: string | null;
+  episode: number;
   next_commit: string | null;
 };
 
@@ -230,7 +237,7 @@ type BatchRow = {
 };
 
 const QUEUE_COLUMNS =
-  "claim_id, generation, commit_sha, state, isolate, retries, reason, next_commit";
+  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit";
 const BATCH_COLUMNS =
   "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
@@ -298,33 +305,38 @@ export function recentEntries(sql: SqlStorage, limit: number): QueueEntry[] {
     .map(toEntry);
 }
 
-/** Adds a waiting entry at the back of the queue. */
-export function insertEntry(sql: SqlStorage, pin: ClaimPin, now: number): void {
+/** Adds a waiting entry for ready episode `episode` at the back of the queue. */
+export function insertEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
     `INSERT INTO train_queue
-       (claim_id, generation, commit_sha, position, state, isolate, retries, reason, enqueued_at, updated_at)
-     VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), 'queued', 0, 0, NULL, ?, ?)`,
+       (claim_id, generation, commit_sha, position, state, isolate, retries, reason, episode,
+        enqueued_at, updated_at)
+     VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), 'queued', 0, 0, NULL,
+       ?, ?, ?)`,
     pin.claimId,
     pin.generation,
     pin.commit,
+    episode,
     now,
     now,
   );
 }
 
 /**
- * Queues a newer ready episode of a claim whose entry is waiting or settled: the entry takes the
- * commit with fresh counters. A waiting entry keeps its place; a settled one goes to the back.
+ * Queues ready episode `episode` of a claim whose entry is waiting or settled: the entry takes the
+ * commit and episode with fresh counters. A waiting entry keeps its place; a settled one goes to the
+ * back.
  */
-export function requeueEntry(sql: SqlStorage, pin: ClaimPin, now: number): void {
+export function requeueEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
-    `UPDATE train_queue SET commit_sha = ?, isolate = 0, retries = 0, reason = NULL,
-       next_commit = NULL, updated_at = ?,
+    `UPDATE train_queue SET commit_sha = ?, episode = ?, isolate = 0, retries = 0, reason = NULL,
+       next_commit = NULL, next_episode = NULL, updated_at = ?,
        position = CASE WHEN state = 'queued' THEN position
          ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue) END,
        state = 'queued'
      WHERE claim_id = ? AND generation = ? AND state <> 'batched'`,
     pin.commit,
+    episode,
     now,
     pin.claimId,
     pin.generation,
@@ -332,16 +344,38 @@ export function requeueEntry(sql: SqlStorage, pin: ClaimPin, now: number): void 
 }
 
 /**
- * Holds the commit of a newer ready episode on a batched entry until its batch settles, or clears
- * it when the episode pinned the batched commit again.
+ * Records that the waiting entry of `pin`, which already holds its commit, was queued again for
+ * ready episode `episode`.
  */
-export function deferCommit(sql: SqlStorage, pin: ClaimPin, now: number): void {
+export function renewEpisode(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET episode = ?, updated_at = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'queued' AND commit_sha = ?`,
+    episode,
+    now,
+    pin.claimId,
+    pin.generation,
+    pin.commit,
+  );
+}
+
+/**
+ * Holds the commit of ready episode `episode` on a batched entry until its batch settles, or, when
+ * the episode pinned the batched commit again, clears any held commit and takes the episode.
+ */
+export function deferCommit(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
     `UPDATE train_queue SET next_commit = CASE WHEN commit_sha = ? THEN NULL ELSE ? END,
+       next_episode = CASE WHEN commit_sha = ? THEN NULL ELSE ? END,
+       episode = CASE WHEN commit_sha = ? THEN ? ELSE episode END,
        updated_at = ?
      WHERE claim_id = ? AND generation = ? AND state = 'batched'`,
     pin.commit,
     pin.commit,
+    pin.commit,
+    episode,
+    pin.commit,
+    episode,
     now,
     pin.claimId,
     pin.generation,
@@ -349,12 +383,13 @@ export function deferCommit(sql: SqlStorage, pin: ClaimPin, now: number): void {
 }
 
 /**
- * Queues, at the back with fresh counters, the newer commit each entry held while it was batched.
- * Call it after a batch's entries settle.
+ * Queues, at the back with fresh counters, the newer commit and episode each entry held while it
+ * was batched. Call it after a batch's entries settle.
  */
 export function promoteDeferred(sql: SqlStorage, now: number): void {
   sql.exec(
-    `UPDATE train_queue SET commit_sha = next_commit, next_commit = NULL, state = 'queued',
+    `UPDATE train_queue SET commit_sha = next_commit, next_commit = NULL,
+       episode = COALESCE(next_episode, episode), next_episode = NULL, state = 'queued',
        isolate = 0, retries = 0, reason = NULL, updated_at = ?,
        position = (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue)
      WHERE next_commit IS NOT NULL AND state <> 'batched'`,
@@ -668,6 +703,7 @@ function toEntry(row: QueueRow): QueueEntry {
     isolate: row.isolate === 1,
     retries: row.retries,
     reason: row.reason === null ? null : parseDropReason(row.reason),
+    episode: row.episode,
     nextCommit: row.next_commit,
   };
 }

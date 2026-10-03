@@ -1104,7 +1104,7 @@ describe("train wake", () => {
     await withTrain(async ({ sql, wakes, restart }) => {
       fakes.ready(pin(1));
       // What an enqueue leaves when the object stops after its commit, before any drive or alarm.
-      insertEntry(sql, pin(1), 1);
+      insertEntry(sql, pin(1), 1, 1);
       writeWake(sql, { dueAt: 1, failures: 0 });
 
       const again = restart();
@@ -1520,6 +1520,45 @@ describe("train ready episodes", () => {
     }, fakes);
   });
 
+  it("records each entry's ready episode and refuses an episode that is not a positive integer", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, events }) => {
+      for (const bad of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(await train.enqueue(pin(1), bad)).toMatchObject({
+          ok: false,
+          code: "invalid_request",
+        });
+      }
+      expect(train.entries(64)).toEqual([]);
+      expect(events()).toEqual([]);
+
+      fakes.head = () => fail("unavailable", "Main is down.");
+      fakes.ready(pin(1));
+      expect(await train.enqueue(pin(1), 2)).toEqual(ok({ queued: true }));
+      // The same commit again is a no-op for the queue, but the entry takes the newer episode.
+      expect(await train.enqueue(pin(1), 4)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({ pin: pin(1), state: "queued", episode: 4 });
+
+      fakes.head = () => ok(fakes.main);
+      await train.drive();
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched", episode: 4 });
+      // A batched entry takes a re-pinned commit's episode now and a held commit's once it settles.
+      expect(await train.enqueue(pin(1), 6)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched", episode: 6 });
+      const newer = pin(1, 1, sha("f"));
+      expect(await train.enqueue(newer, 8)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({
+        pin: pin(1),
+        episode: 6,
+        nextCommit: newer.commit,
+      });
+
+      fakes.ready(newer);
+      await train.recordCheck(report(lastStarted(fakes), "fail"));
+      expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", episode: 8 });
+    }, fakes);
+  });
+
   it("schedules the held commit when the batch fails and drops the old one", async () => {
     const fakes = new Fakes();
     await withTrain(async ({ train }) => {
@@ -1612,7 +1651,7 @@ describe("train module", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       migrateTrain(state.storage);
       const now = Date.now();
-      insertEntry(state.storage.sql, pin(1), now);
+      insertEntry(state.storage.sql, pin(1), 1, now);
       writeWake(state.storage.sql, { dueAt: now, failures: 0 });
       await state.storage.deleteAlarm();
     });

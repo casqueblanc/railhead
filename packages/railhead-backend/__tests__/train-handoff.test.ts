@@ -71,6 +71,11 @@ interface Setup {
   ackAll(): Promise<void>;
   /** Pushes `commit` to the claim's fork. */
   push(claimId: string, commit: string): Promise<void>;
+  /**
+   * Holds the answer of the train's next `claims.pin` read, which has already run, until `release`
+   * is called. `reached` resolves once the read has answered.
+   */
+  holdNextPin(): { reached: Promise<void>; release(): void };
   /** Whether main can be read; while false, every read refuses with `unavailable`. */
   mainUp: boolean;
   /** Moves the Repo's clock forward. */
@@ -132,6 +137,7 @@ function withHandoff<T>(
     };
     const composed: ClaimPin[][] = [];
     const started: CheckAttempt[] = [];
+    let held: { reach(): void; released: Promise<void> } | null = null;
     const base = composeRepo(context);
     const claims = createClaims(context, () => ports);
     const inbox = createInbox(context);
@@ -148,7 +154,19 @@ function withHandoff<T>(
         { ...context, namespace: fake },
         { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
       ),
-      claims,
+      claims: {
+        ...claims,
+        async pin(claimId) {
+          const answer = await claims.pin(claimId);
+          const hold = held;
+          held = null;
+          if (hold !== null) {
+            hold.reach();
+            await hold.released;
+          }
+          return answer;
+        },
+      },
       inbox,
       decisions,
       train: install(train),
@@ -253,6 +271,12 @@ function withHandoff<T>(
         }
       },
       push,
+      holdNextPin() {
+        const reached = signal();
+        const released = signal();
+        held = { reach: reached.resolve, released: released.promise };
+        return { reached: reached.promise, release: released.resolve };
+      },
       mainUp: true,
       advance: (ms) => fake.advance(ms),
       now: () => fake.clock(),
@@ -266,6 +290,15 @@ function withHandoff<T>(
     };
     return body(setup);
   });
+}
+
+/** A promise and the call that resolves it. */
+function signal(): { promise: Promise<void>; resolve(): void } {
+  let resolve: (() => void) | undefined;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve: () => resolve?.() };
 }
 
 function claimState(sql: SqlStorage, claimId: string): string {
@@ -378,7 +411,7 @@ describe("ready hands its pin to the train", () => {
       setup.sql.exec("DELETE FROM train_wake");
       for (let n = 0; n < MAX_QUEUE; n += 1) {
         const other = { claimId: `clm_filler${String(n).padStart(4, "0")}`, generation: 1 };
-        insertEntry(setup.sql, { ...other, commit: ROOT }, 0);
+        insertEntry(setup.sql, { ...other, commit: ROOT }, 1, 0);
       }
       const head = setup.log.head();
       const request = { generation: 1, commit: WORK };
@@ -455,6 +488,50 @@ describe("a re-ready after a superseded decision", () => {
       const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
       expect(setup.composed).toEqual([[pin]]);
       expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
+    });
+  });
+
+  it("keeps a same-commit re-ready queued while the drive that read the old episode drops it", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      // Main is down for the old drive, so after its drop step it stops before forming a batch.
+      setup.mainUp = false;
+
+      // The drive's read finds the pin superseded and reopens the claim; its answer is held.
+      const hold = setup.holdNextPin();
+      const drive = setup.train.resume();
+      await hold.reached;
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+
+      // The holder acknowledges the new version and marks the same commit ready again.
+      await setup.ackAll();
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+
+      // The old drive resumes with its superseded answer and drops nothing it did not read.
+      hold.release();
+      await drive;
+
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+      expect(setup.composed).toEqual([]);
+      const wake = readWake(setup.sql);
+      expect(wake).not.toBeNull();
+      expect(setup.wakes.at(-1)).toBe(wake?.dueAt);
+
+      // The next drive schedules the pin under the new version.
+      setup.mainUp = true;
+      setup.advance(Math.max((wake?.dueAt ?? 0) - setup.now(), 0));
+      await setup.train.resume();
+
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.composed).toEqual([[pin]]);
+      expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
     });
   });
 

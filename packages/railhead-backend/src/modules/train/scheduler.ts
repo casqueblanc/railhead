@@ -31,6 +31,9 @@
 // the commit of its waiting entry or queues its settled entry again, and a batched entry takes the
 // new commit once its batch settles. A batch formed for the earlier episode cannot land it, since
 // the decision versions it was scheduled under are no longer current.
+// Each entry records the episode it was queued for, and a drive settles or batches a waiting entry
+// only while that episode and its commit are the ones it read, so a claim re-readied with the same
+// commit during the drive's reads stays queued for the next pass.
 //
 // Every port call is bounded by `PORT_TIMEOUT_MS`; a call that does not answer in time stops the
 // drive as if the port were unavailable, and the alarm retries it under the same attempt or intent.
@@ -98,6 +101,7 @@ import {
   recordCandidate,
   recordCheckResult,
   recordIntent,
+  renewEpisode,
   requeueEntry,
   requeueFront,
   requestCheck,
@@ -514,11 +518,8 @@ export function createTrain(
     const pins = members.map((entry) => entry.pin);
     const now = clock();
     fenced(generation, () => {
-      // A pin queued during the reads above may have settled an entry; form again from storage.
-      const unchanged = pins.every((pin) => {
-        const entry = readEntry(sql, pin.claimId, pin.generation);
-        return entry?.state === "queued" && entry.pin.commit === pin.commit;
-      });
+      // A pin queued during the reads above may have changed an entry; form again from storage.
+      const unchanged = members.every((entry) => stillObserved(entry));
       if (!unchanged || activeBatch(sql) !== null) return;
       insertBatch(
         sql,
@@ -804,13 +805,24 @@ export function createTrain(
     const now = clock();
     fenced(generation, () => {
       for (const entry of entries) {
-        // A newer ready episode may have replaced the commit during the reads; keep that one.
-        const stored = readEntry(sql, entry.pin.claimId, entry.pin.generation);
-        if (stored?.state === "queued" && stored.pin.commit === entry.pin.commit) {
-          settleEntry(sql, entry.pin, "dropped", reason, now);
-        }
+        // A ready episode queued during the reads is newer than what they judged; keep it.
+        if (stillObserved(entry)) settleEntry(sql, entry.pin, "dropped", reason, now);
       }
     });
+  }
+
+  /**
+   * Whether the waiting entry `observed` is still the one stored: the same commit at the same ready
+   * episode. A claim re-readied with the same commit is a new episode, which a judgement of the
+   * earlier one must not settle.
+   */
+  function stillObserved(observed: QueueEntry): boolean {
+    const stored = readEntry(sql, observed.pin.claimId, observed.pin.generation);
+    return (
+      stored?.state === "queued" &&
+      stored.pin.commit === observed.pin.commit &&
+      stored.episode === observed.episode
+    );
   }
 
   /**
@@ -881,10 +893,17 @@ export function createTrain(
     };
   }
 
-  function queue(_tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }> {
+  function queue(
+    _tx: EventTransaction,
+    pin: ClaimPin,
+    episode: number,
+  ): PortResult<{ queued: boolean }> {
     const now = clock();
-    if (!validPin(pin)) {
-      return fail("invalid_request", "The pin needs a claim, a positive generation and a commit.");
+    if (!validPin(pin) || !Number.isSafeInteger(episode) || episode <= 0) {
+      return fail(
+        "invalid_request",
+        "The pin needs a claim, a positive generation, a commit and a positive episode.",
+      );
     }
     if (highestGeneration(sql, pin.claimId) > pin.generation) {
       return fail("stale_generation", "A newer generation of this claim is queued.");
@@ -895,12 +914,17 @@ export function createTrain(
       switch (existing.state) {
         case "batched":
           // The active batch keeps the commit it was formed with; the newer one waits for it.
-          deferCommit(sql, pin, now);
+          deferCommit(sql, pin, episode, now);
           queued = false;
           break;
         case "queued":
-          if (existing.pin.commit === pin.commit) queued = false;
-          else requeueEntry(sql, pin, now);
+          if (existing.pin.commit === pin.commit) {
+            // Still waiting with this commit, but a drive reading it judged the earlier episode.
+            renewEpisode(sql, pin, episode, now);
+            queued = false;
+          } else {
+            requeueEntry(sql, pin, episode, now);
+          }
           break;
         case "landed":
           // Main already holds this commit, merged under the decision versions of an earlier
@@ -924,8 +948,8 @@ export function createTrain(
       if (countPending(sql) >= MAX_QUEUE) {
         return fail("busy", "The train's queue is full.");
       }
-      if (existing === null) insertEntry(sql, pin, now);
-      else requeueEntry(sql, pin, now);
+      if (existing === null) insertEntry(sql, pin, episode, now);
+      else requeueEntry(sql, pin, episode, now);
     }
     // Every accepted episode is owed a drive, which also restarts a wake whose retries ran out,
     // so work it leaves runnable is never stranded. The Repo's alarm starts the drive once the

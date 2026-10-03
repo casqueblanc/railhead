@@ -5,22 +5,27 @@ import type { PortResult } from "../src/contracts/result";
 import type { Train } from "../src/modules/train/scheduler";
 import type { EventLog } from "../src/repo/eventLog";
 
+/** The last ready episode `enqueue` used; each call takes the next, as each `ready` does. */
+let episodes = 0;
+
 /** A train with `enqueue`, which only tests have. */
 export interface QueueingTrain extends Train {
   /**
    * Queues `pin` through `queue` in a transaction of its own, as `ready` does, then drives the train
-   * as the Repo's alarm would once that transaction commits. A refused pin is not driven. A drive
-   * that throws is logged and not rethrown, as the alarm does.
+   * as the Repo's alarm would once that transaction commits. The pin is a new ready episode, numbered
+   * `episode` when given. A refused pin is not driven. A drive that throws is logged and not
+   * rethrown, as the alarm does.
    */
-  enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
+  enqueue(pin: ClaimPin, episode?: number): Promise<PortResult<{ queued: boolean }>>;
 }
 
 /** Adds `enqueue` to `train`, queuing through `log`, the Repo's event log. */
 export function queueing(train: Train, log: EventLog): QueueingTrain {
   return {
     ...train,
-    async enqueue(pin) {
-      const result = log.transaction((tx) => train.queue(tx, pin)).value;
+    async enqueue(pin, episode) {
+      episodes += 1;
+      const result = log.transaction((tx) => train.queue(tx, pin, episode ?? episodes)).value;
       if (!result.ok) return result;
       try {
         await train.drive();

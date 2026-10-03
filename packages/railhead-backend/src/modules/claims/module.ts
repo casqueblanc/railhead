@@ -356,7 +356,7 @@ export function createClaims(
         const pinned = claimById(tx.sql, claimId);
         if (pinned === null) throw new Error("a pinned claim cannot be read back");
         // Last, since it asks for the train's wake. A refusal rolls the pin back.
-        const queued = ports().train.queue(tx, { claimId, generation, commit });
+        const queued = ports().train.queue(tx, { claimId, generation, commit }, pinned.episode);
         if (!queued.ok) throw new RolledBack(queued);
         return ok({ claim: view(pinned), repeated: false });
       });
