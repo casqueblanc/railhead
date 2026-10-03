@@ -103,6 +103,7 @@ export const unavailableMerge: MergePort = {
 export const unavailableChecks: CheckPort = {
   definitions: refuse("checks"),
   start: refuse("checks"),
+  report: refuse("checks"),
 };
 
 /**

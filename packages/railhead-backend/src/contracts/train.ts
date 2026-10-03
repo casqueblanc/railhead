@@ -66,6 +66,25 @@ export interface CheckReport {
   finishedAt: number;
 }
 
+/**
+ * What the check workflow reports for one run, from outside the sandbox. The checks module accepts
+ * it only for its own started attempt, on the same candidate and definition.
+ */
+export interface CheckRunReport {
+  /** The attempt it reports on. */
+  attemptId: CheckRunId;
+  /** The candidate it ran on. */
+  candidate: CommitSha;
+  /** SHA-256 of the trusted definition the run used. */
+  digest: string;
+  /** The outcome: `fail` only when the check's own command failed, `error` when it could not run. */
+  result: CheckResult;
+  /** The run's output. Untrusted text: stored cut to its end, never logged. */
+  log: string;
+  /** When the run finished. */
+  finishedAt: number;
+}
+
 /** The result of composing pins on main. */
 export type MergeOutcome =
   /** Git merged every pin; `candidate` is the composed commit, published only for checking. */
@@ -125,8 +144,18 @@ export interface CheckPort {
    * `source` is `main`; nothing is read from the candidate.
    */
   definitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
-  /** Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. */
+  /**
+   * Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. A
+   * candidate that edits the definition or a path it protects is refused with `check_held` and
+   * never run.
+   */
   start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
+  /**
+   * Records a run's report for its started attempt and passes it to `TrainPort.recordCheck`. A
+   * report for an attempt it did not start, on another candidate or definition, or with another
+   * result than one already recorded, is refused with `check_mismatch`.
+   */
+  report(run: CheckRunReport): Promise<PortResult<CheckAttempt>>;
 }
 
 /** A persisted check attempt and the report recorded for it, if one has been. */

@@ -897,6 +897,26 @@ describe("authority", () => {
     }
   });
 
+  it("refuses a push held for a person with 403 and its message, before minting a token", async () => {
+    await withGateway(async (world) => {
+      world.authorize = () =>
+        fail("check_held", "The candidate edits protected check paths; a person must approve it.");
+      const advertised = await world.gateway.serve(
+        advertise("git-receive-pack"),
+        FORK,
+        "/info/refs",
+      );
+
+      expect(advertised.status).toBe(403);
+      expect(await advertised.text()).toBe(
+        "railhead: The candidate edits protected check paths; a person must approve it.\n",
+      );
+      expect(world.minted()).toBe(0);
+      expect(world.seen).toEqual([]);
+      expect(world.events()).toEqual([]);
+    });
+  });
+
   it("answers a fetch refused at its POST with an ERR packet, or an HTTP error past 403", async () => {
     await withGateway(async (world) => {
       world.authorize = () => fail("claim_closed", "The claim is closed.");
