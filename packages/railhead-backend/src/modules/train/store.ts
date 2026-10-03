@@ -8,6 +8,10 @@
 // accepts work writes it in the same transaction, so the debt survives a restart even when the
 // Repo's alarm was never set. While the active batch waits for a runner's report, the row is due at
 // the attempt's deadline.
+//
+// `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
+// Each drive takes the next generation, and every write a drive makes checks it still holds the
+// latest one, so a drive that outlived its lease and was taken over cannot change state again.
 
 import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
@@ -61,6 +65,11 @@ const MIGRATIONS: readonly string[] = [
     failures INTEGER NOT NULL CHECK (failures >= 0)
   ) STRICT`,
   "ALTER TABLE train_batches ADD COLUMN check_deadline INTEGER",
+  `CREATE TABLE train_drive (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    lease_until INTEGER NOT NULL
+  ) STRICT`,
 ];
 
 /** Creates or migrates the train's tables. */
@@ -160,7 +169,7 @@ export interface BatchRecord {
   attemptAt: number | null;
   /** Whether the check port accepted the attempt. */
   checkStarted: boolean;
-  /** Once the attempt started, when it expires unless the runner has reported. */
+  /** Once the attempt's start was requested, when it expires unless the runner has reported. */
   checkDeadline: number | null;
   /** The runner's result, once reported. */
   checkResult: CheckResult | null;
@@ -415,16 +424,29 @@ export function recordCandidate(
   );
 }
 
-/** Records that the check port accepted the attempt, and when it expires without a report. */
-export function markCheckStarted(
+/**
+ * Records, before the check port is asked to start the attempt, when the attempt expires without a
+ * report. A deadline already recorded is kept, so asking again never extends it.
+ */
+export function requestCheck(
   sql: SqlStorage,
   batchId: number,
   deadline: number,
   now: number,
 ): void {
   sql.exec(
-    "UPDATE train_batches SET check_started = 1, check_deadline = ?, updated_at = ? WHERE batch_id = ?",
+    `UPDATE train_batches SET check_deadline = ?, updated_at = ?
+       WHERE batch_id = ? AND state = 'checking' AND check_deadline IS NULL`,
     deadline,
+    now,
+    batchId,
+  );
+}
+
+/** Records that the check port accepted the attempt. */
+export function markCheckStarted(sql: SqlStorage, batchId: number, now: number): void {
+  sql.exec(
+    "UPDATE train_batches SET check_started = 1, updated_at = ? WHERE batch_id = ?",
     now,
     batchId,
   );
@@ -518,6 +540,36 @@ export function clearWake(sql: SqlStorage): void {
   sql.exec("DELETE FROM train_wake");
 }
 
+/** The latest drive's generation and when its lease ends. */
+export interface DriveLease {
+  /** Increases by one with each drive. */
+  generation: number;
+  /** When the alarm may take over from the drive, in milliseconds since the Unix epoch. */
+  leaseUntil: number;
+}
+
+/** The latest drive's lease, or `null` before the first drive. */
+export function readDrive(sql: SqlStorage): DriveLease | null {
+  const row = sql
+    .exec<{
+      generation: number;
+      lease_until: number;
+    }>("SELECT generation, lease_until FROM train_drive")
+    .toArray()[0];
+  return row === undefined ? null : { generation: row.generation, leaseUntil: row.lease_until };
+}
+
+/** Records the latest drive's lease. */
+export function writeDrive(sql: SqlStorage, lease: DriveLease): void {
+  sql.exec(
+    `INSERT INTO train_drive (id, generation, lease_until) VALUES (1, ?, ?)
+     ON CONFLICT (id) DO UPDATE SET generation = excluded.generation,
+       lease_until = excluded.lease_until`,
+    lease.generation,
+    lease.leaseUntil,
+  );
+}
+
 /**
  * Whether storage holds work a drive could move now: an active batch that is not waiting for a
  * runner's report, or a waiting pin with no batch active.
@@ -563,7 +615,7 @@ function toBatch(row: BatchRow): BatchRecord {
     attemptAt: row.attempt_at,
     checkStarted: row.check_started === 1,
     // A started attempt always has a deadline; one recorded without it has already expired.
-    checkDeadline: row.check_started === 1 ? (row.check_deadline ?? row.updated_at) : null,
+    checkDeadline: row.check_deadline ?? (row.check_started === 1 ? row.updated_at : null),
     checkResult: row.check_result === null ? null : parseCheckResult(row.check_result),
     logDigest: row.log_digest,
     finishedAt: row.finished_at,

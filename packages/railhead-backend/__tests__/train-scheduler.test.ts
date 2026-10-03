@@ -1,4 +1,9 @@
-import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import {
+  abortAllDurableObjects,
+  evictDurableObject,
+  runDurableObjectAlarm,
+  runInDurableObject,
+} from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { CommitSha, DecisionRef, RailheadEvent } from "@railhead/shared/events";
@@ -18,6 +23,7 @@ import {
   MAX_QUEUE,
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
+  PORT_TIMEOUT_MS,
   WAKE_BASE_MS,
   WAKE_MAX_MS,
   type Train,
@@ -53,6 +59,17 @@ function definition(main: CommitSha): CheckDefinition {
   return { name: "test", source: main, digest: "d".repeat(64), acceptance: null };
 }
 
+/** The port calls the train makes. */
+type PortCall =
+  | "claims.pin"
+  | "mainWriter.head"
+  | "checks.definitions"
+  | "decisions.requirements"
+  | "merge.compose"
+  | "checks.start"
+  | "authorization.authorize"
+  | "mainWriter.publish";
+
 /**
  * Fakes of the published ports. Merge composes deterministically from main and the pins; the
  * main writer is a compare-and-swap ref. Each records what it was asked.
@@ -79,10 +96,19 @@ class Fakes {
   head: () => PortResult<CommitSha> = () => ok(this.main);
   /** When set, each check start waits for it before answering. */
   startGate: (() => Promise<void>) | null = null;
+  /** The port call that never answers, if any. */
+  hang: PortCall | null = null;
+  /** How long the train waits on each port call. */
+  portTimeoutMs = PORT_TIMEOUT_MS;
   readonly intents = new Map<string, MergeIntentRecord>();
 
   ready(...pins: ClaimPin[]): void {
     for (const p of pins) this.pins.set(p.claimId, p);
+  }
+
+  /** Never settles while `call` is the hung one. */
+  async answer(call: PortCall): Promise<void> {
+    if (this.hang === call) await new Promise<never>(() => {});
   }
 
   ports(real: RepoPorts): RepoPorts {
@@ -91,24 +117,33 @@ class Fakes {
       claims: {
         ...real.claims,
         pin: async (claimId) => {
+          await this.answer("claims.pin");
           const current = this.pins.get(claimId);
           return current === undefined ? fail("not_found", "No such claim.") : ok(current);
         },
       },
       decisions: {
         ...real.decisions,
-        requirements: async (claimId) => ok(this.requirements.get(claimId) ?? []),
+        requirements: async (claimId) => {
+          await this.answer("decisions.requirements");
+          return ok(this.requirements.get(claimId) ?? []);
+        },
       },
       merge: {
         compose: async (main, pins) => {
           this.composeCalls.push({ main, pins });
+          await this.answer("merge.compose");
           return this.compose(main, pins);
         },
       },
       checks: {
-        definitions: async (main) => this.definitions(main),
+        definitions: async (main) => {
+          await this.answer("checks.definitions");
+          return this.definitions(main);
+        },
         start: async (attempt) => {
           this.started.push(attempt);
+          await this.answer("checks.start");
           if (this.startGate !== null) await this.startGate();
           return this.start(attempt);
         },
@@ -116,6 +151,7 @@ class Fakes {
       authorization: {
         authorize: async (attemptId) => {
           this.authorized.push(attemptId);
+          await this.answer("authorization.authorize");
           const attempt = this.started.find((a) => a.attemptId === attemptId);
           if (attempt === undefined) return fail("check_not_passed", "Unknown attempt.");
           const result = this.authorize(attempt);
@@ -125,9 +161,13 @@ class Fakes {
         intent: async () => fail("not_found", "No intent."),
       },
       mainWriter: {
-        head: async () => this.head(),
+        head: async () => {
+          await this.answer("mainWriter.head");
+          return this.head();
+        },
         publish: async (intentId) => {
           this.published.push(intentId);
+          await this.answer("mainWriter.publish");
           const record = this.intents.get(intentId);
           if (record === undefined) return fail("not_found", "No intent.");
           if (this.publishOverride !== null) return this.publishOverride(record);
@@ -197,7 +237,7 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       wake: (at) => wakes.push(at),
     };
     const ports = fakes.ports(composeRepo(context));
-    const build = () => createTrain(context, () => ports);
+    const build = () => createTrain(context, () => ports, fakes.portTimeoutMs);
     return body({
       train: build(),
       fakes,
@@ -790,15 +830,20 @@ describe("train wake", () => {
       const accepted = now() + 1;
       expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
       expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
-      // The lease alarm set with the queue entry, then the backoff that moved it earlier.
-      expect(wakes).toEqual([accepted + DRIVE_LEASE_MS, now() + WAKE_BASE_MS]);
+      // The lease alarm set with the queue entry, the drive's own lease, then the backoff that
+      // moved the alarm earlier.
+      expect(wakes).toEqual([
+        accepted + DRIVE_LEASE_MS,
+        accepted + 1 + DRIVE_LEASE_MS,
+        now() + WAKE_BASE_MS,
+      ]);
 
       // An alarm set by another module fires early: nothing is driven, and the wake is asked again.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       await train.resume();
       expect(fakes.composeCalls).toHaveLength(1);
-      expect(wakes).toHaveLength(3);
-      expect(wakes[2]).toBe(wakes[1]);
+      expect(wakes).toHaveLength(4);
+      expect(wakes[3]).toBe(wakes[2]);
 
       advance(WAKE_BASE_MS);
       await train.resume();
@@ -818,11 +863,10 @@ describe("train wake", () => {
 
   it("doubles the delay while a port refuses, then stops asking but keeps the work", async () => {
     const fakes = new Fakes();
-    fakes.start = () => fail("unavailable", "Runner offline.");
+    fakes.compose = () => fail("unavailable", "Sandbox offline.");
     await withTrain(async ({ train, sql, wakes, now, advance }) => {
       fakes.ready(pin(1), pin(2));
       await train.enqueue(pin(1));
-      const attemptId = lastStarted(fakes).attemptId;
       expect(owed(sql).failures).toBe(1);
 
       for (let failures = 2; failures <= MAX_WAKE_FAILURES; failures += 1) {
@@ -832,21 +876,24 @@ describe("train wake", () => {
         expect(owed(sql)).toEqual({ dueAt: now() + delay, failures });
       }
       expect(owed(sql).dueAt - now()).toBe(WAKE_MAX_MS);
-      // The enqueue's lease, then one backoff per failure.
-      expect(wakes).toHaveLength(MAX_WAKE_FAILURES + 1);
+      // The enqueue's lease, then each drive's lease and its backoff.
+      expect(wakes).toHaveLength(2 * MAX_WAKE_FAILURES + 1);
 
+      // The last drive asks for its lease but no backoff.
       advance(WAKE_MAX_MS);
       await train.resume();
       expect(readWake(sql)).toBeNull();
-      expect(wakes).toHaveLength(MAX_WAKE_FAILURES + 1);
-      expect(fakes.started).toHaveLength(MAX_WAKE_FAILURES + 1);
-      expect(train.batches(64)).toMatchObject([{ state: "checking", checkStarted: false }]);
+      expect(wakes).toHaveLength(2 * MAX_WAKE_FAILURES + 2);
+      expect(fakes.composeCalls).toHaveLength(MAX_WAKE_FAILURES + 1);
+      expect(train.batches(64)).toMatchObject([{ batchId: 1, state: "composing" }]);
 
-      // The work stayed in storage: the next call starts the same attempt again.
-      fakes.start = (attempt) => ok({ attemptId: attempt.attemptId });
+      // The work stayed in storage: the next call composes the same batch again.
+      fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
-      expect(lastStarted(fakes).attemptId).toBe(attemptId);
-      expect(train.batches(64)).toMatchObject([{ state: "checking", checkStarted: true }]);
+      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(train.batches(64)).toMatchObject([
+        { batchId: 1, state: "checking", checkStarted: true },
+      ]);
     }, fakes);
   });
 
@@ -997,6 +1044,142 @@ describe("train check deadline", () => {
   });
 });
 
+describe("train hung ports", () => {
+  it("takes over from a drive hung on a check start once its lease ends, and fences the late answer", async () => {
+    const fakes = new Fakes();
+    const gates: (() => void)[] = [];
+    // Only the first start hangs; the port answers every later one at once.
+    fakes.startGate = () =>
+      gates.length === 0 ? new Promise<void>((resolve) => gates.push(resolve)) : Promise.resolve();
+    await withTrain(async ({ train, sql, wakes, advance }) => {
+      fakes.ready(pin(1), pin(2));
+      const accepted = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(gates).toHaveLength(1));
+      const attempt = lastStarted(fakes);
+      // The deadline was recorded before the port was asked.
+      const [requested] = train.batches(1);
+      expect(requested).toMatchObject({ state: "checking", checkStarted: false });
+      expect(requested?.checkDeadline).toBe(attempt.createdAt + 1 + CHECK_DEADLINE_MS);
+
+      // The alarm within the lease returns at once and asks to come back when the lease ends.
+      const leaseEnd = wakes.at(-1);
+      await train.resume();
+      expect(fakes.started).toHaveLength(1);
+      expect(wakes.at(-1)).toBe(leaseEnd);
+
+      // After the lease, the alarm drives again without waiting on the hung start: the same
+      // attempt is started again and acknowledged, under the same deadline.
+      advance(DRIVE_LEASE_MS);
+      await train.resume();
+      expect(fakes.started.map((a) => a.attemptId)).toEqual([attempt.attemptId, attempt.attemptId]);
+      expect(train.batches(1)).toMatchObject([
+        { state: "checking", checkStarted: true, checkDeadline: requested?.checkDeadline },
+      ]);
+
+      // Later work moves while the first start is still pending.
+      expect(await train.recordCheck(report(attempt, "pass"))).toEqual(ok(attempt));
+      expect(fakes.main).toBe(attempt.candidate);
+      expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
+      expect(lastStarted(fakes).pins).toEqual([pin(2)]);
+      const batches = train.batches(64);
+      const wake = readWake(sql);
+      const calls = fakes.started.length;
+
+      // The hung start answers late: its drive writes nothing and calls no other port.
+      gates[0]?.();
+      expect(await accepted).toEqual(ok({ queued: true }));
+      expect(train.batches(64)).toEqual(batches);
+      expect(readWake(sql)).toEqual(wake);
+      expect(fakes.started).toHaveLength(calls);
+    }, fakes);
+  });
+
+  const CASES: [PortCall, string, "form" | "batch" | "land"][] = [
+    ["claims.pin", "pin_unavailable", "form"],
+    ["mainWriter.head", "main_unavailable", "form"],
+    ["checks.definitions", "definitions_unavailable", "form"],
+    ["decisions.requirements", "requirements_unavailable", "form"],
+    ["merge.compose", "merge_unavailable", "batch"],
+    ["checks.start", "checks_unavailable", "batch"],
+    ["authorization.authorize", "authorization_unavailable", "land"],
+    ["mainWriter.publish", "publish_pending", "land"],
+  ];
+
+  it.each(CASES)(
+    "stops a drive whose %s never answers, then retries it",
+    async (call, reason, at) => {
+      const fakes = new Fakes();
+      fakes.portTimeoutMs = 20;
+      await withTrain(async ({ train }) => {
+        fakes.ready(pin(1));
+        if (at !== "land") fakes.hang = call;
+        expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+        if (at === "land") {
+          fakes.hang = call;
+          const passed = report(lastStarted(fakes), "pass");
+          expect(await train.recordCheck(passed)).toMatchObject({ ok: true });
+        }
+        expect(await train.drive()).toEqual({
+          kind: "blocked",
+          batchId: at === "form" ? null : 1,
+          reason,
+          code: "unavailable",
+        });
+
+        fakes.hang = null;
+        if (at === "land") {
+          expect(await train.drive()).toEqual({ kind: "idle" });
+        } else {
+          expect(await train.drive()).toMatchObject({ kind: "checking", batchId: 1 });
+          await train.recordCheck(report(lastStarted(fakes), "pass"));
+        }
+        const attempt = lastStarted(fakes);
+        expect(new Set(fakes.started.map((a) => a.attemptId))).toEqual(
+          new Set([attempt.attemptId]),
+        );
+        expect(fakes.main).toBe(attempt.candidate);
+        // A timed-out authorization or publish is retried for the same attempt and intent.
+        expect(new Set(fakes.authorized)).toEqual(new Set([attempt.attemptId]));
+        expect(new Set(fakes.published).size).toBe(1);
+        expect(train.batches(64).map((b) => b.state)).toEqual(["landed"]);
+      }, fakes);
+    },
+  );
+
+  it("expires an attempt whose start never answered at the deadline recorded before the request", async () => {
+    const fakes = new Fakes();
+    fakes.portTimeoutMs = 20;
+    fakes.hang = "checks.start";
+    await withTrain(async ({ train, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const silent = lastStarted(fakes);
+      const [requested] = train.batches(1);
+      expect(requested).toMatchObject({ state: "checking", checkStarted: false });
+      const deadline = requested?.checkDeadline ?? 0;
+      expect(deadline).toBe(silent.createdAt + 1 + CHECK_DEADLINE_MS);
+
+      // A report from a runner that did start it is refused once the deadline has passed.
+      advance(deadline - now() - 1);
+      expect(await train.recordCheck(report(silent, "pass"))).toMatchObject({
+        ok: false,
+        code: "check_mismatch",
+      });
+
+      fakes.hang = null;
+      await train.resume();
+      const fresh = lastStarted(fakes);
+      expect(fresh.attemptId).not.toBe(silent.attemptId);
+      expect(train.batches(2).map((b) => [b.state, b.failure, b.checkStarted])).toEqual([
+        ["checking", null, true],
+        ["failed", "check_timeout", false],
+      ]);
+      expect(fakes.authorized).toEqual([]);
+      expect(fakes.main).toBe(MAIN);
+    }, fakes);
+  });
+});
+
 describe("train attempt outcome", () => {
   it("reads the persisted attempt, then its recorded report, and nothing for an unknown id", async () => {
     const fakes = new Fakes();
@@ -1126,12 +1309,14 @@ describe("train module", () => {
       await hanging;
       return accepted + 1 + DRIVE_LEASE_MS;
     });
-    // The object stops while the drive waits on the port.
-    await evictDurableObject(stub);
+    // The object stops while the drive waits on the port. Eviction would wait for the drive's port
+    // timeout, so the object is aborted instead, as a crash or a deploy stops it.
+    await abortAllDurableObjects();
+    const restarted = env.REPO.getByName(repoObjectName("acme", name));
 
     // Nothing touches the object until the alarm is well past due.
     await new Promise((resolve) => setTimeout(resolve, Math.max(due - Date.now(), 0) + 1_500));
-    const after = await runInDurableObject(stub, (_instance, state) => ({
+    const after = await runInDurableObject(restarted, (_instance, state) => ({
       wake: readWake(state.storage.sql),
       entry: state.storage.sql.exec("SELECT state FROM train_queue").toArray(),
     }));
@@ -1139,6 +1324,6 @@ describe("train module", () => {
     // on the pin and backs off, and the first backoff may have fired too.
     expect(after.wake?.failures).toBeGreaterThanOrEqual(1);
     expect(after.entry).toEqual([{ state: "queued" }]);
-    await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+    await runInDurableObject(restarted, (_instance, state) => state.storage.deleteAlarm());
   });
 });
