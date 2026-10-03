@@ -79,6 +79,8 @@ interface Setup {
    * is called. `reached` resolves once the read has answered.
    */
   holdNextPin(): { reached: Promise<void>; release(): void };
+  /** The Artifacts fake behind the adapter. */
+  fake: FakeArtifacts;
   /** The commit main is at. */
   main(): CommitSha;
   /** Whether main can be read; while false, every read refuses with `unavailable`. */
@@ -321,6 +323,7 @@ function withHandoff<T>(
         }
       },
       push,
+      fake,
       holdNextPin() {
         const reached = signal();
         const released = signal();
@@ -441,19 +444,24 @@ describe("ready hands its pin to the train", () => {
     );
   });
 
-  it("refuses a ready whose alarm write failed, and a repeat arms the wake and drives the pin", async () => {
+  it("revokes the fork's tokens when ready's alarm write fails, and a repeat arms the wake", async () => {
     // The clock runs an hour ahead, so the runtime never fires a stored alarm on its own. The first
-    // two alarm writes reject: ready's own, and the repeat's.
+    // three alarm writes reject: the one ready's transaction asks for, ready's own after revoking,
+    // and the repeat's.
     const options: HandoffOptions = {
       stub: env.REPO.getByName(crypto.randomUUID()),
       fake: new FakeArtifacts(Date.now() + 60 * 60_000),
       realAlarm: true,
-      failedAlarmWrites: 2,
+      failedAlarmWrites: 3,
     };
     await withHandoff(
       async (setup) => {
         const claim = await setup.open(WORK);
         const request = { generation: 1, commit: WORK };
+
+        // A write token granted before ready, as a push still in flight would hold.
+        const fork = await forkRepoName(REPO, claim.claimId);
+        const inFlight = setup.fake.mintFor(fork, "write", 600);
 
         // The pin commits, but no alarm holds its drive, so ready does not report success.
         expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
@@ -461,6 +469,9 @@ describe("ready hands its pin to the train", () => {
           code: "unavailable",
         });
         expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+        // The fork's tokens were still revoked, so the in-flight push cannot update the fork.
+        expect(setup.fake.accepts(inFlight.plaintext)).toBe(false);
+        expect(setup.fake.liveTokens(fork)).toEqual([]);
         expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
         expect(readWake(setup.sql)).toMatchObject({ failures: 0 });
         expect(await setup.storedAlarm()).toBeNull();
@@ -489,6 +500,39 @@ describe("ready hands its pin to the train", () => {
         expect(setup.composed).toEqual([[pin]]);
         expect(setup.started).toHaveLength(1);
         expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      },
+      undefined,
+      options,
+    );
+  });
+
+  it("arms the wake when ready's revocation fails, and a repeat revokes", async () => {
+    const options: HandoffOptions = {
+      stub: env.REPO.getByName(crypto.randomUUID()),
+      fake: new FakeArtifacts(Date.now() + 60 * 60_000),
+      realAlarm: true,
+    };
+    await withHandoff(
+      async (setup) => {
+        const claim = await setup.open(WORK);
+        const request = { generation: 1, commit: WORK };
+        const fork = await forkRepoName(REPO, claim.claimId);
+        const inFlight = setup.fake.mintFor(fork, "write", 600);
+        setup.fake.failRevocations(100);
+
+        const refused = await setup.claims.ready(agent(1), claim.claimId, request);
+        expect(refused.ok).toBe(false);
+        expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+        expect(setup.fake.accepts(inFlight.plaintext)).toBe(true);
+        // The failed revocation did not skip the wake: the pin's drive is scheduled.
+        const due = readWake(setup.sql)?.dueAt;
+        expect(due).toBeDefined();
+        expect(await setup.storedAlarm()).toBe(due);
+
+        setup.fake.failRevocations(0);
+        const repeated = await setup.claims.ready(agent(1), claim.claimId, request);
+        expect(repeated).toMatchObject({ ok: true, value: { repeated: true } });
+        expect(setup.fake.accepts(inFlight.plaintext)).toBe(false);
       },
       undefined,
       options,
