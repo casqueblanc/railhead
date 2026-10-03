@@ -4,7 +4,8 @@
 //
 // A push is checked before any of it is forwarded: its ref commands are read with the same
 // receive-pack parser the agent gateway uses, and each must create or update a ref under the
-// policy's candidate prefix. The pack after the commands is forwarded unread.
+// policy's write prefix, or delete one under its discard prefix. A policy without a discard grant
+// deletes nothing. The pack after the commands is forwarded unread.
 //
 // The grant lapses at the sandbox's deadline, and the gateway holds it to that through every await:
 // it checks the grant on arrival, after reading a push's commands and after minting a token, so
@@ -76,15 +77,19 @@ export async function serveGitGateway(
   if (request.method !== (op === "info/refs" ? "GET" : "POST")) return refuse("method");
 
   const write = service === "git-receive-pack";
-  const writable = policy.write !== null && policy.write.repo === repo;
+  // The prefixes this repository's refs may be pushed under, or deleted under, or `null`.
+  const prefixes: PushPrefixes = {
+    update: policy.write?.repo === repo ? policy.write.refPrefix : null,
+    delete: policy.discard?.repo === repo ? policy.discard.refPrefix : null,
+  };
+  const writable = prefixes.update !== null || prefixes.delete !== null;
   if (!writable && !policy.read.includes(repo)) return refuse("repository");
   if (write && !writable) return refuse("read-only");
 
   let body: ReadableStream<Uint8Array> | null = null;
   if (op === "git-receive-pack") {
-    const prefix = policy.write?.refPrefix;
-    if (prefix === undefined || request.body === null) return refuse("push");
-    const checked = await checkPush(request.body, prefix, deadline);
+    if (request.body === null) return refuse("push");
+    const checked = await checkPush(request.body, prefixes, deadline);
     if (lapsed()) return refuse("policy");
     if (checked.kind === "refused") return refuse(checked.reason);
     body = checked.body;
@@ -121,19 +126,26 @@ async function isCurrent(grant: SandboxGrant, deps: GatewayDeps): Promise<boolea
   }
 }
 
+/** Where one repository's refs may be created or updated, and deleted; `null` allows none. */
+interface PushPrefixes {
+  update: string | null;
+  delete: string | null;
+}
+
 type PushCheck =
   | { kind: "allowed"; body: ReadableStream<Uint8Array> }
   | { kind: "refused"; reason: "push" | "ref" };
 
 /**
- * Reads a receive-pack body until its ref commands are complete and checks each against `prefix`.
+ * Reads a receive-pack body until its ref commands are complete and checks each against `prefixes`:
+ * a delete under the delete prefix, anything else under the update prefix.
  * Holds at most the head and the chunk that completed it; on success returns a stream that replays
  * those bytes and then the rest of the body. When `deadline` aborts, the body is cancelled, so a
  * read waiting on it ends and nothing more of it is forwarded.
  */
 async function checkPush(
   source: ReadableStream<Uint8Array>,
-  prefix: string,
+  prefixes: PushPrefixes,
   deadline: AbortSignal,
 ): Promise<PushCheck> {
   const reader = source.getReader();
@@ -166,7 +178,7 @@ async function checkPush(
     await reader.cancel();
     return { kind: "refused", reason: "push" };
   }
-  if (!updates.every((update) => update.kind !== "delete" && isUnder(update.ref, prefix))) {
+  if (!updates.every((update) => isAllowed(update, prefixes))) {
     await reader.cancel();
     return { kind: "refused", reason: "ref" };
   }
@@ -185,6 +197,11 @@ async function checkPush(
     },
   });
   return { kind: "allowed", body };
+}
+
+function isAllowed(update: RefUpdate, prefixes: PushPrefixes): boolean {
+  const prefix = update.kind === "delete" ? prefixes.delete : prefixes.update;
+  return prefix !== null && isUnder(update.ref, prefix);
 }
 
 // A ref under the prefix with at least one more segment, and no `..` or empty segment that could

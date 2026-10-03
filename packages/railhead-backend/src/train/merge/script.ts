@@ -40,6 +40,7 @@ const HOST =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const REF = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/[a-z]+$/;
+const PREFIX = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/$/;
 
 /** Where a repository's Git remote lives: the Artifacts host and namespace. */
 export interface RemoteLocation {
@@ -194,6 +195,29 @@ export function pushCommand(url: string, commit: string, ref: string, seconds: n
 }
 
 /**
+ * Deletes every ref under the candidate `prefix` of `url`, and prints `discarded <n>` with how many
+ * it deleted. It lists the prefix first, so a prefix with nothing left succeeds without pushing.
+ * Listed ref names reach `git push` only as quoted arguments, never as shell text. Exits 2 when a
+ * step fails or Git lists a ref outside the prefix.
+ */
+export function discardCommand(url: string, prefix: string, seconds: number): string {
+  if (!PREFIX.test(prefix)) throw new Error("invalid candidate prefix");
+  return script(seconds, [
+    `refs=$(step git ls-remote --refs ${quote(url)} ${quote(`${prefix}*`)}) || fail 2`,
+    "set --",
+    "tab=$(printf '\\t')",
+    'while IFS="$tab" read -r oid ref; do',
+    '  [ -n "$oid" ] || continue',
+    `  case "$ref" in ${quote(prefix)}?*) set -- "$@" "$ref" ;; *) exit 2 ;; esac`,
+    "done <<EOF",
+    "$refs",
+    "EOF",
+    `[ "$#" -eq 0 ] || step git push -q ${quote(url)} --delete "$@" || fail 2`,
+    'echo "discarded $#"',
+  ]);
+}
+
+/**
  * A command body under one deadline. `step` runs a command cut to the time left; `fail` exits with
  * the timeout's status when the step was cut, else with its own code.
  */
@@ -272,6 +296,12 @@ export function parseBinary(stdout: string, count: number): Set<number> | null {
     if (match[2] === "-" || match[3] === "-") binary.add(index);
   }
   return binary;
+}
+
+/** Reads how many refs `discardCommand` deleted, or `null`. */
+export function parseDiscarded(stdout: string): number | null {
+  const match = /^discarded (0|[1-9][0-9]{0,5})\n$/.exec(stdout);
+  return match === null ? null : Number(match[1]);
 }
 
 /** Reads the commit `mergeCommand` printed, or `null`. */

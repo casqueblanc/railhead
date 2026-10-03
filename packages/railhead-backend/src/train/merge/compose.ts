@@ -24,24 +24,37 @@
 // abandoned and its answer ignored; releasing the sandbox destroys it, so no command keeps running.
 // A teardown that has not confirmed within `RELEASE_WAIT_MS` is still finished, and its slot freed,
 // by the sandbox module.
+//
+// The caller names each compose's merge attempt, and so its candidate prefix, before calling, and
+// later discards the prefix with `discard`: a fresh sandbox granted only deletes under that one
+// prefix lists what is left there and deletes it. A compose pushes only from a sandbox admitted
+// within its budget and retired by its lifetime, so nothing it started can publish after
+// `MERGE_PUSH_WINDOW_MS`.
 
 import { isCommitSha, isId, type ClaimId, type CommitSha } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
-import { fail, ok, type PortResult } from "../../contracts/result";
+import { fail, ok, type PortFailure, type PortResult } from "../../contracts/result";
 import type { MergeOutcome, MergePort } from "../../contracts/train";
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxExec, type SandboxPort } from "../../sandbox/entry";
-import { CANDIDATE_REF_PREFIX, MAX_POLICY_REPOS, parseSandboxPolicy } from "../../sandbox/policy";
+import {
+  CANDIDATE_REF_PREFIX,
+  MAX_POLICY_REPOS,
+  parseSandboxPolicy,
+  type SandboxPolicy,
+} from "../../sandbox/policy";
 import {
   CONFLICT_EXIT,
   FETCH_FAILED_EXIT,
   NO_MERGE_BASE_EXIT,
   TIMEOUT_EXITS,
   binaryCommand,
+  discardCommand,
   fetchCommand,
   initCommand,
   mergeCommand,
   parseBinary,
   parseCommit,
+  parseDiscarded,
   parsePartner,
   partnerCommand,
   pushCommand,
@@ -71,6 +84,9 @@ export const MAX_CONFLICT_PATHS = 64;
 /** The ref, under the attempt's candidate prefix, a clean candidate is pushed to. */
 const CANDIDATE_LEAF = "merge";
 
+/** A merge attempt ID, which names its candidate prefix and fits a sandbox attempt ID. */
+const MERGE_ATTEMPT = /^mrg_[A-Za-z0-9]{6,64}$/;
+
 /** File modes a classifiable conflict may have on every side: regular and executable files. */
 const TEXT_MODES = new Set(["100644", "100755"]);
 
@@ -88,15 +104,13 @@ export interface MergeDeps {
   commitExists: (repo: string, commit: CommitSha) => Promise<PortResult<boolean>>;
   /** The current time, in milliseconds since the Unix epoch. */
   clock: () => number;
-  /** A fresh sandbox attempt ID for each compose. */
-  attemptId: () => string;
   /** Limits a test may tighten: `MERGE_TIMEOUT_MS` and `RELEASE_WAIT_MS`. */
   limits?: { timeoutMs: number; releaseWaitMs: number };
 }
 
-/** A fresh merge attempt ID, which also names its candidate prefix. */
-export function mergeAttemptId(): string {
-  return `mrg_${crypto.randomUUID().replaceAll("-", "")}`;
+/** Whether `value` is a merge attempt ID `compose` and `discard` accept. */
+export function isMergeAttempt(value: string): boolean {
+  return MERGE_ATTEMPT.test(value);
 }
 
 /** Builds the merge port over `deps`. */
@@ -106,7 +120,10 @@ export function createMerge(deps: MergeDeps): MergePort {
     releaseWaitMs: RELEASE_WAIT_MS,
   };
   return {
-    async compose(expectedMain, pins) {
+    async compose(expectedMain, pins, attemptId) {
+      if (!isMergeAttempt(attemptId)) {
+        return fail("invalid_request", "The merge attempt is not a merge attempt ID.");
+      }
       if (!isCommitSha(expectedMain)) {
         return fail("invalid_request", "The expected main commit is not a full commit SHA.");
       }
@@ -130,7 +147,6 @@ export function createMerge(deps: MergeDeps): MergePort {
         return fail("unavailable", "The repository's Git remote could not be found.");
       }
       const [location, main, forks] = located.value;
-      const attemptId = deps.attemptId();
       const prefix = `${CANDIDATE_REF_PREFIX}${attemptId}/`;
       const policy = parseSandboxPolicy({
         host: location.host,
@@ -140,45 +156,129 @@ export function createMerge(deps: MergeDeps): MergePort {
       });
       if (policy === null) throw new Error("the merge built an invalid sandbox policy");
 
-      const sandbox = deps.sandbox();
-      // Releases the attempt, waiting for its teardown no longer than the budget allows.
-      const release = () =>
-        within(sandbox.release(attemptId), Math.min(releaseWaitMs, deadline - deps.clock()));
-      const admitting = sandbox.admit(attemptId, policy, MERGE_SANDBOX_LIFETIME_MS);
-      const admitted = await until.race(admitting);
-      if (admitted.kind !== "done") {
-        // Whatever the admission did, release it once it settles.
-        void admitting.finally(() => sandbox.release(attemptId)).catch(() => undefined);
-        if (admitted.kind === "timeout") return ok(failure("timeout"));
-        return fail("unavailable", "The sandbox could not be admitted.");
+      const ran = await inSandbox(deps, attemptId, policy, until, releaseUntil(deadline), (run) =>
+        run.compose({
+          location,
+          main,
+          expectedMain,
+          pins,
+          forks,
+          ref: `${prefix}${CANDIDATE_LEAF}`,
+        }),
+      );
+      switch (ran.kind) {
+        case "ran":
+          return ok(ran.value);
+        case "timeout":
+          return ok(failure("timeout"));
+        case "refused":
+          return ran.failure;
+        default:
+          return unreachable(ran);
       }
-      if (!admitted.value.ok) {
-        // A start that did not confirm leaves its slot uncertain; releasing it retries the teardown.
-        await release();
-        return admitted.value;
-      }
-      if (admitted.value.value.kind === "queued") {
-        await release();
-        return fail("busy", "Every sandbox is taken; the compose can be tried again later.");
-      }
+    },
 
-      const run = new Run(sandbox, attemptId, until, deps);
-      try {
-        return ok(
-          await run.compose({
-            location,
-            main,
-            expectedMain,
-            pins,
-            forks,
-            ref: `${prefix}${CANDIDATE_LEAF}`,
-          }),
-        );
-      } finally {
-        await release();
+    async discard(attemptId) {
+      if (!isMergeAttempt(attemptId)) {
+        return fail("invalid_request", "The merge attempt is not a merge attempt ID.");
+      }
+      const deadline = deps.clock() + timeoutMs;
+      const until = new Deadline(deadline - releaseWaitMs, deps.clock);
+      const located = await until.race(
+        Promise.all([deps.locate().catch(() => null), deps.mainRepo()]),
+      );
+      if (located.kind !== "done" || located.value[0] === null) {
+        return fail("unavailable", "The repository's Git remote could not be found.");
+      }
+      const [location, main] = located.value;
+      const prefix = `${CANDIDATE_REF_PREFIX}${attemptId}/`;
+      // The sandbox reads and writes nothing else: its one grant deletes under this prefix.
+      const policy = parseSandboxPolicy({
+        host: location.host,
+        namespace: location.namespace,
+        read: [],
+        write: null,
+        discard: { repo: main, refPrefix: prefix },
+      });
+      if (policy === null) throw new Error("the merge built an invalid sandbox policy");
+
+      // A sandbox attempt of its own, so a compose slot left uncertain never blocks the discard.
+      const sandboxAttempt = `dsc_${attemptId.slice("mrg_".length)}`;
+      const url = remoteUrl(location, main);
+      const ran = await inSandbox(
+        deps,
+        sandboxAttempt,
+        policy,
+        until,
+        releaseUntil(deadline),
+        (run) => run.discard(url, prefix),
+      );
+      switch (ran.kind) {
+        case "ran":
+          return ran.value === null
+            ? fail("unavailable", "The candidate refs could not be deleted.")
+            : ok({ removed: ran.value });
+        case "timeout":
+          return fail("unavailable", "The discard did not finish in time.");
+        case "refused":
+          return ran.failure;
+        default:
+          return unreachable(ran);
       }
     },
   };
+
+  /** How long a release may wait: its own limit, cut to what is left of the budget. */
+  function releaseUntil(deadline: number): () => number {
+    return () => Math.min(releaseWaitMs, deadline - deps.clock());
+  }
+}
+
+/** What running in a sandbox came to: the body's value, or why it never ran to the end. */
+type InSandbox<T> =
+  | { kind: "ran"; value: T }
+  | { kind: "timeout" }
+  | { kind: "refused"; failure: PortFailure };
+
+/**
+ * Admits `attemptId` under `policy`, runs `body` in its sandbox under `until` and releases it,
+ * waiting for the teardown no longer than `releaseWait` says.
+ */
+async function inSandbox<T>(
+  deps: MergeDeps,
+  attemptId: string,
+  policy: SandboxPolicy,
+  until: Deadline,
+  releaseWait: () => number,
+  body: (run: Run) => Promise<T>,
+): Promise<InSandbox<T>> {
+  const sandbox = deps.sandbox();
+  const release = () => within(sandbox.release(attemptId), releaseWait());
+  const admitting = sandbox.admit(attemptId, policy, MERGE_SANDBOX_LIFETIME_MS);
+  const admitted = await until.race(admitting);
+  if (admitted.kind !== "done") {
+    // Whatever the admission did, release it once it settles.
+    void admitting.finally(() => sandbox.release(attemptId)).catch(() => undefined);
+    if (admitted.kind === "timeout") return { kind: "timeout" };
+    return { kind: "refused", failure: fail("unavailable", "The sandbox could not be admitted.") };
+  }
+  if (!admitted.value.ok) {
+    // A start that did not confirm leaves its slot uncertain; releasing it retries the teardown.
+    await release();
+    return { kind: "refused", failure: admitted.value };
+  }
+  if (admitted.value.value.kind === "queued") {
+    await release();
+    return {
+      kind: "refused",
+      failure: fail("busy", "Every sandbox is taken; the call can be tried again later."),
+    };
+  }
+  try {
+    return { kind: "ran", value: await body(new Run(sandbox, attemptId, until, deps)) };
+  } finally {
+    await release();
+  }
 }
 
 interface ComposeInput {
@@ -238,6 +338,13 @@ class Run {
     const pushed = await this.#exec((seconds) => pushCommand(url, candidate, ref, seconds));
     if (pushed.kind === "ended") return pushed.outcome;
     return pushed.exec.exitCode === 0 ? { kind: "clean", candidate } : failure("infrastructure");
+  }
+
+  /** Deletes every ref under `prefix` of `url`: how many it deleted, or `null` when it failed. */
+  async discard(url: string, prefix: string): Promise<number | null> {
+    const step = await this.#exec((seconds) => discardCommand(url, prefix, seconds));
+    if (step.kind === "ended" || step.exec.exitCode !== 0) return null;
+    return parseDiscarded(step.exec.stdout);
   }
 
   /** Fetches every target at each depth in turn; `null` once every pin reaches main's history. */
@@ -363,6 +470,10 @@ function failure(
   reason: Extract<MergeOutcome, { kind: "error" }>["reason"],
 ): Extract<MergeOutcome, { kind: "error" }> {
   return { kind: "error", reason };
+}
+
+function unreachable(value: never): never {
+  throw new Error(`unhandled sandbox run: ${String(value)}`);
 }
 
 /** The point by which a compose's work must answer, read from the injected clock. */

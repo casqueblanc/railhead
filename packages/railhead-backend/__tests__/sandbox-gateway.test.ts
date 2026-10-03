@@ -24,6 +24,16 @@ const POLICY: SandboxPolicy = {
   write: { repo: "main-repo", refPrefix: `${CANDIDATE_REF_PREFIX}chk_attempt1/` },
 };
 
+/** A policy that may only delete the candidate refs of one merge attempt. */
+const DISCARD_GRANT = { repo: "main-repo", refPrefix: `${CANDIDATE_REF_PREFIX}mrg_attempt1/` };
+const DISCARD: SandboxPolicy = {
+  host: HOST,
+  namespace: "railhead",
+  read: [],
+  write: null,
+  discard: DISCARD_GRANT,
+};
+
 function noop(): void {}
 
 /** One pkt-line, written by hand so the tests do not reuse the subject's parser. */
@@ -276,10 +286,136 @@ describe("serveGitGateway", () => {
   });
 });
 
+/** A push of `commands` with no pack, as Git sends a delete-only push. */
+function deletes(...commands: string[]): string {
+  const [first = "", ...rest] = commands;
+  return (
+    pkt(`${first}\u0000report-status delete-refs\n`) +
+    rest.map((line) => pkt(`${line}\n`)).join("") +
+    "0000"
+  );
+}
+
+function receive(body: string): Request {
+  return new Request(url("main-repo", "git-receive-pack"), { method: "POST", body });
+}
+
+describe("serveGitGateway discard grant", () => {
+  it("forwards deletes under the granted prefix with a write token", async () => {
+    const deps = recorder();
+    const body = deletes(
+      `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`,
+      `${NEW} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/extra/leaf`,
+    );
+    const discovery = new Request(`${url("main-repo", "info/refs")}?service=git-receive-pack`);
+
+    expect((await serveGitGateway(discovery, live(DISCARD), deps)).status).toBe(200);
+    expect((await serveGitGateway(receive(body), live(DISCARD), deps)).status).toBe(200);
+
+    expect(deps.minted).toEqual([
+      ["main-repo", "write"],
+      ["main-repo", "write"],
+    ]);
+    expect(deps.forwarded[1]?.body).toBe(body);
+  });
+
+  it.each([
+    ["main", `${OLD} ${ZERO} refs/heads/main`],
+    ["another attempt's candidate", `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt2/merge`],
+    [
+      "a longer attempt sharing the prefix",
+      `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt10/merge`,
+    ],
+    ["the bare prefix", `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/`],
+    ["a dot-dot escape", `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/../../main`],
+    ["a tag", `${OLD} ${ZERO} refs/tags/v1`],
+    ["an update under the prefix", `${OLD} ${NEW} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`],
+    ["a create under the prefix", `${ZERO} ${NEW} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`],
+  ])("refuses a delete grant's push to %s and forwards nothing", async (_name, command) => {
+    const deps = recorder();
+
+    expect(
+      await refusal(await serveGitGateway(receive(deletes(command)), live(DISCARD), deps)),
+    ).toBe("ref");
+    expect(deps.minted).toEqual([]);
+    expect(deps.forwarded).toEqual([]);
+  });
+
+  it("refuses a delete outside the prefix even beside one inside it", async () => {
+    const deps = recorder();
+    const body = deletes(
+      `${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`,
+      `${OLD} ${ZERO} refs/heads/main`,
+    );
+
+    expect(await refusal(await serveGitGateway(receive(body), live(DISCARD), deps))).toBe("ref");
+    expect(deps.forwarded).toEqual([]);
+  });
+
+  it("keeps a write grant and a discard grant to their own kind of command", async () => {
+    const deps = recorder();
+    const both: SandboxPolicy = { ...POLICY, discard: DISCARD_GRANT };
+    const writePrefix = `${CANDIDATE_REF_PREFIX}chk_attempt1/head`;
+    const discardPrefix = `${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`;
+
+    const allowed = [
+      deletes(`${OLD} ${ZERO} ${discardPrefix}`),
+      deletes(`${OLD} ${NEW} ${writePrefix}`),
+    ];
+    for (const body of allowed) {
+      expect((await serveGitGateway(receive(body), live(both), deps)).status).toBe(200);
+    }
+    // A delete under the write prefix and an update under the discard prefix are both refused.
+    for (const command of [`${OLD} ${ZERO} ${writePrefix}`, `${OLD} ${NEW} ${discardPrefix}`]) {
+      const response = await serveGitGateway(receive(deletes(command)), live(both), deps);
+      expect(await refusal(response)).toBe("ref");
+    }
+    expect(deps.forwarded).toHaveLength(2);
+  });
+
+  it("refuses a delete grant's push to another repository and a fetch of a fork", async () => {
+    const deps = recorder();
+    const other = new Request(url("fork-a", "git-receive-pack"), {
+      method: "POST",
+      body: deletes(`${OLD} ${ZERO} ${CANDIDATE_REF_PREFIX}mrg_attempt1/merge`),
+    });
+
+    expect(await refusal(await serveGitGateway(other, live(DISCARD), deps))).toBe("repository");
+    expect(await refusal(await serveGitGateway(fetchRefs("fork-a"), live(DISCARD), deps))).toBe(
+      "repository",
+    );
+    expect(deps.minted).toEqual([]);
+  });
+});
+
 describe("parseSandboxPolicy", () => {
-  it("accepts a policy and a read-only one", () => {
+  it("accepts a policy, a read-only one and one with a discard grant", () => {
     expect(parseSandboxPolicy(POLICY)).toEqual(POLICY);
     expect(parseSandboxPolicy({ ...POLICY, write: null })).toEqual({ ...POLICY, write: null });
+    expect(parseSandboxPolicy(DISCARD)).toEqual(DISCARD);
+    // A policy without the field grants no delete.
+    expect(parseSandboxPolicy(POLICY)).not.toHaveProperty("discard");
+  });
+
+  it.each([
+    ["main", "refs/heads/main"],
+    ["the candidate root", CANDIDATE_REF_PREFIX],
+    ["a prefix without a trailing slash", `${CANDIDATE_REF_PREFIX}mrg_attempt1`],
+    ["two segments", `${CANDIDATE_REF_PREFIX}a/b/`],
+    ["a dot-dot segment", `${CANDIDATE_REF_PREFIX}../`],
+    ["another branch namespace", "refs/heads/feature/"],
+  ])("refuses a discard prefix of %s", (_name, refPrefix) => {
+    expect(
+      parseSandboxPolicy({ ...DISCARD, discard: { repo: "main-repo", refPrefix } }),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["null", null],
+    ["a repository with a slash", { repo: "a/b", refPrefix: `${CANDIDATE_REF_PREFIX}mrg_x1/` }],
+    ["a missing prefix", { repo: "main-repo" }],
+  ])("refuses a discard grant of %s", (_name, discard) => {
+    expect(parseSandboxPolicy({ ...DISCARD, discard })).toBeNull();
   });
 
   it.each([

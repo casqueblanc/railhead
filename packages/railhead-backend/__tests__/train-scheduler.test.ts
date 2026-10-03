@@ -9,19 +9,23 @@ import { describe, expect, it, vi } from "vitest";
 import type { CommitSha, DecisionRef, RailheadEvent } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import { fail, ok, type PortResult } from "../src/contracts/result";
-import type {
-  CheckAttempt,
-  CheckDefinition,
-  CheckReport,
-  MergeIntentRecord,
-  MergeOutcome,
+import {
+  MERGE_PUSH_WINDOW_MS,
+  type CheckAttempt,
+  type CheckDefinition,
+  type CheckReport,
+  type MergeIntentRecord,
+  type MergeOutcome,
 } from "../src/contracts/train";
 import {
   CHECK_DEADLINE_MS,
   createTrain,
+  DISCARD_BASE_MS,
+  DISCARD_MAX_MS,
   DRIVE_LEASE_MS,
   EXHAUSTED_FAILURES,
   MAX_QUEUE,
+  MAX_DISCARDS_PER_WAKE,
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
   PORT_TIMEOUT_MS,
@@ -83,6 +87,17 @@ class Fakes {
   /** Requirements returned per claim. */
   readonly requirements = new Map<string, DecisionRef[]>();
   composeCalls: { main: CommitSha; pins: ClaimPin[] }[] = [];
+  /** The merge attempt of each compose, in order. */
+  composeAttempts: string[] = [];
+  /**
+   * The attempts whose candidate ref the merge fake holds. Every compose publishes its ref before
+   * it answers, as a real one may before it times out, and `discard` deletes it.
+   */
+  readonly candidateRefs = new Set<string>();
+  /** Each discard asked for, in order. */
+  discards: string[] = [];
+  discard: (attempt: string) => PortResult<{ removed: number }> = (attempt) =>
+    ok({ removed: this.candidateRefs.delete(attempt) ? 1 : 0 });
   started: CheckAttempt[] = [];
   authorized: string[] = [];
   published: string[] = [];
@@ -145,10 +160,16 @@ class Fakes {
         },
       },
       merge: {
-        compose: async (main, pins) => {
+        compose: async (main, pins, attempt) => {
           this.composeCalls.push({ main, pins });
+          this.composeAttempts.push(attempt);
+          this.candidateRefs.add(attempt);
           await this.answer("merge.compose");
           return this.compose(main, pins);
+        },
+        discard: async (attempt) => {
+          this.discards.push(attempt);
+          return this.discard(attempt);
         },
       },
       checks: {
@@ -241,8 +262,10 @@ interface Harness {
   restart(): Train;
   events(): RailheadEvent[];
   sql: SqlStorage;
-  /** Every time the train asked the Repo's alarm for, oldest first. */
+  /** Every time the train asked the Repo's alarm for a drive, oldest first. */
   wakes: number[];
+  /** Every time it asked the alarm for a pending discard, oldest first. */
+  discardWakes: number[];
   /** The clock's current time. */
   now(): number;
   /** Moves the clock forward. */
@@ -256,13 +279,22 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
     let now = 1_000;
     const log = EventLog.open(state.storage, REPO_ID, () => now);
     const wakes: number[] = [];
+    const discardWakes: number[] = [];
+    // A wake for a pending discard is kept apart from the drive wakes most tests count.
+    const forDiscard = (at: number) =>
+      state.storage.sql
+        .exec<{ found: number }>(
+          "SELECT EXISTS (SELECT 1 FROM train_discards WHERE due_at = ?) AS found",
+          at,
+        )
+        .one().found === 1;
     const context: RepoContext = {
       repoId: REPO_ID,
       storage: state.storage,
       log,
       clock: () => (now += 1),
       env,
-      wake: (at) => wakes.push(at),
+      wake: (at) => (forDiscard(at) ? discardWakes : wakes).push(at),
     };
     const ports = fakes.ports(composeRepo(context));
     const build = () => createTrain(context, () => ports, fakes.portTimeoutMs);
@@ -273,6 +305,7 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       events: () => log.replay(0, 256).events,
       sql: state.storage.sql,
       wakes,
+      discardWakes,
       now: () => now,
       advance: (ms) => {
         now += ms;
@@ -988,8 +1021,10 @@ describe("train wake", () => {
       const release = fakes.hold("merge.compose");
       const duplicate = train.enqueue(pin(1));
       await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(composes + 1));
-      expect(owed(sql)).toEqual({ dueAt: now(), failures: 0 });
-      expect(wakes.slice(asked)).toEqual([now() + DRIVE_LEASE_MS]);
+      // Due when the drive started, before the merge attempt was recorded and the port asked.
+      const started = owed(sql);
+      expect(started).toEqual({ dueAt: now() - 1, failures: 0 });
+      expect(wakes.slice(asked)).toEqual([started.dueAt + DRIVE_LEASE_MS]);
       expectDebtCovered(sql, wakes, false);
 
       // Crash: the object stops mid-drive. The rebuilt train asks for the wake again.
@@ -1604,5 +1639,196 @@ describe("train module", () => {
     expect(after.entry).toEqual([{ state: "dropped", reason: "pin_changed" }]);
     expect(after.wake).toBeNull();
     await runInDurableObject(restarted, (_instance, state) => state.storage.deleteAlarm());
+  });
+});
+
+/** The discards the train still owes, earliest first. */
+function pendingDiscards(sql: SqlStorage): { attempt: string; dueAt: number; failures: number }[] {
+  return sql
+    .exec<{ attempt: string; due_at: number; failures: number }>(
+      "SELECT attempt, due_at, failures FROM train_discards ORDER BY due_at, attempt",
+    )
+    .toArray()
+    .map((row) => ({ attempt: row.attempt, dueAt: row.due_at, failures: row.failures }));
+}
+
+describe("candidate discards", () => {
+  it("deletes a landed batch's candidate refs once its compose can no longer push", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, discardWakes, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const before = now();
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      expect(states(train)).toEqual({ "clm_claim001@1": "landed" });
+
+      const [attempt] = fakes.composeAttempts;
+      expect(attempt).toMatch(/^mrg_[0-9a-f]{32}$/);
+      expect(train.batches(1)).toMatchObject([{ state: "landed", mergeAttempt: attempt }]);
+      const [pending] = pendingDiscards(sql);
+      expect(pending).toMatchObject({ attempt, failures: 0 });
+      expect(pending?.dueAt).toBeGreaterThan(before + MERGE_PUSH_WINDOW_MS);
+      expect(pending?.dueAt).toBeLessThanOrEqual(now() + MERGE_PUSH_WINDOW_MS);
+      expect(discardWakes.at(-1)).toBe(pending?.dueAt);
+
+      // An alarm before the window ends deletes nothing: the compose might still push.
+      await train.resume();
+      expect(fakes.discards).toEqual([]);
+      expect(fakes.candidateRefs.has(attempt ?? "")).toBe(true);
+
+      advance((pending?.dueAt ?? 0) - now());
+      await train.resume();
+      expect(fakes.discards).toEqual([attempt]);
+      expect(fakes.candidateRefs.size).toBe(0);
+      expect(pendingDiscards(sql)).toEqual([]);
+
+      // Nothing is owed any more, so a later alarm asks for nothing and discards nothing.
+      const asked = discardWakes.length;
+      advance(DISCARD_MAX_MS);
+      await train.resume();
+      expect(fakes.discards).toEqual([attempt]);
+      expect(discardWakes).toHaveLength(asked);
+    }, fakes);
+  });
+
+  it("deletes a failed batch's candidate refs", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      // The check fails, so the pin goes back alone and is dropped; nothing lands.
+      await train.recordCheck(report(lastStarted(fakes), "fail"));
+      expect(train.batches(1)).toMatchObject([{ state: "failed", failure: "check_fail" }]);
+      const [failed] = fakes.composeAttempts;
+      expect(pendingDiscards(sql).map((d) => d.attempt)).toEqual([failed]);
+
+      advance(MERGE_PUSH_WINDOW_MS);
+      await train.resume();
+      expect(fakes.discards).toEqual([failed]);
+      expect(fakes.candidateRefs.size).toBe(0);
+      expect(pendingDiscards(sql)).toEqual([]);
+    }, fakes);
+  });
+
+  it("deletes an attempt a new compose of the same batch superseded, before the batch settles", async () => {
+    const fakes = new Fakes();
+    // The first compose publishes its ref and then fails to answer as the train needs.
+    fakes.compose = () => fail("unavailable", "Sandbox offline.");
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      expect(train.batches(1)).toMatchObject([{ state: "composing" }]);
+      const [first] = fakes.composeAttempts;
+
+      fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      const [, second] = fakes.composeAttempts;
+      expect(second).toBeDefined();
+      expect(second).not.toBe(first);
+      // The batch now records the second attempt; the first waits for its discard.
+      expect(train.batches(1)).toMatchObject([{ state: "checking", mergeAttempt: second }]);
+      expect(pendingDiscards(sql).map((d) => d.attempt)).toEqual([first]);
+
+      advance(MERGE_PUSH_WINDOW_MS);
+      await train.resume();
+      expect(fakes.discards).toEqual([first]);
+      expect([...fakes.candidateRefs]).toEqual([second]);
+      expect(train.batches(1)).toMatchObject([{ state: "checking" }]);
+
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      advance(MERGE_PUSH_WINDOW_MS);
+      await train.resume();
+      expect(fakes.discards).toEqual([first, second]);
+      expect(fakes.candidateRefs.size).toBe(0);
+    }, fakes);
+  });
+
+  it("tries a failed discard again with a doubling delay, capped, until it succeeds", async () => {
+    const fakes = new Fakes();
+    const failing = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await withTrain(async ({ train, sql, discardWakes, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      const [attempt] = fakes.composeAttempts;
+
+      fakes.discard = () => fail("unavailable", "Sandbox offline.");
+      const delays: number[] = [];
+      for (let failures = 1; delays.at(-1) !== DISCARD_MAX_MS; failures += 1) {
+        advance((pendingDiscards(sql)[0]?.dueAt ?? 0) - now());
+        // One failure is a throw, which counts like a refusal.
+        if (failures === 2) {
+          fakes.discard = () => {
+            throw new Error("merge module crashed");
+          };
+        } else {
+          fakes.discard = () => fail("unavailable", "Sandbox offline.");
+        }
+        await train.resume();
+        const [pending] = pendingDiscards(sql);
+        expect(pending).toMatchObject({ attempt, failures });
+        const delay = (pending?.dueAt ?? 0) - now();
+        expect(delay).toBe(Math.min(DISCARD_BASE_MS * 2 ** (failures - 1), DISCARD_MAX_MS));
+        expect(discardWakes.at(-1)).toBe(pending?.dueAt);
+        delays.push(delay);
+      }
+      expect(delays.length).toBeGreaterThan(2);
+      expect(fakes.candidateRefs.has(attempt ?? "")).toBe(true);
+      // Each failure is logged with its code, never with the port's message.
+      const logged = failing.mock.calls.map(([line]) => String(line));
+      expect(logged.some((line) => line.includes('"event":"train.discard_failed"'))).toBe(true);
+      expect(logged.some((line) => line.includes("Sandbox offline"))).toBe(false);
+
+      fakes.discard = (gone) => ok({ removed: fakes.candidateRefs.delete(gone) ? 1 : 0 });
+      advance(DISCARD_MAX_MS);
+      await train.resume();
+      expect(fakes.candidateRefs.size).toBe(0);
+      expect(pendingDiscards(sql)).toEqual([]);
+    }, fakes);
+    failing.mockRestore();
+  });
+
+  it("tries at most a few discards per wake and asks again for the rest", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, discardWakes, now }) => {
+      // More attempts due than one wake takes, as after a long outage.
+      const attempts = Array.from(
+        { length: MAX_DISCARDS_PER_WAKE + 2 },
+        (_, n) => `mrg_backlog${String(n).padStart(3, "0")}`,
+      );
+      for (const attempt of attempts) {
+        sql.exec(
+          "INSERT INTO train_discards (attempt, due_at, failures) VALUES (?, ?, 0)",
+          attempt,
+          now(),
+        );
+      }
+      await train.resume();
+      expect(fakes.discards).toEqual(attempts.slice(0, MAX_DISCARDS_PER_WAKE));
+      // The rest are already due, so the alarm is asked for at once.
+      expect(discardWakes.at(-1)).toBeLessThanOrEqual(now());
+
+      await train.resume();
+      expect(fakes.discards).toEqual(attempts);
+      expect(pendingDiscards(sql)).toEqual([]);
+    }, fakes);
+  });
+
+  it("asks again for a pending discard after a restart", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, restart, discardWakes, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      const [pending] = pendingDiscards(sql);
+      const asked = discardWakes.length;
+
+      const again = restart();
+      expect(discardWakes.slice(asked)).toEqual([pending?.dueAt]);
+      advance((pending?.dueAt ?? 0) - now());
+      await again.resume();
+      expect(fakes.discards).toEqual([pending?.attempt]);
+    }, fakes);
   });
 });
