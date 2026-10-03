@@ -89,7 +89,7 @@ interface Harness {
   /** The inbox entries an agent has pending, oldest first. */
   entries(agentId: string): Promise<{ item: number; entry: InboxEntry; version: number }[]>;
   events(): RailheadEvent[];
-  count(table: "decision_versions" | "decision_obligations"): number;
+  count(table: "decision_versions" | "decision_obligations" | "inbox_items" | "landings"): number;
 }
 
 async function freshRepo(): Promise<{ stub: DurableObjectStub<Repo>; repoId: string }> {
@@ -111,7 +111,7 @@ async function withDecisions<R>(
   const { stub, repoId } = repo ?? (await freshRepo());
   return runInDurableObject(stub, async (_instance, state) => {
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env };
+    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let inbox: InboxPort = realInbox;
@@ -535,6 +535,71 @@ describe("relied", () => {
         { agentId: BOREAS, entry: entry("rework", decisionId, 2) },
       ]);
       expect(await h.entries(ATLAS)).toHaveLength(1);
+    });
+  });
+
+  it("rolls back reliance with the caller's landing when rework fails, and owes it once on retry", async () => {
+    await withDecisions(async (h) => {
+      const decisionId = await answered(h);
+      expect(await h.record(decisionId, "reject", 1)).toEqual(ok({ decisionId, version: 2 }));
+      // The caller's own state change, made in the same transaction as the landing.
+      h.storage.sql.exec("CREATE TABLE landings (claim_id TEXT NOT NULL)");
+      const land = (): RailheadEvent[] =>
+        h.log.transaction((tx) => {
+          tx.sql.exec("INSERT INTO landings (claim_id) VALUES (?)", CLAIM);
+          h.decisions.relied(tx, CLAIM, 1, [{ decisionId, version: 1 }]);
+        }).events;
+      const relied = (): Array<{ relied: number | null }> =>
+        h.storage.sql
+          .exec<{ relied: number | null }>(
+            "SELECT relied FROM decision_claims WHERE decision_id = ? AND claim_id = ?",
+            decisionId,
+            CLAIM,
+          )
+          .toArray();
+      const head = h.log.head();
+      const obligations = h.obligations();
+      expect(relied()).toEqual([{ relied: null }]);
+      expect(h.count("inbox_items")).toBe(2);
+      expect(h.count("decision_obligations")).toBe(2);
+
+      // The inbox writes the rework item, then fails.
+      h.useInbox({
+        ...h.inbox,
+        queue: (tx, target, item) => {
+          h.inbox.queue(tx, target, item);
+          throw new Error("the inbox refused the item");
+        },
+      });
+      expect(land).toThrow("the inbox refused the item");
+      expect(h.count("landings")).toBe(0);
+      expect(relied()).toEqual([{ relied: null }]);
+      expect(h.obligations()).toEqual(obligations);
+      expect(h.count("decision_obligations")).toBe(2);
+      expect(h.count("inbox_items")).toBe(2);
+      expect(h.log.head()).toBe(head);
+
+      h.useInbox(h.inbox);
+      expect(land().map((event) => event.data)).toMatchObject([
+        { agentId: ATLAS, entry: entry("rework", decisionId, 2) },
+      ]);
+      expect(h.count("landings")).toBe(1);
+      expect(relied()).toEqual([{ relied: 1 }]);
+      expect(h.obligations()).toContainEqual(
+        expect.objectContaining({
+          decision: { decisionId, version: 2 },
+          kind: "rework",
+          delivery: { agentId: ATLAS, item: 3 },
+        }),
+      );
+      // A repeated landing owes nothing more.
+      expect(land()).toEqual([]);
+      expect(h.count("decision_obligations")).toBe(3);
+      expect((await h.entries(ATLAS)).map((item) => item.entry)).toEqual([
+        entry("decision", decisionId, 1),
+        entry("decision", decisionId, 2),
+        entry("rework", decisionId, 2),
+      ]);
     });
   });
 
