@@ -113,6 +113,9 @@ class Hub {
 
   endAll(reason: SubscriptionEnd): void {
     for (const live of this.#live) live.end(reason);
+    // Ended subscriptions ignore wakes, so the log need not be watched while their slots drain.
+    this.#stopObserving?.();
+    this.#stopObserving = null;
   }
 
   #remove(subscription: Subscription): void {
