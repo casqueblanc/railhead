@@ -79,7 +79,7 @@ function inRepo<T>(
       log,
       clock: fake.clock,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const artifacts = createArtifactsAdapter({ ...context, namespace: fake }, FAST);
     const base = composeRepo(context);
@@ -523,7 +523,7 @@ describe("allocation failures", () => {
         log,
         clock: () => 1,
         env,
-        wake: () => {},
+        wake: async () => true,
       };
       const base = composeRepo(context);
       const port = claimsEntry(context, () => base);

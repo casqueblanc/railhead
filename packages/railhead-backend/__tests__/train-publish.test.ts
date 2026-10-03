@@ -175,7 +175,10 @@ function withRepo<R>(
       log,
       clock: () => (now += 1),
       env,
-      wake: (at) => wakes.push(at),
+      wake: async (at) => {
+        wakes.push(at);
+        return true;
+      },
     };
     const wakes: number[] = [];
     const current = new Map(pins.map((p) => [p.claimId, p]));
