@@ -5,6 +5,9 @@
 //
 //   (context, ports) => createGitGateway({
 //     log: context.log,
+//     storage: context.storage,
+//     clock: context.clock,
+//     wake: context.wake,
 //     ports,
 //     remote: artifactsRemotes(context.env.ARTIFACTS),
 //     upstream: (request) => fetch(request),
@@ -23,6 +26,11 @@ export interface GitPort {
    * `/info/refs`; the caller is authenticated from the request's own credentials.
    */
   serve(request: Request, target: GitTarget, path: string): Promise<Response>;
+  /**
+   * Called by the Repo's alarm. Records the pushes Artifacts may have applied whose report never
+   * settled them, and asks for the next wake they need.
+   */
+  resume(): Promise<void>;
 }
 
 /** Builds the Git module of one repository. */
@@ -32,4 +40,6 @@ export const git: ModuleFactory<GitPort> = () => ({
       status: 503,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     }),
+  // It forwards no push, so it owes no reconciliation.
+  resume: async () => undefined,
 });

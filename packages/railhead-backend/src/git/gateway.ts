@@ -25,12 +25,17 @@
 // gateway reads a push's response to its end whether or not the client keeps reading it, so a client
 // that stops reading or goes away after its push was applied does not lose the record; a client
 // that falls more than a bounded buffer behind loses its response instead. A refused,
-// failed, cut-off or unreadable push records nothing, nor does one that outlived its claim. A push
-// the upstream applied but that was left unrecorded, because its claim changed or the record failed,
-// is logged as `git_push_unrecorded` with its claim and generation, for reconciliation. So is a push
-// whose last bytes were sent but whose outcome is unknown: the upstream failed or answered with no
-// Git result, its response was cut off, or its report could not be read. Only a refusal the
-// upstream reported in a complete report is known to have moved nothing.
+// failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
+//
+// A push the upstream applied is recorded even when its response gives no record. Before its last
+// bytes are sent, the push is saved in storage as pending, with its claim, generation and refs, and
+// the Repo's alarm is asked for once the exchange must have ended; if it cannot be saved, the bytes
+// are withheld. Its report settles it: the record and the pending row are written in one
+// transaction, and a complete refusal drops it. A push the report does not settle, because the
+// outcome is unknown or the record failed, is left to the alarm, which reads the fork's branches
+// back and records each ref found at the commit the push sent it to, while the claim is still
+// working at the push's generation. A pending push whose claim moved on is dropped and logged as
+// `git_push_unrecorded`; that a claim can move on after its push's last bytes were sent is #159.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -48,6 +53,7 @@ import {
 import type { GitPort, GitTarget } from "../modules/git/entry";
 import type { RepoPorts } from "../repo/composeRepo";
 import { EventLogError, type EventLog } from "../repo/eventLog";
+import { atomically, migrate, type RepoStorage } from "../repo/storage";
 import {
   readReceivePackHead,
   receivePackRefusal,
@@ -57,6 +63,7 @@ import {
   type ReceivePackHead,
   type RefUpdate,
 } from "./pktLine";
+import { AdvertisedRefsReader } from "./refAdvertisement";
 import { PushReportReader, reportFraming } from "./reportStatus";
 
 /** Bounds on one Git request. A test may tighten them. */
@@ -109,6 +116,12 @@ export type Upstream = (request: Request) => Promise<Response>;
 export interface GitGatewayContext {
   /** The event log, for confirmed pushes. */
   readonly log: EventLog;
+  /** The repository's storage, where pushes wait for their record. */
+  readonly storage: RepoStorage;
+  /** The current time, in milliseconds since the Unix epoch. */
+  readonly clock: () => number;
+  /** Asks the Repo's alarm to run `resume` no later than `at`. */
+  readonly wake: (at: number) => void;
   /** The ports the gateway calls on each request; never called while the Repo is composed. */
   readonly ports: () => Pick<RepoPorts, "sessions" | "claims" | "artifacts">;
   /** Where each Artifacts repository is served. */
@@ -143,6 +156,33 @@ const HELD_PUSH_BYTES = 20;
 const CLAIM_CHANGED = "the claim changed while this push was being sent";
 /** How many times a confirmed push's record is tried before it is left to reconciliation. */
 const RECORD_ATTEMPTS = 3;
+const UNSAVED = "the push could not be saved for its record";
+
+/** The migration owner name of the gateway's own table. */
+const GIT_OWNER = "git_gateway";
+/** Released schema steps of the gateway's table. Append a step to change it; never edit one. */
+const MIGRATIONS: readonly string[] = [
+  `CREATE TABLE git_pending_push (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    updates TEXT NOT NULL,
+    due_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL
+  ) STRICT`,
+  "CREATE INDEX git_pending_push_due ON git_pending_push (due_at)",
+];
+/** How many pending pushes one alarm reconciles; the alarm is asked for again for the rest. */
+const RECONCILE_BATCH = 8;
+/** How many times a pending push's fork is read before it is dropped and logged. */
+const RECONCILE_ATTEMPTS = 5;
+/** The wait before reading a fork again, doubled after each failed read. */
+const RECONCILE_RETRY_MS = 60_000;
+/** The largest ref advertisement read back from a fork, in bytes. */
+const MAX_ADVERTISEMENT_BYTES = 1024 * 1024;
+const ADVERTISE_UPLOAD_PACK: Route = { service: "git-upload-pack", phase: "advertise" };
 
 /** Builds the Git gateway of one repository. */
 export function createGitGateway(
@@ -159,6 +199,10 @@ class GitGateway implements GitPort {
   constructor(context: GitGatewayContext, limits: GitGatewayLimits) {
     this.#context = context;
     this.#limits = limits;
+    migrate(context.storage, GIT_OWNER, MIGRATIONS);
+    // A wake asked for with a pending push may have failed to reach storage; ask again.
+    const next = this.#nextDue();
+    if (next !== null) context.wake(next);
   }
 
   async serve(request: Request, target: GitTarget, path: string): Promise<Response> {
@@ -265,20 +309,241 @@ class GitGateway implements GitPort {
         (update) => reasons.get(update) ?? "refused with the rest of this push",
       );
     }
+    let pending: number | null = null;
     return this.#forward(request, route, grant, {
       head,
       body: parsed.body,
       deadline,
       admit: () => this.#readmit(route, access, grant, head),
-      current: () =>
-        this.#context.ports().claims.workingGeneration(fence.claimId) === fence.generation,
+      release: () => {
+        try {
+          pending = this.#save(principal, fence, grant.repo, head);
+        } catch (error) {
+          logPush("git_push_unsaved", fence, { error: errorName(error) });
+          return "unsaved";
+        }
+        return pending === null ? "claim_changed" : "released";
+      },
       record: (updated) => {
-        this.#recordPush(principal, fence, head, updated);
+        if (pending !== null) this.#recordPush(pending, principal, fence, head, updated);
+      },
+      refused: () => {
+        if (pending !== null) this.#drop(pending, fence);
       },
       unknown: () => {
         logUnrecorded(fence, "outcome_unknown");
       },
     });
+  }
+
+  /**
+   * Saves a push about to be released as pending and asks the alarm for it once the exchange must
+   * have ended, in one transaction, if the claim is still working at the push's generation.
+   * Returns the pending row, or `null` when the claim changed.
+   */
+  #save(
+    principal: AgentPrincipal,
+    fence: Fence,
+    repo: ArtifactsRepoName,
+    head: ReceivePackHead,
+  ): number | null {
+    const updates = head.updates.flatMap(pushedRef);
+    const dueAt = this.#context.clock() + this.#limits.maxDurationMs;
+    return atomically(this.#context.storage, () => {
+      if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
+        return null;
+      }
+      const row = this.#context.storage.sql
+        .exec<{ id: number }>(
+          `INSERT INTO git_pending_push
+             (claim_id, generation, agent_id, repo, updates, due_at, attempts)
+           VALUES (?, ?, ?, ?, ?, ?, 0) RETURNING id`,
+          fence.claimId,
+          fence.generation,
+          principal.agentId,
+          repo,
+          JSON.stringify(updates),
+          dueAt,
+        )
+        .one();
+      this.#context.wake(dueAt);
+      return row.id;
+    });
+  }
+
+  /** Drops a pending push its complete report refused. If that fails, the alarm finds nothing moved. */
+  #drop(pending: number, fence: Fence): void {
+    try {
+      atomically(this.#context.storage, () => {
+        this.#context.storage.sql.exec("DELETE FROM git_pending_push WHERE id = ?", pending);
+      });
+    } catch (error) {
+      logPush("git_push_drop_failed", fence, { error: errorName(error) });
+    }
+  }
+
+  /**
+   * Reconciles the pending pushes that are due: each one's report never settled it. Asks the alarm
+   * again for the earliest one left, even when reconciling one failed.
+   */
+  async resume(): Promise<void> {
+    try {
+      const due = this.#context.storage.sql
+        .exec<PendingRow>(
+          `SELECT id, claim_id, generation, agent_id, repo, updates, attempts
+           FROM git_pending_push WHERE due_at <= ? ORDER BY due_at, id LIMIT ?`,
+          this.#context.clock(),
+          RECONCILE_BATCH,
+        )
+        .toArray();
+      for (const row of due) {
+        try {
+          await this.#reconcile(row);
+        } catch (error) {
+          this.#retryLater(row, error);
+        }
+      }
+    } finally {
+      const next = this.#nextDue();
+      if (next !== null) this.#context.wake(next);
+    }
+  }
+
+  /**
+   * Reads the fork of one pending push back and records each ref found at the commit the push sent
+   * it to. A ref found elsewhere was not updated by this push, or was moved on by a later one that
+   * has its own record. A push whose claim moved on is dropped.
+   */
+  async #reconcile(row: PendingRow): Promise<void> {
+    const fence: Fence = { claimId: row.claim_id, generation: row.generation };
+    const updates = parsePushedRefs(row.updates);
+    if (updates === null) {
+      this.#drop(row.id, fence);
+      logUnrecorded(fence, "unreadable_record");
+      return;
+    }
+    if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
+      this.#drop(row.id, fence);
+      logUnrecorded(fence, "claim_changed");
+      return;
+    }
+    const refs = await this.#readRefs(
+      row.repo,
+      updates.map((update) => update.ref),
+    );
+    if (refs === null) {
+      this.#retryLater(row, null);
+      return;
+    }
+    const applied = updates.filter((update) => refs.get(update.ref) === update.to);
+    const outcome = this.#settle(row.id, row.agent_id, fence, applied);
+    switch (outcome) {
+      case "recorded":
+        logPush("git_push_reconciled", fence, {
+          recorded: applied.length,
+          skipped: updates.length - applied.length,
+        });
+        return;
+      case "claim_changed":
+        if (applied.length > 0) logUnrecorded(fence, "claim_changed");
+        return;
+      case "settled":
+        return;
+      default:
+        return unreachable(outcome);
+    }
+  }
+
+  /**
+   * Counts a failed reconciliation of `row` and waits longer before the next one; drops and logs
+   * the push once `RECONCILE_ATTEMPTS` reads have failed.
+   */
+  #retryLater(row: PendingRow, error: unknown): void {
+    const fence: Fence = { claimId: row.claim_id, generation: row.generation };
+    if (error !== null) logPush("git_push_reconcile_failed", fence, { error: errorName(error) });
+    const attempts = row.attempts + 1;
+    if (attempts >= RECONCILE_ATTEMPTS) {
+      this.#drop(row.id, fence);
+      logUnrecorded(fence, "reconcile_failed");
+      return;
+    }
+    atomically(this.#context.storage, () => {
+      this.#context.storage.sql.exec(
+        "UPDATE git_pending_push SET attempts = ?, due_at = ? WHERE id = ?",
+        attempts,
+        this.#context.clock() + RECONCILE_RETRY_MS * 2 ** row.attempts,
+        row.id,
+      );
+    });
+  }
+
+  #nextDue(): number | null {
+    const row = this.#context.storage.sql
+      .exec<{ due_at: number | null }>("SELECT MIN(due_at) AS due_at FROM git_pending_push")
+      .toArray()[0];
+    return row?.due_at ?? null;
+  }
+
+  /**
+   * Reads which commits `wanted` branches of `repo` point at, from its upload-pack advertisement,
+   * within the headers wait. Returns `null` when the advertisement could not be read whole.
+   */
+  async #readRefs(
+    repo: ArtifactsRepoName,
+    wanted: readonly string[],
+  ): Promise<ReadonlyMap<string, string> | null> {
+    const { tokenTtlMs, maxDurationMs, headersTimeoutMs } = this.#limits;
+    const token = await this.#context
+      .ports()
+      .artifacts.token(repo, "read", Math.max(tokenTtlMs, 2 * maxDurationMs));
+    if (!token.ok) return null;
+    const remote = await this.#context.remote(repo);
+    if (!remote.ok) return null;
+    const url = upstreamUrl(remote.value, ADVERTISE_UPLOAD_PACK);
+    if (url === null) {
+      logFailure(ADVERTISE_UPLOAD_PACK, "bad_remote");
+      return null;
+    }
+    const deadline = new Deadline(headersTimeoutMs);
+    try {
+      const response = await untilAborted(
+        this.#context.upstream(
+          new Request(url, {
+            headers: { authorization: `Bearer ${token.value.value}` },
+            redirect: "manual",
+            signal: deadline.signal,
+          }),
+        ),
+        deadline.signal,
+      );
+      if (
+        response.status !== 200 ||
+        response.headers.get("content-type") !== "application/x-git-upload-pack-advertisement" ||
+        response.body === null
+      ) {
+        await response.body?.cancel().catch(() => undefined);
+        logFailure(ADVERTISE_UPLOAD_PACK, `status_${response.status}`);
+        return null;
+      }
+      const reader = new AdvertisedRefsReader(wanted);
+      const body = response.body
+        .pipeThrough(inspected(MAX_ADVERTISEMENT_BYTES, deadline, null, () => undefined))
+        .getReader();
+      for (;;) {
+        const { done, value } = await body.read();
+        if (done) break;
+        reader.push(value);
+      }
+      const read = reader.end();
+      if (read.kind === "read") return read.refs;
+      logFailure(ADVERTISE_UPLOAD_PACK, "unreadable");
+      return null;
+    } catch {
+      logFailure(ADVERTISE_UPLOAD_PACK, deadline.expired ? "timeout" : "unreachable");
+      return null;
+    } finally {
+      deadline.abort();
+    }
   }
 
   /**
@@ -419,7 +684,7 @@ class GitGateway implements GitPort {
       }, this.#limits.headersTimeoutMs);
     };
     const sent =
-      body === null ? null : limited(body, maxBody, deadline, push?.current ?? null, awaitHeaders);
+      body === null ? null : limited(body, maxBody, deadline, push?.release ?? null, awaitHeaders);
     // Once a push's last bytes are sent, the upstream may have applied it: an exchange that then
     // ends without a readable report leaves the fork to reconciliation.
     let settled = false;
@@ -452,7 +717,10 @@ class GitGateway implements GitPort {
       if (sent?.exceeded === true) {
         return text(413, "railhead: the request is larger than Railhead accepts");
       }
-      if (sent?.withheld === true && push !== null) return claimChanged(push.head);
+      if (sent?.withheld === "claim_changed" && push !== null) return claimChanged(push.head);
+      if (sent?.withheld === "unsaved") {
+        return text(503, `railhead: ${UNSAVED}; nothing was updated`, { "retry-after": "5" });
+      }
       const outcome = deadline.expired ? "timeout" : "unreachable";
       logFailure(route, outcome);
       outcomeUnknown();
@@ -499,6 +767,7 @@ class GitGateway implements GitPort {
             push.record(outcome.updated);
             return;
           case "refused":
+            push.refused();
             return;
           case "unknown":
             push.unknown();
@@ -526,30 +795,27 @@ class GitGateway implements GitPort {
   }
 
   /**
-   * Records each ref the upstream reported updated. Deletions are refused before a push is
-   * forwarded, since `claim.pushed` cannot express one; one that got this far is not recorded.
-   * Nothing is recorded unless the claim is still working at the push's generation when the record
-   * is written: a claim that expired, changed hands or went ready while the push was in flight
-   * keeps its own history. A record that fails is tried again up to `RECORD_ATTEMPTS` times in
-   * all, unless the event log refused it, which no retry changes. A record left unwritten either
-   * way is logged as `git_push_unrecorded` with the claim and generation, as is a push whose
-   * outcome is unknown, so the fork can be reconciled. The client's response is not cut short:
-   * the upstream has already applied the push.
+   * Records each ref the upstream reported updated and settles the pending push, in one
+   * transaction. Deletions are refused before a push is forwarded, since `claim.pushed` cannot
+   * express one. Nothing is recorded unless the claim is still working at the push's generation when
+   * the record is written: a claim that expired, changed hands or went ready while the push was in
+   * flight keeps its own history, and the push is logged as `git_push_unrecorded`. A record that
+   * fails is tried again up to `RECORD_ATTEMPTS` times in all, unless the event log refused it,
+   * which no retry changes. A record left unwritten is logged and stays pending, so the alarm
+   * reconciles it. The client's response is not cut short: the upstream has already applied the push.
    */
   #recordPush(
+    pending: number,
     principal: AgentPrincipal,
-    fence: { claimId: string; generation: number },
+    fence: Fence,
     head: ReceivePackHead,
     updated: ReadonlySet<string>,
   ): void {
-    const pushed = head.updates.filter(
-      (update) => update.kind !== "delete" && updated.has(update.ref),
-    );
-    if (pushed.length === 0) return;
+    const pushed = head.updates.filter((update) => updated.has(update.ref)).flatMap(pushedRef);
     for (let attempt = 1; ; attempt += 1) {
       try {
-        const recorded = this.#appendPushed(principal, fence, pushed);
-        if (!recorded) logUnrecorded(fence, "claim_changed");
+        const outcome = this.#settle(pending, principal.agentId, fence, pushed);
+        if (outcome === "claim_changed" && pushed.length > 0) logUnrecorded(fence, "claim_changed");
         return;
       } catch (error) {
         if (error instanceof EventLogError || attempt >= RECORD_ATTEMPTS) {
@@ -560,34 +826,103 @@ class GitGateway implements GitPort {
     }
   }
 
-  /** Appends `pushed` in one transaction if the claim is still working at the fence's generation. */
-  #appendPushed(
-    principal: AgentPrincipal,
-    fence: { claimId: string; generation: number },
-    pushed: readonly RefUpdate[],
-  ): boolean {
+  /**
+   * Settles the pending push `pending` in one transaction: appends `pushed` if the claim is still
+   * working at the fence's generation, and deletes the row either way. Nothing is written once the
+   * row is gone, since whoever settled it first wrote its record.
+   */
+  #settle(
+    pending: number,
+    agentId: string,
+    fence: Fence,
+    pushed: readonly PushedRef[],
+  ): "recorded" | "claim_changed" | "settled" {
+    const { sql } = this.#context.storage;
     return this.#context.log.transaction((tx) => {
+      const deleted = sql.exec("DELETE FROM git_pending_push WHERE id = ?", pending).rowsWritten;
+      if (deleted === 0) return "settled";
       if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
-        return false;
+        return "claim_changed";
       }
       for (const update of pushed) {
         tx.append(
-          { kind: "agent", id: principal.agentId },
+          { kind: "agent", id: agentId },
           {
             type: "claim.pushed",
             data: {
               claimId: fence.claimId,
               generation: fence.generation,
               ref: update.ref,
-              from: update.kind === "create" ? null : update.oldId,
-              to: update.newId,
+              from: update.from,
+              to: update.to,
             },
           },
         );
       }
-      return true;
+      return "recorded";
     }).value;
   }
+}
+
+type Fence = NonNullable<GitGrant["fence"]>;
+
+/** One branch a push moves, as a pending push keeps it and `claim.pushed` records it. */
+interface PushedRef {
+  readonly ref: string;
+  readonly from: string | null;
+  readonly to: string;
+}
+
+/** A pending push as stored. */
+interface PendingRow extends Record<string, SqlStorageValue> {
+  id: number;
+  claim_id: string;
+  generation: number;
+  agent_id: string;
+  repo: string;
+  updates: string;
+  attempts: number;
+}
+
+/** What a push's release decided. */
+type Release = "released" | "claim_changed" | "unsaved";
+
+/** `update` as a pushed ref; a deletion, which is refused before a push is sent, is none. */
+function pushedRef(update: RefUpdate): PushedRef[] {
+  switch (update.kind) {
+    case "create":
+      return [{ ref: update.ref, from: null, to: update.newId }];
+    case "update":
+      return [{ ref: update.ref, from: update.oldId, to: update.newId }];
+    case "delete":
+      return [];
+    default:
+      return update.kind satisfies never;
+  }
+}
+
+/** Reads the refs a pending push saved, or `null` if they are not what `#save` wrote. */
+function parsePushedRefs(stored: string): PushedRef[] | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(stored);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const items: unknown[] = value;
+  const refs: PushedRef[] = [];
+  for (const item of items) {
+    if (typeof item !== "object" || item === null) return null;
+    const ref: unknown = Reflect.get(item, "ref");
+    const from: unknown = Reflect.get(item, "from");
+    const to: unknown = Reflect.get(item, "to");
+    if (typeof ref !== "string" || !ref.startsWith(BRANCH_PREFIX)) return null;
+    if (from !== null && (typeof from !== "string" || !isCommitSha(from))) return null;
+    if (typeof to !== "string" || !isCommitSha(to)) return null;
+    refs.push({ ref, from, to });
+  }
+  return refs;
 }
 
 interface PendingPush {
@@ -598,10 +933,15 @@ interface PendingPush {
   readonly deadline: Deadline;
   /** Decides the push again against current claim state: `null` to go ahead, or the refusal. */
   readonly admit: () => Promise<Response | null>;
-  /** Whether the claim is still working at the push's generation, read without awaiting. */
-  readonly current: () => boolean;
+  /**
+   * Decides, without awaiting, whether the push's last bytes may be sent: only while the claim is
+   * still working at the push's generation, and only once the push is saved as pending.
+   */
+  readonly release: () => Release;
   /** Records the refs the upstream reported updated. */
   readonly record: (updated: ReadonlySet<string>) => void;
+  /** Drops a push whose complete report said nothing was updated. */
+  readonly refused: () => void;
   /** Leaves a push that may have been applied, though nothing says what it updated, to reconciliation. */
   readonly unknown: () => void;
 }
@@ -844,17 +1184,31 @@ async function discarding(request: Request, response: Response): Promise<Respons
  * logged.
  */
 function logUnrecorded(
-  fence: { claimId: string; generation: number },
-  reason: "claim_changed" | "record_failed" | "outcome_unknown",
+  fence: Fence,
+  reason:
+    | "claim_changed"
+    | "record_failed"
+    | "outcome_unknown"
+    | "reconcile_failed"
+    | "unreadable_record",
 ): void {
+  logPush("git_push_unrecorded", fence, { reason });
+}
+
+/** Logs one event about a push: its claim, generation and Railhead's own codes and counts. */
+function logPush(event: string, fence: Fence, fields: Record<string, string | number>): void {
   console.warn(
-    JSON.stringify({
-      event: "git_push_unrecorded",
-      claimId: fence.claimId,
-      generation: fence.generation,
-      reason,
-    }),
+    JSON.stringify({ event, claimId: fence.claimId, generation: fence.generation, ...fields }),
   );
+}
+
+/** An error's name, never its message, which may carry text from elsewhere. */
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "unknown";
+}
+
+function unreachable(value: never): never {
+  throw new Error(`unhandled value: ${String(value)}`);
 }
 
 function logFailure(route: Route, outcome: string): void {
@@ -989,25 +1343,25 @@ function cancelledOnAbort(
 
 /**
  * A request body that errors once more than `max` bytes pass or the deadline expires, and calls
- * `ended` once the whole body has passed. With `current`, the body's last `HELD_PUSH_BYTES` bytes
- * are held back until the client has sent everything, and passed on only if `current` still holds
- * then, after which the body is `released`; otherwise the exchange is ended and it is `withheld`.
+ * `ended` once the whole body has passed. With `release`, the body's last `HELD_PUSH_BYTES` bytes
+ * are held back until the client has sent everything, and passed on only if `release` allows it
+ * then, after which the body is `released`; otherwise the exchange is ended and `withheld` says why.
  */
 function limited(
   body: ReadableStream<Uint8Array>,
   max: number,
   deadline: Deadline,
-  current: (() => boolean) | null,
+  release: (() => Release) | null,
   ended: () => void,
 ): {
   readonly stream: ReadableStream<Uint8Array>;
   readonly exceeded: boolean;
-  readonly withheld: boolean;
+  readonly withheld: Exclude<Release, "released"> | null;
   readonly released: boolean;
 } {
   let seen = 0;
   let exceeded = false;
-  let withheld = false;
+  let withheld: Exclude<Release, "released"> | null = null;
   let released = false;
   let held = new Uint8Array(0);
   const stream = body.pipeThrough(
@@ -1022,7 +1376,7 @@ function limited(
           controller.error(new Error("the request body is too large"));
           return;
         }
-        if (current === null) {
+        if (release === null) {
           controller.enqueue(chunk);
           return;
         }
@@ -1041,10 +1395,11 @@ function limited(
         held = data.slice(cut);
       },
       flush(controller) {
-        if (current !== null) {
-          if (!current()) {
-            withheld = true;
-            controller.error(new Error(CLAIM_CHANGED));
+        if (release !== null) {
+          const decision = release();
+          if (decision !== "released") {
+            withheld = decision;
+            controller.error(new Error(decision === "claim_changed" ? CLAIM_CHANGED : UNSAVED));
             deadline.abort();
             return;
           }

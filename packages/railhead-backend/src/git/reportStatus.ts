@@ -40,7 +40,7 @@ export function reportFraming(capabilities: readonly string[]): ReportFraming {
 }
 
 /** Splits a byte stream into pkt-lines, holding at most one packet at a time. */
-class PacketSplitter {
+export class PacketSplitter {
   #pending: Uint8Array = new Uint8Array(0);
 
   /** Returns the complete packets in `chunk`, `null` for a flush, or `"bad"` on bad framing. */

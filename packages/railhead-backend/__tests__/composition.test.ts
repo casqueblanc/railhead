@@ -340,7 +340,7 @@ describe("Repo alarm", () => {
     }
   });
 
-  it("resumes nothing for an empty list and lists the train for a composed Repo", async () => {
+  it("resumes nothing for an empty list and lists the Git gateway and the train for a composed Repo", async () => {
     await expect(resumeAll("rep_alarm0001", [])).resolves.toBeUndefined();
     const { stub, repoId } = await freshRepo();
     const modules = await runInDurableObject(stub, (_instance, state) =>
@@ -355,7 +355,7 @@ describe("Repo alarm", () => {
         }),
       ).map((entry) => entry.module),
     );
-    expect(modules).toEqual(["train"]);
+    expect(modules).toEqual(["git", "train"]);
   });
 });
 

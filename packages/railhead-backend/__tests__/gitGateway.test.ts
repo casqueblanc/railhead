@@ -22,6 +22,7 @@ import {
   type RemoteResolver,
   type Upstream,
 } from "../src/git/gateway";
+import { AdvertisedRefsReader, type AdvertisedRefs } from "../src/git/refAdvertisement";
 import { artifactsRemotes } from "../src/git/remotes";
 import { PushReportReader } from "../src/git/reportStatus";
 import type { GitPort, GitTarget } from "../src/modules/git/entry";
@@ -146,6 +147,14 @@ interface World {
   tokens: () => string[];
   /** The tokens still live, across main and the fork. */
   live: () => FakeToken[];
+  /** How far the gateway's clock is ahead of the real one, in milliseconds. */
+  skew: number;
+  /** Every alarm time the gateway asked the Repo for. */
+  wakes: number[];
+  /** Builds a new gateway over the same storage, as a restarted Repo would. */
+  restart: () => void;
+  /** The pushes waiting for their record, as stored. */
+  pending: () => { claim_id: string; generation: number; attempts: number; due_at: number }[];
 }
 
 /** A `ClaimsPort` whose `authorizeGit` follows the A21 contract over one mutable claim. */
@@ -230,7 +239,10 @@ function withGateway(
     // Forking mints one token that the adapter revokes at once; it is not the gateway's.
     const setupTokens = allTokens().length;
     const world: World = {
-      gateway: { serve: () => Promise.reject(new Error("not built")) },
+      gateway: {
+        serve: () => Promise.reject(new Error("not built")),
+        resume: () => Promise.reject(new Error("not built")),
+      },
       fake,
       artifacts,
       mainName,
@@ -260,17 +272,35 @@ function withGateway(
       minted: () => allTokens().length - setupTokens,
       tokens: allTokens,
       live: () => [...fake.liveTokens(mainName), ...fake.liveTokens(forkName)],
+      skew: 0,
+      wakes: [],
+      restart: () => {
+        world.gateway = build();
+      },
+      pending: () =>
+        state.storage.sql
+          .exec<{ claim_id: string; generation: number; attempts: number; due_at: number }>(
+            "SELECT claim_id, generation, attempts, due_at FROM git_pending_push ORDER BY id",
+          )
+          .toArray(),
     };
     const claims = claimsFor(world);
-    world.gateway = createGitGateway(
-      {
-        log,
-        ports: () => ({ sessions, claims, artifacts }),
-        remote: (repo) => world.remote(repo),
-        upstream: (request) => world.upstream(request),
-      },
-      limits,
-    );
+    const build = (): GitPort =>
+      createGitGateway(
+        {
+          log,
+          storage: state.storage,
+          clock: () => Date.now() + world.skew,
+          wake: (at) => {
+            world.wakes.push(at);
+          },
+          ports: () => ({ sessions, claims, artifacts }),
+          remote: (repo) => world.remote(repo),
+          upstream: (request) => world.upstream(request),
+        },
+        limits,
+      );
+    world.gateway = build();
     await body(world);
   });
 }
@@ -351,7 +381,9 @@ function pushedEvents(world: World): RailheadEvent[] {
 let logged: string[] = [];
 
 /** The warning for a push that moved the claim's fork without a `claim.pushed` event. */
-function unrecorded(reason: "claim_changed" | "record_failed" | "outcome_unknown"): string {
+function unrecorded(
+  reason: "claim_changed" | "record_failed" | "outcome_unknown" | "reconcile_failed",
+): string {
   return JSON.stringify({ event: "git_push_unrecorded", claimId: CLAIM, generation: 3, reason });
 }
 
@@ -2261,6 +2293,307 @@ describe("a push whose record fails", () => {
       expect(logged).toEqual([unrecorded("record_failed")]);
       expect(world.events()).toEqual([]);
     });
+  });
+});
+
+/** An upload-pack advertisement listing `refs`, each `[id, ref]`, written by hand. */
+function advertisement(refs: readonly (readonly [string, string])[]): Response {
+  const lines = refs.map(([id, ref], index) =>
+    pkt(index === 0 ? `${id} ${ref}\0multi_ack side-band-64k\n` : `${id} ${ref}\n`),
+  );
+  return gitResponse(
+    "git-upload-pack",
+    "advertisement",
+    `${pkt("# service=git-upload-pack\n")}0000${lines.join("")}0000`,
+  );
+}
+
+/** The line logged when the alarm settles a pending push. */
+function reconciled(recorded: number, skipped: number): string {
+  return JSON.stringify({
+    event: "git_push_reconciled",
+    claimId: CLAIM,
+    generation: 3,
+    recorded,
+    skipped,
+  });
+}
+
+/** The fork reads the gateway sent since `from`. */
+function forkReads(world: World, from = 0): Seen[] {
+  return world.seen.slice(from).filter((seen) => seen.method === "GET");
+}
+
+/** Pushes the stock push with its record failing every attempt, leaving it pending. */
+async function pushWithFailedRecord(world: World): Promise<void> {
+  failingRecord(world, { times: 10, error: new Error("storage failed") });
+  const response = await world.gateway.serve(
+    rpc("git-receive-pack", PUSH_REQUEST),
+    FORK,
+    "/git-receive-pack",
+  );
+  expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+  world.generationFault = null;
+  expect(world.events()).toEqual([]);
+}
+
+describe("a push left pending", () => {
+  it("is saved before release, and recorded by the alarm of a restarted gateway after its record failed", async () => {
+    await withGateway(async (world) => {
+      const before = Date.now();
+      await pushWithFailedRecord(world);
+      const [row, ...others] = world.pending();
+      expect(others).toEqual([]);
+      expect(row).toMatchObject({ claim_id: CLAIM, generation: 3, attempts: 0 });
+      // The alarm is asked for once the push's exchange must have ended.
+      expect(row?.due_at).toBeGreaterThanOrEqual(before + FAST.maxDurationMs);
+      expect(world.wakes).toEqual([row?.due_at]);
+
+      world.restart();
+      // A restarted gateway asks again for the wake its pending push needs.
+      expect(world.wakes).toEqual([row?.due_at, row?.due_at]);
+      world.respond = (request) =>
+        request.method === "GET"
+          ? advertisement([
+              [HEAD, "refs/heads/main"],
+              [PUSHED, "refs/heads/feature"],
+            ])
+          : new Response(null, { status: 500 });
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+
+      expect(world.events()).toMatchObject([
+        {
+          type: "claim.pushed",
+          actor: { kind: "agent", id: AGENT.agentId },
+          data: {
+            claimId: CLAIM,
+            generation: 3,
+            ref: "refs/heads/feature",
+            from: null,
+            to: PUSHED,
+          },
+        },
+      ]);
+      expect(world.pending()).toEqual([]);
+      const [read, ...more] = forkReads(world);
+      expect(more).toEqual([]);
+      expect(read?.url).toBe(
+        `https://fake.artifacts.invalid/${world.forkName}.git/info/refs?service=git-upload-pack`,
+      );
+      expect(logged).toEqual([unrecorded("record_failed"), reconciled(1, 0)]);
+
+      // Settled once: a later alarm reads nothing and records nothing more.
+      await world.gateway.resume();
+      expect(forkReads(world)).toHaveLength(1);
+      expect(pushedEvents(world)).toHaveLength(1);
+      expectNoTokenLeak(world, "");
+    });
+  });
+
+  it("is dropped and logged by the alarm when its claim moved on, without reading the fork", async () => {
+    await withGateway(async (world) => {
+      await pushWithFailedRecord(world);
+      world.claim = { ...world.claim, generation: 4 };
+      world.respond = () => advertisement([[PUSHED, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      expect(forkReads(world)).toEqual([]);
+      expect(logged).toEqual([unrecorded("record_failed"), unrecorded("claim_changed")]);
+    });
+  });
+
+  it("waits for its due time, then records only the refs the fork shows the push applied", async () => {
+    await withGateway(async (world) => {
+      const created = "a".repeat(40);
+      const moved = "b".repeat(40);
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode("0008"));
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc(
+          "git-receive-pack",
+          pushBody([`${ZERO} ${created} refs/heads/a`, `${HEAD} ${moved} refs/heads/b`]),
+        ),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      // Due only once the exchange must have ended: an earlier alarm leaves it alone.
+      await world.gateway.resume();
+      expect(forkReads(world)).toEqual([]);
+      expect(world.pending()).toHaveLength(1);
+
+      await response.body?.cancel();
+      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
+      expect(unknownOutcomes()).toBe(1);
+      expect(world.pending()).toHaveLength(1);
+
+      // `a` reached the commit the push sent; `b` did not move.
+      world.respond = () =>
+        advertisement([
+          [created, "refs/heads/a"],
+          [HEAD, "refs/heads/b"],
+        ]);
+      await world.gateway.resume();
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { claimId: CLAIM, generation: 3, ref: "refs/heads/a", from: null, to: created } },
+      ]);
+      expect(world.pending()).toEqual([]);
+      expect(logged.at(-1)).toBe(reconciled(1, 1));
+    });
+  });
+
+  it("is read again later when the fork cannot be read, and dropped and logged after its last attempt", async () => {
+    await withGateway(async (world) => {
+      await pushWithFailedRecord(world);
+      world.respond = () => new Response("down", { status: 500 });
+      for (let attempt = 1; attempt < 5; attempt += 1) {
+        world.skew += 24 * 60 * 60_000;
+        const now = Date.now() + world.skew;
+        await world.gateway.resume();
+        const [row] = world.pending();
+        expect(row?.attempts).toBe(attempt);
+        // Each failed read waits twice as long as the one before.
+        expect(row?.due_at).toBeGreaterThanOrEqual(now + 60_000 * 2 ** (attempt - 1));
+        expect(world.wakes.at(-1)).toBe(row?.due_at);
+      }
+      // A truncated advertisement is no better than none.
+      world.respond = () =>
+        gitResponse(
+          "git-upload-pack",
+          "advertisement",
+          `${pkt("# service=git-upload-pack\n")}0000${pkt(`${PUSHED} refs/heads/feature\n`)}`,
+        );
+      world.skew += 24 * 60 * 60_000;
+      await world.gateway.resume();
+      expect(forkReads(world)).toHaveLength(5);
+      expect(world.pending()).toEqual([]);
+      expect(world.events()).toEqual([]);
+      expect(logged.at(-1)).toBe(unrecorded("reconcile_failed"));
+    });
+  });
+
+  it("is settled by its report: recorded or refused, nothing stays for the alarm", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      await bytesOf(
+        await world.gateway.serve(rpc("git-receive-pack", PUSH_REQUEST), FORK, "/git-receive-pack"),
+      );
+      expect(pushedEvents(world)).toHaveLength(1);
+      expect(world.pending()).toEqual([]);
+
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          sideBand(
+            `${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/feature unpacker error\n")}0000`,
+          ),
+        );
+      await bytesOf(
+        await world.gateway.serve(rpc("git-receive-pack", PUSH_REQUEST), FORK, "/git-receive-pack"),
+      );
+      expect(pushedEvents(world)).toHaveLength(1);
+      expect(world.pending()).toEqual([]);
+
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(forkReads(world)).toEqual([]);
+      expect(logged).toEqual([]);
+    });
+  });
+
+  it("withholds the push's last bytes when it cannot be saved", async () => {
+    await withGateway(async (world) => {
+      const received: number[] = [];
+      world.upstream = async (request) => {
+        try {
+          received.push((await request.arrayBuffer()).byteLength);
+        } catch {
+          received.push(-1);
+        }
+        return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      };
+      // The release's claim check is the first read of the claim's generation.
+      world.generationFault = { times: 1, error: new Error("storage failed") };
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(503);
+      expect(await response.text()).toBe(
+        "railhead: the push could not be saved for its record; nothing was updated\n",
+      );
+      expect(received).toEqual([-1]);
+      expect(world.pending()).toEqual([]);
+      expect(world.events()).toEqual([]);
+      expect(world.wakes).toEqual([]);
+      expect(logged).toEqual([
+        JSON.stringify({
+          event: "git_push_unsaved",
+          claimId: CLAIM,
+          generation: 3,
+          error: "Error",
+        }),
+      ]);
+    });
+  });
+});
+
+/** Feeds `body` to an advertisement reader one byte at a time. */
+async function readAdvertised(body: Response, wanted: string[]): Promise<AdvertisedRefs> {
+  const reader = new AdvertisedRefsReader(wanted);
+  for (const byte of await bytesOf(body)) reader.push(Uint8Array.of(byte));
+  return reader.end();
+}
+
+describe("ref advertisements", () => {
+  it("keeps only the refs asked for, read one byte at a time", async () => {
+    const refs = await readAdvertised(
+      advertisement([
+        [HEAD, "refs/heads/main"],
+        [PUSHED, "refs/heads/feature"],
+        [ROOT, "refs/tags/v1"],
+      ]),
+      ["refs/heads/feature", "refs/heads/gone"],
+    );
+    expect(refs).toEqual({ kind: "read", refs: new Map([["refs/heads/feature", PUSHED]]) });
+  });
+
+  it("reads an empty repository's advertisement as having no refs", async () => {
+    const refs = await readAdvertised(advertisement([[ZERO, "capabilities^{}"]]), [
+      "refs/heads/feature",
+    ]);
+    expect(refs).toEqual({ kind: "read", refs: new Map() });
+  });
+
+  it("knows nothing from a cut-off, malformed or foreign advertisement", async () => {
+    const service = `${pkt("# service=git-upload-pack\n")}0000`;
+    const bodies = [
+      `${service}${pkt(`${PUSHED} refs/heads/feature\n`)}`,
+      `${service}${pkt(`${PUSHED} refs/heads/feature\n`)}00`,
+      `${service}${pkt(`zz refs/heads/feature\n`)}0000`,
+      `${pkt("# service=git-receive-pack\n")}0000${pkt(`${PUSHED} refs/heads/feature\n`)}0000`,
+      `${service}0000${pkt(`${PUSHED} refs/heads/feature\n`)}`,
+      "000eversion 2\n0000",
+    ];
+    for (const body of bodies) {
+      const refs = await readAdvertised(gitResponse("git-upload-pack", "advertisement", body), [
+        "refs/heads/feature",
+      ]);
+      expect(refs).toEqual({ kind: "unreadable" });
+    }
   });
 });
 
