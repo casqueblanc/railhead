@@ -1,0 +1,21 @@
+{
+  "name": "@railhead/ai",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./clef": {
+      "types": "./src/clef.ts",
+      "import": "./src/clef.ts"
+    }
+  },
+  "scripts": {
+    "test:run": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@railhead/scripts": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
