@@ -9,10 +9,16 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels the run it replaces. On `main` every run gets a group of its
+# own: a shared group would still cancel a run left pending behind another, even without
+# `cancel-in-progress`.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# On a pull request each job first asks scripts/ci-changes.mjs whether the change touches its inputs,
+# and on `false` skips its remaining steps. The job still reports success under its usual name, so a
+# required check never waits on a job that did not run. Pushes to `main` run every step.
 jobs:
   # Parallel to `test` so lint and test failures surface on the same run. Package type checking
   # lives in Build; `scripts/` is checked here instead.
@@ -21,39 +27,54 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Depth 2 so the pull request's merge commit has its base, `HEAD^1`, to diff against.
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
+
+      - name: Detect lint inputs
+        id: changes
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs lint >> "$GITHUB_OUTPUT"
 
       # Vite+ downloads its own pnpm for `vp install` and exposes no shim, so this is what puts
       # `pnpm` on PATH for the steps below.
       - name: Enable Corepack
+        if: steps.changes.outputs.run != 'false'
         run: corepack enable
 
       # Vite+ resolves its own version from the `vite-plus` catalog entry, and installs the pnpm
       # named in `packageManager` (integrity hash checked as Corepack does), so setup-node is not
       # needed.
       #
-      # No `cache` here, unlike `test`: this job is fast anyway, and both caching means they race
-      # to reserve the same lockfile-keyed entry.
+      # Restores the pnpm store `test` saves but never saves it: both jobs saving would race to
+      # reserve the same lockfile-keyed entry.
       - name: Set up Vite+, Node.js and dependencies
+        if: steps.changes.outputs.run != 'false'
         uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
         with:
           node-version-file: .node-version
-          cache: false
+          cache: true
+          cache-save: false
           run-install: true
 
       - name: Check engineering guidance
+        if: steps.changes.outputs.run != 'false'
         run: pnpm engineering:check
 
       - name: Format and lint
+        if: steps.changes.outputs.run != 'false'
         run: pnpm lint:check
 
       - name: Type-check scripts/
+        if: steps.changes.outputs.run != 'false'
         run: pnpm types:scripts
 
       - name: Check generated worker configs and types
+        if: steps.changes.outputs.run != 'false'
         run: pnpm configs:check
 
   test:
@@ -67,20 +88,49 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
+
+      - name: Detect build and test inputs
+        id: changes
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs test >> "$GITHUB_OUTPUT"
 
       - name: Enable Corepack
+        if: steps.changes.outputs.run != 'false'
         run: corepack enable
 
+      # The pnpm store holds every package download, workerd's binary and Wrangler included.
       - name: Set up Vite+, Node.js and dependencies
+        if: steps.changes.outputs.run != 'false'
         uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1.21.1
         with:
           node-version-file: .node-version
           cache: true
           run-install: true
 
+      # The `vp run` task cache, after the install so the install cannot touch it. Vite+ fingerprints
+      # each task's inputs itself and replays only an exact match, so the key only has to be fresh:
+      # each run saves under its commit and restores the newest entry for the same lockfile. The
+      # type checks never cache (scripts/typecheck-task-vite-config.ts).
+      - name: Restore the Vite+ task cache
+        if: steps.changes.outputs.run != 'false'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node_modules/.vite/task-cache
+          key: vp-tasks-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
+          restore-keys: vp-tasks-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
       # Every package's type check and the board bundle (`types:check` aliases this).
       - name: Build
+        if: steps.changes.outputs.run != 'false'
         run: pnpm build
 
       - name: Test
+        if: steps.changes.outputs.run != 'false'
         run: pnpm test
+
+      # Names, per task, the input that caused each cache miss.
+      - name: Explain task cache misses
+        if: steps.changes.outputs.run != 'false'
+        run: pnpm exec vp run --last-details
