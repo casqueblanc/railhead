@@ -192,6 +192,8 @@ function withRepo<R>(
           started.push(attempt);
           return ok({ attemptId: attempt.attemptId });
         },
+        // Reports reach the train through `recordCheck` in these tests.
+        report: async () => fail("unavailable", "Not used."),
       },
       authorization,
       mainWriter,
