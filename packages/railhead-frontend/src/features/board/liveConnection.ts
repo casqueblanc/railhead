@@ -4,8 +4,11 @@
 // enrollment once, and builds one port object of each kind for that session, so a form can tell a
 // replaced session's port from the current one. Everything an attempt obtained is disposed when the
 // attempt ends, and nothing it started can update state afterwards: a replaced session never
-// overwrites the current one. The folded board outlives sessions, so a reconnect resumes from its
-// cursor instead of reloading the log.
+// overwrites the current one. Every call the attempt waits on before the board can show anything
+// carries a deadline; one that stays pending fails the attempt, which offers to try again. The
+// folded board outlives sessions, so a reconnect resumes from its cursor instead of reloading the
+// log, except a halted fold: reloading it starts over from an empty board, or reloads the page when
+// the board needs newer code to read the log.
 
 import { useEffect, useRef, useState } from "react";
 import type { BoardErrorCode, BoardFailure, BoardResult } from "@railhead/shared/board-api";
@@ -17,6 +20,7 @@ import {
   openApiSession,
 } from "../../rpc/apiSession";
 import { BoardStream, type StreamPhase, type StreamSink } from "../../rpc/boardStream";
+import { withDeadline } from "../../rpc/deadline";
 import { type CurrentSession, useApiConnection } from "../../rpc/useApiConnection";
 import type {
   DecisionActions,
@@ -50,14 +54,17 @@ interface SessionView {
 
 const OFFLINE = { kind: "unavailable", reason: "offline" } as const;
 
+const reloadPage = () => window.location.reload();
+
 /**
- * The board page's ports for `target`, bound to one backend session at a time. `connect` and
- * `authenticate` are replaced in tests.
+ * The board page's ports for `target`, bound to one backend session at a time. `connect`,
+ * `authenticate` and `reload` are replaced in tests.
  */
 export const useLiveBoardPorts = (
   target: BoardRepo,
   connect: () => ApiSession = openApiSession,
   authenticate: () => Authenticator | null = browserAuthenticator,
+  reload: () => void = reloadPage,
 ): BoardPorts => {
   const { status, session, onRetry } = useApiConnection(connect);
   const [authenticator] = useState(authenticate);
@@ -84,6 +91,27 @@ export const useLiveBoardPorts = (
       if (current)
         setView((prior) => (prior?.session === session ? { ...prior, ...patch } : prior));
     };
+    // Ends the attempt: nothing it started can change state afterwards, and everything it holds,
+    // or obtains late, is disposed.
+    const release = () => {
+      current = false;
+      controller.abort();
+      liveAccess.abort();
+      stream?.[Symbol.dispose]();
+      for (const stub of held.toReversed()) stub[Symbol.dispose]();
+    };
+    const fail = () => {
+      if (!current) return;
+      update({
+        board: "failed",
+        stream: null,
+        owner: OFFLINE,
+        enrollment: OFFLINE,
+        decisions: OFFLINE,
+      });
+      release();
+    };
+    const dispose = (stub: Disposable) => stub[Symbol.dispose]();
     const keep = (next: Folded) => {
       kept.current = next;
       setFolded(next);
@@ -116,11 +144,8 @@ export const useLiveBoardPorts = (
     };
 
     // Resolved once: every enrollment call of this session reaches the same capability.
-    const enrollment = Promise.resolve(api.ownerEnrollment());
-    void enrollment.then(
-      (stub) => (current ? held.push(stub) : stub[Symbol.dispose]()),
-      () => {},
-    );
+    const enrollment = withDeadline(api.ownerEnrollment(), dispose);
+    void enrollment.then((stub) => (current ? held.push(stub) : stub[Symbol.dispose]()), fail);
     setView({
       session,
       board: "opening",
@@ -131,7 +156,9 @@ export const useLiveBoardPorts = (
     });
 
     const open = async () => {
-      const opened = await api.openBoard(org, repo);
+      const opened = await withDeadline(api.openBoard(org, repo), (late) => {
+        if (late.ok) late.value[Symbol.dispose]();
+      });
       if (!current) {
         if (opened.ok) opened.value[Symbol.dispose]();
         return;
@@ -143,7 +170,7 @@ export const useLiveBoardPorts = (
       const board = opened.value;
       held.push(board);
       stream = new BoardStream(board, sink, kept.current?.board.cursor ?? 0);
-      const owner = await board.owner();
+      const owner = await withDeadline(board.owner(), dispose);
       if (!current) {
         owner[Symbol.dispose]();
         return;
@@ -174,20 +201,30 @@ export const useLiveBoardPorts = (
               },
       });
     };
-    open().catch(() => update({ board: "failed" }));
+    open().catch(fail);
 
-    return () => {
-      current = false;
-      controller.abort();
-      stream?.[Symbol.dispose]();
-      for (const stub of held.toReversed()) stub[Symbol.dispose]();
-    };
+    return release;
   }, [session, org, repo, authenticator]);
+
+  // A halted fold ignores every later event, so resuming it would halt again: reloading starts
+  // from an empty board, or reloads the page when only newer code can read the log.
+  const onReconnect = () => {
+    const stream = kept.current?.board.stream;
+    if (stream?.kind === "halted") {
+      if (stream.fault.kind === "unsupported_version") {
+        reload();
+        return;
+      }
+      kept.current = null;
+      setFolded(null);
+    }
+    onRetry();
+  };
 
   const bound = view !== null && view.session === session ? view : null;
   return {
     connection: status,
-    onReconnect: onRetry,
+    onReconnect,
     board: boardRead(bound, folded?.key === `${org}/${repo}` ? folded : null, status),
     decisions: bound?.decisions ?? OFFLINE,
     owner: bound?.owner ?? OFFLINE,
@@ -247,13 +284,16 @@ const openFailure = (code: BoardErrorCode): SessionView["board"] => {
 const LOST_CALL: BoardFailure = {
   ok: false,
   code: "internal",
-  message: "The call did not complete: the session failed.",
+  message: "The call did not complete: the session failed or did not answer in time.",
 };
 
-/** Turns a call that threw, on a broken or replaced session, into a failed result. */
+/**
+ * Turns a call that threw, on a broken or replaced session, or that stayed pending past its
+ * deadline, into a failed result.
+ */
 const settle = async <T>(call: () => PromiseLike<BoardResult<T>>): Promise<BoardResult<T>> => {
   try {
-    return await call();
+    return await withDeadline(call());
   } catch {
     return LOST_CALL;
   }
@@ -275,7 +315,8 @@ const enrollmentPort = (enrollment: PromiseLike<EnrollmentSession>): EnrollmentP
 /**
  * Records a decision with a fresh passkey assertion bound to exactly that answer. Nothing is
  * performed once `control.signal` aborts, `control.onSent` is called just before the answer is
- * sent, and a result for anything but the requested decision is a failure. Never throws.
+ * sent, and a result for anything but the requested decision, or none before the deadline, is a
+ * failure. Never throws.
  */
 export const recordDecision = async (
   owner: OwnerSession,
@@ -286,7 +327,7 @@ export const recordDecision = async (
   const { decisionId } = request;
   const { signal } = control;
   try {
-    const prepared = await owner.prepare({ kind: "decision.record", ...request });
+    const prepared = await withDeadline(owner.prepare({ kind: "decision.record", ...request }));
     if (!prepared.ok) return { ok: false, message: refusal(prepared.code) };
     if (signal.aborted) return WITHDRAWN;
     const signed = await signAction(authenticator, prepared.value, signal);
@@ -302,7 +343,7 @@ export const recordDecision = async (
     }
     if (signal.aborted) return WITHDRAWN;
     control.onSent();
-    const performed = await owner.perform(prepared.value.challengeId, signed.value);
+    const performed = await withDeadline(owner.perform(prepared.value.challengeId, signed.value));
     if (!performed.ok) return { ok: false, message: refusal(performed.code) };
     const result = performed.value;
     if (result.kind !== "decision.record" || result.decisionId !== decisionId) {

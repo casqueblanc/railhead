@@ -1,9 +1,10 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { SYNTH_REPO } from "../../../../../fixtures/board/syntheticLog";
+import { CALL_DEADLINE_MS } from "../../rpc/deadline";
 import { FakeApi, FakeBoard, type Fault } from "../../rpc/fakeApi";
 import type { RecordDecisionRequest } from "../decisions/decisionActions";
 import { FAKE_ENCODED, fakeAuthenticator, type FakeAnswer } from "../enrollment/fakeAuthenticator";
@@ -33,6 +34,18 @@ const event = (seq: number): RailheadEvent => {
   return found;
 };
 
+/** Passes one call deadline on fake timers. */
+const expire = () => act(async () => vi.advanceTimersByTime(CALL_DEADLINE_MS));
+
+/** Answers held calls after their deadline. */
+const late = async (resume: () => void) => {
+  resume();
+  await act(async () => {});
+};
+
+/** A log whose second event the fold rejects. */
+const halting = (forged: RailheadEvent) => new FakeBoard(SYNTH_REPO, [event(1), forged]);
+
 describe("useLiveBoardPorts", () => {
   let root: Root;
   let sessions: FakeApi[];
@@ -40,16 +53,23 @@ describe("useLiveBoardPorts", () => {
   let opens: (FakeBoard | Fault)[];
   let authenticator: Authenticator | null;
   let answer: FakeAnswer;
+  /** Calls the next session holds pending. */
+  let stalled: ("openBoard" | "ownerEnrollment")[];
+  let reloads: number;
 
   const connect = () => {
     const next = opens.shift() ?? "unavailable";
     const session = new FakeApi(next);
+    for (const call of stalled.splice(0)) session.stalls.names.add(call);
     sessions.push(session);
     return session;
   };
   const authenticate = () => authenticator;
+  const reload = () => {
+    reloads += 1;
+  };
   const Probe = () => {
-    ports = useLiveBoardPorts(TARGET, connect, authenticate);
+    ports = useLiveBoardPorts(TARGET, connect, authenticate, reload);
     return null;
   };
   const session = (attempt: number): FakeApi => {
@@ -72,6 +92,12 @@ describe("useLiveBoardPorts", () => {
     return current.board.cursor;
   };
 
+  /** Mounts and lets the session's probe answer. */
+  const start = async () => {
+    await mount();
+    await act(async () => session(0).answer());
+  };
+
   /** Records `REQUEST` through the decisions port, failing the test when it is unavailable. */
   const record = async () => {
     if (ports.decisions.kind !== "available") throw new Error("decisions unavailable");
@@ -84,6 +110,8 @@ describe("useLiveBoardPorts", () => {
   beforeEach(() => {
     sessions = [];
     opens = [];
+    stalled = [];
+    reloads = 0;
     answer = "sign";
     authenticator = fakeAuthenticator(() => answer).authenticator;
   });
@@ -225,6 +253,165 @@ describe("useLiveBoardPorts", () => {
       expect(board.ownerStub.disposed).toBe(true);
       expect(session(0).enrollment.disposed).toBe(true);
       expect(session(0).disposed).toBe(true);
+    });
+  });
+
+  describe("when the fold halts", () => {
+    it("reloads the board from a fresh fold, not from the halted one", async () => {
+      opens = [halting({ ...event(2), repo: "rep_otherrepo" })];
+      await mount();
+      await act(async () => session(0).answer());
+      const halted = feed();
+      expect(halted).toMatchObject({
+        kind: "board",
+        board: { cursor: 1, stream: { kind: "halted" } },
+      });
+
+      const fresh = new FakeBoard(SYNTH_REPO, LOG);
+      opens = [fresh];
+      await act(async () => ports.onReconnect());
+      await act(async () => session(1).answer());
+
+      expect(fresh.reads).toEqual([0]);
+      expect(fresh.subscriptions.map((s) => s.cursor)).toEqual([HEAD]);
+      expect(feed()).toMatchObject({
+        kind: "board",
+        connection: "live",
+        recovered: false,
+        board: { cursor: HEAD, stream: { kind: "consistent" } },
+      });
+      expect(reloads).toBe(0);
+    });
+
+    it("reloads the page when the log needs a newer board to read it", async () => {
+      opens = [halting({ ...event(2), v: 99 })];
+      await mount();
+      await act(async () => session(0).answer());
+
+      await act(async () => ports.onReconnect());
+
+      expect(reloads).toBe(1);
+      expect(sessions).toHaveLength(1);
+    });
+
+    it("keeps resuming from the cursor when the board did not halt", async () => {
+      opens = [new FakeBoard(SYNTH_REPO, LOG.slice(0, 2)), new FakeBoard(SYNTH_REPO, LOG)];
+      await mount();
+      await act(async () => session(0).answer());
+
+      await act(async () => ports.onReconnect());
+      await act(async () => session(1).answer());
+
+      expect(feed()).toMatchObject({ kind: "board", recovered: true, board: { cursor: HEAD } });
+      expect(reloads).toBe(0);
+    });
+  });
+
+  describe("when a call never answers", () => {
+    let board: FakeBoard;
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      board = new FakeBoard(SYNTH_REPO, LOG);
+      opens = [board];
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("fails the board at the open's deadline and disposes a board opened late", async () => {
+      stalled = ["openBoard"];
+      await start();
+      expect(feed()).toEqual({ kind: "loading" });
+
+      await expire();
+      expect(feed()).toEqual({ kind: "failed" });
+      expect(ports.connection).toBe("connected");
+
+      await late(() => session(0).stalls.resume());
+      expect(board.disposed).toBe(true);
+      expect(board.reads).toEqual([]);
+      expect(feed()).toEqual({ kind: "failed" });
+
+      opens = [new FakeBoard(SYNTH_REPO, LOG)];
+      await act(async () => ports.onReconnect());
+      await act(async () => session(1).answer());
+      expect(feed()).toMatchObject({ kind: "board", connection: "live" });
+    });
+
+    it("opens a board that answers one millisecond before the deadline", async () => {
+      stalled = ["openBoard"];
+      await start();
+      await act(async () => vi.advanceTimersByTime(CALL_DEADLINE_MS - 1));
+      await late(() => session(0).stalls.resume());
+      await expire();
+
+      expect(feed()).toMatchObject({ kind: "board", connection: "live" });
+      expect(board.disposed).toBe(false);
+    });
+
+    it("fails the board at the first page's deadline and folds no page that arrives late", async () => {
+      board.stalls.names.add("readEvents");
+      await start();
+
+      await expire();
+      expect(feed()).toEqual({ kind: "failed" });
+
+      await late(() => board.stalls.resume());
+      expect(feed()).toEqual({ kind: "failed" });
+      expect(board.subscriptions).toHaveLength(0);
+    });
+
+    it("shows the board stale at the subscription's deadline and disposes a late one", async () => {
+      board.stalls.names.add("subscribe");
+      await start();
+      expect(feed()).toEqual({ kind: "loading" });
+
+      await expire();
+      expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+
+      await late(() => board.stalls.resume());
+      expect(board.latest().handle.disposed).toBe(true);
+      expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+    });
+
+    it("fails the session at the owner's deadline and disposes an owner that arrives late", async () => {
+      board.stalls.names.add("owner");
+      await start();
+      expect(feed()).toMatchObject({ kind: "board", connection: "live" });
+
+      await expire();
+      expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+      expect(ports.owner).toEqual({ kind: "unavailable", reason: "offline" });
+      expect(ports.decisions).toEqual({ kind: "unavailable", reason: "offline" });
+      expect(board.latest().handle.disposed).toBe(true);
+
+      await late(() => board.stalls.resume());
+      expect(board.ownerStub.disposed).toBe(true);
+      expect(ports.owner).toEqual({ kind: "unavailable", reason: "offline" });
+    });
+
+    it("fails the session at enrollment's deadline and disposes enrollment that arrives late", async () => {
+      stalled = ["ownerEnrollment"];
+      await start();
+
+      await expire();
+      expect(ports.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
+      expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+
+      await late(() => session(0).stalls.resume());
+      expect(session(0).enrollment.disposed).toBe(true);
+    });
+
+    it("turns an owner call that never answers into a failed result at its deadline", async () => {
+      board.ownerStub.prepare = () => new Promise(() => {});
+      await start();
+      if (ports.owner.kind !== "available") throw new Error("owner unavailable");
+
+      const pending = ports.owner.onPrepareAction({ kind: "agent.revoke", agentId: "agt_x" });
+      await expire();
+
+      expect(await pending).toMatchObject({ ok: false, code: "internal" });
     });
   });
 

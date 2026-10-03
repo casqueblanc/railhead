@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { type ApiSession, openApiSession } from "./apiSession";
+import { withDeadline } from "./deadline";
 
-/** Where the backend session stands. `lost` covers a failed first probe and a later break. */
+/**
+ * Where the backend session stands. `lost` covers a first probe that failed or went unanswered past
+ * its deadline, and a later break.
+ */
 export type ConnectionStatus = "connecting" | "connected" | "lost";
 
 /**
@@ -32,7 +36,7 @@ export const useApiConnection = (
       if (current) setStatus("lost");
     };
     api.onRpcBroken(markLost);
-    api.ping().then(() => {
+    withDeadline(api.ping()).then(() => {
       if (current) setStatus("connected");
     }, markLost);
     setSession({ api });

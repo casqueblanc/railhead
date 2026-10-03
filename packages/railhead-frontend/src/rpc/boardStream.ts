@@ -1,7 +1,8 @@
 // Keeps a folded board current from one repository's log over one session, following the
 // snapshot-plus-cursor contract in `@railhead/shared/board-api`: page `readEvents` from the cursor
 // up to the head, subscribe from the cursor, and on a gap or a `slow` or `restart` end, page over
-// the gap and subscribe again. The stream never holds board state; its sink folds and reports the
+// the gap and subscribe again. Every read and subscribe carries a deadline: one that stays pending
+// stops the stream as failed. The stream never holds board state; its sink folds and reports the
 // cursor, which is what a later session resumes from.
 
 import { RpcTarget } from "capnweb";
@@ -13,6 +14,7 @@ import {
 } from "@railhead/shared/board-api";
 import type { RailheadEvent, RepoId } from "@railhead/shared/events";
 import type { BoardSession, SubscriptionSession } from "./apiSession";
+import { withDeadline } from "./deadline";
 
 /** Resyncs in a row that may leave the cursor where it was before the stream gives up. */
 export const MAX_RESYNCS_WITHOUT_PROGRESS = 5;
@@ -33,7 +35,7 @@ export type StreamStop =
   | "revoked"
   /** The fold stopped on an event it could not apply. */
   | "halted"
-  /** The backend failed or kept failing to deliver; a new session may recover. */
+  /** The backend failed, kept failing to deliver or did not answer in time; a new session may recover. */
   | "failed";
 
 /** What the stream is doing. */
@@ -216,7 +218,9 @@ export class BoardStream implements Disposable {
     }
     const listener = new Listener(this);
     this.#listener = listener;
-    const result = await this.#board.subscribe(this.#cursor, listener);
+    const result = await withDeadline(this.#board.subscribe(this.#cursor, listener), (late) => {
+      if (late.ok) late.value[Symbol.dispose]();
+    });
     if (!this.#isCurrent(listener)) {
       if (result.ok) result.value[Symbol.dispose]();
       return;
@@ -236,7 +240,7 @@ export class BoardStream implements Disposable {
   async #catchUp(): Promise<StreamStop | null> {
     let head: number | null = null;
     for (;;) {
-      const page = await this.#board.readEvents(this.#cursor, MAX_EVENT_PAGE);
+      const page = await withDeadline(this.#board.readEvents(this.#cursor, MAX_EVENT_PAGE));
       if (this.#disposed || this.#stopped) return null;
       if (!page.ok) return stopFor(page.code);
       if (head === null) {

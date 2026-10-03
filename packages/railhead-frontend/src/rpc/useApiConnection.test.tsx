@@ -1,6 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CALL_DEADLINE_MS } from "./deadline";
 import { FakeApi } from "./fakeApi";
 import { useApiConnection } from "./useApiConnection";
 
@@ -89,6 +90,39 @@ describe("useApiConnection", () => {
     await act(async () => session(0).answer());
 
     expect(connection.status).toBe("connecting");
+  });
+
+  describe("when the backend never answers the probe", () => {
+    // The probe's deadline starts with the session, so the session is opened under fake timers.
+    beforeEach(async () => {
+      await act(async () => root.unmount());
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      sessions = [];
+      root = createRoot(document.createElement("div"));
+      await act(async () => root.render(<Probe />));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("is lost at the probe's deadline and stays lost when the answer arrives late", async () => {
+      await act(async () => vi.advanceTimersByTime(CALL_DEADLINE_MS - 1));
+      expect(connection.status).toBe("connecting");
+
+      await act(async () => vi.advanceTimersByTime(1));
+      expect(connection.status).toBe("lost");
+
+      await act(async () => session(0).answer());
+      expect(connection.status).toBe("lost");
+    });
+
+    it("connects on retry once the replacement answers", async () => {
+      await act(async () => vi.advanceTimersByTime(CALL_DEADLINE_MS));
+      await act(async () => connection.onRetry());
+      await act(async () => session(1).answer());
+
+      expect(connection.status).toBe("connected");
+    });
   });
 
   it("disposes its session when the component unmounts", async () => {

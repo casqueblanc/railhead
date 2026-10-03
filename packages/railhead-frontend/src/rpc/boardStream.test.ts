@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../fixtures/board/checkBeforeLand";
 import { SYNTH_REPO } from "../../../../fixtures/board/syntheticLog";
@@ -9,6 +9,7 @@ import {
   type StreamPhase,
   type StreamSink,
 } from "./boardStream";
+import { CALL_DEADLINE_MS } from "./deadline";
 import { FakeBoard, releaseTarget } from "./fakeApi";
 
 const LOG = checkBeforeLand.events;
@@ -59,6 +60,15 @@ describe("BoardStream", () => {
     stream?.[Symbol.dispose]();
     stream = null;
   });
+  /** Starts a stream on fake timers over a board that holds `call` pending. */
+  const stalled = (call: "readEvents" | "subscribe") => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const board = new FakeBoard(SYNTH_REPO, LOG);
+    board.stalls.names.add(call);
+    const sink = folding();
+    stream = new BoardStream(board, sink.sink, 0);
+    return { board, sink };
+  };
 
   it("pages the log up to its head, then subscribes from the cursor it reached", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
@@ -303,6 +313,49 @@ describe("BoardStream", () => {
     expect(sink.stops).toEqual(["halted"]);
     expect(sink.board().stream.kind).toBe("halted");
     expect(board.subscriptions).toHaveLength(0);
+  });
+
+  describe("when a call stays pending", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("fails at the deadline of a page that never arrives and folds none that arrives late", async () => {
+      const { board, sink } = stalled("readEvents");
+      await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+      expect(sink.phases).toEqual(["catching_up"]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sink.stops).toEqual(["failed"]);
+
+      board.stalls.resume();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(() => sink.board()).toThrow("no board yet");
+      expect(board.subscriptions).toHaveLength(0);
+      expect(sink.phases).toEqual(["catching_up", "stopped"]);
+    });
+
+    it("fails at the deadline of a subscription and disposes the one that arrives late", async () => {
+      const { board, sink } = stalled("subscribe");
+      await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS);
+      expect(sink.stops).toEqual(["failed"]);
+      expect(sink.board().cursor).toBe(HEAD);
+
+      board.stalls.resume();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(board.latest().handle.disposed).toBe(true);
+      expect(sink.phases).toEqual(["catching_up", "stopped"]);
+    });
+
+    it("goes live when the subscription answers just before its deadline", async () => {
+      const { board, sink } = stalled("subscribe");
+      await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+      board.stalls.resume();
+      await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS);
+
+      expect(sink.phases).toEqual(["catching_up", "live"]);
+      expect(board.latest().handle.disposed).toBe(false);
+    });
   });
 
   it("folds nothing once disposed, even when a page was already requested", async () => {

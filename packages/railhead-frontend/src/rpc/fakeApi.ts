@@ -38,6 +38,29 @@ const fault = <T>(
   return Promise.resolve(scripted === null ? answer() : failure(scripted));
 };
 
+/**
+ * Calls a test holds pending, as a backend that never answers over an open session would. Each held
+ * call answers normally, late, once the test resumes it.
+ */
+export class Stalls<Name extends string> {
+  readonly names = new Set<Name>();
+  readonly #held: (() => void)[] = [];
+
+  /** Answers with `answer` now, or holds the call while `name` is stalled. */
+  gate<T>(name: Name, answer: () => Promise<T>): Promise<T> {
+    if (!this.names.has(name)) return answer();
+    return new Promise((resolve, reject) => {
+      this.#held.push(() => answer().then(resolve, reject));
+    });
+  }
+
+  /** Stops stalling and answers every held call. */
+  resume(): void {
+    this.names.clear();
+    for (const answer of this.#held.splice(0)) answer();
+  }
+}
+
 /** Disposes `listener` the way Cap'n Web disposes a target once its last remote reference goes. */
 export const releaseTarget = (listener: BoardListener): void => {
   const dispose: unknown = Reflect.get(listener, Symbol.dispose);
@@ -149,6 +172,7 @@ export class FakeBoard implements BoardSession {
   pageSize: number = MAX_EVENT_PAGE;
   readFault: Fault | null = null;
   subscribeFault: Fault | null = null;
+  readonly stalls = new Stalls<"readEvents" | "subscribe" | "owner">();
   /** The cursor of every `readEvents` call. */
   readonly reads: number[] = [];
   readonly subscriptions: Subscribed[] = [];
@@ -169,6 +193,10 @@ export class FakeBoard implements BoardSession {
 
   readEvents(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
     this.reads.push(cursor);
+    return this.stalls.gate("readEvents", () => this.#page(cursor, limit));
+  }
+
+  #page(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
     return fault(this.readFault, (): BoardResult<EventPage> => {
       if (cursor > this.#log.length) return failure("cursor_ahead");
       const events = this.#log.slice(cursor, cursor + Math.min(limit, this.pageSize));
@@ -185,15 +213,17 @@ export class FakeBoard implements BoardSession {
   }
 
   subscribe(cursor: number, listener: BoardListener): Promise<BoardResult<SubscriptionSession>> {
-    return fault(this.subscribeFault, () => {
-      const handle = new FakeSubscription(listener);
-      this.subscriptions.push({ cursor, listener, handle });
-      return { ok: true, value: handle };
-    });
+    return this.stalls.gate("subscribe", () =>
+      fault(this.subscribeFault, () => {
+        const handle = new FakeSubscription(listener);
+        this.subscriptions.push({ cursor, listener, handle });
+        return { ok: true, value: handle };
+      }),
+    );
   }
 
   owner(): Promise<OwnerSession> {
-    return Promise.resolve(this.ownerStub);
+    return this.stalls.gate("owner", () => Promise.resolve(this.ownerStub));
   }
 
   /** The newest subscription. */
@@ -216,6 +246,8 @@ export class FakeApi implements ApiSession {
   break: () => void = () => {};
   readonly opened: string[] = [];
   readonly enrollment = new FakeEnrollment();
+  /** Held until resumed; the probe is held until `answer` or `refuse`. */
+  readonly stalls = new Stalls<"openBoard" | "ownerEnrollment">();
   /** What `openBoard` answers with: the board, or a scripted fault. */
   board: FakeBoard | Fault;
   readonly #probe = new Promise<void>((resolve, reject) => {
@@ -238,12 +270,15 @@ export class FakeApi implements ApiSession {
   openBoard(org: string, repo: string): Promise<BoardResult<BoardSession>> {
     this.opened.push(`${org}/${repo}`);
     const { board } = this;
-    if (board instanceof FakeBoard) return Promise.resolve({ ok: true, value: board });
-    return fault(board, () => failure("internal"));
+    return this.stalls.gate("openBoard", () =>
+      board instanceof FakeBoard
+        ? Promise.resolve({ ok: true, value: board })
+        : fault(board, () => failure("internal")),
+    );
   }
 
   ownerEnrollment(): Promise<EnrollmentSession> {
-    return Promise.resolve(this.enrollment);
+    return this.stalls.gate("ownerEnrollment", () => Promise.resolve(this.enrollment));
   }
 
   [Symbol.dispose](): void {
