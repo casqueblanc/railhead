@@ -66,9 +66,10 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     case "seed": {
       requireDryRun(values["dry-run"], "seed");
       const history = planHistory(request);
+      const empty = new MemoryTarget();
       return [
         ...header(history),
-        ...describePlan(await planSeed(manifest, history, new MemoryTarget())),
+        ...describePlan(await planSeed(manifest, history, empty, empty)),
         ...decisionLines(
           manifest.decision.key,
           manifest.decision.options.map((o) => o.key),
@@ -80,7 +81,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
       requireDryRun(values["dry-run"], "reset");
       // Planned against an instance holding the demo repository, so the deletion is listed.
       const target = new MemoryTarget();
-      await target.createRepo({ org: manifest.org, repo: manifest.repo });
+      target.leaveWithoutMain({ org: manifest.org, repo: manifest.repo });
       return [
         ...describePlan(await planReset(manifest, target)),
         `note planned against an instance holding only ${manifest.org}/${manifest.repo}: no live target exists yet`,

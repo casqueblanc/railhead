@@ -34,12 +34,13 @@ The manifest check enforces this shape: exactly three issues, exactly two touchi
 
 ## Repeatable seed, safe reset
 
-Seed and reset reconcile against a target through the `SeedTarget` port in `scripts/demoSeed/reconcile.ts`:
+Seed and reset reconcile against a target through the `SeedTarget` port in `scripts/demoSeed/reconcile.ts`. The port has the shape of the backend's `DemoSeedApi` ([#149](https://github.com/casqueblanc/railhead/pull/149)): `read` returns the repository's main or nothing, `seed` creates the repository and imports main in one action, and `reset` deletes it.
 
-- Seed reads the target, then writes only what is missing: the repository and its main. A second seed writes nothing. A seed that failed halfway finishes on the next run.
-- Main is imported from the bundle itself: `importMain` receives the bundle's bytes and the head it was approved for, the input the backend's `demo.seed` takes ([#149](https://github.com/casqueblanc/railhead/pull/149)). The bundle carries `refs/heads/main` alone, with no prerequisites, and at most 8 MiB. Importing only creates main: a repeat at the same head succeeds without writing, and a main at another head is refused as stale, so a seed whose response was lost is safe to run again.
-- Filing an issue is an owner action that needs a passkey assertion, so the port cannot file one. The plan lists each seeded issue as done when the board shows its title and as an owner step otherwise.
-- Seed refuses, writing nothing, when main already holds another head or a seeded title carries a different body. Reset first.
+- Seed reads the target, then seeds only when the repository is missing. A second seed writes nothing.
+- `seed` receives the bundle's bytes and the head it was approved for, the input `demo.seed` takes. The bundle carries `refs/heads/main` alone, with no prerequisites, and at most 8 MiB. Nothing is visible until main is in place, so a failed seed leaves no repository and the next run seeds it. Main is only ever created: a repeat at the same head succeeds without writing, so a seed whose response was lost is safe to run again.
+- Seed refuses, writing nothing, when main already holds another head, when the repository exists without a main (a reset that did not finish; the backend answers `action_stale`), or when a seeded title carries a different body. Reset first.
+- Each backend write needs its own owner passkey assertion. The live adapter obtains it ([#148](https://github.com/casqueblanc/railhead/issues/148)); the port does not carry one.
+- `DemoSeedApi` has no issue read, so issues are read through a second port, `BoardIssues`. Filing an issue is an owner action on the board, so neither port can file one. The plan lists each seeded issue as done when the board shows its title and as an owner step otherwise.
 - Other issues are left alone.
 - The port takes no lock: run one seed at a time.
 - Reset deletes `demo/upload-app` by name. It never lists repositories to choose what to delete, so no other repository can go with it. Reset of an absent repository writes nothing.
@@ -48,7 +49,7 @@ The tests in `scripts/demoSeed/` run these rules against an in-memory target, al
 
 ## Running it live
 
-There is no live target yet. The Worker has no entry that initializes a repository or imports its main, and no Artifacts binding; [#142](https://github.com/casqueblanc/railhead/issues/142) adds them and makes them the live `SeedTarget`, which reads, creates, imports and deletes but files no issue. Until then `seed` and `reset` refuse to run without `--dry-run`, and nothing here creates a Cloudflare resource or reads a secret.
+There is no live target yet. The Worker has no entry that initializes a repository or imports its main, and no Artifacts binding; [#142](https://github.com/casqueblanc/railhead/issues/142) adds them and wires `DemoSeedApi` as the live `SeedTarget`, with a board issue read as `BoardIssues`. Until then `seed` and `reset` refuse to run without `--dry-run`, and nothing here creates a Cloudflare resource or reads a secret.
 
 The owner's steps for H03 ([#68](https://github.com/casqueblanc/railhead/issues/68)), once #142 has merged and been deployed:
 

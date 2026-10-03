@@ -73,8 +73,7 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
 
   // The app's one commit, then the commit that makes it stand alone.
   assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
-  assert.deepEqual(lines.slice(1, 2), ["todo create repository demo/upload-app"]);
-  assert.match(lines[2] ?? "", /^todo import main demo\/upload-app@main = [0-9a-f]{40}$/);
+  assert.match(lines[1] ?? "", /^todo seed repository demo\/upload-app@main = [0-9a-f]{40}$/);
   assert.equal(
     lines.filter((line) => line.startsWith("todo owner files issue demo/upload-app#")).length,
     3,

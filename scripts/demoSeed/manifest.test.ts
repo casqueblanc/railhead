@@ -6,6 +6,8 @@ import {
   assertAskable,
   assertDemoTarget,
   assertMatchesChecks,
+  DEMO_ORG,
+  DEMO_REPO,
   loadManifest,
   MAX_OPTIONS,
   MAX_PATH_LENGTH,
@@ -211,6 +213,18 @@ test("the restated wire rules match @railhead/shared", () => {
   // MAX_SCOPE_BYTES is half the request limit; the scope-bytes vectors above check the sum.
   assert.ok(agentApi.includes("export const MAX_AGENT_REQUEST_BYTES = 16 * 1024;"));
   assert.ok(agentApi.includes("export const MAX_SCOPE_BYTES = MAX_AGENT_REQUEST_BYTES / 2;"));
+});
+
+test("the demo repository is the board's default repository", () => {
+  const apiSession = readFileSync(
+    join(root, "packages", "railhead-frontend", "src", "rpc", "apiSession.ts"),
+    "utf8",
+  );
+  assert.ok(
+    apiSession.includes(
+      `export const DEFAULT_BOARD_REPO: BoardRepo = { org: "${DEMO_ORG}", repo: "${DEMO_REPO}" };`,
+    ),
+  );
 });
 
 test("a manifest naming another repository is refused", () => {

@@ -1,21 +1,24 @@
 // Seed and reset as reconciliation against a `SeedTarget`.
 //
-// A plan compares what the manifest wants with what the target reports, and lists one step per
-// target with whether it is already in place. Seeding applies only the missing steps, so a repeat
-// after success changes nothing and a repeat after a partial failure finishes the job. A step whose
-// write failed is not retried here: the next run reads the target again first, so an uncertain
-// write is reconciled before anything is written a second time.
+// The port mirrors the backend's `DemoSeedApi` (#149): `read` returns the repository and its main,
+// `seed` creates the repository and imports main in one action, and `reset` deletes it. A plan
+// compares what the manifest wants with what the target reports and lists each step with whether
+// it is already in place, so a repeat after success writes nothing. A step whose write failed is
+// not retried here: the next run reads the target again first, so an uncertain write is reconciled
+// before anything is written a second time.
 //
-// Filing an issue is an owner action that needs the owner's passkey assertion, so the port has no
-// way to file one. The plan lists each seeded issue and whether the board already shows it; the
-// owner files the missing ones on the board.
+// Each backend write needs its own owner passkey assertion. The live adapter obtains it (#148); the
+// port does not carry one.
+//
+// Issues are read through `BoardIssues`, a separate port: `DemoSeedApi` has no issue read. Filing an
+// issue is an owner action on the board, so neither port can file one. The plan lists each seeded
+// issue and whether the board already shows it; the owner files the missing ones.
 //
 // Reset deletes the demo repository by name and nothing else. It never lists the target to choose
 // what to delete, so another repository cannot be swept up with it.
 //
-// The live target, a Railhead backend entry that initializes the repository and imports its main,
-// does not exist yet; until it does the commands only plan, and `docs/demo-seed.md` gives the
-// owner's steps.
+// The live target does not exist yet; until it does the commands only plan, and
+// `docs/demo-seed.md` gives the owner's steps.
 
 import { assertDemoTarget, SeedRefusal, type SeedIssue, type SeedManifest } from "./manifest.ts";
 import type { ImportedHistory, MainBundle } from "./history.ts";
@@ -26,29 +29,37 @@ export interface RepoRef {
   readonly repo: string;
 }
 
-/** What the target holds for one repository. */
+/** What the target holds for one repository, as `DemoSeedState` (#149). */
 export interface RepoState {
-  /** The head of its main, or `null` before the history is imported. */
+  /** The head of its main, or `null` when a reset did not finish. */
   readonly main: string | null;
-  /** Its issues, in filing order. */
-  readonly issues: readonly { readonly title: string; readonly body: string }[];
 }
 
-/** Where the seed writes. Each method touches only the repository it is given. */
+/** Where the seed writes, as `DemoSeedApi` (#149). Each method touches only the repository given. */
 export interface SeedTarget {
   /** The repository's state, or `null` when it does not exist. */
   read(ref: RepoRef): Promise<RepoState | null>;
-  /** Creates the repository with an empty main. */
-  createRepo(ref: RepoRef): Promise<void>;
   /**
-   * Imports `bundle` as main, which only creates main and never moves it: when main is already
-   * `bundle.head` it succeeds without writing, and when main holds another head it throws
-   * `ActionStale`. These are the backend's `demo.seed` rules (#149), so a repeat after a lost
-   * response is safe.
+   * Creates the repository if it is missing and imports `bundle` as its main, as `demo.seed`. Main
+   * is only ever created, never moved: when it is already `bundle.head` this succeeds without
+   * writing, and when it holds another head, or the repository exists without a main, it throws
+   * `ActionStale`. Nothing is visible until main is in place, so a failure leaves no repository.
    */
-  importMain(ref: RepoRef, bundle: MainBundle): Promise<void>;
-  /** Deletes the repository and everything in it. */
-  deleteRepo(ref: RepoRef): Promise<void>;
+  seed(ref: RepoRef, bundle: MainBundle): Promise<void>;
+  /** Deletes the repository and everything in it, as `demo.reset`; `false` when it was absent. */
+  reset(ref: RepoRef): Promise<boolean>;
+}
+
+/** An issue as the board shows it. */
+export interface BoardIssue {
+  readonly title: string;
+  readonly body: string;
+}
+
+/** The board's issues for one repository: the read `DemoSeedApi` does not offer. */
+export interface BoardIssues {
+  /** The repository's issues in filing order, empty when it does not exist. */
+  issues(ref: RepoRef): Promise<readonly BoardIssue[]>;
 }
 
 /** The target refused a write because it holds something else, as the backend's `action_stale`. */
@@ -58,8 +69,7 @@ export class ActionStale extends Error {
 
 /** One step of a plan. */
 export type SeedStep =
-  | { readonly action: "repo.create"; readonly target: string }
-  | { readonly action: "main.import"; readonly target: string; readonly head: string }
+  | { readonly action: "repo.seed"; readonly target: string; readonly head: string }
   | { readonly action: "issue.file"; readonly target: string; readonly issue: SeedIssue }
   | { readonly action: "repo.delete"; readonly target: string };
 
@@ -75,22 +85,26 @@ export function demoRef(manifest: SeedManifest): RepoRef {
   return { org: manifest.org, repo: manifest.repo };
 }
 
-/** Plans a seed of `manifest` with `history` as main against what `target` holds now. */
+/** Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. */
 export async function planSeed(
   manifest: SeedManifest,
   history: ImportedHistory,
   target: SeedTarget,
+  board: BoardIssues,
 ): Promise<PlannedStep[]> {
   const ref = demoRef(manifest);
   const name = `${ref.org}/${ref.repo}`;
   const state = await target.read(ref);
 
-  if (state !== null && state.main !== null && state.main !== history.head) {
+  if (state !== null && state.main === null) {
+    throw new SeedRefusal(`${name} exists without a main: a reset did not finish. Reset it first.`);
+  }
+  if (state !== null && state.main !== history.head) {
     throw new SeedRefusal(
       `${name} already has main at ${state.main}, not the import's ${history.head}. Reset it first.`,
     );
   }
-  const filed = new Map((state?.issues ?? []).map((issue) => [issue.title, issue.body]));
+  const filed = new Map((await board.issues(ref)).map((issue) => [issue.title, issue.body]));
   for (const issue of manifest.issues) {
     const body = filed.get(issue.title);
     if (body !== undefined && body !== issue.body) {
@@ -101,10 +115,9 @@ export async function planSeed(
   }
 
   return [
-    { step: { action: "repo.create", target: name }, status: state === null ? "missing" : "done" },
     {
-      step: { action: "main.import", target: `${name}@main`, head: history.head },
-      status: state?.main === history.head ? "done" : "missing",
+      step: { action: "repo.seed", target: `${name}@main`, head: history.head },
+      status: state === null ? "missing" : "done",
     },
     ...manifest.issues.map((issue, index): PlannedStep => ({
       step: { action: "issue.file", target: `${name}#seed-${index + 1}`, issue },
@@ -114,24 +127,22 @@ export async function planSeed(
 }
 
 /**
- * Applies the missing repository and main steps of a fresh seed plan, in order, and returns the
- * plan. Main is imported from `bundle`, the bytes the target receives. Missing issues stay missing: the owner files them on the board.
+ * Seeds the repository with main from `bundle`, the bytes the target receives, when a fresh plan
+ * finds it missing, and returns the plan. Missing issues stay missing: the owner files them.
  */
 export async function seed(
   manifest: SeedManifest,
   bundle: MainBundle,
   target: SeedTarget,
+  board: BoardIssues,
 ): Promise<PlannedStep[]> {
   const ref = demoRef(manifest);
-  const plan = await planSeed(manifest, bundle, target);
+  const plan = await planSeed(manifest, bundle, target, board);
   for (const { step, status } of plan) {
     if (status === "done") continue;
     switch (step.action) {
-      case "repo.create":
-        await target.createRepo(ref);
-        break;
-      case "main.import":
-        await target.importMain(ref, bundle);
+      case "repo.seed":
+        await target.seed(ref, bundle);
         break;
       case "issue.file":
         // The owner's step; the seed holds no authority to file an issue.
@@ -164,7 +175,7 @@ export async function planReset(
 export async function reset(manifest: SeedManifest, target: SeedTarget): Promise<PlannedStep[]> {
   const ref = demoRef(manifest);
   const plan = await planReset(manifest, target);
-  if (plan.some((planned) => planned.status === "missing")) await target.deleteRepo(ref);
+  if (plan.some((planned) => planned.status === "missing")) await target.reset(ref);
   return plan;
 }
 
@@ -173,10 +184,8 @@ export function describePlan(plan: readonly PlannedStep[]): string[] {
   return plan.map(({ step, status }) => {
     const mark = status === "done" ? "ok  " : "todo";
     switch (step.action) {
-      case "repo.create":
-        return `${mark} create repository ${step.target}`;
-      case "main.import":
-        return `${mark} import main ${step.target} = ${step.head}`;
+      case "repo.seed":
+        return `${mark} seed repository ${step.target} = ${step.head}`;
       case "issue.file":
         return `${mark} owner files issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
       case "repo.delete":
