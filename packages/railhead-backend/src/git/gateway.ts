@@ -10,6 +10,12 @@
 // Git result of the expected type; its headers are replaced and the token is masked out of its
 // body, so neither a redirect, an error page nor an echo can carry the token to the client.
 //
+// A push is decided three times: when its request arrives, again once its head has been read and
+// before a write token is minted, and again immediately before it is sent upstream. A claim closed or
+// passed on while the client held its head back, or while the token was being minted, therefore
+// never gets a token minted for it or a push sent under it. The head itself must arrive within its
+// own time limit; a client that stalls inside it is cut off and its body released.
+//
 // A push is recorded as `claim.pushed` only for the refs the upstream itself reported updated, once
 // its response has ended. A refused, failed, cut-off or unreadable push records nothing.
 //
@@ -34,6 +40,7 @@ import {
   receivePackRefusal,
   uploadPackError,
   describeHeadFailure,
+  type PushHead,
   type ReceivePackHead,
   type RefUpdate,
 } from "./pktLine";
@@ -47,9 +54,14 @@ export interface GitGatewayLimits {
   readonly maxPushBytes: number;
   /** The largest response body passed on from the upstream, in bytes. */
   readonly maxResponseBytes: number;
+  /** How long a push's client may take to send the head of its body, its command list. */
+  readonly headTimeoutMs: number;
   /** How long the upstream may take to answer with headers. */
   readonly headersTimeoutMs: number;
-  /** How long one request may take from the upstream call to the end of its response. */
+  /**
+   * How long one request may take to the end of its response, counted from the upstream call, or
+   * for a push from the first read of its body.
+   */
   readonly maxDurationMs: number;
   /** The lifetime of the Artifacts token asked for. */
   readonly tokenTtlMs: number;
@@ -61,6 +73,7 @@ export const GIT_GATEWAY_LIMITS: GitGatewayLimits = {
   // Workers accept request bodies up to 100 MB on most plans.
   maxPushBytes: 100 * 1024 * 1024,
   maxResponseBytes: 512 * 1024 * 1024,
+  headTimeoutMs: 30_000,
   headersTimeoutMs: 30_000,
   maxDurationMs: 10 * 60_000,
   tokenTtlMs: 10 * 60_000,
@@ -148,7 +161,7 @@ class GitGateway implements GitPort {
     }
 
     if (route.phase === "rpc" && route.service === "git-receive-pack") {
-      return this.#push(request, route, grant.value, principal.value);
+      return this.#push(request, route, grant.value, access);
     }
     return this.#forward(request, route, grant.value, null);
   }
@@ -158,9 +171,10 @@ class GitGateway implements GitPort {
     request: Request,
     route: Route,
     grant: GitGrant,
-    principal: AgentPrincipal | null,
+    access: GitAccess,
   ): Promise<Response> {
     const { fence } = grant;
+    const { principal } = access;
     if (fence === null || principal === null) {
       return discarding(request, text(500, "railhead: the Git grant does not match the request"));
     }
@@ -170,8 +184,14 @@ class GitGateway implements GitPort {
     const tooLarge = declaredTooLarge(request, this.#limits.maxPushBytes);
     if (tooLarge !== null) return discarding(request, tooLarge);
     if (request.body === null) return text(400, "railhead: a push needs a body");
-    const parsed = await readReceivePackHead(request.body);
+    const deadline = new Deadline(this.#limits.maxDurationMs);
+    const parsed = await this.#readHead(request.body, deadline);
+    if (parsed.kind === "late") {
+      deadline.clear();
+      return text(408, "railhead: the push's command list did not arrive in time");
+    }
     if (parsed.kind === "refused") {
+      deadline.clear();
       return text(400, `railhead: ${describeHeadFailure(parsed.reason)}`);
     }
     const { head } = parsed;
@@ -181,6 +201,7 @@ class GitGateway implements GitPort {
       if (reason !== null) reasons.set(update, reason);
     }
     if (reasons.size > 0) {
+      deadline.clear();
       await parsed.body.cancel();
       return gitResult(
         route.service,
@@ -194,22 +215,75 @@ class GitGateway implements GitPort {
     return this.#forward(request, route, grant, {
       head,
       body: parsed.body,
+      deadline,
+      admit: () => this.#readmit(route, access, grant, head),
       record: (updated) => {
         this.#recordPush(principal, fence, head, updated);
       },
     });
   }
 
+  /**
+   * Asks the claims module again whether the push `grant` was given for may still go ahead, and
+   * answers the refusal if not. The grant must be the same: a new generation of the same claim is a
+   * different owner's authority, not this request's.
+   */
+  async #readmit(
+    route: Route,
+    access: GitAccess,
+    grant: GitGrant,
+    head: ReceivePackHead,
+  ): Promise<Response | null> {
+    const current = await this.#context.ports().claims.authorizeGit(access);
+    if (!current.ok) {
+      if (!pushRefusable(current)) return refusal(route, current);
+      const message = `railhead: ${current.message}`;
+      return gitResult(
+        route.service,
+        receivePackRefusal(head, message, () => current.message),
+      );
+    }
+    if (sameGrant(current.value, grant)) return null;
+    const message = "the claim changed while this push was being sent";
+    return gitResult(
+      route.service,
+      receivePackRefusal(head, `railhead: ${message}`, () => message),
+    );
+  }
+
   /** Answers a push refused by the claims module in Git's own report, read from its head. */
   async #refusePush(request: Request, message: string): Promise<Response> {
     if (request.body === null) return text(403, `railhead: ${message}`);
-    const parsed = await readReceivePackHead(request.body);
-    if (parsed.kind === "refused") return text(403, `railhead: ${message}`);
+    const deadline = new Deadline(this.#limits.maxDurationMs);
+    const parsed = await this.#readHead(request.body, deadline);
+    deadline.clear();
+    if (parsed.kind !== "complete") return text(403, `railhead: ${message}`);
     await parsed.body.cancel();
     return gitResult(
       "git-receive-pack",
       receivePackRefusal(parsed.head, `railhead: ${message}`, () => message),
     );
+  }
+
+  /**
+   * Reads a push's head within the head time limit and `deadline`. Once either passes, the client's
+   * body is cancelled, so a client that stalls inside its head holds nothing open.
+   */
+  async #readHead(
+    body: ReadableStream<Uint8Array>,
+    deadline: Deadline,
+  ): Promise<PushHead | { readonly kind: "late" }> {
+    const headTimer = setTimeout(() => {
+      deadline.expire();
+    }, this.#limits.headTimeoutMs);
+    try {
+      return await readReceivePackHead(cancelledOnAbort(body, deadline.signal));
+    } catch (error) {
+      if (deadline.expired) return { kind: "late" };
+      throw error;
+    } finally {
+      clearTimeout(headTimer);
+    }
   }
 
   async #authenticate(request: Request): Promise<PortResult<AgentPrincipal | null>> {
@@ -248,11 +322,18 @@ class GitGateway implements GitPort {
       body = push?.body ?? request.body;
       if (body === null) return text(400, "railhead: a Git request needs a body");
     }
+    // A push's deadline started before its head was read.
+    const deadline = push?.deadline ?? new Deadline(this.#limits.maxDurationMs);
     const release = async (response: Response): Promise<Response> => {
+      deadline.clear();
       await body?.cancel().catch(() => undefined);
       return response;
     };
 
+    // A push's claim may have closed while its head was held back: it is decided again before a
+    // token is minted for it, and again after, so a closure during the mint is seen too.
+    const before = await push?.admit();
+    if (before !== undefined && before !== null) return release(before);
     const ports = this.#context.ports();
     const token = await ports.artifacts.token(grant.repo, grant.scope, this.#limits.tokenTtlMs);
     if (!token.ok) return release(refusal(route, token));
@@ -263,8 +344,10 @@ class GitGateway implements GitPort {
       logFailure(route, "bad_remote");
       return release(text(502, "railhead: the repository store is misconfigured"));
     }
+    // Nothing is awaited between this decision and the upstream call.
+    const after = await push?.admit();
+    if (after !== undefined && after !== null) return release(after);
 
-    const deadline = new Deadline(this.#limits.maxDurationMs);
     const sent = body === null ? null : limited(body, maxBody, deadline);
     const headers = new Headers();
     for (const name of FORWARDED_REQUEST_HEADERS) {
@@ -369,6 +452,10 @@ interface PendingPush {
   readonly head: ReceivePackHead;
   /** The whole request body, head included. */
   readonly body: ReadableStream<Uint8Array>;
+  /** The push's time limit, running since its body was first read. */
+  readonly deadline: Deadline;
+  /** Decides the push again against current claim state: `null` to go ahead, or the refusal. */
+  readonly admit: () => Promise<Response | null>;
   /** Records the refs the upstream reported updated. */
   readonly record: (updated: ReadonlySet<string>) => void;
 }
@@ -411,6 +498,16 @@ function grantFits(grant: GitGrant, access: GitAccess): boolean {
     default:
       return access.operation satisfies never;
   }
+}
+
+/** Whether `current` is the grant `original` was: the same repository, scope, claim and generation. */
+function sameGrant(current: GitGrant, original: GitGrant): boolean {
+  return (
+    current.repo === original.repo &&
+    current.scope === original.scope &&
+    current.fence?.claimId === original.fence?.claimId &&
+    current.fence?.generation === original.fence?.generation
+  );
 }
 
 /** Why one update of an otherwise authorized push is refused, or `null` to allow it. */
@@ -651,6 +748,39 @@ class Deadline {
       { once: true },
     );
   }
+}
+
+/**
+ * Passes `body` on until `signal` aborts, then errors the result and cancels `body`, releasing a
+ * read the client is holding open.
+ */
+function cancelledOnAbort(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        const onAbort = (): void => {
+          controller.error(signal.reason);
+          reader.cancel(signal.reason).catch(() => undefined);
+        };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      },
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (signal.aborted) return;
+        if (done) controller.close();
+        else controller.enqueue(value);
+      },
+      async cancel(reason) {
+        await reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
 }
 
 /** A request body that errors once more than `max` bytes pass or the deadline expires. */

@@ -99,7 +99,12 @@ const SESSION = "session-token-of-agent-one";
 const OTHER_SESSION = "session-token-of-agent-two";
 const FORK: GitTarget = { kind: "fork", claimId: CLAIM };
 const MAIN: GitTarget = { kind: "main" };
-const FAST: GitGatewayLimits = { ...GIT_GATEWAY_LIMITS, headersTimeoutMs: 100, maxDurationMs: 300 };
+const FAST: GitGatewayLimits = {
+  ...GIT_GATEWAY_LIMITS,
+  headTimeoutMs: 100,
+  headersTimeoutMs: 100,
+  maxDurationMs: 300,
+};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -115,8 +120,12 @@ interface Seen {
 interface World {
   gateway: GitPort;
   fake: FakeArtifacts;
+  /** The Artifacts port the gateway calls. */
+  artifacts: ArtifactsPort;
   claim: { agentId: string; generation: number; state: ClaimState };
   authorizations: GitAccess[];
+  /** Whether the claims module answers every decision as unavailable. */
+  claimsDown: boolean;
   /** The requests the default upstream received, with their bodies. */
   seen: Seen[];
   /** What the default upstream answers once it has read a request carrying a live token. */
@@ -127,6 +136,8 @@ interface World {
   events: () => RailheadEvent[];
   forkName: string;
   mainName: string;
+  /** How many tokens Artifacts minted after the world was set up, revoked or not. */
+  minted: () => number;
   /** Every token Artifacts minted for this world, revoked or not. */
   tokens: () => string[];
   /** The tokens still live, across main and the fork. */
@@ -139,6 +150,7 @@ function claimsFor(world: World): ClaimsPort {
     ...unavailableClaims,
     async authorizeGit(access) {
       world.authorizations.push(access);
+      if (world.claimsDown) return fail("unavailable", "The claims module is unavailable.");
       const { principal, target, operation } = access;
       if (principal === null || principal.repoId !== REPO) {
         return fail("unauthenticated", "A Git request needs a session for this repository.");
@@ -200,13 +212,19 @@ function withGateway(
     const artifacts = wrapArtifacts(adapter);
     const log = EventLog.open(state.storage, REPO, fake.clock);
     const forkName = await forkRepoName(REPO, CLAIM);
+    const allTokens = (): string[] =>
+      [...fake.repos.values()].flatMap((repo) => repo.tokens.map((token) => token.plaintext));
+    // Forking mints one token that the adapter revokes at once; it is not the gateway's.
+    const setupTokens = allTokens().length;
     const world: World = {
       gateway: { serve: () => Promise.reject(new Error("not built")) },
       fake,
+      artifacts,
       mainName,
       forkName,
       claim: { agentId: AGENT.agentId, generation: 3, state: "working" },
       authorizations: [],
+      claimsDown: false,
       seen: [],
       respond: () => new Response(null, { status: 500 }),
       upstream: async (request) => {
@@ -224,8 +242,8 @@ function withGateway(
       },
       remote: async (repo) => ok(`https://fake.artifacts.invalid/${repo}.git`),
       events: () => log.replay(0, 100).events,
-      tokens: () =>
-        [...fake.repos.values()].flatMap((repo) => repo.tokens.map((token) => token.plaintext)),
+      minted: () => allTokens().length - setupTokens,
+      tokens: allTokens,
       live: () => [...fake.liveTokens(mainName), ...fake.liveTokens(forkName)],
     };
     const claims = claimsFor(world);
@@ -572,6 +590,170 @@ describe("authority", () => {
   });
 });
 
+/** A push body that sends `PUSH_REQUEST` up to `cut` bytes, then the rest once `resume` is called. */
+function pausedPush(cut: number): { body: ReadableStream<Uint8Array>; resume: () => void } {
+  let release: (() => void) | undefined;
+  const resumed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const resume = (): void => {
+    release?.();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      controller.enqueue(PUSH_REQUEST.slice(0, cut));
+      await resumed;
+      controller.enqueue(PUSH_REQUEST.slice(cut));
+      controller.close();
+    },
+  });
+  return { body, resume };
+}
+
+/** Resolves once `condition` holds, polling briefly; fails the test rather than hanging. */
+async function until(condition: () => boolean): Promise<void> {
+  for (let tries = 0; tries < 200; tries += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error("the condition never held");
+}
+
+describe("a push decided again after it was admitted", () => {
+  it("mints nothing and sends nothing when the claim closes while the head is held back", async () => {
+    const changes: [string, (world: World) => void, string][] = [
+      [
+        "closed",
+        (world) => {
+          world.claim.state = "expired";
+        },
+        "ng refs/heads/feature The claim is closed.",
+      ],
+      [
+        "taken over",
+        (world) => {
+          world.claim.agentId = OTHER.agentId;
+          world.claim.generation += 1;
+        },
+        "ng refs/heads/feature This agent does not hold the claim.",
+      ],
+      [
+        "reclaimed at a new generation",
+        (world) => {
+          world.claim.generation += 1;
+        },
+        "ng refs/heads/feature the claim changed while this push was being sent",
+      ],
+    ];
+    for (const [label, change, report] of changes) {
+      await withGateway(async (world) => {
+        world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+        // Ten bytes is inside the first pkt-line: the head cannot be complete.
+        const { body, resume } = pausedPush(10);
+        const pending = world.gateway.serve(
+          rpc("git-receive-pack", body),
+          FORK,
+          "/git-receive-pack",
+        );
+        await until(() => world.authorizations.length === 1);
+        change(world);
+        const revoked = await world.artifacts.revokeTokens(world.forkName);
+        expect(revoked.ok, label).toBe(true);
+        resume();
+        const response = await pending;
+        expect(response.status, label).toBe(200);
+        expect(decoder.decode(await bytesOf(response)), label).toContain(report);
+        expect(world.authorizations, label).toHaveLength(2);
+        expect(world.minted(), label).toBe(0);
+        expect(world.seen, label).toEqual([]);
+        expect(pushedEvents(world), label).toEqual([]);
+      });
+    }
+  });
+
+  it("sends nothing when the claim closes while the token or remote is being prepared", async () => {
+    let duringMint: (() => Promise<void>) | null = null;
+    const pausingMint = (base: ArtifactsPort): ArtifactsPort => ({
+      forkForClaim: (claimId, commit) => base.forkForClaim(claimId, commit),
+      commitExists: (repo, commit) => base.commitExists(repo, commit),
+      revokeTokens: (repo) => base.revokeTokens(repo),
+      async token(repo, scope, ttlMs) {
+        const minted = await base.token(repo, scope, ttlMs);
+        await duringMint?.();
+        return minted;
+      },
+    });
+    for (const step of ["token", "remote"] as const) {
+      await withGateway(
+        async (world) => {
+          world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+          const close = async (): Promise<void> => {
+            world.claim.state = "expired";
+            const revoked = await world.artifacts.revokeTokens(world.forkName);
+            expect(revoked.ok, step).toBe(true);
+          };
+          duringMint = step === "token" ? close : null;
+          if (step === "remote") {
+            const remote = world.remote;
+            world.remote = async (repo) => {
+              await close();
+              return remote(repo);
+            };
+          }
+          const response = await world.gateway.serve(
+            rpc("git-receive-pack", PUSH_REQUEST),
+            FORK,
+            "/git-receive-pack",
+          );
+          expect(response.status, step).toBe(200);
+          expect(decoder.decode(await bytesOf(response)), step).toContain(
+            "ng refs/heads/feature The claim is closed.",
+          );
+          // A token was minted before the claim closed, and the closure revoked it.
+          expect(world.minted(), step).toBe(1);
+          expect(world.fake.liveTokens(world.forkName), step).toEqual([]);
+          expect(world.authorizations, step).toHaveLength(3);
+          expect(world.seen, step).toEqual([]);
+          expect(pushedEvents(world), step).toEqual([]);
+        },
+        FAST,
+        pausingMint,
+      );
+    }
+  });
+
+  it("forwards a push whose claim is unchanged after deciding it three times", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(world.authorizations).toHaveLength(3);
+      expect(world.seen).toHaveLength(1);
+      expect(pushedEvents(world)).toHaveLength(1);
+    });
+  });
+
+  it("answers 503 and sends nothing when the claims module is down at the second decision", async () => {
+    await withGateway(async (world) => {
+      const { body, resume } = pausedPush(10);
+      const pending = world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack");
+      await until(() => world.authorizations.length === 1);
+      world.claimsDown = true;
+      resume();
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("5");
+      expect(world.minted()).toBe(0);
+      expect(world.seen).toEqual([]);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
 describe("invalid requests", () => {
   it("refuses dumb HTTP, wrong methods, wrong types and unknown paths before any authority", async () => {
     await withGateway(async (world) => {
@@ -619,6 +801,41 @@ describe("invalid requests", () => {
 });
 
 describe("bounds", () => {
+  it("cuts off a client that stalls inside the push head, whether or not the claim admits it", async () => {
+    const cases: [ClaimState, number, string][] = [
+      ["working", 408, "did not arrive in time"],
+      ["ready", 403, "The claim is ready"],
+    ];
+    for (const [state, status, message] of cases) {
+      await withGateway(async (world) => {
+        world.claim.state = state;
+        let cancelled = false;
+        // A length and half a command, then nothing: the head never completes and the body never ends.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(`00b9${ZERO} ${HEAD} refs/he`));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        });
+        const started = Date.now();
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", body),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(Date.now() - started, state).toBeLessThan(FAST.maxDurationMs);
+        expect(response.status, state).toBe(status);
+        expect(await response.text(), state).toContain(message);
+        expect(cancelled, state).toBe(true);
+        expect(world.minted(), state).toBe(0);
+        expect(world.seen, state).toEqual([]);
+        expect(pushedEvents(world), state).toEqual([]);
+      });
+    }
+  });
+
   it("refuses a body declared or found larger than the limit", async () => {
     await withGateway(
       async (world) => {
