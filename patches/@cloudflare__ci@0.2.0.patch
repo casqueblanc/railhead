@@ -112,7 +112,7 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..313689a60b31712c80f6c8e703cd6d8d
    );
    if (!archive) {
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a11b5a360 100644
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..7cf12df2e8a054cfc58918c6768f34754954d8cc 100644
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
 @@ -1,5 +1,6 @@
@@ -122,17 +122,31 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
  
  import { z } from 'zod';
  import type {
-@@ -103,7 +104,8 @@ async function prepareStep(
-   const cacheKey = await resolveStepCacheKey(
-     sourceControlProvider,
-     source,
+@@ -100,11 +101,18 @@ async function prepareStep(
+     providerData: input.providerData,
+   };
+   const checkout = await sourceControlProvider.getSourceCheckout(source);
+-  const cacheKey = await resolveStepCacheKey(
+-    sourceControlProvider,
+-    source,
 -    input
-+    input,
-+    env.BACKUP_BUCKET !== undefined
-   );
+-  );
++  // Railhead patch: a fenced checkout is a trusted check in an admitted
++  // sandbox. Its result must come from its command run there, so it never
++  // looks up or publishes a cached workspace that could skip the command.
++  const fenced = checkout.kind === 'git' && !!checkout.fence;
++  const cacheKey = fenced
++    ? undefined
++    : await resolveStepCacheKey(
++        sourceControlProvider,
++        source,
++        input,
++        env.BACKUP_BUCKET !== undefined
++      );
    const extraEnv: Record<string, string> = { ...input.env };
    if (
-@@ -167,6 +169,7 @@ async function executeStep(
+     input.cloudflareCredentials !== undefined &&
+@@ -167,6 +175,7 @@ async function executeStep(
      ? await lookupSnapshotCache(env, {
          key: prepared.cacheKey,
          label: input.label,
@@ -140,7 +154,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
        })
      : { status: 'miss' as const };
    if (cache.status === 'hit') {
-@@ -210,9 +213,14 @@ async function finalizeStep(
+@@ -210,9 +219,14 @@ async function finalizeStep(
    prepared: PreparedStep,
    execution: CompletedStepExecution
  ): Promise<CompletedStepExecution> {
@@ -155,7 +169,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
    // Write the small JSON pointer at the deterministic cache key. It records the
    // randomly generated id of the sandbox workspace backup so a future run can
    // rediscover it; the backup already exists, we only add the indirection.
-@@ -234,11 +242,19 @@ async function finalizeStep(
+@@ -234,11 +248,19 @@ async function finalizeStep(
  async function resolveStepCacheKey(
    sourceControlProvider: SourceControlProvider,
    source: SourceControlSource,

@@ -1518,22 +1518,20 @@ describe("a check run through the patched SDK", () => {
     ["at the inline limit", INLINE_LOG_BYTES, ["log:read", "log:read"]],
     ["above the inline limit", INLINE_LOG_BYTES + 1, ["log:tail", "log:tail"]],
   ])(
-    "publishes the install cache of a check whose logs are %s only after retiring its sandbox",
+    "reads the logs of a check whose logs are %s before retiring, and publishes no cache",
     async (_name, logBytes, reads) => {
-      // Another commit wrote the pointer, so the install runs and publishes its own.
+      // The runner asks for a cache, which a fenced check never uses.
       const { outcome, sandbox } = await run({ cached: true, cachedBy: "c".repeat(40), logBytes });
 
       expect(outcome).toEqual({ kind: "pass" });
-      expect(sandbox.calls.slice(0, 8)).toEqual([
+      expect(sandbox.calls).toEqual([
         "join",
         "checkout",
         "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
         "backup",
         ...reads,
         "retire",
-        "pointer",
       ]);
-      expect(sandbox.calls).toHaveLength(8);
     },
   );
 
@@ -1741,14 +1739,19 @@ describe("a check run through the patched SDK", () => {
     expect(output).toBe("[REDACTED] exited with status 1");
   });
 
-  it("reuses a cached install without starting the sandbox", async () => {
-    const { outcome, sandbox, artifacts } = await run({ cached: true });
+  it("runs the command for every check of the same commit, never passing from a cache", async () => {
+    // The bucket holds a cache pointer written by this very commit, which the SDK would reuse.
+    const first = await run({ cached: true });
+    const second = await run({ cached: true });
 
-    expect(outcome).toEqual({ kind: "pass" });
-    // The cache hit skips the install's command, so the sandbox is never started or restored.
-    expect(sandbox.calls).toEqual([]);
-    expect(sandbox.restored).toEqual([]);
-    expect(artifacts.calls).toEqual(["get:demo"]);
+    for (const { outcome, sandbox, artifacts } of [first, second]) {
+      expect(outcome).toEqual({ kind: "pass" });
+      expect(sandbox.calls).toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
+      expect(sandbox.calls).not.toContain("pointer");
+      expect(sandbox.restored).toEqual([]);
+      // No cache fingerprint was even read.
+      expect(artifacts.calls).toEqual([]);
+    }
   });
 
   it("runs a single runner without a BACKUP_BUCKET binding, with no backup or cache", async () => {
@@ -1773,7 +1776,8 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.restored).toEqual([]);
     expect(artifacts.calls).toEqual([]);
     const warnings = warn.mock.calls.map(([message]) => message);
-    expect(warnings).toContain("[cache] no BACKUP_BUCKET binding; skipping cache");
+    // A fenced check never consults the cache, with or without the binding.
+    expect(warnings.filter((message) => String(message).startsWith("[cache]"))).toEqual([]);
     expect(warnings).toContain("[sandbox] no BACKUP_BUCKET binding; no workspace backup");
   });
 
