@@ -202,6 +202,33 @@ describe("EarliestAlarm", () => {
     expect(stored).toBe(base);
   });
 
+  it("resolves each request with whether storage holds an alarm no later than it asked", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const base = Date.now() + 3_600_000;
+    const result = await runInDurableObject(stub, async (_instance, state) => {
+      const errors: unknown[] = [];
+      const alarm = new EarliestAlarm(state.storage, (error) => errors.push(error));
+      await alarm.load();
+      const set = await alarm.request(base + 1_000);
+      // Covered by the alarm already set: nothing is written, and that write's outcome is answered.
+      const covered = await alarm.request(base + 2_000);
+      const refused = await alarm.request(0);
+      // The refused write left nothing remembered, so the same time is written again, and set.
+      const retried = await alarm.request(base);
+      const stored = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      return { set, covered, refused, retried, stored, errors: errors.length };
+    });
+    expect(result).toEqual({
+      set: true,
+      covered: true,
+      refused: false,
+      retried: true,
+      stored: base,
+      errors: 1,
+    });
+  });
+
   it("reports a refused write from settle until the alarm fires, and writes again after it", async () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     const base = Date.now() + 3_600_000;

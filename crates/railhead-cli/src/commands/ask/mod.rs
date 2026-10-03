@@ -22,9 +22,9 @@ use ssh_key::rand_core::{OsRng, RngCore};
 
 use crate::commands::claim::{session, workspace};
 use crate::commands::join;
-use crate::commands::sync::{quoted, render_decision};
+use crate::commands::sync::render_decision;
 use crate::http::{self, Endpoint};
-use crate::output::{LocalCode, Output, Render};
+use crate::output::{LocalCode, Output, Render, quoted};
 use crate::{Agent, Error, Result};
 
 /// Longest `--wait`, in seconds.
@@ -310,9 +310,8 @@ fn resumable(error: Error, question_id: &str, request_id: &str, seconds: u64) ->
 /// the result of asking it. Returns the last answer and whether the wait ran out.
 ///
 /// A poll never runs past the deadline: one still pending then is dropped, and the wait ends with
-/// the last known state. A session renewal that logs in can overrun it by up to one request
-/// timeout, plus any wait for another process's login on the session lock; bounding that login
-/// by the deadline is casqueblanc/railhead#153.
+/// the last known state. A session renewal is bounded by the same deadline, both its wait for
+/// another process's login on the session lock and its own login.
 ///
 /// A `busy` or `rate_limited` refusal is polled again after [`retry_delay`] when that pause ends
 /// before the deadline; any other failure ends the wait.
@@ -408,14 +407,22 @@ fn poll(
     deadline: Instant,
 ) -> Result<Option<AgentSuccess<QuestionResult>>> {
     let left = || deadline.saturating_duration_since(Instant::now());
-    let passed =
-        |error: &Error| matches!(error, Error::Http(http::Error::Timeout(_))) && left().is_zero();
+    let passed = |error: &Error| {
+        matches!(
+            error,
+            Error::Http(http::Error::Timeout(_))
+                | Error::Local {
+                    code: LocalCode::Timeout,
+                    ..
+                }
+        ) && left().is_zero()
+    };
     if left().is_zero() {
         return Ok(None);
     }
     let timeout = left().min(Duration::from_millis(AGENT_REQUEST_TIMEOUT_MS));
     let client = http::Client::with_timeout(&agent.identity.origin, &agent.identity.repo, timeout)?;
-    let session = match join::session_with(agent, &client) {
+    let session = match join::session_with(agent, &client, Some(deadline)) {
         Ok(session) => session.into_token(),
         Err(error) if passed(&error) => return Ok(None),
         Err(error) => return Err(error),

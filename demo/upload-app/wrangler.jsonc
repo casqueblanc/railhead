@@ -4,6 +4,10 @@
   "name": "railhead-demo-upload",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-30",
+  // The main commit this deployment was built from, served at GET /api/revision so the board can
+  // tell a stale deployment. The operator sets it at deploy: `wrangler deploy --var APP_REVISION:<sha>`.
+  // A public commit id, not a secret.
+  "vars": { "APP_REVISION": "unknown" },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
