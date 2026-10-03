@@ -71,6 +71,7 @@ const MIGRATIONS: readonly string[] = [
     generation INTEGER NOT NULL CHECK (generation > 0),
     lease_until INTEGER NOT NULL
   ) STRICT`,
+  "ALTER TABLE train_batches ADD COLUMN check_held INTEGER NOT NULL DEFAULT 0 CHECK (check_held IN (0, 1))",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -141,6 +142,8 @@ export type BatchFailure =
   | "check_error"
   /** The runner did not report before the attempt's deadline. Never a pass. */
   | "check_timeout"
+  /** The candidate edits protected check paths and waited for a person past its deadline. */
+  | "check_held"
   /** Authorization refused the passed attempt, such as a changed generation or decision. */
   | "authorization_refused"
   /** Main was not at the expected commit when the writer tried to move it. */
@@ -170,6 +173,8 @@ export interface BatchRecord {
   attemptAt: number | null;
   /** Whether the check port accepted the attempt. */
   checkStarted: boolean;
+  /** Whether the check port held the attempt for a person: it will not run, and is not an outage. */
+  checkHeld: boolean;
   /** Once the attempt's start was requested, when it expires unless the runner has reported. */
   checkDeadline: number | null;
   /** The runner's result, once reported. */
@@ -209,6 +214,7 @@ type BatchRow = {
   attempt_id: string | null;
   attempt_at: number | null;
   check_started: number;
+  check_held: number;
   check_deadline: number | null;
   check_result: string | null;
   log_digest: string | null;
@@ -221,7 +227,7 @@ type BatchRow = {
 
 const QUEUE_COLUMNS = "claim_id, generation, commit_sha, state, isolate, retries, reason";
 const BATCH_COLUMNS =
-  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
+  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_held, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
 /** The queue entry of `claimId` at `generation`, or `null`. */
 export function readEntry(sql: SqlStorage, claimId: string, generation: number): QueueEntry | null {
@@ -444,6 +450,15 @@ export function requestCheck(
   );
 }
 
+/** Records that the check port held the attempt for a person. */
+export function markCheckHeld(sql: SqlStorage, batchId: number, now: number): void {
+  sql.exec(
+    "UPDATE train_batches SET check_held = 1, updated_at = ? WHERE batch_id = ?",
+    now,
+    batchId,
+  );
+}
+
 /** Records that the check port accepted the attempt. */
 export function markCheckStarted(sql: SqlStorage, batchId: number, now: number): void {
   sql.exec(
@@ -592,7 +607,8 @@ export function hasMovableWork(sql: SqlStorage): boolean {
       `SELECT CASE
          WHEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
            THEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1
-             AND (state IN ('composing', 'passed') OR (state = 'checking' AND check_started = 0)))
+             AND (state IN ('composing', 'passed')
+               OR (state = 'checking' AND check_started = 0 AND check_held = 0)))
          ELSE EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued')
        END AS movable`,
     )
@@ -626,6 +642,7 @@ function toBatch(row: BatchRow): BatchRecord {
     attemptId: row.attempt_id,
     attemptAt: row.attempt_at,
     checkStarted: row.check_started === 1,
+    checkHeld: row.check_held === 1,
     // A started attempt always has a deadline; one recorded without it has already expired.
     checkDeadline: row.check_deadline ?? (row.check_started === 1 ? row.updated_at : null),
     checkResult: row.check_result === null ? null : parseCheckResult(row.check_result),
@@ -657,6 +674,7 @@ const BATCH_FAILURES = [
   "check_fail",
   "check_error",
   "check_timeout",
+  "check_held",
   "authorization_refused",
   "main_rejected",
   "publish_refused",

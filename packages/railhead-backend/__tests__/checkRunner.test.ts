@@ -38,7 +38,7 @@ import {
   recordCandidate,
   requestCheck,
 } from "../src/modules/train/store";
-import { CHECK_DEADLINE_MS } from "../src/modules/train/scheduler";
+import { CHECK_DEADLINE_MS, createTrain } from "../src/modules/train/scheduler";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { MAX_SANDBOX_LIFETIME_MS, type Admission } from "../src/sandbox/admission";
 import type { SandboxPolicy } from "../src/sandbox/policy";
@@ -1206,5 +1206,131 @@ describe("the checks module as the Repo composes it", () => {
     });
 
     expect(result).toEqual(fail("unavailable", "Checks have no Artifacts repository."));
+  });
+});
+
+/**
+ * A Worker environment configured for checks over `repository`: Artifacts objects served from it,
+ * and recording sandbox and Workflow bindings that start nothing.
+ */
+function heldEnvironment(repository: FakeRepository): {
+  configured: Env;
+  starts: string[];
+  creates: string[];
+} {
+  const starts: string[] = [];
+  const creates: string[] = [];
+  const configured: Env = { ...env, CLOUDFLARE_ACCOUNT_ID: "0".repeat(32) };
+  Reflect.set(configured, "ARTIFACTS", {
+    get: async () => ({
+      readFile: async ({ ref, path }: { ref: string; path: string }) => {
+        const bytes = await repository.readFile(ref, path, MAX_DEFINITION_BYTES);
+        return bytes === null ? null : new Blob([bytes]);
+      },
+      readCommit: async (hash: string) => {
+        const treeHash = await repository.rootTree(hash);
+        return treeHash === null ? null : { treeHash };
+      },
+      readTree: (hash: string) => repository.readTree(hash),
+      [Symbol.dispose]: () => {},
+    }),
+  });
+  Reflect.set(configured, "SANDBOX", {
+    idFromName: (name: string) => name,
+    get: (name: string) => ({
+      railheadStart: async () => {
+        starts.push(name);
+      },
+      railheadRetire: async () => {},
+    }),
+  });
+  Reflect.set(configured, "CHECKS", {
+    createBatch: async (batch: { id?: string }[]) => {
+      for (const { id } of batch) creates.push(id ?? "");
+      return [];
+    },
+  });
+  return { configured, starts, creates };
+}
+
+describe("a held check through the train", () => {
+  it("blocks without backoff until the deadline, then requeues the pin without counting a retry", async () => {
+    const { stub, repoId } = await initializedRepository();
+    const repository = new FakeRepository();
+    repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: definitionText() });
+    // The candidate rewrites its own check: it must wait for a person.
+    repository.commit(CANDIDATE, { [CHECK_DEFINITION_PATH]: definitionText({ command: "true" }) });
+    const { configured, starts, creates } = heldEnvironment(repository);
+    const pin = { claimId: "clm_heldpin01", generation: 1, commit: OTHER };
+
+    const seen = await runInDurableObject(stub, async (_instance, state) => {
+      let now = NOW;
+      const wakes: number[] = [];
+      const context: RepoContext = {
+        repoId,
+        storage: state.storage,
+        log: EventLog.open(state.storage, repoId),
+        clock: () => now,
+        env: configured,
+        wake: (at) => wakes.push(at),
+      };
+      const composed = composeRepo(context);
+      const ports = (): RepoPorts => ({
+        ...composed,
+        claims: { ...composed.claims, pin: async () => ok(pin) },
+        decisions: { ...composed.decisions, requirements: async () => ok([]) },
+        mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
+        merge: { compose: async () => ok({ kind: "clean", candidate: CANDIDATE }) },
+      });
+      const train = createTrain(context, ports);
+
+      await train.enqueue(pin);
+      const first = train.batches(1)[0];
+      const blockedOutcome = await train.drive();
+      const wakeWhileHeld = wakes.at(-1);
+      const reads = repository.reads;
+      // A later drive before the deadline asks the checks module nothing.
+      const again = await train.drive();
+      const readsAgain = repository.reads;
+
+      now = (first?.checkDeadline ?? NOW) + 1;
+      await train.drive();
+      return {
+        first,
+        blockedOutcome,
+        again,
+        wakeWhileHeld,
+        reads,
+        readsAgain,
+        batches: train.batches(3),
+        entry: train.entries(1)[0],
+        held: new AttemptTable(state.storage).get(first?.attemptId ?? "")?.state,
+      };
+    });
+
+    expect(seen.first?.checkHeld).toBe(true);
+    expect(seen.blockedOutcome).toEqual({
+      kind: "blocked",
+      batchId: seen.first?.batchId,
+      reason: "check_held",
+      code: "check_held",
+    });
+    expect(seen.again).toEqual(seen.blockedOutcome);
+    // No backoff: the only wake asked for while held is the attempt's deadline.
+    expect(seen.wakeWhileHeld).toBe(seen.first?.checkDeadline);
+    expect(seen.readsAgain).toBe(seen.reads);
+    expect(seen.held).toEqual({ kind: "held", paths: [CHECK_DEFINITION_PATH] });
+    // Past the deadline the held batch fails as held, and the pin goes back unharmed: a new batch
+    // holds it again, with no retry counted and nothing dropped.
+    expect(seen.batches.map((batch) => [batch.state, batch.failure])).toEqual([
+      ["checking", null],
+      ["failed", "check_held"],
+    ]);
+    expect(seen.entry).toEqual(
+      expect.objectContaining({ pin, state: "batched", retries: 0, reason: null }),
+    );
+    // Nothing ran: no sandbox admitted and started, no Workflow created.
+    expect(starts).toEqual([]);
+    expect(creates).toEqual([]);
   });
 });
