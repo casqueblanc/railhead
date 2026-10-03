@@ -7,7 +7,12 @@
 // belongs to the module that issues and consumes challenges. Reference: WebAuthn Level 3, section
 // 7.2 "Verifying an Authentication Assertion".
 
-import type { BoardErrorCode, OwnerAction, PasskeyAssertion } from "@railhead/shared/board-api";
+import type {
+  BoardErrorCode,
+  DemoSeedAction,
+  OwnerAction,
+  PasskeyAssertion,
+} from "@railhead/shared/board-api";
 import type { RepoId } from "@railhead/shared/events";
 
 /** The hosts a Railhead instance may use as its relying party: submission, then development. */
@@ -60,8 +65,14 @@ export function relyingParty(host: string): RelyingParty | undefined {
   return rpId === undefined ? undefined : { rpId, origin: `https://${rpId}` };
 }
 
-/** What an action challenge commits to. The issuer stores it and passes it back to verify. */
-export interface ActionBinding {
+/** An action an owner passkey can approve. */
+export type ApprovableAction = OwnerAction | DemoSeedAction;
+
+/**
+ * What an action challenge commits to, for an action of type `A`, a repository's own by default.
+ * The issuer stores it and passes it back to verify.
+ */
+export interface ActionBinding<A extends ApprovableAction = OwnerAction> {
   /** The repository the action applies to. */
   readonly repoId: RepoId;
   /** The challenge id quoted by `perform`. */
@@ -71,7 +82,7 @@ export interface ActionBinding {
   /** When the challenge stops being usable, in milliseconds since the Unix epoch. */
   readonly expiresAt: number;
   /** The exact action the owner approves. */
-  readonly action: OwnerAction;
+  readonly action: A;
 }
 
 /** The owner's enrolled credential, as the enrollment module stored it. */
@@ -130,7 +141,7 @@ export interface ActionAssertionInput {
   /** The instance's relying party. */
   readonly relyingParty: RelyingParty;
   /** The stored challenge being performed. */
-  readonly binding: ActionBinding;
+  readonly binding: ActionBinding<ApprovableAction>;
   /** The owner's credential. */
   readonly credential: StoredCredential;
   /** The browser's assertion, untrusted. */
@@ -174,7 +185,7 @@ export function boardErrorFor(reason: PasskeyFailure): BoardErrorCode {
  */
 export async function actionChallenge(
   party: RelyingParty,
-  binding: ActionBinding,
+  binding: ActionBinding<ApprovableAction>,
 ): Promise<{ ok: true; challenge: string } | { ok: false; reason: "invalid-binding" }> {
   const nonce = decodeBase64Url(binding.nonce, MAX_CLIENT_DATA_BYTES);
   if (
@@ -198,7 +209,7 @@ export async function actionChallenge(
   return { ok: true, challenge: encodeBase64Url(digest) };
 }
 
-function actionFields(action: OwnerAction): (string | number | null)[] {
+function actionFields(action: ApprovableAction): (string | number | null)[] {
   switch (action.kind) {
     case "invite.create":
       return [action.kind, action.name];
@@ -210,6 +221,10 @@ function actionFields(action: OwnerAction): (string | number | null)[] {
       return [action.kind, action.title, action.body];
     case "decision.record":
       return [action.kind, action.decisionId, action.option, action.expectedVersion];
+    case "demo.seed":
+      return [action.kind, action.head];
+    case "demo.reset":
+      return [action.kind];
     default: {
       const unreachable: never = action;
       return unreachable;

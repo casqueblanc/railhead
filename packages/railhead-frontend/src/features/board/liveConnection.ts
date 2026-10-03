@@ -37,6 +37,8 @@ interface Folded {
   /** The repository it was read from, as `org/repo`. */
   key: string;
   board: BoardState;
+  /** The history the board's cursor was read under; a later session resumes only in it. */
+  history: string;
   /** A session has caught this board up to its subscription at least once. */
   everLive: boolean;
   recovered: boolean;
@@ -118,9 +120,9 @@ export const useLiveBoardPorts = (
     };
 
     const sink: StreamSink = {
-      onRepo: (repoId) => {
+      onRepo: (repoId, history) => {
         if (current && kept.current === null) {
-          keep({ key, board: emptyBoardState(repoId), everLive: false, recovered: false });
+          keep({ key, board: emptyBoardState(repoId), history, everLive: false, recovered: false });
         }
       },
       onEvents: (events) => {
@@ -169,7 +171,12 @@ export const useLiveBoardPorts = (
       }
       const board = opened.value;
       held.push(board);
-      stream = new BoardStream(board, sink, kept.current?.board.cursor ?? 0);
+      const resume = kept.current;
+      stream = new BoardStream(
+        board,
+        sink,
+        resume === null ? null : { cursor: resume.board.cursor, history: resume.history },
+      );
       const owner = await withDeadline(board.owner(), dispose);
       if (!current) {
         owner[Symbol.dispose]();
@@ -274,6 +281,7 @@ const openFailure = (code: BoardErrorCode): SessionView["board"] => {
     case "action_stale":
     case "bootstrap_closed":
     case "quota_exceeded":
+    case "busy":
     case "internal":
       return "failed";
     default:
@@ -380,6 +388,8 @@ const refusal = (code: BoardErrorCode): string => {
       return "The answer changed since this board read it. Nothing was recorded.";
     case "unavailable":
       return "This Railhead cannot record answers: its decisions module is not installed.";
+    case "busy":
+      return "The backend is busy. Nothing was recorded; try again shortly.";
     case "invalid_request":
     case "not_found":
     case "bootstrap_closed":
