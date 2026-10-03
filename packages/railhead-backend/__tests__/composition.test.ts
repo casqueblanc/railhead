@@ -205,7 +205,6 @@ describe("unavailable modules", () => {
         env,
       });
       return Promise.all([
-        ports.inbox.readyGate(CLAIM, 1),
         ports.checks.start({
           attemptId: "chk_attempt1",
           expectedMain: "a".repeat(40),

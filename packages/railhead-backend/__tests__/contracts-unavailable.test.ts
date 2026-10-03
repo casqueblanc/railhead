@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { unavailable, type PortName } from "../src/contracts/result";
 import {
+  UnavailableError,
   unavailableArtifacts,
   unavailableAuthorization,
   unavailableChecks,
@@ -35,31 +36,44 @@ const PORTS: [PortName, object][] = [
   ["mainWriter", unavailableMainWriter],
 ];
 
-/** The synchronous fence readers, and what each reports while its module is missing. */
-const READERS = new Map<string, unknown>([
+/**
+ * The synchronous methods, and what each does while its module is missing: a fence reader reports
+ * `null`, and a writer that runs inside the caller's transaction throws so the transaction rolls
+ * back.
+ */
+const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
   ["decisions.currentVersions", null],
+  ["inbox.queue", "throws"],
   ["train.attemptOutcome", null],
 ]);
 
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {
-    const readers = new Map<string, unknown>();
+    const sync = new Map<string, unknown>();
     for (const [port, implementation] of PORTS) {
       for (const [method, fn] of Object.entries(implementation)) {
         if (typeof fn !== "function") throw new TypeError(`${port}.${method} is not a method`);
-        const result: unknown = Reflect.apply(fn, implementation, ["clm_claim001", 0]);
+        let result: unknown;
+        try {
+          result = Reflect.apply(fn, implementation, ["clm_claim001", 0]);
+        } catch (error) {
+          if (!(error instanceof UnavailableError)) throw error;
+          sync.set(`${port}.${method}`, "throws");
+          continue;
+        }
         if (result instanceof Promise) {
           expect(await result, `${port}.${method}`).toEqual(unavailable(port));
         } else {
-          readers.set(`${port}.${method}`, result);
+          sync.set(`${port}.${method}`, result);
         }
       }
     }
 
-    // Exactly the three fence readers are synchronous, and each reports unknown rather than an
-    // attempt, a generation or a decision list, which would let a caller treat it as current.
-    expect(readers).toEqual(READERS);
+    // Exactly these methods are synchronous. Each fence reader reports unknown rather than an
+    // attempt, a generation or a decision list, which would let a caller treat it as current, and
+    // the inbox's queue refuses rather than queuing nothing.
+    expect(sync).toEqual(SYNC);
   });
 
   it("give authorization nothing to pass inside a Repo transaction, and write nothing", async () => {
