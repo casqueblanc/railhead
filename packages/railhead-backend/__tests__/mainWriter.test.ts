@@ -417,7 +417,7 @@ describe("publish writes only against the expected commit", () => {
     });
   });
 
-  it(`stops after ${MAX_WRITE_ATTEMPTS} unconfirmed attempts and then only reads main`, async () => {
+  it(`stops one publication after ${MAX_WRITE_ATTEMPTS} unconfirmed attempts`, async () => {
     const ref = new FakeMain(
       MAIN,
       Array.from({ length: MAX_WRITE_ATTEMPTS }, () => "drop"),
@@ -428,15 +428,34 @@ describe("publish writes only against the expected commit", () => {
       expect(h.authorization.record(INTENT)).toEqual(pendingRecord(MAX_WRITE_ATTEMPTS));
       expect(h.log.head()).toBe(1);
 
-      // A later publication still reconciles, but never writes once the attempts are used up.
+      // Git answers again: the next publication reads main back, then writes conditionally.
+      const reads = ref.reads;
+      expect(await h.writer.publish(INTENT)).toEqual({
+        ok: true,
+        value: settled("updated", MAX_WRITE_ATTEMPTS + 1, CANDIDATE),
+      });
+      expect(ref.reads).toBe(reads + 1);
+      expect(ref.updates).toHaveLength(MAX_WRITE_ATTEMPTS + 1);
+      expectOnlyConditional(ref);
+      expect(mainEvents(h.log)).toEqual([mainEvent(2, "updated", CANDIDATE)]);
+    });
+  });
+
+  it("settles a late landing found after a publication used its attempts", async () => {
+    const ref = new FakeMain(
+      MAIN,
+      Array.from({ length: MAX_WRITE_ATTEMPTS }, () => "drop"),
+    );
+    await withIntent(ref, async (h) => {
       expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
-      expect(ref.updates).toHaveLength(MAX_WRITE_ATTEMPTS);
+      // One of those writes applies after its uncertain answer.
       ref.main = CANDIDATE;
       expect(await h.writer.publish(INTENT)).toEqual({
         ok: true,
         value: settled("reconciled", MAX_WRITE_ATTEMPTS, CANDIDATE),
       });
       expect(ref.updates).toHaveLength(MAX_WRITE_ATTEMPTS);
+      expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", CANDIDATE)]);
     });
   });
 });

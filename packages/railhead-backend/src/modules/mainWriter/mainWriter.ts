@@ -21,6 +21,11 @@
 // Every call to main's ref is bounded by a deadline. A read that does not answer in time refuses
 // the publication; an update that does not answer in time stays counted and is read back on the
 // next publication, like any uncertain write.
+//
+// One publication makes at most `MAX_WRITE_ATTEMPTS` updates. The count on the intent only grows,
+// and fences each attempt; it is not a budget. A publication refused as `unavailable` leaves the
+// intent authorized, and the train publishes it again on its next drive, after reading main back,
+// so an intent whose writes failed while Git was down still lands once Git answers.
 
 import { isId, type CommitSha, type IntentId } from "@railhead/shared/events";
 import type { ClaimId, DecisionRef } from "@railhead/shared/events";
@@ -36,7 +41,7 @@ import type {
 import type { EventLog } from "../../repo/eventLog";
 import { TRAIN_ACTOR } from "../../train/authorize";
 
-/** Write attempts one intent may make before the writer stops trying and only reads main back. */
+/** Updates one publication may make before it returns `unavailable`; a later one may try again. */
 export const MAX_WRITE_ATTEMPTS = 3;
 
 /** Publications that may wait behind the one in progress before more are refused as `busy`. */
@@ -105,7 +110,7 @@ async function publish(
   mainRef: BoundedRef,
   intentId: IntentId,
 ): Promise<PortResult<MergeIntentRecord>> {
-  for (;;) {
+  for (let tries = 0; ; tries += 1) {
     let record = deps.authorization.record(intentId);
     // The async read tells an unknown intent from a missing module.
     if (record === null) return refusal(await deps.authorization.intent(intentId));
@@ -127,6 +132,9 @@ async function publish(
       }
     }
 
+    if (tries >= MAX_WRITE_ATTEMPTS) {
+      return fail("unavailable", "Main could not be confirmed moved; it will be read back again.");
+    }
     const begun = begin(log, deps, record);
     if (!begun.ok) return begun;
     const update = await mainRef.update(begun.value.expectedMain, begun.value.candidate);
@@ -180,7 +188,7 @@ function reconcile(
 
 /**
  * Fences one write attempt and counts it on the intent, in one transaction. Nothing is counted
- * when a fence refuses or the attempts are used up.
+ * when a fence refuses.
  */
 function begin(
   log: EventLog,
@@ -195,9 +203,6 @@ function begin(
       current.attempts !== record.attempts
     ) {
       return fail("busy", "The merge intent changed during publication; try again.");
-    }
-    if (current.attempts >= MAX_WRITE_ATTEMPTS) {
-      return fail("unavailable", "Main could not be confirmed moved; it will be read back again.");
     }
     for (const pin of current.pins) {
       if (deps.currentGeneration(pin.claimId) !== pin.generation) {
