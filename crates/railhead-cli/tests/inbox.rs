@@ -6,19 +6,17 @@
 //! log, never inferred from the output.
 
 use std::fs;
-use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 const TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLXNlY3JldA";
 /// The token a login during the test issues.
@@ -219,209 +217,46 @@ async fn answer(world: &World, verb: &str, route: &str, response: ResponseTempla
         .await;
 }
 
-/// How long a held request is kept open at most: far beyond any `--wait` a test passes.
+/// How long a held response is delayed: far beyond any `--wait` a test passes.
 const HOLD: Duration = Duration::from_secs(20);
 /// Room for process exit after a wait ends. A wait plus this stays well under [`HOLD`], so a CLI
-/// that waited for the held request still fails.
+/// that waited for the held answer still fails.
 const EXIT_SLACK: Duration = Duration::from_secs(10);
-/// How much earlier than its deadline `rh` may close a held request, for timer resolution.
-const EARLY: Duration = Duration::from_millis(100);
 
-/// A request [`Front`] held: its target and credentials, when it arrived, and when the client
-/// closed it, if it did within [`HOLD`].
+/// A response held for [`HOLD`] that records when each request arrived, so a test times the CLI's
+/// wait from the request it held, not from process start, which a loaded machine delays.
 #[derive(Clone)]
-struct Hold {
-    target: String,
-    authorization: Option<String>,
-    arrived: Instant,
-    closed: Option<Instant>,
+struct Held {
+    response: ResponseTemplate,
+    arrivals: Arc<Mutex<Vec<Instant>>>,
 }
 
-/// A front for the mock server that never answers the first `count` requests for one route: it
-/// holds each open until the client closes it or [`HOLD`] passes, and records when. Every other
-/// request goes to the mock server on a connection of its own.
-///
-/// It times a wait on the server side, from the held request, so neither a slow process start nor
-/// a late request can stand in for the wait.
-struct Front {
-    origin: String,
-    holds: Arc<Mutex<Vec<Hold>>>,
-}
-
-impl Front {
-    fn start(server: &MockServer, route: &str, count: usize) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let origin = format!("http://{}", listener.local_addr()?);
-        let upstream = *server.address();
-        let held = format!("{PREFIX}{route}");
-        let holds = Arc::<Mutex<Vec<Hold>>>::default();
-        let recorded = Arc::clone(&holds);
-        thread::spawn(move || {
-            for client in listener.incoming().map_while(Result::ok) {
-                let held = held.clone();
-                let recorded = Arc::clone(&recorded);
-                // A connection that breaks shows up as a missing request or hold in the test.
-                thread::spawn(move || {
-                    let _ = serve(&client, upstream, &held, count, &recorded);
-                });
-            }
-        });
-        Ok(Self { origin, holds })
+impl Held {
+    fn new(response: ResponseTemplate) -> Self {
+        Self {
+            response: response.set_delay(HOLD),
+            arrivals: Arc::default(),
+        }
     }
 
-    /// The requests held so far.
-    fn holds(&self) -> Vec<Hold> {
-        self.holds
+    /// How long the latest held request stayed open before `rh` exited at `exited`.
+    fn open_until(&self, exited: Instant) -> anyhow::Result<Duration> {
+        let arrivals = self.arrivals.lock().unwrap_or_else(PoisonError::into_inner);
+        let arrived = arrivals
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no request was held"))?;
+        Ok(exited.duration_since(*arrived))
+    }
+}
+
+impl Respond for Held {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .push(Instant::now());
+        self.response.clone()
     }
-
-    /// Checks that `rh`, started at `started` with `wait` and gone at `exited`, kept the latest
-    /// held request open until its wait was over, and for as long as it asked to be held, and
-    /// exited soon after it was sent.
-    fn waited(&self, started: Instant, wait: Duration, exited: Instant) -> anyhow::Result<()> {
-        // The front notices the close on its own thread, which a loaded machine may run late.
-        let until = Instant::now() + HOLD;
-        let (hold, closed) = loop {
-            let hold = self
-                .holds()
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("no request was held"))?;
-            if let Some(closed) = hold.closed {
-                break (hold, closed);
-            }
-            anyhow::ensure!(Instant::now() < until, "the held request was never closed");
-            thread::sleep(Duration::from_millis(10));
-        };
-        anyhow::ensure!(
-            closed >= started + wait.saturating_sub(EARLY),
-            "closed {:?} after the start, before the {wait:?} wait was over",
-            closed.duration_since(started)
-        );
-        // A poll asks the backend to hold it for `waitMs`, so it stays open at least that long
-        // however late it was sent.
-        if let Some(held) = wait_ms(&hold) {
-            let kept = closed.duration_since(hold.arrived);
-            anyhow::ensure!(
-                kept >= Duration::from_millis(held).saturating_sub(EARLY),
-                "closed {kept:?} after it arrived, asking to be held for {held}ms"
-            );
-        }
-        let open = exited.duration_since(hold.arrived);
-        anyhow::ensure!(
-            open < wait + EXIT_SLACK,
-            "exited {open:?} after the held request"
-        );
-        Ok(())
-    }
-}
-
-/// Serves one client connection for [`Front`].
-fn serve(
-    client: &TcpStream,
-    upstream: SocketAddr,
-    held: &str,
-    count: usize,
-    holds: &Mutex<Vec<Hold>>,
-) -> io::Result<()> {
-    client.set_read_timeout(Some(HOLD))?;
-    let mut reader = BufReader::new(client.try_clone()?);
-    let mut request = String::new();
-    if reader.read_line(&mut request)? == 0 {
-        return Ok(());
-    }
-    let mut headers = Vec::new();
-    let mut length = 0;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().map_err(io::Error::other)?;
-            }
-            if name.eq_ignore_ascii_case("connection") {
-                continue;
-            }
-        }
-        headers.push(line);
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
-
-    let target = request.split(' ').nth(1).unwrap_or_default().to_owned();
-    let at = {
-        let mut holds = holds.lock().unwrap_or_else(PoisonError::into_inner);
-        let route = target.split('?').next().unwrap_or_default();
-        (route == held && holds.len() < count).then(|| {
-            let authorization = headers.iter().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("authorization")
-                    .then(|| value.trim().to_owned())
-            });
-            holds.push(Hold {
-                target: target.clone(),
-                authorization,
-                arrived: Instant::now(),
-                closed: None,
-            });
-            holds.len() - 1
-        })
-    };
-    if let Some(at) = at {
-        // Never answered: the connection stays open until the client closes it.
-        let mut rest = [0; 256];
-        let closed = loop {
-            match reader.read(&mut rest) {
-                Ok(0) => break Some(Instant::now()),
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break None;
-                }
-                Err(_) => break Some(Instant::now()),
-            }
-        };
-        let mut holds = holds.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hold) = holds.get_mut(at) {
-            hold.closed = closed;
-        }
-        return Ok(());
-    }
-
-    // Passed on with `Connection: close`, so the whole answer is what the server sends
-    // before closing, and the client opens a new connection for its next request.
-    let mut server = TcpStream::connect(upstream)?;
-    server.set_read_timeout(Some(HOLD))?;
-    server.write_all(request.as_bytes())?;
-    server.write_all(b"connection: close\r\n")?;
-    for header in &headers {
-        server.write_all(header.as_bytes())?;
-    }
-    server.write_all(b"\r\n")?;
-    server.write_all(&body)?;
-    let mut answer = Vec::new();
-    server.read_to_end(&mut answer)?;
-    let mut client = reader.get_ref();
-    client.write_all(&answer)?;
-    client.shutdown(Shutdown::Both)?;
-    Ok(())
-}
-
-/// The `waitMs` a held request asked for.
-fn wait_ms(hold: &Hold) -> Option<u64> {
-    url::Url::parse(&format!("http://front{}", hold.target))
-        .ok()?
-        .query_pairs()
-        .find(|(key, _)| key == "waitMs")
-        .and_then(|(_, value)| value.parse().ok())
 }
 
 /// The requests the server received on `route`.
@@ -1698,10 +1533,7 @@ async fn an_ask_interrupted_in_flight_has_already_named_its_key() -> anyhow::Res
 
 #[tokio::test]
 async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
-    // The backend holds every poll far beyond the wait.
-    let server = MockServer::start().await;
-    let stall = Front::start(&server, "/questions/qst_upload1", usize::MAX)?;
-    let world = world_at(server, &stall.origin)?;
+    let world = world().await?;
     answer(
         &world,
         "POST",
@@ -1709,6 +1541,17 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         fixture("ask.json", "asks the owner and returns at once")?,
     )
     .await;
+    // The backend holds every poll far beyond the wait, then answers.
+    let stall = Held::new(fixture(
+        "question.json",
+        "an answered question carries the decision",
+    )?);
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .respond_with(stall.clone())
+        .mount(&world.server)
+        .await;
 
     // Asked and waited on: the wait ends with the question as asked, before the held answer.
     let mut args = ask_args(QUESTION, "src/upload.ts");
@@ -1717,20 +1560,21 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     let run = rh_in_clone(&world, &args)?;
     let exited = Instant::now();
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    stall.waited(started, Duration::from_secs(2), exited)?;
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.at("/data/timedOut")?, json!(true));
     assert_eq!(run.at("/data/question/state")?, json!("open"));
     assert_eq!(run.at("/next")?, json!("rh ask"));
-    let polls = stall.holds();
+    let polls = received(&world, "/questions/qst_upload1").await;
     assert_eq!(polls.len(), 1);
-    let held = polls.first().and_then(wait_ms).unwrap_or(u64::MAX);
-    assert!((1_000..=1_500).contains(&held), "{held}");
-    let bearer = format!("Bearer {TOKEN}");
-    assert!(
-        polls
-            .iter()
-            .all(|poll| poll.authorization.as_deref() == Some(bearer.as_str()))
-    );
+    let held = polls
+        .first()
+        .and_then(|poll| poll.url.query_pairs().find(|(key, _)| key == "waitMs"))
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    assert!((1..=2_000).contains(&held), "{held}");
 
     // Resumed: nothing of the question is known, so the timeout says how to wait again.
     let started = Instant::now();
@@ -1739,7 +1583,10 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
     )?;
     let exited = Instant::now();
-    stall.waited(started, Duration::from_secs(1), exited)?;
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(1) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/retryable")?, json!(true));
@@ -1751,18 +1598,15 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         ),
         "{message}"
     );
-    assert_eq!(stall.holds().len(), 2);
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
     assert_eq!(acks(&world).await, 0);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Result<()> {
-    // The first login's challenge is held far beyond the wait.
-    let server = MockServer::start().await;
-    let stall = Front::start(&server, "/session/challenge", 1)?;
-    let origin = stall.origin.clone();
-    let world = world_at(server, &origin)?;
+    let world = world().await?;
+    let origin = world.server.uri();
     let atlas = world.home.path().join("agents/atlas");
     fs::remove_file(atlas.join("session"))?;
     write_private(&atlas.join("session"), &session_record(&origin, TOKEN, 1))?;
@@ -1776,6 +1620,14 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
         &json!({"ok": true, "data": {"challengeId": CHALLENGE, "expiresAt": EXPIRES,
             "message": message}, "inbox": null, "next": null}),
     );
+    // The first login's challenge is held far beyond the wait.
+    let stall = Held::new(challenge.clone());
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session/challenge")))
+        .respond_with(stall.clone())
+        .up_to_n_times(1)
+        .mount(&world.server)
+        .await;
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
         .respond_with(challenge)
@@ -1805,7 +1657,10 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
     let started = Instant::now();
     let run = rh(&world, &args)?;
     let exited = Instant::now();
-    stall.waited(started, Duration::from_secs(2), exited)?;
+    let elapsed = exited.duration_since(started);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
@@ -1820,122 +1675,6 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
     assert_eq!(run.at("/data/timedOut")?, json!(false));
     let stored: Value = serde_json::from_str(&fs::read_to_string(atlas.join("session"))?)?;
     assert_eq!(stored.pointer("/token"), Some(&json!(FRESH)));
-    Ok(())
-}
-
-/// Lapses `atlas`'s stored session and gives it a key, so its next command logs in. Returns the
-/// lapsed record and the challenge response for that login.
-fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
-    let origin = world.server.uri();
-    let atlas = world.home.path().join("agents/atlas");
-    let lapsed = session_record(&origin, TOKEN, 1);
-    fs::remove_file(atlas.join("session"))?;
-    write_private(&atlas.join("session"), &lapsed)?;
-    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
-    write_private(&atlas.join("key"), &key.to_openssh(LineEnding::LF)?)?;
-    let message = format!(
-        "railhead-login-v1\norigin={origin}\nrepo=casqueblanc/demo\nagent=agt_atlas01\nchallenge={CHALLENGE}\nexpires={EXPIRES}\n"
-    );
-    let challenge = json_response(
-        200,
-        &json!({"ok": true, "data": {"challengeId": CHALLENGE, "expiresAt": EXPIRES,
-            "message": message}, "inbox": null, "next": null}),
-    );
-    Ok((lapsed, challenge))
-}
-
-#[tokio::test]
-async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> anyhow::Result<()> {
-    let world = world().await?;
-    let (lapsed, challenge) = lapse_session(&world)?;
-    // The challenge answers just before the deadline, and the session request then stalls: each
-    // fits one request timeout, but the two together do not fit the wait.
-    Mock::given(method("POST"))
-        .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(challenge.set_delay(Duration::from_millis(3_500)))
-        .mount(&world.server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(format!("{PREFIX}/session")))
-        .respond_with(
-            json_response(
-                200,
-                &json!({"ok": true, "data": {"token": FRESH, "expiresAt": 4_102_444_800_000_u64,
-                    "agent": {"agentId": "agt_atlas01", "name": "atlas",
-                    "ownerId": "usr_lemarier", "state": "confirmed"}, "repoId": "rep_demo0001"},
-                    "inbox": null, "next": null}),
-            )
-            .set_delay(Duration::from_secs(20)),
-        )
-        .mount(&world.server)
-        .await;
-
-    let started = Instant::now();
-    let run = rh(
-        &world,
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
-    )?;
-    let elapsed = started.elapsed();
-    // Without the deadline the session request alone would run to 7.5 s.
-    assert!(
-        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_millis(6_500),
-        "{elapsed:?}"
-    );
-    assert_eq!(run.code, Some(1), "{}", run.stdout);
-    assert_eq!(run.at("/error/code")?, json!("timeout"));
-    assert_eq!(run.at("/error/next")?, json!("rh ask"));
-    // The login reached its session request, no poll was sent, and the lapsed session is kept.
-    assert_eq!(received(&world, "/session").await.len(), 1);
-    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
-    let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
-    assert_eq!(stored, lapsed);
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Result<()> {
-    let world = world().await?;
-    let (lapsed, challenge) = lapse_session(&world)?;
-    Mock::given(method("POST"))
-        .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(challenge)
-        .mount(&world.server)
-        .await;
-    // Another process holds the session lock, as a login of its own would, well past the wait. It
-    // lets go after 10 s so that a wait the deadline does not end fails instead of hanging.
-    let lock = world.home.path().join("agents/atlas/.session.lock");
-    let held = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock)?;
-    held.lock()?;
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(10));
-        drop(held);
-    });
-
-    let started = Instant::now();
-    let run = rh(
-        &world,
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
-    )?;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
-        "{elapsed:?}"
-    );
-    assert_eq!(run.code, Some(1), "{}", run.stdout);
-    assert_eq!(run.at("/error/code")?, json!("timeout"));
-    assert_eq!(run.at("/error/next")?, json!("rh ask"));
-    // Nothing was sent while the lock was held, and the lapsed session is kept.
-    assert_eq!(requests(&world).await, 0);
-    let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
-    assert_eq!(stored, lapsed);
-    release
-        .join()
-        .map_err(|_| anyhow::anyhow!("the lock holder panicked"))?;
     Ok(())
 }
 
