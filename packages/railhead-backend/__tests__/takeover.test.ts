@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ClaimView } from "@railhead/shared/agent-api";
 import type { DecisionId, RailheadEvent } from "@railhead/shared/events";
 import {
@@ -18,7 +18,13 @@ import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import { unavailableSessions } from "../src/contracts/unavailable";
 import { createGitGateway } from "../src/git/gateway";
-import { CLAIM_LEASE_MS, REVOKE_RETRY_MS, createClaims } from "../src/modules/claims/module";
+import {
+  CLAIM_LEASE_MS,
+  CLAIMS_LIMITS,
+  REVOKE_RETRY_MS,
+  createClaims,
+  type ClaimsLimits,
+} from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
@@ -71,6 +77,8 @@ interface Setup {
   artifacts: ArtifactsPort;
   /** When set, each `revokeTokens` awaits it before reaching Artifacts. */
   holdRevocation: (() => Promise<void>) | null;
+  /** When set, each `forkForClaim` awaits it after Artifacts answers, before returning. */
+  holdFork: (() => Promise<void>) | null;
   /**
    * Fires the Repo's alarm as `Repo.alarm` does: the alarm forgets its time, every resumable module
    * resumes through `resumeAll`, and the alarm's writes settle. The clock does not move.
@@ -82,8 +90,14 @@ interface Setup {
   laterResumes: { git: number; train: number };
 }
 
-/** Runs `body` in a fresh Repo with real claims, inbox and decisions, and fake Artifacts. */
-function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
+/**
+ * Runs `body` in a fresh Repo with real claims, inbox and decisions, and fake Artifacts, under
+ * `limits`.
+ */
+function withTakeover<T>(
+  body: (setup: Setup) => Promise<T>,
+  limits: ClaimsLimits = CLAIMS_LIMITS,
+): Promise<T> {
   const stub: DurableObjectStub<Repo> = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
     const fake = new FakeArtifacts();
@@ -119,7 +133,11 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
     );
     const artifacts: RepoPorts["artifacts"] = {
-      forkForClaim: (claimId, forkBase) => adapter.forkForClaim(claimId, forkBase),
+      async forkForClaim(claimId, forkBase) {
+        const forked = await adapter.forkForClaim(claimId, forkBase);
+        await setup.holdFork?.();
+        return forked;
+      },
       commitExists: (repo, commit) => adapter.commitExists(repo, commit),
       token(repo, scope, ttlMs) {
         setup.minted.push(repo);
@@ -132,7 +150,7 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       },
     };
     const decisions = createDecisions(context, () => ports);
-    const port = createClaims(context, () => ports);
+    const port = createClaims(context, () => ports, limits);
     const laterResumes = { git: 0, train: 0 };
     const ports: RepoPorts = {
       ...base,
@@ -186,6 +204,7 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       minted: [],
       artifacts,
       holdRevocation: null,
+      holdFork: null,
       async repoAlarm() {
         alarm.fired();
         storedAlarm = null;
@@ -1156,6 +1175,127 @@ describe("takeover", () => {
       });
       expect(types(setup.events())).not.toContain("claim.reassigned");
       expect(await setup.port.activeClaim(agent(1))).toEqual(ok(null));
+    });
+  });
+
+  it("lets a same-owner successor take a lapsed allocation while the owner is at its limit", async () => {
+    for (const via of ["work", "claim"] as const) {
+      await withTakeover(
+        async (setup) => {
+          const issueId = await setup.file("Add uploads");
+          setup.fake.failNextFork("lose-response");
+          expect(await setup.port.work(agent(1))).toMatchObject({ ok: false });
+          const [intent] = setup.sql
+            .exec<{ claim_id: string }>("SELECT claim_id FROM claims_claims")
+            .toArray();
+          if (intent === undefined) throw new Error("no fork intent was recorded");
+          const take = () =>
+            via === "work" ? setup.port.work(agent(2)) : setup.port.claim(agent(2), issueId);
+
+          // While the allocation's lease runs it fills the owner's one slot.
+          const newer = await setup.file("Add downloads");
+          setup.fake.advance(CLAIM_LEASE_MS - 1);
+          await setup.port.resume();
+          expectFailure(await setup.port.work(agent(2)), "quota_exceeded");
+          expectFailure(await setup.port.claim(agent(2), newer), "quota_exceeded");
+          expectFailure(await setup.port.claim(agent(2), issueId), "issue_unavailable");
+          expect(stored(setup.sql, intent.claim_id)).toMatchObject({
+            agent_id: "agt_agent0001",
+            generation: 1,
+            state: "allocating",
+          });
+
+          // Once it lapses it no longer counts, and the same owner's other agent takes it.
+          setup.fake.advance(1);
+          expect(await take()).toMatchObject({
+            ok: true,
+            value: { claim: { claimId: intent.claim_id, generation: 2, state: "working" } },
+          });
+          expect(stored(setup.sql, intent.claim_id)).toMatchObject({
+            agent_id: "agt_agent0002",
+            generation: 2,
+            state: "working",
+          });
+          expect(setup.port.currentGeneration(intent.claim_id)).toBe(2);
+
+          // The original agent stays fenced: no claim, no push and no ready at its generation.
+          expect(await setup.port.activeClaim(agent(1))).toEqual(ok(null));
+          expectFailure(
+            await setup.port.authorizeGit(push(agent(1), intent.claim_id)),
+            "stale_generation",
+          );
+          expectFailure(
+            await setup.port.ready(agent(1), intent.claim_id, { generation: 1, commit: HEAD }),
+            "stale_generation",
+          );
+        },
+        { maxActiveClaimsPerOwner: 1 },
+      );
+    }
+  });
+
+  it("opens nothing when the fork answers after the allocation's lease lapsed", async () => {
+    await withTakeover(async (setup) => {
+      await setup.file("Add uploads");
+      const gate = deferred();
+      setup.holdFork = () => gate.promise;
+      const first = setup.port.work(agent(1));
+      // The fork exists, but its response is held until the lease has lapsed.
+      await vi.waitFor(() => {
+        expect(setup.fake.forkCalls).toBe(1);
+      });
+      const [intent] = setup.sql
+        .exec<{ claim_id: string; lease_until: number }>(
+          "SELECT claim_id, lease_until FROM claims_claims",
+        )
+        .toArray();
+      if (intent === undefined) throw new Error("no fork intent was recorded");
+      setup.fake.advance(CLAIM_LEASE_MS);
+      setup.holdFork = null;
+      gate.resolve();
+
+      expectFailure(await first, "busy");
+      expect(
+        setup.sql
+          .exec<{ state: string; generation: number; base: string | null; lease_until: number }>(
+            "SELECT state, generation, base, lease_until FROM claims_claims",
+          )
+          .toArray(),
+      ).toEqual([
+        { state: "allocating", generation: 1, base: null, lease_until: intent.lease_until },
+      ]);
+      expect(types(setup.events())).not.toContain("claim.opened");
+      expect(setup.port.currentGeneration(intent.claim_id)).toBeNull();
+
+      // The intent is left for a successor, which opens the same fork at the next generation.
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: intent.claim_id, generation: 2, base: HEAD } },
+      });
+      // The fork the late response named is the one the successor opens: no second fork.
+      expect(setup.fake.forkCalls).toBe(1);
+      expect(types(setup.events()).filter((type) => type === "claim.opened")).toHaveLength(1);
+    });
+  });
+
+  it("opens a claim whose fork answers a millisecond before the lease lapses", async () => {
+    await withTakeover(async (setup) => {
+      await setup.file("Add uploads");
+      const gate = deferred();
+      setup.holdFork = () => gate.promise;
+      const first = setup.port.work(agent(1));
+      await vi.waitFor(() => {
+        expect(setup.fake.forkCalls).toBe(1);
+      });
+      setup.fake.advance(CLAIM_LEASE_MS - 1);
+      setup.holdFork = null;
+      gate.resolve();
+
+      expect(await first).toMatchObject({
+        ok: true,
+        value: { claim: { generation: 1, state: "working", base: HEAD } },
+      });
+      expect(types(setup.events())).toContain("claim.opened");
     });
   });
 });

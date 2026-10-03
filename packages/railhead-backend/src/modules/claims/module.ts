@@ -43,7 +43,8 @@
 // recorded past the deadline. From the expiry on, the former holder is refused and the fork's tokens
 // are owed a revocation. A lease is renewed only before it lapses: a lapsed allocation is no longer
 // its holder's, which sees no active claim and is answered `busy` by `work` and `claim` until
-// another agent takes the allocation over. The claim stays expired until that revocation is
+// another agent takes the allocation over. It no longer counts toward its owner's limit, and a fork
+// whose response arrives after the lapse opens nothing and answers `busy`. The claim stays expired until that revocation is
 // settled; a failed revocation, or one Artifacts reports as `pending_debt`, is retried by the
 // Repo's alarm, and meanwhile nobody gets a write grant on the fork.
 //
@@ -179,7 +180,7 @@ export function createClaims(
     if (releasePendingBefore(sql, issueId)) {
       return fail("busy", "An older expired claim is still being released; repeat later.");
     }
-    if (activeClaimsOfOwner(sql, agent.ownerId) >= limits.maxActiveClaimsPerOwner) {
+    if (activeClaimsOfOwner(sql, agent.ownerId, clock()) >= limits.maxActiveClaimsPerOwner) {
       return fail("quota_exceeded", "This person's agents hold as many claims as allowed.");
     }
     const claimId: ClaimId = `clm_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -279,10 +280,11 @@ export function createClaims(
    * decisions to `agent`. Runs in a transaction.
    */
   const takeOver = (tx: EventTransaction, agent: AgentPrincipal, row: ClaimRow): Chosen => {
-    if (activeClaimsOfOwner(tx.sql, agent.ownerId) >= limits.maxActiveClaimsPerOwner) {
+    const now = clock();
+    // A lapsed allocation is not counted, so its own transfer never trips the limit.
+    if (activeClaimsOfOwner(tx.sql, agent.ownerId, now) >= limits.maxActiveClaimsPerOwner) {
       return fail("quota_exceeded", "This person's agents hold as many claims as allowed.");
     }
-    const now = clock();
     if (!reassignClaim(tx.sql, row.claimId, row.generation, agent, now, now + CLAIM_LEASE_MS)) {
       throw new Error("a claim read in this transaction could not be reassigned");
     }
@@ -334,8 +336,9 @@ export function createClaims(
     }
     const fork = await ports().artifacts.forkForClaim(row.claimId, forkBase);
     if (!fork.ok) return fork;
+    // A fork answered after the lease lapsed opens nothing: the intent waits for a successor.
     const opened = log.transaction((tx) => {
-      if (openClaim(tx.sql, row.claimId, row.generation, fork.value.head)) {
+      if (openClaim(tx.sql, row.claimId, row.generation, fork.value.head, clock())) {
         tx.append(
           { kind: "agent", id: row.agentId },
           {
@@ -355,8 +358,9 @@ export function createClaims(
       return activeClaimOf(tx.sql, row.agentId);
     }).value;
     // A concurrent request may have opened it first; either way the stored claim is the answer.
-    if (opened === null || opened.claimId !== row.claimId || opened.state === "allocating") {
-      return lost();
+    if (opened === null || opened.claimId !== row.claimId) return lost();
+    if (opened.state === "allocating") {
+      return lapsedAllocation(opened, clock()) ? lapsedHold() : lost();
     }
     return ok({ claim: view(opened), resumed });
   };

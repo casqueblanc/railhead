@@ -142,12 +142,17 @@ export function claimById(sql: SqlStorage, claimId: ClaimId): ClaimRow | null {
   return first(sql.exec<RawClaim>(`${SELECT_CLAIM} WHERE c.claim_id = ?`, claimId));
 }
 
-/** How many active claims the owner's agents hold. */
-export function activeClaimsOfOwner(sql: SqlStorage, ownerId: UserId): number {
+/**
+ * How many active claims the owner's agents hold at `now`. An allocation whose lease lapsed at or
+ * before `now` is held by nobody and is not counted, so a successor of the same owner can take it.
+ */
+export function activeClaimsOfOwner(sql: SqlStorage, ownerId: UserId, now: number): number {
   const [row] = sql
     .exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM claims_claims WHERE owner_id = ? AND state IN ${ACTIVE}`,
+      `SELECT COUNT(*) AS n FROM claims_claims WHERE owner_id = ? AND state IN ${ACTIVE}
+         AND NOT (state = 'allocating' AND lease_until IS NOT NULL AND lease_until <= ?)`,
       ownerId,
+      now,
     )
     .toArray();
   return row?.n ?? 0;
@@ -400,23 +405,27 @@ export function recordForkBase(sql: SqlStorage, claimId: ClaimId, base: CommitSh
 
 /**
  * Opens an allocating claim at `generation` on a fork whose head is `base`. Returns `false`, and
- * writes nothing, when the claim is no longer that allocation.
+ * writes nothing, when the claim is no longer that allocation or its lease lapsed at or before
+ * `now`.
  */
 export function openClaim(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
   base: CommitSha,
+  now: number,
 ): boolean {
   // `rowsWritten` also counts index entries, so the updated rows are counted by `RETURNING`.
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', base = ?
        WHERE claim_id = ? AND generation = ? AND state = 'allocating'
+         AND (lease_until IS NULL OR lease_until > ?)
        RETURNING claim_id`,
       base,
       claimId,
       generation,
+      now,
     )
     .toArray();
   return updated.length === 1;
