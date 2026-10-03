@@ -36,7 +36,27 @@ describe("gateOnConnection", () => {
     expect(gated.decisions).toEqual({ kind: "unavailable", reason: "offline" });
     expect(gated.owner).toEqual({ kind: "unavailable", reason: "offline" });
     expect(gated.enrollment).toEqual({ kind: "unavailable", reason: "offline" });
-    expect(gated.board).toEqual({ kind: "available", feed: { kind: "loading" } });
+  });
+
+  it("marks a retained board lost when only the session is lost, keeping its data", () => {
+    const live = boardFeed("live");
+    const gated = gateOnConnection(
+      ports({ connection: "lost", board: { kind: "available", feed: live } }),
+    );
+
+    expect(gated.board).toEqual({ kind: "available", feed: { ...live, connection: "lost" } });
+  });
+
+  it("fails a board still loading when the session is lost, so a retry is offered", () => {
+    const gated = gateOnConnection(ports({ connection: "lost" }));
+
+    expect(gated.board).toEqual({ kind: "available", feed: { kind: "failed" } });
+  });
+
+  it("leaves an unavailable board alone when the session is lost", () => {
+    const gated = gateOnConnection(ports({ connection: "lost", board: { kind: "unavailable" } }));
+
+    expect(gated.board).toEqual({ kind: "unavailable" });
   });
 
   it("withdraws the actions when the board's feed is lost even if the binding says connected", () => {

@@ -186,6 +186,38 @@ describe("HomePage", () => {
     expect(recorded).toEqual([]);
   });
 
+  it("shows a retained board as disconnected when only the session is lost, then recovers", async () => {
+    const live = ports({ board: { kind: "available", feed: feedOf(openQuestion) } });
+    await render(live);
+    expect(text()).not.toContain("Disconnected");
+    expect(button("Record answer").disabled).toBe(false);
+
+    await render({ ...live, connection: "lost" });
+
+    expect(text().match(/Disconnected/g)).toHaveLength(2);
+    expect(text()).toContain("Answering is blocked while the board is offline.");
+    expect(button("Record answer").disabled).toBe(true);
+    await act(async () => button("Reconnect").click());
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+
+    await render(live);
+
+    expect(text()).not.toContain("Disconnected");
+    expect(button("Record answer").disabled).toBe(false);
+    expect(recorded).toEqual([]);
+  });
+
+  it("offers a retry instead of loading forever when the session is lost", async () => {
+    await render(
+      ports({ connection: "lost", board: { kind: "available", feed: { kind: "loading" } } }),
+    );
+
+    expect(text()).toContain("Questions did not load");
+    expect(container.querySelector('[aria-busy="true"]')).toBeNull();
+    await act(async () => button("Try again").click());
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
   it("offers a retry in each section when the board fails to load", async () => {
     await render(ports({ board: { kind: "available", feed: { kind: "failed" } } }));
 

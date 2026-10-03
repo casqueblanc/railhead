@@ -99,9 +99,28 @@ export type FeatureEntry<Props> =
   | { kind: "unavailable" };
 
 /**
+ * Shows a lost session in the feed the sections render from. A retained board becomes stale with a
+ * Reconnect control, and a board still loading becomes failed with a retry, since neither can
+ * progress until the session is replaced.
+ */
+const feedOnLostSession = (feed: BoardFeed): BoardFeed => {
+  switch (feed.kind) {
+    case "loading":
+      return { kind: "failed" };
+    case "failed":
+      return feed;
+    case "board":
+      return feed.connection === "lost" ? feed : { ...feed, connection: "lost" };
+    default:
+      return unreachable(feed);
+  }
+};
+
+/**
  * Withdraws the actions while the session or the board's feed is lost, whatever the binding last
  * reported, so nothing offers to act on a board that cannot reach the backend. An action that is
- * already unavailable keeps its own reason.
+ * already unavailable keeps its own reason. A lost session also marks the feed lost, so every
+ * section says the board is stale and offers to reconnect.
  */
 export const gateOnConnection = (ports: BoardPorts): BoardPorts => {
   const feedLost =
@@ -111,6 +130,10 @@ export const gateOnConnection = (ports: BoardPorts): BoardPorts => {
   if (ports.connection !== "lost" && !feedLost) return ports;
   return {
     ...ports,
+    board:
+      ports.connection === "lost" && ports.board.kind === "available"
+        ? { kind: "available", feed: feedOnLostSession(ports.board.feed) }
+        : ports.board,
     decisions:
       ports.decisions.kind === "available"
         ? { kind: "unavailable", reason: "offline" }
@@ -122,4 +145,8 @@ export const gateOnConnection = (ports: BoardPorts): BoardPorts => {
         ? { kind: "unavailable", reason: "offline" }
         : ports.enrollment,
   };
+};
+
+const unreachable = (value: never): never => {
+  throw new Error(`unhandled board feed: ${JSON.stringify(value)}`);
 };
