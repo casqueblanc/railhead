@@ -476,11 +476,12 @@ async function decideGit(
   }
   const { claimId } = target;
   if (!isId("claim", claimId)) return fail("invalid_request", "The claim id is malformed.");
+  const repo = await forkRepoName(repoId, claimId);
+  // Nothing below awaits, so the grant is decided on the claim as it stands now.
   const row = claimById(sql, claimId);
   if (row === null || row.state === "allocating") {
     return fail("not_found", "The claim has no fork.");
   }
-  const repo = await forkRepoName(repoId, claimId);
   switch (operation) {
     case "fetch":
       return ok({ repo, scope: "read", fence: null });

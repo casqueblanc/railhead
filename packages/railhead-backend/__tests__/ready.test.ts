@@ -1096,3 +1096,73 @@ describe("authorizeGit", () => {
     });
   });
 });
+
+describe("authorizeGit races", () => {
+  // `authorizeGit` awaits the fork's name, so a change made right after the call starts lands
+  // while the name is being looked up.
+  const push = { kind: "fork", operation: "push" } as const;
+
+  function pushOf(claimId: string) {
+    return {
+      principal: agent(1),
+      target: { kind: push.kind, claimId },
+      operation: push.operation,
+    };
+  }
+
+  it("refuses the former holder when a takeover lands during the lookup", async () => {
+    await withReady(async (setup) => {
+      const { claim } = await setup.open();
+      const pending = setup.port.authorizeGit(pushOf(claim.claimId));
+      setup.sql.exec(
+        "UPDATE claims_claims SET generation = 2, agent_id = 'agt_agent0002' WHERE claim_id = ?",
+        claim.claimId,
+      );
+
+      expectFailure(await pending, "stale_generation");
+    });
+  });
+
+  it("refuses a write when the claim becomes ready during the lookup", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      const [pinned] = setup.sql
+        .exec<{ ready_decisions: string | null }>(
+          "SELECT ready_decisions FROM claims_claims WHERE claim_id = ?",
+          claim.claimId,
+        )
+        .toArray();
+      if (pinned === undefined) throw new Error("no such claim");
+      // Back to working, so the call starts on a working claim and the pin lands mid-lookup.
+      setup.sql.exec(
+        "UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL WHERE claim_id = ?",
+        claim.claimId,
+      );
+      const pending = setup.port.authorizeGit(pushOf(claim.claimId));
+      setup.sql.exec(
+        "UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ? WHERE claim_id = ?",
+        WORK,
+        pinned.ready_decisions,
+        claim.claimId,
+      );
+
+      expectFailure(await pending, "after_ready");
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+    });
+  });
+
+  it("refuses a push to a claim that expires during the lookup", async () => {
+    await withReady(async (setup) => {
+      const { claim } = await setup.open();
+      const pending = setup.port.authorizeGit(pushOf(claim.claimId));
+      setup.sql.exec(
+        "UPDATE claims_claims SET state = 'expired' WHERE claim_id = ?",
+        claim.claimId,
+      );
+
+      expectFailure(await pending, "claim_closed");
+    });
+  });
+});
