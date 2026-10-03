@@ -97,8 +97,9 @@ const Detail = ({ detail }: { detail: CheckDetail }) => {
     <div className="grid gap-3 text-sm">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
         <dt className="text-kumo-subtle">Candidate</dt>
-        <dd>
-          <ShortSha sha={detail.candidate} />
+        {/* The full id, so a person can read and copy the exact commit checked. */}
+        <dd className="font-mono break-all select-all" translate="no">
+          {detail.candidate}
         </dd>
         <dt className="text-kumo-subtle">Composed on main</dt>
         <dd>

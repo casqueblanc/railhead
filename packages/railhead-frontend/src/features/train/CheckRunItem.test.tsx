@@ -96,7 +96,8 @@ describe("check runs in the train section", () => {
     expect(checkItems()).toHaveLength(1);
     expect(item?.textContent).toContain("Failed");
     expect(item?.textContent).toContain("test: Failed");
-    expect(item?.querySelector(`[title="${CANDIDATE}"]`)).not.toBeNull();
+    expect(item?.querySelector(`[title="${CANDIDATE}"]`)?.textContent).toBe(CANDIDATE.slice(0, 7));
+    expect(text()).not.toContain(CANDIDATE);
     expect(text()).toContain("Nothing merged yet");
     expect(reads).toEqual([]);
   });
@@ -113,7 +114,12 @@ describe("check runs in the train section", () => {
     );
     expect(text()).toContain("Failed at");
     expect(text()).toContain("Composed on main");
-    expect(container.querySelectorAll(`[title="${CANDIDATE}"]`)).toHaveLength(2);
+    // The full candidate id is visible text in the detail, not only a tooltip.
+    const candidate = [...container.querySelectorAll("dt")].find(
+      (term) => term.textContent === "Candidate",
+    )?.nextElementSibling;
+    expect(candidate?.textContent).toBe(CANDIDATE);
+    expect(candidate?.hasAttribute("title")).toBe(false);
   });
 
   it("renders a command and output holding markup as inert text", async () => {
