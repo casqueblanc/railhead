@@ -381,6 +381,23 @@ async fn a_repeated_claim_resumes_the_same_clone_and_keeps_edits() -> anyhow::Re
     fs::write(clone.join("scratch.txt"), "untracked\n")?;
 
     // The fork is unreachable now, so a reuse that fetched or re-cloned would fail.
+    // Settings Railhead owns gain second values, which plain `git config` refuses to replace.
+    git_in(
+        &world,
+        &clone,
+        &["remote", "set-branches", "--add", "origin", "spike"],
+    )?;
+    git_in(
+        &world,
+        &clone,
+        &[
+            "config",
+            "--add",
+            "remote.upstream.pushurl",
+            "file:///elsewhere.git",
+        ],
+    )?;
+
     point_fork_at(&world, &world.work.path().join("gone.git"))?;
     world.server.reset().await;
     let resumed = ResponseTemplate::new(200).set_body_raw(
@@ -416,6 +433,13 @@ async fn a_repeated_claim_resumes_the_same_clone_and_keeps_edits() -> anyhow::Re
             "untracked\n"
         );
         assert_eq!(git_in(&world, &clone, &["rev-parse", "HEAD"])?, local_head);
+    }
+    for (key, value) in [
+        ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ("remote.upstream.pushurl", "upstream-is-read-only"),
+    ] {
+        let values = git_in(&world, &clone, &["config", "--local", "--get-all", key])?;
+        assert_eq!(values, value, "{key}");
     }
     // No second clone appeared beside the first.
     let clones = fs::read_dir(world.work.path())?

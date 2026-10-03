@@ -331,7 +331,8 @@ fn build(staging: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remot
 }
 
 /// Writes the clone's Railhead settings: its agent, the generation it saw, both remotes and the
-/// credential helper. Leaves the working tree alone.
+/// credential helper. Each replaces every value the key had, so a key the agent gave a second
+/// value cannot make a resumed claim fail. Leaves the working tree alone.
 fn configure(
     dir: &Path,
     identity: &Identity,
@@ -343,28 +344,51 @@ fn configure(
     let settings: [&[&str]; 11] = [
         &[
             "config",
+            "--replace-all",
             GIT_IDENTITY_CONFIG_KEY,
             identity.agent_id.as_str(),
         ],
-        &["config", GIT_GENERATION_CONFIG_KEY, &generation],
-        &["config", "remote.origin.url", &remotes.origin],
         &[
             "config",
+            "--replace-all",
+            GIT_GENERATION_CONFIG_KEY,
+            &generation,
+        ],
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.url",
+            &remotes.origin,
+        ],
+        &[
+            "config",
+            "--replace-all",
             "remote.origin.fetch",
             "+refs/heads/*:refs/remotes/origin/*",
         ],
-        &["config", "remote.upstream.url", &remotes.upstream],
         &[
             "config",
+            "--replace-all",
+            "remote.upstream.url",
+            &remotes.upstream,
+        ],
+        &[
+            "config",
+            "--replace-all",
             "remote.upstream.fetch",
             "+refs/heads/*:refs/remotes/upstream/*",
         ],
-        &["config", "remote.upstream.pushurl", UPSTREAM_PUSH_URL],
+        &[
+            "config",
+            "--replace-all",
+            "remote.upstream.pushurl",
+            UPSTREAM_PUSH_URL,
+        ],
         // An empty value drops every helper configured outside this clone, so Git asks only rh.
         &["config", "--replace-all", "credential.helper", ""],
         &["config", "--add", "credential.helper", &helper],
-        &["config", "credential.useHttpPath", "true"],
-        &["config", "push.default", "upstream"],
+        &["config", "--replace-all", "credential.useHttpPath", "true"],
+        &["config", "--replace-all", "push.default", "upstream"],
     ];
     for args in settings {
         git(dir, args)?;
