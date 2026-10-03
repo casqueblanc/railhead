@@ -211,7 +211,7 @@ export interface MinuteActivity {
   /** `claim.opened` events. */
   claimsOpened: number;
   /** `train.check` events: one per check result, whatever the result. */
-  checksRun: number;
+  checksReported: number;
   /** Claims carried by a merge that moved main to its candidate. */
   changesLanded: number;
 }
@@ -489,13 +489,13 @@ type ActivityCounts = Omit<MinuteActivity, "minute">;
 const activityOf = (next: BoardState, event: RailheadEvent): ActivityCounts | null => {
   switch (event.type) {
     case "claim.opened":
-      return { claimsOpened: 1, checksRun: 0, changesLanded: 0 };
+      return { claimsOpened: 1, checksReported: 0, changesLanded: 0 };
     case "train.check":
-      return { claimsOpened: 0, checksRun: 1, changesLanded: 0 };
+      return { claimsOpened: 0, checksReported: 1, changesLanded: 0 };
     case "train.main": {
       const intent = own(next.intents, event.data.intentId);
       if (intent?.landing.kind !== "landed") return null;
-      return { claimsOpened: 0, checksRun: 0, changesLanded: intent.claims.length };
+      return { claimsOpened: 0, checksReported: 0, changesLanded: intent.claims.length };
     }
     default:
       return null;
@@ -525,7 +525,7 @@ const countRecent = (
   const updated: MinuteActivity = {
     minute,
     claimsOpened: (prior?.claimsOpened ?? 0) + counts.claimsOpened,
-    checksRun: (prior?.checksRun ?? 0) + counts.checksRun,
+    checksReported: (prior?.checksReported ?? 0) + counts.checksReported,
     changesLanded: (prior?.changesLanded ?? 0) + counts.changesLanded,
   };
   return [...kept, updated].toSorted((a, b) => a.minute - b.minute);

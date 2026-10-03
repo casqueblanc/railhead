@@ -104,6 +104,7 @@ describe("check runs in the train section", () => {
 
     const [item] = checkItems();
     expect(checkItems()).toHaveLength(1);
+    expect(container.querySelector("h3")?.textContent).toBe("Reported check runs");
     expect(item?.textContent).toContain("Failed");
     expect(item?.textContent).toContain("test: Failed");
     expect(item?.querySelector(`[title="${CANDIDATE}"]`)?.textContent).toBe(CANDIDATE.slice(0, 7));
@@ -158,7 +159,7 @@ describe("check runs in the train section", () => {
     expect((globalThis as { pwned?: number }).pwned).toBeUndefined();
   });
 
-  it("says when the output was cut, a run with no recorded command, and a held run's paths", async () => {
+  it("says when the output was cut and a run with no recorded command", async () => {
     answers = [
       {
         ok: true,
@@ -173,21 +174,33 @@ describe("check runs in the train section", () => {
     expect(text()).toContain(`Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB`);
     expect(text()).toContain("Not recorded: this run predates commands being kept.");
     expect(container.querySelector("pre[aria-label=Command]")).toBeNull();
+  });
 
+  // A listed run has reported, so an answer that it is still held or running does not match it.
+  it("shows nothing from an answer that the listed run never reported", async () => {
     answers = [
       { ok: true, value: detail({ state: { kind: "held", paths: [".railhead/check.json"] } }) },
     ];
+    await render(feedOf(failingLog));
+    await openDetail();
+    expect(text()).toContain("does not match this run's reported result");
+    expect(text()).not.toContain(".railhead/check.json");
+    expect(container.querySelector("pre")).toBeNull();
+
+    answers = [{ ok: true, value: detail({ state: { kind: "started", deadline: 0 } }) }];
     // Another result for the open run reads it again.
     await render(
       feedOf(
-        syntheticLog("Synthetic held run", [
+        syntheticLog("Synthetic second result", [
           checkResult(RUN, CANDIDATE, "test", "fail"),
           checkResult(RUN, CANDIDATE, "lint", "error"),
         ]).events,
       ),
     );
-    expect(text()).toContain("Held for a person");
-    expect(text()).toContain(".railhead/check.json");
+    expect(reads).toEqual([RUN, RUN]);
+    expect(text()).toContain("does not match this run's reported result");
+    expect(text()).not.toContain("Running");
+    expect(container.querySelector("pre")).toBeNull();
   });
 
   it("shows nothing from an answer for another commit than the run's", async () => {
@@ -195,7 +208,7 @@ describe("check runs in the train section", () => {
     await render(feedOf(failingLog));
     await openDetail();
 
-    expect(text()).toContain("The backend answered for another run or commit");
+    expect(text()).toContain("does not match this run's reported result");
     expect(container.querySelector("pre")).toBeNull();
   });
 
@@ -289,6 +302,6 @@ describe("check runs in the train section", () => {
     await render(feedOf(many));
 
     expect(checkItems()).toHaveLength(MAX_LISTED_CHECK_RUNS);
-    expect(text()).toContain("2 older check runs are not listed; the totals count them.");
+    expect(text()).toContain("2 older reported check runs are not listed; the totals count them.");
   });
 });

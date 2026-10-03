@@ -1,6 +1,7 @@
-// Check runs: every run the train recorded, newest first, with each result as the log gave it. A
-// failing run often never reaches a merge, so runs are listed on their own, not only under the
-// intent that cites them.
+// Check runs: every run that reported a result to the train, newest first, with each result as the
+// log gave it. A failing run often never reaches a merge, so runs are listed on their own, not only
+// under the intent that cites them. A run that timed out or is held has no event in the log yet, so
+// it is not listed.
 
 import type {
   CheckResult,

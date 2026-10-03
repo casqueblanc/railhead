@@ -46,7 +46,7 @@ describe("boardMetrics", () => {
       changesLanded: 2,
       activeClaims: 0,
       // The whole synthetic log is recorded within its first minute.
-      recent: { minutes: 1, claimsOpened: 2, checksRun: 5, changesLanded: 2 },
+      recent: { minutes: 1, claimsOpened: 2, checksReported: 5, changesLanded: 2 },
     });
   });
 
@@ -72,7 +72,7 @@ describe("boardMetrics", () => {
     expect(metrics.checks).toEqual({ pass: 1, fail: 1, error: 1 });
     expect(metrics.changesLanded).toBe(0);
     expect(metrics.activeClaims).toBe(2);
-    expect(metrics.recent?.checksRun).toBe(3);
+    expect(metrics.recent?.checksReported).toBe(3);
   });
 
   it("reports nothing recent and only zeros for a log with no events", () => {
@@ -102,12 +102,17 @@ describe("boardMetrics", () => {
     const at = (count: number) => boardMetrics(fold(events.slice(0, prelude.length + count)));
 
     // After minute 5 the log spans six minutes.
-    expect(at(2).recent).toEqual({ minutes: 6, claimsOpened: 2, checksRun: 2, changesLanded: 0 });
+    expect(at(2).recent).toEqual({
+      minutes: 6,
+      claimsOpened: 2,
+      checksReported: 2,
+      changesLanded: 0,
+    });
     // After minute 12 the window is minutes 3 to 12: the prelude and minute 0 fell out.
     expect(at(4).recent).toEqual({
       minutes: ACTIVITY_WINDOW_MINUTES,
       claimsOpened: 0,
-      checksRun: 3,
+      checksReported: 3,
       changesLanded: 0,
     });
     // The totals still count everything.
@@ -125,7 +130,7 @@ describe("boardMetrics", () => {
     expect(boardMetrics(fold(events)).recent).toEqual({
       minutes: 2,
       claimsOpened: 2,
-      checksRun: 1,
+      checksReported: 1,
       changesLanded: 0,
     });
   });
@@ -149,7 +154,7 @@ describe("boardMetrics", () => {
     expect(metrics.recent).toEqual({
       minutes: ACTIVITY_WINDOW_MINUTES,
       claimsOpened: 0,
-      checksRun: 0,
+      checksReported: 0,
       changesLanded: 0,
     });
   });

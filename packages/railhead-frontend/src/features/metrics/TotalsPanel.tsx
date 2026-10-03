@@ -5,8 +5,8 @@ import { feedView, type BoardFeed, type FeedView } from "../claims/boardFeed";
 import { boardMetrics, type BoardMetrics } from "./metrics";
 
 /**
- * Raw totals counted from the log: questions, human actions, checks including failures, changes
- * landed, active claims and the recent window. Every number is a count of recorded events.
+ * Raw totals counted from the log: questions, human actions, reported checks including failures,
+ * changes landed, active claims and the recent window. Every number is a count of recorded events.
  */
 export const TotalsPanel = ({ feed }: { feed: BoardFeed }) => {
   const headingId = useId();
@@ -94,13 +94,13 @@ const emptyReason = (kind: "halted" | "stale" | "recovered" | "live") => {
 
 const Counts = ({ metrics }: { metrics: BoardMetrics }) => {
   const { checks, recent } = metrics;
-  const checksRun = checks.pass + checks.fail + checks.error;
+  const checksReported = checks.pass + checks.fail + checks.error;
   return (
     <>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2">
         <Count label="Questions asked" value={metrics.questionsAsked} />
         <Count label="Human actions" value={metrics.humanActions} />
-        <Count label="Checks run" value={checksRun} />
+        <Count label="Checks reported" value={checksReported} />
         <Count label="Checks failed" value={checks.fail} />
         <Count label="Checks that could not run" value={checks.error} />
         <Count label="Changes landed" value={metrics.changesLanded} />
@@ -113,11 +113,16 @@ const Counts = ({ metrics }: { metrics: BoardMetrics }) => {
           </Text>
           <dl className="grid grid-cols-3 gap-x-4 gap-y-2">
             <Count label="Claims opened" value={recent.claimsOpened} />
-            <Count label="Checks run" value={recent.checksRun} />
+            <Count label="Checks reported" value={recent.checksReported} />
             <Count label="Changes landed" value={recent.changesLanded} />
           </dl>
         </div>
       )}
+      {/* The log has no event for these yet: casqueblanc/railhead#240. */}
+      <Text variant="secondary">
+        Checks count once they report. A check that times out or is held for a person is not counted
+        yet.
+      </Text>
     </>
   );
 };

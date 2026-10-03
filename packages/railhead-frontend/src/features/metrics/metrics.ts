@@ -14,7 +14,7 @@ export interface RecentActivity {
    */
   minutes: number;
   claimsOpened: number;
-  checksRun: number;
+  checksReported: number;
   changesLanded: number;
 }
 
@@ -24,7 +24,10 @@ export interface BoardMetrics {
   questionsAsked: number;
   /** Events a person recorded: invites, confirmations, revocations, filed issues and decisions. */
   humanActions: number;
-  /** Check results recorded, by result. A failure and a check that could not run both count. */
+  /**
+   * Check results reported, by result. A failure and a check that could not run both count; a
+   * check that timed out or is held for a person has no result in the log and is not counted.
+   */
   checks: Readonly<Record<CheckResult, number>>;
   /** Claims carried by merges that moved main to their candidate. */
   changesLanded: number;
@@ -61,12 +64,12 @@ const recentActivity = (state: BoardState): RecentActivity | null => {
   const activity: RecentActivity = {
     minutes: Math.min(ACTIVITY_WINDOW_MINUTES, spanned),
     claimsOpened: 0,
-    checksRun: 0,
+    checksReported: 0,
     changesLanded: 0,
   };
   for (const minute of state.recent) {
     activity.claimsOpened += minute.claimsOpened;
-    activity.checksRun += minute.checksRun;
+    activity.checksReported += minute.checksReported;
     activity.changesLanded += minute.changesLanded;
   }
   return activity;

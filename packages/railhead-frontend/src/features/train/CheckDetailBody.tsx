@@ -1,9 +1,9 @@
 import { Button, SkeletonLine, Text } from "@cloudflare/kumo";
-import { MAX_CHECK_DETAIL_LOG_BYTES, type CheckDetail } from "@railhead/shared/board-api";
+import { MAX_CHECK_DETAIL_LOG_BYTES } from "@railhead/shared/board-api";
 import type { CheckDetailUnavailableReason } from "../board/boardPorts";
 import { ShortSha } from "../claims/ShortSha";
 import { CHECK_RESULT_BADGE } from "./CheckResultBadge";
-import type { CheckDetailLoad } from "./useCheckDetail";
+import type { CheckDetailLoad, ReportedCheckDetail } from "./useCheckDetail";
 
 const UNAVAILABLE_TEXT: Readonly<Record<CheckDetailUnavailableReason, string>> = {
   offline: "The board is offline. Reconnect to read this run.",
@@ -66,7 +66,7 @@ const Failure = ({
     case "mismatch":
       return (
         <Text variant="secondary">
-          The backend answered for another run or commit, so nothing is shown.
+          The backend's record does not match this run's reported result, so nothing is shown.
         </Text>
       );
     case "invalid_request":
@@ -91,7 +91,7 @@ const Failure = ({
   }
 };
 
-const Detail = ({ detail }: { detail: CheckDetail }) => {
+const Detail = ({ detail }: { detail: ReportedCheckDetail }) => {
   const { state } = detail;
   return (
     <div className="grid gap-3 text-sm">
@@ -118,48 +118,23 @@ const Detail = ({ detail }: { detail: CheckDetail }) => {
           <TextBlock text={detail.command} label="Command" />
         )}
       </div>
-      {state.kind === "held" && (
-        <div className="grid gap-1">
-          <Text>
-            Held for a person: the candidate edits paths the check protects, so nothing ran.
-          </Text>
-          <ul className="grid list-disc gap-1 pl-5">
-            {state.paths.map((path) => (
-              <li key={path} className="break-all font-mono" translate="no">
-                {path}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {state.kind === "started" && (
+      <div className="grid gap-1">
         <Text>
-          Running. Its sandbox stops at{" "}
-          <time dateTime={new Date(state.deadline).toISOString()}>
-            {timeFormat.format(state.deadline)}
+          {CHECK_RESULT_BADGE[state.result].label} at{" "}
+          <time dateTime={new Date(state.finishedAt).toISOString()}>
+            {timeFormat.format(state.finishedAt)}
           </time>
           .
         </Text>
-      )}
-      {state.kind === "reported" && (
-        <div className="grid gap-1">
-          <Text>
-            {CHECK_RESULT_BADGE[state.result].label} at{" "}
-            <time dateTime={new Date(state.finishedAt).toISOString()}>
-              {timeFormat.format(state.finishedAt)}
-            </time>
-            .
-          </Text>
-          <Text variant="secondary">
-            {state.logCut ? `Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB` : "Output"}
-          </Text>
-          {state.logTail === "" ? (
-            <Text variant="secondary">No output.</Text>
-          ) : (
-            <TextBlock text={state.logTail} label="Output" />
-          )}
-        </div>
-      )}
+        <Text variant="secondary">
+          {state.logCut ? `Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB` : "Output"}
+        </Text>
+        {state.logTail === "" ? (
+          <Text variant="secondary">No output.</Text>
+        ) : (
+          <TextBlock text={state.logTail} label="Output" />
+        )}
+      </div>
     </div>
   );
 };

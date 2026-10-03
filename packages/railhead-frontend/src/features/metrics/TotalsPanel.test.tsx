@@ -49,18 +49,22 @@ describe("TotalsPanel", () => {
     expect(counts()).toEqual([
       ["Questions asked", "1"],
       ["Human actions", "7"],
-      ["Checks run", "5"],
+      ["Checks reported", "5"],
       ["Checks failed", "0"],
       ["Checks that could not run", "0"],
       ["Changes landed", "2"],
       ["Active claims", "0"],
       ["Claims opened", "2"],
-      ["Checks run", "5"],
+      ["Checks reported", "5"],
       ["Changes landed", "2"],
     ]);
     expect(text()).toContain("In the last minute of the log");
     expect(text()).toContain(`Counted from events 1–${complete.cursor}.`);
     expect(text()).not.toMatch(/%|per minute|rate/i);
+    expect(text()).not.toContain("Checks run");
+    expect(text()).toContain(
+      "Checks count once they report. A check that times out or is held for a person is not counted yet.",
+    );
   });
 
   it("labels the span from the earliest event when a later one carries an earlier time", async () => {
@@ -79,7 +83,7 @@ describe("TotalsPanel", () => {
     expect(text()).toContain("In the last 2 minutes of the log");
     expect(counts().slice(-3)).toEqual([
       ["Claims opened", "2"],
-      ["Checks run", "1"],
+      ["Checks reported", "1"],
       ["Changes landed", "0"],
     ]);
   });
@@ -102,6 +106,7 @@ describe("TotalsPanel", () => {
 
     expect(text()).toContain("Nothing counted yet");
     expect(counts()).toEqual([]);
+    expect(text()).not.toContain("Checks count once they report");
   });
 
   it("says why nothing is counted when the board halts or misses its first events", async () => {

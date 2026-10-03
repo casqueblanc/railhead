@@ -1,14 +1,30 @@
 import { useEffect, useState } from "react";
-import type { BoardErrorCode, BoardResult, CheckDetail } from "@railhead/shared/board-api";
+import type {
+  BoardErrorCode,
+  BoardResult,
+  CheckDetail,
+  CheckDetailState,
+} from "@railhead/shared/board-api";
 import type { CheckRunId, CommitSha } from "@railhead/shared/events";
 import type { CheckDetailPort, CheckDetailUnavailableReason } from "../board/boardPorts";
+
+/**
+ * A run's detail once it reported. A listed run always has: the backend records the report before
+ * it appends the run's first result to the log.
+ */
+export type ReportedCheckDetail = CheckDetail & {
+  state: Extract<CheckDetailState, { kind: "reported" }>;
+};
 
 /** What the board knows of one run's recorded detail. */
 export type CheckDetailLoad =
   | { kind: "closed" }
   | { kind: "loading" }
-  | { kind: "loaded"; detail: CheckDetail }
-  /** The backend refused, or answered for another run or commit than the one asked about. */
+  | { kind: "loaded"; detail: ReportedCheckDetail }
+  /**
+   * The backend refused, or its answer does not match the listed run: another run or commit, or
+   * no report.
+   */
   | { kind: "failed"; code: BoardErrorCode | "mismatch" }
   /** The board cannot ask right now. */
   | { kind: "unavailable"; reason: CheckDetailUnavailableReason };
@@ -22,7 +38,7 @@ export interface CheckRunKey {
 
 /**
  * Reads the run's detail while `open`. A new result for the run in the log reads it again, so an
- * open detail never keeps showing a run as started after it reported. A loaded answer stays shown
+ * open detail never keeps showing an older answer. A loaded answer stays shown
  * when the session is lost; `onRetry` asks again after a failure.
  */
 export const useCheckDetail = (
@@ -70,8 +86,13 @@ const loadOf = (
 ): CheckDetailLoad => {
   if (!result.ok) return { kind: "failed", code: result.code };
   const detail = result.value;
-  if (detail.checkRunId !== checkRunId || detail.candidate !== candidate) {
+  const { state } = detail;
+  if (
+    detail.checkRunId !== checkRunId ||
+    detail.candidate !== candidate ||
+    state.kind !== "reported"
+  ) {
     return { kind: "failed", code: "mismatch" };
   }
-  return { kind: "loaded", detail };
+  return { kind: "loaded", detail: { ...detail, state } };
 };
