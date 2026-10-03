@@ -163,6 +163,12 @@ const enrolled: BoardResult<{ ownerId: string }> = {
 };
 
 /** An enrollment port that records each token and completed challenge. */
+const CLOSED =
+  "This Railhead already has an owner, or the bootstrap token is wrong. Use an owner passkey you already hold; if none is accepted, ask the operator.";
+
+const UNCONFIRMED =
+  "Enrollment was not confirmed after the passkey was sent. Try again; if enrollment is closed, that does not show this passkey was enrolled, so check it with an owner action.";
+
 const enrollmentPort = (
   completed: () => Promise<BoardResult<{ ownerId: string }>> = async () => enrolled,
   prepared: () => Promise<BoardResult<EnrollmentChallenge>> = async () => ({
@@ -588,9 +594,64 @@ describe("EnrollmentPanel", () => {
       await type(input("Bootstrap token"), "wrong");
       await click(button("Enroll owner passkey"));
 
+      expect(text()).toContain(CLOSED);
+    });
+
+    it("does not treat a closed enrollment after a failed prepare as an enrolled passkey", async () => {
+      const { owner } = recordingOwner(echo);
+      const answers: (() => Promise<BoardResult<EnrollmentChallenge>>)[] = [
+        () => Promise.reject(new Error("response lost")),
+        async () => ({ ok: false, code: "bootstrap_closed", message: "closed" }),
+      ];
+      const { port, tokens, completions } = enrollmentPort(undefined, () => {
+        const answer = answers.shift();
+        if (answer === undefined) throw new Error("unexpected prepare");
+        return answer();
+      });
+      const { authenticator, creations } = fakeAuthenticator();
+      await render(live(fold([])), owner, authenticator, port);
+
+      await type(input("Bootstrap token"), "wrong");
+      await click(button("Enroll owner passkey"));
       expect(text()).toContain(
-        "The owner passkey is already enrolled, or the bootstrap token is wrong.",
+        "Enrollment failed before the passkey was sent. Nothing was enrolled. Try again.",
       );
+
+      await click(button("Enroll owner passkey"));
+      expect(tokens).toEqual(["wrong", "wrong"]);
+      expect(creations).toHaveLength(0);
+      expect(completions).toEqual([]);
+      expect(text()).toContain(CLOSED);
+      expect(text()).not.toContain("passkey was enrolled");
+      expect(text()).not.toContain("Owner passkey enrolled.");
+    });
+
+    it("leaves an unconfirmed completion uncertain when enrollment then reports closed", async () => {
+      const { owner } = recordingOwner(echo);
+      const prepares: (() => Promise<BoardResult<EnrollmentChallenge>>)[] = [
+        async () => ({ ok: true, value: enrollmentChallenge() }),
+        async () => ({ ok: false, code: "bootstrap_closed", message: "closed" }),
+      ];
+      const { port, completions } = enrollmentPort(
+        () => Promise.reject(new Error("response lost")),
+        () => {
+          const answer = prepares.shift();
+          if (answer === undefined) throw new Error("unexpected prepare");
+          return answer();
+        },
+      );
+      await render(live(fold([])), owner, fakeAuthenticator().authenticator, port);
+
+      await type(input("Bootstrap token"), "deploy-token");
+      await click(button("Enroll owner passkey"));
+      expect(completions).toEqual(["enr_1"]);
+      expect(text()).toContain(UNCONFIRMED);
+
+      await click(button("Enroll owner passkey"));
+      expect(completions).toEqual(["enr_1"]);
+      expect(text()).toContain(CLOSED);
+      expect(text()).not.toContain("passkey was enrolled");
+      expect(text()).not.toContain("Owner passkey enrolled.");
     });
 
     it("says why enrollment is unavailable, even while the board is loading", async () => {
@@ -669,9 +730,7 @@ describe("EnrollmentPanel", () => {
         await act(async () => completing.resolve(enrolled));
 
         expect(text()).not.toContain("Owner passkey enrolled.");
-        expect(text()).toContain(
-          "The board lost its connection after the passkey was sent. Try again; if enrollment is closed, the passkey was enrolled.",
-        );
+        expect(text()).toContain(`The board lost its connection. ${UNCONFIRMED}`);
 
         await click(button("Enroll owner passkey"));
         expect(second.tokens).toEqual(["deploy-token"]);

@@ -2,7 +2,12 @@ import { Button, Input, Text } from "@cloudflare/kumo";
 import { useId, useState, type FormEvent } from "react";
 import type { EnrollmentPort } from "../board/boardPorts";
 import { BlockedNote } from "./BlockedNote";
-import { enrollOwner, type AvailableEnrollmentPort, type BootstrapOutcome } from "./ownerBootstrap";
+import {
+  enrollOwner,
+  UNCONFIRMED_ENROLLMENT,
+  type AvailableEnrollmentPort,
+  type BootstrapOutcome,
+} from "./ownerBootstrap";
 import type { EnrollmentBlock } from "./ownerActions";
 import { usePortAttempt } from "./usePortAttempt";
 import type { Authenticator } from "./webauthn";
@@ -103,7 +108,7 @@ export const OwnerPasskeySetup = ({ enrollment, authenticator }: OwnerPasskeySet
             {state.kind === "withdrawn" && (
               <Text variant="error" DANGEROUS_className="break-words">
                 {state.sent
-                  ? "The board lost its connection after the passkey was sent. Try again; if enrollment is closed, the passkey was enrolled."
+                  ? `The board lost its connection. ${UNCONFIRMED_ENROLLMENT}`
                   : "Stopped: the board lost its connection before the passkey was sent. Nothing was enrolled."}
               </Text>
             )}

@@ -151,7 +151,7 @@ export const failureMessage = (code: BoardErrorCode): string => {
     case "not_found":
       return "The repository is not available to this board.";
     case "bootstrap_closed":
-      return "The owner passkey is already enrolled, or the bootstrap token is wrong.";
+      return "This Railhead already has an owner, or the bootstrap token is wrong. Use an owner passkey you already hold; if none is accepted, ask the operator.";
     case "cursor_ahead":
     case "internal":
       return "The backend failed. Check the agents list, then try again.";

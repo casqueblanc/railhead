@@ -7,11 +7,19 @@
 // The board can lose its session, or the panel can unmount, while enrollment waits on the backend
 // or the passkey. The caller then aborts the attempt: the prompt is cancelled where the browser
 // allows, and nothing more is sent after the abort.
+//
+// The backend answers `bootstrap_closed` both for a wrong token and once an owner exists, so a
+// closed enrollment never shows that a particular passkey was enrolled. When the outcome of a sent
+// passkey is unknown, the owner checks it with an owner action instead.
 
 import type { UserId } from "@railhead/shared/events";
 import type { EnrollmentPort } from "../board/boardPorts";
 import { failureMessage, unreachable, type AttemptControl } from "./ownerActions";
 import { registerPasskey, type Authenticator } from "./webauthn";
+
+/** What to tell the owner when a sent passkey may or may not have been enrolled. */
+export const UNCONFIRMED_ENROLLMENT =
+  "Enrollment was not confirmed after the passkey was sent. Try again; if enrollment is closed, that does not show this passkey was enrolled, so check it with an owner action.";
 
 /** The callbacks of an available enrollment port. */
 export type AvailableEnrollmentPort = Extract<EnrollmentPort, { kind: "available" }>;
@@ -39,6 +47,7 @@ export const enrollOwner = async (
   control: AttemptControl,
 ): Promise<BootstrapOutcome> => {
   const { signal } = control;
+  let sent = false;
   try {
     const prepared = await enrollment.onPrepareEnrollment(bootstrapToken);
     if (signal.aborted) return { kind: "withdrawn", sent: false };
@@ -54,6 +63,7 @@ export const enrollOwner = async (
       default:
         return unreachable(registered);
     }
+    sent = true;
     control.onSent();
     const completed = await enrollment.onCompleteEnrollment(
       prepared.value.challengeId,
@@ -65,8 +75,9 @@ export const enrollOwner = async (
   } catch {
     return {
       kind: "failed",
-      message:
-        "Enrollment was not confirmed. Try again; if enrollment is closed, the passkey was enrolled.",
+      message: sent
+        ? UNCONFIRMED_ENROLLMENT
+        : "Enrollment failed before the passkey was sent. Nothing was enrolled. Try again.",
     };
   }
 };
