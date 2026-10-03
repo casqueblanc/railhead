@@ -40,9 +40,15 @@ export const useCheckDetail = (
   useEffect(() => {
     if (!open || onReadCheck === null || answered) return;
     let current = true;
-    void onReadCheck(checkRunId).then((result) => {
-      if (current) setSettled({ key, load: loadOf(result, checkRunId, candidate) });
-    });
+    // The live port never rejects; any other port that does is shown as a failed read.
+    void onReadCheck(checkRunId).then(
+      (result) => {
+        if (current) setSettled({ key, load: loadOf(result, checkRunId, candidate) });
+      },
+      () => {
+        if (current) setSettled({ key, load: { kind: "failed", code: "internal" } });
+      },
+    );
     return () => {
       current = false;
     };

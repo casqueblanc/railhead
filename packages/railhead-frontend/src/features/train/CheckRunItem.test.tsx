@@ -206,6 +206,16 @@ describe("check runs in the train section", () => {
     expect(container.querySelector("pre[aria-label=Command]")).not.toBeNull();
   });
 
+  it("shows a read that rejects as a failed read", async () => {
+    await render(feedOf(failingLog), {
+      kind: "available",
+      onReadCheck: () => Promise.reject(new Error("session broken")),
+    });
+    await openDetail();
+
+    expect(text()).toContain("The run could not be read.");
+  });
+
   it("reads an open run again when the log records another result for it", async () => {
     await render(feedOf(failingLog));
     await openDetail();
