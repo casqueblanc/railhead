@@ -119,16 +119,41 @@ export interface MergePort {
 
 /** Starts trusted check runs. Results arrive later through `TrainPort.recordCheck`. */
 export interface CheckPort {
+  /**
+   * The check definitions stored in `main`, the main commit a candidate is composed on. Each one's
+   * `source` is `main`; nothing is read from the candidate.
+   */
+  definitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
   /** Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. */
   start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
 }
 
-/** The train's queue and its check bookkeeping. */
+/** A persisted check attempt and the report recorded for it, if one has been. */
+export interface AttemptOutcome {
+  /** The attempt. */
+  attempt: CheckAttempt;
+  /** The report `recordCheck` accepted for it, or `null` while none has been. */
+  report: CheckReport | null;
+}
+
+/**
+ * The train's queue and its check bookkeeping.
+ *
+ * `attemptOutcome` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
+ * until that transaction commits. Read outside a transaction, the result may already be stale.
+ */
 export interface TrainPort {
   /** Queues a ready pin. A repeat for the same claim and generation is a no-op. */
   enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
   recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>>;
+  /**
+   * The persisted attempt and its recorded report, or `null` when the attempt is unknown or the
+   * module is missing; `null` is a refusal. Call it only inside the caller's transaction; an `await`
+   * between this read and the write that relies on it is not a fence.
+   */
+  attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
 }
 
 /**
@@ -163,8 +188,13 @@ export interface MainRefPort {
   update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>>;
 }
 
-/** Publishes authorized intents to main. */
+/** Publishes authorized intents to main, and reads main for the modules that do not hold its ref. */
 export interface MainWriterPort {
+  /**
+   * Main's current commit. It only reads: main may move as soon as it returns, so a caller records
+   * it as an expected commit that a later conditional update checks, never as main itself.
+   */
+  head(): Promise<PortResult<CommitSha>>;
   /**
    * Moves main for an authorized intent and records the outcome. An intent left `authorized` by an
    * earlier attempt is reconciled by reading main before any new write.
