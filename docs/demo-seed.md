@@ -61,3 +61,5 @@ The owner's steps for H03 ([#68](https://github.com/casqueblanc/railhead/issues/
 To start over, reset `demo/upload-app` through the same entry and repeat from step 2. The bundle can be reused: the head changes only when the app or a file the overlay copies changes.
 
 Measurement-only edit 1.
+
+Measurement-only edit 2.
