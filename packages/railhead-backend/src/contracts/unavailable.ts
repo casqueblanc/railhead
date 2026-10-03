@@ -56,6 +56,9 @@ export const unavailableInbox: InboxPort = {
   pending: refuse("inbox"),
   digest: refuse("inbox"),
   ack: refuse("inbox"),
+  queue: () => {
+    throw new UnavailableError("inbox");
+  },
   readyGate: refuse("inbox"),
 };
 
@@ -115,6 +118,21 @@ export const unavailableMainWriter: MainWriterPort = {
   head: refuse("mainWriter"),
   publish: refuse("mainWriter"),
 };
+
+/**
+ * Thrown by a synchronous method of a missing module, inside its caller's transaction, so the
+ * caller's whole change rolls back.
+ */
+export class UnavailableError extends Error {
+  /** The missing module. */
+  readonly port: PortName;
+
+  constructor(port: PortName) {
+    super(`The ${port} module is not available.`);
+    this.name = "UnavailableError";
+    this.port = port;
+  }
+}
 
 /** A method that ignores its arguments and refuses. */
 function refuse(port: PortName): () => Promise<PortFailure> {
