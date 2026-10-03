@@ -11,7 +11,7 @@
 //! identity to storing the session, and a second join for the name stops before sending anything.
 //! Before its first request a join for a name without an identity also stores the enrollment's
 //! scope, the origin, repository, invite and key, and removes it only once it logs in or the
-//! backend refuses the join. Until then
+//! backend refuses that first request; a refused resume keeps it. Until then
 //! a join with any other invite under the name stops before sending anything, so a response lost
 //! to a crash or a dropped connection leaves an enrollment the same invite resumes.
 //!
@@ -137,9 +137,11 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
         {
             Ok(success) => success,
             Err(error) => {
-                // A refused join registered nothing: the enrollment is over, and a key made for it
-                // is not anyone's yet. Any other failure may have registered it, so both stay.
-                if is_refusal(&error) {
+                // A refused first request registered nothing: the enrollment this run reserved
+                // is over, and a key made for it is not anyone's yet. A refused resume proves only
+                // that this request registered nothing, so an earlier one may have: its
+                // reservation and key stay. Any other failure may have registered it, so both stay.
+                if is_refusal(&error) && started.is_none() {
                     store.remove_enrollment(&name)?;
                     if made == KeyOrigin::Created {
                         store.remove(&name, SecretKind::SigningKey)?;

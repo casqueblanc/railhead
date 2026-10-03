@@ -874,6 +874,17 @@ async fn a_failed_rejoin_leaves_a_joined_agent_able_to_log_in() -> anyhow::Resul
     Ok(())
 }
 
+/// Asserts that a join under `atlas` at `world` stops on the name before sending anything.
+async fn refuses_atlas(world: &World) -> anyhow::Result<()> {
+    let run = join(world, &["--name", "atlas"])?;
+    assert_eq!(
+        run.json()?.pointer("/error/code"),
+        Some(&json!("invalid_input"))
+    );
+    assert_eq!(world.requests("/join").await, 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_lost_first_answer_leaves_an_enrollment_only_its_invite_resumes() -> anyhow::Result<()> {
     let world = world().await?;
@@ -928,9 +939,30 @@ async fn a_lost_first_answer_leaves_an_enrollment_only_its_invite_resumes() -> a
         0
     );
 
-    // Without the key it registered, the enrollment cannot resume, and no other key is sent.
+    // A refused retry of the same invite proves only that it registered nothing itself: the
+    // earlier enrollment keeps its scope and key, and the name stays closed to other invites.
     let key = dir.join("key");
     let saved = fs::read(&key)?;
+    let wrong = format!(
+        "{}/join/casqueblanc/demo/{INVITE}#{}",
+        world.origin(),
+        "A".repeat(43)
+    );
+    let refused = rh(
+        &world,
+        &["--json", "join", wrong.as_str(), "--name", "atlas"],
+    )?;
+    assert_eq!(
+        refused.json()?.pointer("/error/code"),
+        Some(&json!("join_refused"))
+    );
+    assert_eq!(world.requests("/join").await, 2);
+    let record: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    assert_eq!(record, scope, "a refused retry dropped the enrollment");
+    assert_eq!(fs::read(&key)?, saved, "a refused retry dropped the key");
+    refuses_atlas(&other).await?;
+
+    // Without the key it registered, the enrollment cannot resume, and no other key is sent.
     fs::remove_file(&key)?;
     let keyless = join(&world, &["--name", "atlas"])?;
     assert_eq!(
@@ -938,7 +970,7 @@ async fn a_lost_first_answer_leaves_an_enrollment_only_its_invite_resumes() -> a
         Some(&json!("store"))
     );
     assert!(!key.exists(), "a key made for the refused resume was kept");
-    assert_eq!(world.requests("/join").await, 1);
+    assert_eq!(world.requests("/join").await, 2);
     fs::write(&key, &saved)?;
     #[cfg(unix)]
     fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
@@ -958,12 +990,7 @@ async fn a_lost_first_answer_leaves_an_enrollment_only_its_invite_resumes() -> a
     assert_eq!(stored(&world, "atlas")?.get("token"), Some(&json!(TOKEN)));
 
     // Once it is finished, the name still belongs to the first origin.
-    let after = join(&other, &["--name", "atlas"])?;
-    assert_eq!(
-        after.json()?.pointer("/error/code"),
-        Some(&json!("invalid_input"))
-    );
-    assert_eq!(other.requests("/join").await, 0);
+    refuses_atlas(&other).await?;
     Ok(())
 }
 
