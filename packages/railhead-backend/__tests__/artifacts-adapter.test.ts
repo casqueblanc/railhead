@@ -15,7 +15,7 @@ import {
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
 import type { ArtifactsPort, MintCutoff } from "../src/contracts/artifacts";
-import type { RepoStorage } from "../src/repo/storage";
+import { migrate, type RepoStorage } from "../src/repo/storage";
 
 const REPO = "rep_aaaaaaaaaaaa";
 const OTHER_REPO = "rep_bbbbbbbbbbbb";
@@ -81,9 +81,18 @@ function forkRows(
 function debtRows(storage: RepoStorage): { repo: string; owed_until: number; retry_at: number }[] {
   return storage.sql
     .exec<{ repo: string; owed_until: number; retry_at: number }>(
-      "SELECT repo, owed_until, retry_at FROM artifacts_token_debts ORDER BY repo",
+      "SELECT repo, owed_until, retry_at FROM artifacts_sweep_debts ORDER BY repo, id",
     )
     .toArray();
+}
+
+function cutoffRows(storage: RepoStorage): MintCutoff[] {
+  return storage.sql
+    .exec<{ cutoff_seq: number; cutoff_started_at: number }>(
+      "SELECT cutoff_seq, cutoff_started_at FROM artifacts_sweep_debts ORDER BY id",
+    )
+    .toArray()
+    .map((row) => ({ seq: row.cutoff_seq, startedAt: row.cutoff_started_at }));
 }
 
 function mintRows(storage: RepoStorage): number {
@@ -789,6 +798,28 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("owes a sweep under the racing mint's cutoff when its cleanup listing is partial", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const paused = fake.pauseNext("createTokenBeforeMint");
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      const seq = cutoffNow().seq;
+      expect(await port.revokeTokens(repo, cutoffNow())).toMatchObject({ ok: false, code: "busy" });
+      fake.failRevocations(1);
+      fake.pageTokens(1, "creation");
+      paused.release();
+
+      expect(await minting).toMatchObject({ ok: false, code: "internal" });
+      // The token stays live behind the page, so the fork owes a sweep covering that mint alone.
+      expect(fake.liveTokens(repo)).toHaveLength(1);
+      expect(cutoffRows(storage).map((cutoff) => cutoff.seq)).toEqual([seq]);
+      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({ code: "busy" });
+    });
+  });
+
   it("drops the fork's cached tokens when a racing mint's cleanup sweeps the fork", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
@@ -1341,6 +1372,160 @@ describe("revocation cutoff", () => {
       expect(fake.accepts(late.plaintext)).toBe(true);
       expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
       expect(fake.accepts(late.plaintext)).toBe(false);
+    });
+  });
+});
+
+describe("debt cutoffs", () => {
+  it("settles a debt under its own cutoff on the next token request, keeping a token minted after it", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const before = await tokenValue(port, repo, "write");
+      const cutoff = cutoffNow();
+      const after = await tokenValue(port, repo, "read");
+
+      // A sweep under the earlier cutoff sees only the revoked initial token: it owes a debt.
+      fake.pageTokens(1, "creation");
+      expect(await port.revokeTokens(repo, cutoff)).toEqual(PENDING_DEBT);
+      expect(cutoffRows(storage)).toEqual([cutoff]);
+
+      // The retry a token request makes revokes what the debt's cutoff covers, and nothing later.
+      fake.pageTokens(null);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+      const renewed = await tokenValue(port, repo, "read");
+      expect(fake.accepts(before)).toBe(false);
+      expect(fake.accepts(after)).toBe(true);
+      expect(fake.accepts(renewed)).toBe(true);
+      expect(debtRows(storage)).toEqual([]);
+    });
+  });
+
+  it("keeps a newer token through a retry whose listing is still partial", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const cutoff = cutoffNow();
+      const after = await tokenValue(port, repo, "write");
+
+      // Live tokens come first, so the newer token is listed but not covered.
+      fake.pageTokens(1, "live-first");
+      expect(await port.revokeTokens(repo, cutoff)).toEqual(PENDING_DEBT);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+      const lists = fake.listTokensCalls;
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(fake.listTokensCalls).toBe(lists + 1);
+      expect(fake.accepts(after)).toBe(true);
+      expect(cutoffRows(storage)).toEqual([cutoff]);
+    });
+  });
+
+  it("sweeps each of several debts under its own cutoff", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const old = fake.mintFor(repo, "write", 3600);
+      fake.advance(MINT_CLOCK_SKEW_MS + 1);
+      const early = cutoffNow();
+      const logged = await tokenValue(port, repo, "write");
+      // Neither cutoff covers the other: one reaches the logged mint, the other later unlogged tokens.
+      const wide = { seq: cutoffNow().seq, startedAt: early.startedAt - MINT_CLOCK_SKEW_MS };
+      const late = { seq: early.seq, startedAt: fake.clock() };
+      const newer = await tokenValue(port, repo, "read");
+
+      fake.pageTokens(1, "creation");
+      expect(await port.revokeTokens(repo, wide)).toEqual(PENDING_DEBT);
+      expect(await port.revokeTokens(repo, late)).toEqual(PENDING_DEBT);
+      expect(cutoffRows(storage)).toEqual([wide, late]);
+
+      // The retry sweeps under each debt's cutoff in turn; the token after both stays live.
+      fake.pageTokens(null);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+      const renewed = await tokenValue(port, repo, "write");
+      expect(fake.accepts(old.plaintext)).toBe(false);
+      expect(fake.accepts(logged)).toBe(false);
+      expect(fake.accepts(newer)).toBe(true);
+      expect(fake.accepts(renewed)).toBe(true);
+      expect(debtRows(storage)).toEqual([]);
+    });
+  });
+
+  it("folds a stale cutoff's debt into a newer one and never clears the newer one from a stale clean sweep", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const stale = cutoffNow();
+      const held = await tokenValue(port, repo, "write");
+      const current = cutoffNow();
+
+      fake.pageTokens(1, "creation");
+      expect(await port.revokeTokens(repo, current)).toEqual(PENDING_DEBT);
+      // The stale attempt's partial result is covered by the newer debt, so no second row exists.
+      expect(await port.revokeTokens(repo, stale)).toEqual(PENDING_DEBT);
+      expect(cutoffRows(storage)).toEqual([current]);
+
+      // A clean sweep under the stale cutoff cannot settle the newer debt.
+      fake.pageTokens(null);
+      expect(await port.revokeTokens(repo, stale)).toEqual(PENDING_DEBT);
+      expect(fake.accepts(held)).toBe(true);
+      expect(cutoffRows(storage)).toEqual([current]);
+
+      // A newer partial cutoff absorbs the older debt, keeping its deadline.
+      const [first] = debtRows(storage);
+      fake.advance(MINUTE);
+      fake.pageTokens(1, "creation");
+      const newest = cutoffNow();
+      expect(await port.revokeTokens(repo, newest)).toEqual(PENDING_DEBT);
+      expect(cutoffRows(storage)).toEqual([newest]);
+      expect(debtRows(storage).map((row) => row.owed_until)).toEqual([first?.owed_until]);
+    });
+  });
+
+  it("gives a debt recorded before debts kept a cutoff every mint logged so far", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    await runInDurableObject(stub, async (_instance, state) => {
+      const storage = state.storage;
+      // The adapter's schema before debts kept a cutoff.
+      migrate(storage, "artifacts", [
+        `CREATE TABLE artifacts_forks (
+          claim_id TEXT PRIMARY KEY, repo TEXT NOT NULL UNIQUE, base TEXT NOT NULL, head TEXT,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'ready')), created_at INTEGER NOT NULL
+        ) STRICT`,
+        `CREATE TABLE artifacts_mints (
+          id TEXT PRIMARY KEY, repo TEXT NOT NULL, started_at INTEGER NOT NULL, ttl_ms INTEGER NOT NULL
+        ) STRICT`,
+        `CREATE TABLE artifacts_token_debts (
+          repo TEXT PRIMARY KEY, owed_until INTEGER NOT NULL, retry_at INTEGER NOT NULL,
+          generation INTEGER NOT NULL
+        ) STRICT`,
+        `CREATE TABLE artifacts_mint_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, mint_id TEXT NOT NULL UNIQUE, repo TEXT NOT NULL,
+          token_id TEXT, keep_until INTEGER NOT NULL
+        ) STRICT`,
+        "CREATE INDEX artifacts_mint_log_by_repo ON artifacts_mint_log (repo, token_id)",
+      ]);
+      storage.sql.exec(
+        "INSERT INTO artifacts_mint_log (mint_id, repo, keep_until) VALUES ('m1', 'f', 1), ('m2', 'f', 1)",
+      );
+      const recordedAt = 1_000_000_000;
+      const owedUntil = recordedAt + 60 * MINUTE + MINT_CLOCK_SKEW_MS;
+      storage.sql.exec(
+        "INSERT INTO artifacts_token_debts VALUES ('f', ?, ?, 4)",
+        owedUntil,
+        recordedAt + TOKEN_DEBT_RETRY_MS,
+      );
+
+      const fake = new FakeArtifacts();
+      createArtifactsAdapter({ repoId: REPO, storage, clock: fake.clock, namespace: fake }, FAST);
+      expect(cutoffRows(storage)).toEqual([{ seq: 2, startedAt: recordedAt }]);
+      expect(debtRows(storage)).toEqual([
+        { repo: "f", owed_until: owedUntil, retry_at: recordedAt + TOKEN_DEBT_RETRY_MS },
+      ]);
+      expect(
+        storage.sql
+          .exec("SELECT name FROM sqlite_master WHERE name = 'artifacts_token_debts'")
+          .toArray(),
+      ).toEqual([]);
     });
   });
 });

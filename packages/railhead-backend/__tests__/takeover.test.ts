@@ -8,6 +8,7 @@ import {
   createArtifactsAdapter,
   forkRepoName,
   mainRepoName,
+  TOKEN_DEBT_RETRY_MS,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
 import type { ArtifactsPort, ArtifactsRepoName } from "../src/contracts/artifacts";
@@ -340,6 +341,10 @@ function stored(
 }
 
 /** Every stored revocation barrier, by claim and attempt. */
+function debts(sql: SqlStorage): number {
+  return sql.exec("SELECT 1 FROM artifacts_sweep_debts").toArray().length;
+}
+
 function barriers(sql: SqlStorage): { claim_id: string; attempt: number; expires_at: number }[] {
   return sql
     .exec<{ claim_id: string; attempt: number; expires_at: number }>(
@@ -1927,6 +1932,58 @@ describe("revocation at ready", () => {
       await setup.port.resume();
       expect(setup.revoked).toEqual([fork, fork]);
       expect(setup.fake.accepts(token.value.value)).toBe(true);
+    });
+  });
+
+  it("keeps a new holder's token when a lost sweep resumes on a partial listing and its debt is retried", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      // Sweep A begins, recording its barrier and cutoff, then stalls before reaching Artifacts.
+      const stalled = deferred();
+      setup.holdRevocation = () => stalled.promise;
+      const pending = setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+
+      // The Repo restarts, a newer decision reopens the claim, and sweep B replaces A's barrier.
+      const rebooted = setup.rebooted();
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      setup.fake.advance(REVOCATION_BARRIER_MS);
+      await rebooted.claims.resume();
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+
+      // The newer holder is granted the push and a token minted for it.
+      expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+      const token = await rebooted.artifacts.token(fork, "write", 120_000);
+      if (!token.ok) throw new Error(`token refused: ${token.code}`);
+
+      // A resumes while the listing shows only the revoked initial token: its sweep owes a debt.
+      setup.fake.pageTokens(1, "creation");
+      stalled.resolve();
+      expectFailure(await pending, "busy");
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+      expect(debts(setup.sql)).toBe(1);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+
+      // The holder's next token request retries the debt under A's cutoff, which the token is after.
+      setup.fake.pageTokens(null);
+      setup.fake.advance(TOKEN_DEBT_RETRY_MS);
+      const again = await rebooted.artifacts.token(fork, "write", 120_000);
+      if (!again.ok) throw new Error(`token refused: ${again.code}`);
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+      expect(setup.fake.accepts(again.value.value)).toBe(true);
+      expect(debts(setup.sql)).toBe(0);
+      expect(setup.revoked).toEqual([fork, fork]);
     });
   });
 

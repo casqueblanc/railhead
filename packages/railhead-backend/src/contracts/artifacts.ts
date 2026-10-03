@@ -66,6 +66,8 @@ export interface ArtifactsPort {
    * mint has not answered. It is not a revocation: a caller must not grant a new holder write access
    * to `repo` until a later call returns `revoked`. After a partial listing `token` refuses `repo`,
    * and that debt ends by itself at most `MAX_TOKEN_TTL_MS` plus clock skew after it was recorded.
+   * The debt keeps `cutoff`, and every later sweep for it, a token request's included, revokes only
+   * what `cutoff` covers.
    */
   revokeTokens(repo: ArtifactsRepoName, cutoff: MintCutoff): Promise<PortResult<TokenRevocation>>;
 }
