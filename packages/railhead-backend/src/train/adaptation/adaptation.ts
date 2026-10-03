@@ -14,17 +14,19 @@
 //
 // The train calls `owe` inside the transaction that marks a batch landed, so the landing and its
 // pending adaptation commit together: if `owe` throws, the landing rolls back and the train lands it
-// again. It then calls `recordLanding`, which settles the landing in its own nested transaction, so
-// a refusal or a throw rolls back only the settlement and leaves the landing pending. A pending
+// again. `owe` also snapshots, in the same row, the decision versions and options each landed claim
+// depends on, while the claims are still held. It then calls `recordLanding`, which settles the
+// landing in its own nested transaction, so a refusal or a throw rolls back only the settlement and
+// leaves the landing pending. A pending
 // landing (its settlement threw, a reader reported unknown, or the intent has not settled) is
 // retried with a doubling backoff by the Repo's alarm through `resume`, and by later landings, up
 // to `MAX_SETTLE_TRIES` times. A landing that settled stays settled; `adapted` re-checks the decision's
 // current version and option every time it is read, so a later supersession removes the adaptation
 // without rewriting it.
 //
-// The decisions module answers a claim's requirements only while the claim is held, so a merged
-// claim's requirements cannot be read again later. The claims of a landing and the decision versions
-// each one depended on are captured when the landing is first read and kept.
+// The decisions module answers a claim's requirements only while the claim is held, so a merged or
+// expired claim's requirements cannot be read again later. Settlement therefore reads a landed
+// claim's dependencies only from the snapshot `owe` took, never from the decisions module.
 //
 // No event is appended: the board derives the same verdict from `train.intent`, `train.check` and
 // `train.main`. Nothing here reads repository content.
@@ -37,6 +39,7 @@ import {
   type DecisionRef,
   type IntentId,
 } from "@railhead/shared/events";
+import type { ClaimPin } from "../../contracts/claims";
 import type { AttemptOutcome, MergeIntentRecord } from "../../contracts/train";
 import { atomically, migrate, type RepoStorage } from "../../repo/storage";
 
@@ -58,9 +61,12 @@ export const RETRY_MAX_MS = 5 * 60_000;
 /** Released schema steps. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [
   // One row per landed intent. `outcome` is `NULL` while the landing is pending, and `next_at` is
-  // when a pending landing is next due.
+  // when a pending landing is next due. `claims` is the JSON snapshot of the claims the intent
+  // merged and, for each, the decision versions and options it depended on when it landed, or
+  // `null` when they could not be read; such a claim never adapts from this landing.
   `CREATE TABLE adaptation_landings (
     intent_id TEXT PRIMARY KEY,
+    claims TEXT NOT NULL,
     outcome TEXT,
     tries INTEGER NOT NULL CHECK (tries >= 0),
     next_at INTEGER NOT NULL,
@@ -68,15 +74,6 @@ const MIGRATIONS: readonly string[] = [
     updated_at INTEGER NOT NULL
   ) STRICT`,
   "CREATE INDEX adaptation_landings_pending ON adaptation_landings (next_at) WHERE outcome IS NULL",
-  // The claims a landing merged, and the decision versions each depended on when it landed, as JSON.
-  // `decisions` is `NULL` when they could not be read; such a claim never adapts from this landing.
-  `CREATE TABLE adaptation_claims (
-    intent_id TEXT NOT NULL,
-    claim_id TEXT NOT NULL,
-    decisions TEXT,
-    PRIMARY KEY (intent_id, claim_id)
-  ) STRICT`,
-  "CREATE INDEX adaptation_claims_claim ON adaptation_claims (claim_id)",
   // One row per claim and decision version proven on a landed commit.
   `CREATE TABLE adaptations (
     claim_id TEXT NOT NULL,
@@ -124,12 +121,22 @@ const OUTCOMES: ReadonlySet<string> = new Set<LandingOutcome>([
   "unknown",
 ]);
 
+/** A decision version a claim depended on when it landed, and the option that version chose. */
+export interface LandedDependency {
+  /** The decision. */
+  decisionId: DecisionId;
+  /** The version the claim depended on. */
+  version: number;
+  /** The key of the option that version chose. */
+  option: string;
+}
+
 /** One claim a landing merged. */
 export interface LandedClaim {
   /** The claim. */
   claimId: ClaimId;
-  /** The decision versions it depended on when it landed, or `null` when they were unknown. */
-  decisions: DecisionRef[] | null;
+  /** What it depended on when it landed, or `null` when that was unknown. */
+  decisions: LandedDependency[] | null;
 }
 
 /** What the adaptation module recorded about one landing. */
@@ -138,7 +145,7 @@ export interface LandingRecord {
   intentId: IntentId;
   /** How it settled, or `null` while pending. */
   outcome: LandingOutcome | null;
-  /** The claims it merged, once its intent was read; empty before. */
+  /** The claims it merged and what each depended on, snapshotted when the landing was owed. */
   claims: LandedClaim[];
   /** How many times it was read without settling. */
   tries: number;
@@ -152,15 +159,19 @@ export interface LandingRecord {
  */
 export interface AdaptationPort {
   /**
-   * Records, inside the caller's transaction, that the intent landed and its adaptation is owed,
-   * and asks the Repo's alarm to settle it. A repeat records nothing more. Throws on an id that is
-   * not an intent, so the caller's landing rolls back rather than landing without it.
+   * Records, inside the caller's transaction, that the intent landed `pins` and its adaptation is
+   * owed, snapshots what each pinned claim depends on, and asks the Repo's alarm to settle it. Call
+   * it while the claims are still held. A repeat records nothing more. Throws on an id that is not
+   * an intent, or when a reader throws, so the caller's landing rolls back rather than landing
+   * without it.
    */
-  owe(intentId: IntentId): void;
+  owe(intentId: IntentId, pins: readonly ClaimPin[]): void;
   /**
-   * Records that the intent landed and settles it, together with up to `MAX_SETTLE_PER_CALL - 1`
-   * other pending landings that are due, least recently due first. Returns the intent's record, or `null` for an
-   * id that is not an intent. A settlement that throws rolls back alone and stays pending.
+   * Owes the landing of the intent's pins as `owe` does unless it was owed already, then settles
+   * it, together with up to `MAX_SETTLE_PER_CALL - 1` other pending landings that are due, least
+   * recently due first. Returns the intent's record, or `null` for an id that is not an intent or
+   * an intent neither owed nor recorded. A settlement that throws rolls back alone and stays
+   * pending.
    */
   recordLanding(intentId: IntentId): LandingRecord | null;
   /**
@@ -183,7 +194,10 @@ export interface AdaptationReaders {
   intent(intentId: IntentId): MergeIntentRecord | null;
   /** The persisted check attempt and its report, or `null` when unknown. */
   attemptOutcome(attemptId: string): AttemptOutcome | null;
-  /** The decision versions the claim must satisfy now, or `null` when unknown. */
+  /**
+   * The decision versions the claim must satisfy now, or `null` when unknown. Read only when a
+   * landing is owed: a merged claim reads as unknown.
+   */
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
   /** The decision's current version and chosen option, or `null` when unknown. */
   currentDecision(decisionId: DecisionId): { version: number; option: string } | null;
@@ -203,13 +217,9 @@ export interface AdaptationDeps {
 
 interface LandingRow extends Record<string, SqlStorageValue> {
   intent_id: string;
+  claims: string;
   outcome: string | null;
   tries: number;
-}
-
-interface ClaimRow extends Record<string, SqlStorageValue> {
-  claim_id: string;
-  decisions: string | null;
 }
 
 interface AdaptationRow extends Record<string, SqlStorageValue> {
@@ -237,23 +247,10 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
   function landingRow(intentId: IntentId): LandingRow | undefined {
     return sql
       .exec<LandingRow>(
-        "SELECT intent_id, outcome, tries FROM adaptation_landings WHERE intent_id = ?",
+        "SELECT intent_id, claims, outcome, tries FROM adaptation_landings WHERE intent_id = ?",
         intentId,
       )
       .toArray()[0];
-  }
-
-  function claimsOf(intentId: IntentId): LandedClaim[] {
-    return sql
-      .exec<ClaimRow>(
-        "SELECT claim_id, decisions FROM adaptation_claims WHERE intent_id = ? ORDER BY rowid",
-        intentId,
-      )
-      .toArray()
-      .map((row) => ({
-        claimId: row.claim_id,
-        decisions: row.decisions === null ? null : readRefs(row.decisions),
-      }));
   }
 
   function record(intentId: IntentId): LandingRecord | null {
@@ -262,36 +259,55 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     return {
       intentId,
       outcome: row.outcome === null ? null : readOutcome(row.outcome),
-      claims: claimsOf(intentId),
+      claims: readClaims(row.claims),
       tries: row.tries,
     };
   }
 
-  // Captures the claims an intent merged and what each depended on, once.
-  function capture(intent: MergeIntentRecord): void {
-    const captured = sql
-      .exec("SELECT 1 FROM adaptation_claims WHERE intent_id = ? LIMIT 1", intent.intentId)
-      .toArray();
-    if (captured.length > 0) return;
-    for (const pin of intent.pins) {
-      const refs = readers().currentVersions(pin.claimId);
-      sql.exec(
-        "INSERT INTO adaptation_claims (intent_id, claim_id, decisions) VALUES (?, ?, ?)",
-        intent.intentId,
-        pin.claimId,
-        refs === null ? null : JSON.stringify(refs),
-      );
-    }
+  // What each pinned claim depends on now. Called only while the landing is owed.
+  function snapshot(pins: readonly ClaimPin[]): LandedClaim[] {
+    return pins.map((pin) => ({
+      claimId: pin.claimId,
+      decisions: dependenciesOf(pin.claimId),
+    }));
   }
 
-  // Decides a landing, writing its claims and adaptations. `PENDING` writes only the capture.
-  function decide(intentId: IntentId): LandingOutcome | typeof PENDING {
+  // The claim's current decision versions with the option each chose, or `null` when unknown.
+  function dependenciesOf(claimId: ClaimId): LandedDependency[] | null {
+    const refs = readers().currentVersions(claimId);
+    if (refs === null) return null;
+    const dependencies: LandedDependency[] = [];
+    for (const { decisionId, version } of refs) {
+      const current = readers().currentDecision(decisionId);
+      if (current === null || current.version !== version) return null;
+      dependencies.push({ decisionId, version, option: current.option });
+    }
+    return dependencies;
+  }
+
+  // Records the landing of `pins` as owed and due now with its snapshot, once.
+  function insertOwed(intentId: IntentId, pins: readonly ClaimPin[]): void {
+    const claims = JSON.stringify(snapshot(pins));
+    const now = clock();
+    sql.exec(
+      `INSERT INTO adaptation_landings
+         (intent_id, claims, outcome, tries, next_at, recorded_at, updated_at)
+       VALUES (?, ?, NULL, 0, ?, ?, ?)`,
+      intentId,
+      claims,
+      now,
+      now,
+      now,
+    );
+  }
+
+  // Decides a landing from its snapshot, writing its adaptations. `PENDING` writes nothing.
+  function decide(intentId: IntentId, claims: LandedClaim[]): LandingOutcome | typeof PENDING {
     const intent = readers().intent(intentId);
     if (intent === null || intent.intentId !== intentId) return PENDING;
     const landed = landedCommit(intent);
     if (landed === PENDING) return PENDING;
     if (landed === "not_landed") return "not_landed";
-    capture(intent);
 
     const outcome = readers().attemptOutcome(intent.checkAttemptId);
     if (outcome === null) return PENDING;
@@ -311,10 +327,14 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     if (current.version !== version) return "obsolete_version";
     if (current.option !== acceptance.option) return "wrong_option";
 
-    const dependent = claimsOf(intentId).filter(
+    const dependent = claims.filter(
       (claim) =>
-        claim.decisions?.some((ref) => ref.decisionId === decisionId && ref.version === version) ===
-        true,
+        claim.decisions?.some(
+          (dependency) =>
+            dependency.decisionId === decisionId &&
+            dependency.version === version &&
+            dependency.option === acceptance.option,
+        ) === true,
     );
     if (dependent.length === 0) return "no_dependent_claim";
     const now = clock();
@@ -335,20 +355,6 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
       );
     }
     return "adapted";
-  }
-
-  // Records the landing as owed and due now, once.
-  function insertOwed(intentId: IntentId): void {
-    const now = clock();
-    sql.exec(
-      `INSERT OR IGNORE INTO adaptation_landings
-         (intent_id, outcome, tries, next_at, recorded_at, updated_at)
-       VALUES (?, NULL, 0, ?, ?, ?)`,
-      intentId,
-      now,
-      now,
-      now,
-    );
   }
 
   // Pending landings that are due, least recently due first, besides `except`.
@@ -382,7 +388,9 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     let outcome: LandingOutcome | typeof PENDING;
     try {
       outcome = atomically(storage, () => {
-        const decided = decide(intentId);
+        const row = landingRow(intentId);
+        if (row === undefined) return PENDING;
+        const decided = decide(intentId, readClaims(row.claims));
         if (decided !== PENDING) {
           sql.exec(
             "UPDATE adaptation_landings SET outcome = ?, updated_at = ? WHERE intent_id = ?",
@@ -421,18 +429,22 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
   }
 
   return {
-    owe(intentId) {
+    owe(intentId, pins) {
       if (!isId("intent", intentId)) {
         throw new AdaptationWriteError("the landing does not name an intent");
       }
-      insertOwed(intentId);
+      if (landingRow(intentId) === undefined) insertOwed(intentId, pins);
       requestWake();
     },
 
     recordLanding(intentId) {
       if (!isId("intent", intentId)) return null;
       return atomically(storage, () => {
-        insertOwed(intentId);
+        if (landingRow(intentId) === undefined) {
+          const intent = readers().intent(intentId);
+          if (intent === null || intent.intentId !== intentId) return null;
+          insertOwed(intentId, intent.pins);
+        }
         const others = due(MAX_SETTLE_PER_CALL - 1, intentId);
         if (landingRow(intentId)?.outcome === null) settle(intentId);
         for (const other of others) settle(other);
@@ -501,22 +513,40 @@ function isOutcome(value: string): value is LandingOutcome {
   return OUTCOMES.has(value);
 }
 
-function readRefs(json: string): DecisionRef[] {
+function readClaims(json: string): LandedClaim[] {
   const value: unknown = JSON.parse(json);
-  if (!Array.isArray(value)) throw new Error("stored landed decisions are not a list");
+  if (!Array.isArray(value)) throw new Error("a stored landing snapshot is not a list");
   return value.map((item: unknown) => {
     if (
       typeof item !== "object" ||
       item === null ||
-      !("decisionId" in item) ||
-      !("version" in item) ||
-      typeof item.decisionId !== "string" ||
-      typeof item.version !== "number"
+      !("claimId" in item) ||
+      !("decisions" in item) ||
+      typeof item.claimId !== "string"
     ) {
-      throw new Error("a stored landed decision is not a decision version");
+      throw new Error("a stored landed claim is not a claim");
     }
-    return { decisionId: item.decisionId, version: item.version };
+    const { decisions } = item;
+    if (decisions === null) return { claimId: item.claimId, decisions: null };
+    if (!Array.isArray(decisions)) throw new Error("a stored landed claim has no decision list");
+    return { claimId: item.claimId, decisions: decisions.map(readDependency) };
   });
+}
+
+function readDependency(item: unknown): LandedDependency {
+  if (
+    typeof item !== "object" ||
+    item === null ||
+    !("decisionId" in item) ||
+    !("version" in item) ||
+    !("option" in item) ||
+    typeof item.decisionId !== "string" ||
+    typeof item.version !== "number" ||
+    typeof item.option !== "string"
+  ) {
+    throw new Error("a stored landed decision is not a decision version");
+  }
+  return { decisionId: item.decisionId, version: item.version, option: item.option };
 }
 
 function unreachable(value: never): never {

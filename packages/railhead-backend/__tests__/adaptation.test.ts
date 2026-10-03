@@ -1,6 +1,7 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import type { ClaimView } from "@railhead/shared/agent-api";
 import type { CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import { fail, ok } from "../src/contracts/result";
@@ -13,6 +14,7 @@ import type {
 } from "../src/contracts/train";
 import { unavailableChecks } from "../src/contracts/unavailable";
 import { adaptation as adaptationModule } from "../src/modules/adaptation/entry";
+import { createDecisions } from "../src/modules/decisions/decisions";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
@@ -24,6 +26,7 @@ import {
   RETRY_MAX_MS,
   type AdaptationPort,
   type AdaptationReaders,
+  type LandedDependency,
 } from "../src/train/adaptation/adaptation";
 
 const REPO_ID = "rep_adapt0001";
@@ -35,6 +38,8 @@ const ATLAS = "clm_claim001";
 const BIRCH = "clm_claim002";
 const INTENT = "int_intent001";
 const ATTEMPT = "chk_attempt001";
+const AGENT = "agt_atlas01";
+const OWNER = "usr_lemarier";
 
 function sha(digit: string): CommitSha {
   return digit.repeat(40);
@@ -44,12 +49,22 @@ function ref(version: number): DecisionRef {
   return { decisionId: DECISION, version };
 }
 
-function acceptanceCheck(version: number, option: string, source = MAIN): CheckDefinition {
+/** What a claim that depended on `version` of the decision snapshots when it lands. */
+function dep(version: number, option = "chunk"): LandedDependency {
+  return { decisionId: DECISION, version, option };
+}
+
+function acceptanceCheck(
+  version: number,
+  option: string,
+  source = MAIN,
+  decisionId = DECISION,
+): CheckDefinition {
   return {
     name: `accept-${option}`,
     source,
     digest: "d".repeat(64),
-    acceptance: { decision: ref(version), option },
+    acceptance: { decision: { decisionId, version }, option },
   };
 }
 
@@ -147,7 +162,7 @@ interface Harness {
   adaptation: AdaptationPort;
   world: World;
   /** Rows in each adaptation table. */
-  counts(): { landings: number; claims: number; adaptations: number };
+  counts(): { landings: number; adaptations: number };
   /** Every time the module asked the Repo's alarm for, oldest first. */
   wakes: number[];
   /** The clock's current time. */
@@ -177,7 +192,6 @@ async function withAdaptation<R>(
       world,
       counts: () => ({
         landings: count("adaptation_landings"),
-        claims: count("adaptation_claims"),
         adaptations: count("adaptations"),
       }),
       wakes,
@@ -195,14 +209,14 @@ describe("recordLanding", () => {
       expect(adaptation.recordLanding(INTENT)).toEqual({
         intentId: INTENT,
         outcome: "adapted",
-        claims: [{ claimId: ATLAS, decisions: [ref(1)] }],
+        claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
         tries: 0,
       });
       expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
-      expect(counts()).toEqual({ landings: 1, claims: 1, adaptations: 1 });
+      expect(counts()).toEqual({ landings: 1, adaptations: 1 });
       // A repeat settles nothing again and writes nothing more.
       expect(adaptation.recordLanding(INTENT)?.outcome).toBe("adapted");
-      expect(counts()).toEqual({ landings: 1, claims: 1, adaptations: 1 });
+      expect(counts()).toEqual({ landings: 1, adaptations: 1 });
     });
   });
 
@@ -299,7 +313,7 @@ describe("recordLanding", () => {
       world.intents.set(INTENT, intentOf({ pins: [pinOf(ATLAS), pinOf(BIRCH)] }));
       world.versions.set(BIRCH, []);
       expect(adaptation.recordLanding(INTENT)?.claims).toEqual([
-        { claimId: ATLAS, decisions: [ref(1)] },
+        { claimId: ATLAS, decisions: [dep(1)] },
         { claimId: BIRCH, decisions: [] },
       ]);
       expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
@@ -317,7 +331,7 @@ describe("recordLanding", () => {
         expect(adaptation.recordLanding(id)).toBeNull();
         expect(adaptation.landing(id)).toBeNull();
       }
-      expect(counts()).toEqual({ landings: 0, claims: 0, adaptations: 0 });
+      expect(counts()).toEqual({ landings: 0, adaptations: 0 });
     });
   });
 });
@@ -329,13 +343,29 @@ describe("retained dependencies of merged claims", () => {
       world.outcomes.delete(ATTEMPT);
       expect(adaptation.recordLanding(INTENT)).toMatchObject({
         outcome: null,
-        claims: [{ claimId: ATLAS, decisions: [ref(1)] }],
+        claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
       });
-      // The claim merged, so the decisions module no longer answers for it.
-      world.versions.delete(ATLAS);
+      // The claim merged, so the decisions module no longer answers for it; settling reads only
+      // the snapshot, so even a different answer would not change the outcome.
+      world.versions.set(ATLAS, []);
       world.outcomes.set(ATTEMPT, { attempt: attemptOf(), report: reportOf() });
       expect(adaptation.recordLanding(INTENT)?.outcome).toBe("adapted");
       expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
+    });
+  });
+
+  it("never adapts a claim that depended on the version only after it landed", async () => {
+    await withAdaptation(({ adaptation, world }) => {
+      world.versions.set(ATLAS, []);
+      world.outcomes.delete(ATTEMPT);
+      expect(adaptation.recordLanding(INTENT)).toMatchObject({
+        outcome: null,
+        claims: [{ claimId: ATLAS, decisions: [] }],
+      });
+      world.versions.set(ATLAS, [ref(1)]);
+      world.outcomes.set(ATTEMPT, { attempt: attemptOf(), report: reportOf() });
+      expect(adaptation.recordLanding(INTENT)?.outcome).toBe("no_dependent_claim");
+      expect(adaptation.adapted(ATLAS, DECISION)).toBe(false);
     });
   });
 
@@ -388,10 +418,15 @@ describe("failures", () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await withAdaptation(({ adaptation, world, counts, advance }) => {
+        adaptation.owe(INTENT, [pinOf(ATLAS)]);
         world.failure = new TypeError("storage gone");
-        expect(adaptation.recordLanding(INTENT)).toMatchObject({ outcome: null, tries: 1 });
+        expect(adaptation.recordLanding(INTENT)).toMatchObject({
+          outcome: null,
+          claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
+          tries: 1,
+        });
         // The throw rolled back everything the settlement wrote; only the pending row is kept.
-        expect(counts()).toEqual({ landings: 1, claims: 0, adaptations: 0 });
+        expect(counts()).toEqual({ landings: 1, adaptations: 0 });
         expect(errors).toHaveBeenCalledWith(
           JSON.stringify({ event: "adaptation.settle_failed", intent: INTENT, error: "TypeError" }),
         );
@@ -410,6 +445,7 @@ describe("failures", () => {
 
   it("keeps a landing pending while the decision is unknown", async () => {
     await withAdaptation(({ adaptation, world }) => {
+      adaptation.owe(INTENT, [pinOf(ATLAS)]);
       world.decisions.delete(DECISION);
       expect(adaptation.recordLanding(INTENT)).toMatchObject({ outcome: null, tries: 1 });
       world.decisions.set(DECISION, { version: 1, option: "chunk" });
@@ -419,6 +455,7 @@ describe("failures", () => {
 
   it("settles a landing as unknown after the last try", async () => {
     await withAdaptation(({ adaptation, world }) => {
+      adaptation.owe(INTENT, [pinOf(ATLAS)]);
       world.intents.delete(INTENT);
       for (let attempt = 1; attempt < MAX_SETTLE_TRIES; attempt += 1) {
         expect(adaptation.recordLanding(INTENT)).toMatchObject({ outcome: null, tries: attempt });
@@ -439,6 +476,8 @@ describe("failures", () => {
         { length: MAX_SETTLE_PER_CALL + 2 },
         (_, n) => `int_pending${String(n).padStart(3, "0")}`,
       );
+      const authorized = { status: "authorized", attempts: 0, main: null } as const;
+      for (const id of ids) world.intents.set(id, intentOf({ intentId: id, ...authorized }));
       for (const id of ids) adaptation.recordLanding(id);
       for (const id of ids) world.intents.set(id, intentOf({ intentId: id }));
       advance(RETRY_MAX_MS);
@@ -454,10 +493,14 @@ describe("failures", () => {
 describe("owe and resume", () => {
   it("owes a landing due now, and the alarm settles it", async () => {
     await withAdaptation(async ({ adaptation, counts, wakes, now }) => {
-      adaptation.owe(INTENT);
-      adaptation.owe(INTENT);
-      expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 0, claims: [] });
-      expect(counts()).toEqual({ landings: 1, claims: 0, adaptations: 0 });
+      adaptation.owe(INTENT, [pinOf(ATLAS)]);
+      adaptation.owe(INTENT, [pinOf(ATLAS)]);
+      expect(adaptation.landing(INTENT)).toMatchObject({
+        outcome: null,
+        tries: 0,
+        claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
+      });
+      expect(counts()).toEqual({ landings: 1, adaptations: 0 });
       expect(wakes.at(-1)).toBeLessThanOrEqual(now());
       await adaptation.resume();
       expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
@@ -465,20 +508,42 @@ describe("owe and resume", () => {
     });
   });
 
+  it("throws when a reader throws while owing, writing nothing", async () => {
+    await withAdaptation(({ adaptation, world, counts, wakes }) => {
+      world.failure = new TypeError("storage gone");
+      expect(() => adaptation.owe(INTENT, [pinOf(ATLAS)])).toThrow("storage gone");
+      expect(counts()).toEqual({ landings: 0, adaptations: 0 });
+      expect(wakes).toEqual([]);
+    });
+  });
+
+  it("owes a landing with no pins, which settles with no dependent claim", async () => {
+    await withAdaptation(async ({ adaptation }) => {
+      adaptation.owe(INTENT, []);
+      expect(adaptation.landing(INTENT)?.claims).toEqual([]);
+      await adaptation.resume();
+      expect(adaptation.landing(INTENT)?.outcome).toBe("no_dependent_claim");
+    });
+  });
+
   it("refuses to owe an id that is not an intent, writing nothing", async () => {
     await withAdaptation(({ adaptation, counts, wakes }) => {
       for (const id of ["", "clm_claim001", "int_bad id!"]) {
-        expect(() => adaptation.owe(id)).toThrow("the landing does not name an intent");
+        expect(() => adaptation.owe(id, [pinOf(ATLAS)])).toThrow(
+          "the landing does not name an intent",
+        );
       }
-      expect(counts()).toEqual({ landings: 0, claims: 0, adaptations: 0 });
+      // An intent neither owed nor recorded cannot be settled.
+      expect(adaptation.recordLanding("int_unknown01")).toBeNull();
+      expect(counts()).toEqual({ landings: 0, adaptations: 0 });
       expect(wakes).toEqual([]);
     });
   });
 
   it("backs off a pending landing and retries it only once it is due", async () => {
     await withAdaptation(async ({ adaptation, world, wakes, now, advance }) => {
+      adaptation.owe(INTENT, [pinOf(ATLAS)]);
       world.decisions.delete(DECISION);
-      adaptation.owe(INTENT);
       await adaptation.resume();
       expect(adaptation.landing(INTENT)).toMatchObject({ outcome: null, tries: 1 });
       const due = wakes.at(-1);
@@ -500,12 +565,15 @@ describe("owe and resume", () => {
   });
 
   it("settles at most a bounded number of due landings per alarm", async () => {
-    await withAdaptation(async ({ adaptation }) => {
+    await withAdaptation(async ({ adaptation, world }) => {
       const ids = Array.from(
         { length: MAX_SETTLE_PER_CALL + 1 },
         (_, n) => `int_pending${String(n).padStart(3, "0")}`,
       );
-      for (const id of ids) adaptation.owe(id);
+      for (const id of ids) {
+        world.intents.set(id, intentOf({ intentId: id, status: "authorized", main: null }));
+        adaptation.owe(id, [pinOf(ATLAS)]);
+      }
       await adaptation.resume();
       const tried = ids.filter((id) => (adaptation.landing(id)?.tries ?? 0) > 0);
       expect(tried).toHaveLength(MAX_SETTLE_PER_CALL);
@@ -513,14 +581,98 @@ describe("owe and resume", () => {
   });
 });
 
-/** A train over fakes that lands one pin, with the given adaptation. */
+/** The Repo context of one `runInDurableObject` body, with a clock that starts at `start`. */
+function repoContext(
+  storage: DurableObjectStorage,
+  start: number,
+): { context: RepoContext; wakes: number[] } {
+  let now = start;
+  const wakes: number[] = [];
+  const log = EventLog.open(storage, REPO_ID, () => now);
+  return {
+    context: {
+      repoId: REPO_ID,
+      storage,
+      log,
+      clock: () => (now += 1),
+      env,
+      wake: (at) => wakes.push(at),
+    },
+    wakes,
+  };
+}
+
+/** ATLAS held at generation 1 by `AGENT`, as the claims module reports it. */
+const HELD: ClaimView = {
+  claimId: ATLAS,
+  issueId: "iss_issue001",
+  generation: 1,
+  base: MAIN,
+  state: "working",
+  readyCommit: null,
+  originUrl: "https://railhead.test/acme/demo/claims/clm_claim001.git",
+  upstreamUrl: "https://railhead.test/acme/demo.git",
+  task: { title: "Upload", body: "" },
+};
+
+/** Claims ports in which ATLAS is held at generation 1. */
+function holding(claims: RepoPorts["claims"]): RepoPorts["claims"] {
+  return {
+    ...claims,
+    pin: async () => ok(pinOf(ATLAS)),
+    activeClaim: async () => ok(HELD),
+    currentGeneration: (claimId) => (claimId === ATLAS ? 1 : null),
+  };
+}
+
+/**
+ * Records, through the real decisions module, a decision ATLAS asked for and its first version
+ * choosing `chunk`, and returns the decision's id.
+ */
+async function decideChunk(stub: DurableObjectStub): Promise<string> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const { context } = repoContext(state.storage, 500);
+    const composed = composeRepo(context);
+    const ports = (): RepoPorts => ({ ...composed, claims: holding(composed.claims) });
+    const decisions = createDecisions(context, ports);
+    const agent = { kind: "agent", agentId: AGENT, ownerId: OWNER, repoId: REPO_ID } as const;
+    const asked = await decisions.ask(agent, ATLAS, {
+      generation: 1,
+      requestId: "req_upload0000000001",
+      text: "Should uploads above 10 MB be rejected or chunked?",
+      options: [
+        { key: "reject", label: "Reject them" },
+        { key: "chunk", label: "Upload them in chunks" },
+      ],
+      scope: ["src/upload.ts"],
+    });
+    if (!asked.ok) throw new Error(`ask failed: ${asked.code}`);
+    const { decisionId } = asked.value;
+    const recorded = await decisions.record({
+      kind: "human",
+      userId: OWNER,
+      repoId: REPO_ID,
+      grantId: "chl_grant0001",
+      action: { kind: "decision.record", decisionId, option: "chunk", expectedVersion: null },
+    });
+    if (!recorded.ok) throw new Error(`record failed: ${recorded.code}`);
+    return decisionId;
+  });
+}
+
+/**
+ * A train over fakes that lands one pin, with the given adaptation. With `decisionId`, the real
+ * decisions module answers, ATLAS is held, and the check accepts that decision.
+ */
 async function land(
   stub: DurableObjectStub,
   world: World,
   adaptationOf: (context: RepoContext, ports: () => RepoPorts) => AdaptationPort,
+  decisionId: string | null = null,
 ): Promise<{
   states: string[];
   landing: ReturnType<AdaptationPort["landing"]>;
+  intent: MergeIntentRecord | null;
   wakes: number[];
 }> {
   return runInDurableObject(stub, async (_instance, state) => {
@@ -543,21 +695,29 @@ async function land(
     const ports = (): RepoPorts => current;
     current = {
       ...composed,
-      claims: { ...composed.claims, pin: async () => ok(pinOf(ATLAS)) },
-      decisions: {
-        ...composed.decisions,
-        requirements: async () => ok([ref(1)]),
-        currentVersions: (claimId) => world.versions.get(claimId) ?? null,
-        currentDecision: (decisionId) => world.decisions.get(decisionId) ?? null,
-      },
+      claims:
+        decisionId === null
+          ? { ...composed.claims, pin: async () => ok(pinOf(ATLAS)) }
+          : holding(composed.claims),
+      decisions:
+        decisionId === null
+          ? {
+              ...composed.decisions,
+              requirements: async () => ok([ref(1)]),
+              currentVersions: (claimId) => world.versions.get(claimId) ?? null,
+              currentDecision: (id) => world.decisions.get(id) ?? null,
+            }
+          : createDecisions(context, ports),
       merge: { compose: async () => ok({ kind: "clean", candidate: LANDED }) },
       checks: {
-        definitions: async (source) => ok([acceptanceCheck(1, "chunk", source)]),
+        definitions: async (source) =>
+          ok([acceptanceCheck(1, "chunk", source, decisionId ?? DECISION)]),
         start: async (attempt) => {
           started.push(attempt);
           return ok({ attemptId: attempt.attemptId });
         },
         report: unavailableChecks.report,
+        detail: unavailableChecks.detail,
       },
       authorization: {
         authorize: async (attemptId) => {
@@ -600,6 +760,7 @@ async function land(
     return {
       states: train.entries(8).map((entry) => entry.state),
       landing: port.landing(INTENT),
+      intent: intents.get(INTENT) ?? null,
       wakes,
     };
   });
@@ -615,7 +776,7 @@ describe("train landing", () => {
     expect(result.states).toEqual(["landed"]);
     expect(result.landing).toMatchObject({
       outcome: "adapted",
-      claims: [{ claimId: ATLAS, decisions: [ref(1)] }],
+      claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
     });
   });
 
@@ -631,13 +792,21 @@ describe("train landing", () => {
         },
       }));
       expect(throwing.states).toEqual(["landed"]);
-      expect(throwing.landing).toEqual({ intentId: INTENT, outcome: null, claims: [], tries: 0 });
+      // The landing owed its adaptation with the claim's dependencies snapshotted.
+      expect(throwing.landing).toEqual({
+        intentId: INTENT,
+        outcome: null,
+        claims: [{ claimId: ATLAS, decisions: [dep(1)] }],
+        tries: 0,
+      });
       expect(throwing.wakes.length).toBeGreaterThan(0);
       expect(errors).toHaveBeenCalledWith(
         JSON.stringify({ event: "train.adaptation_failed", repo: REPO_ID, error: "TypeError" }),
       );
 
-      // The Repo restarts; its alarm resumes the owed landing from storage alone.
+      // The claim merges, so its requirements read as unknown, and the Repo restarts; its alarm
+      // resumes the owed landing from storage alone.
+      world.versions.delete(ATLAS);
       await evictDurableObject(stub);
       await withAdaptation(
         async ({ adaptation, advance }) => {
@@ -650,6 +819,57 @@ describe("train landing", () => {
         stub,
         world,
       );
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("adapts from the landing's snapshot after the claim merged and the Repo restarted", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const stub = env.REPO.getByName(crypto.randomUUID());
+      const decisionId = await decideChunk(stub);
+      const throwing = await land(
+        stub,
+        new World(),
+        (context, ports) => ({
+          ...adaptationModule(context, ports),
+          recordLanding: () => {
+            throw new TypeError("adaptation is broken");
+          },
+        }),
+        decisionId,
+      );
+      expect(throwing.states).toEqual(["landed"]);
+      expect(throwing.landing).toEqual({
+        intentId: INTENT,
+        outcome: null,
+        claims: [{ claimId: ATLAS, decisions: [{ decisionId, version: 1, option: "chunk" }] }],
+        tries: 0,
+      });
+      const intent = throwing.intent;
+      if (intent === null) throw new Error("the intent was not recorded");
+
+      await evictDurableObject(stub);
+      await runInDurableObject(stub, async (_instance, state) => {
+        // The restarted Repo's claims module has no current generation for ATLAS, as for a
+        // merged claim; only the intent, which the fake authorization kept in memory, is replayed.
+        const { context } = repoContext(state.storage, Math.max(...throwing.wakes));
+        const composed = composeRepo(context);
+        const ports: RepoPorts = {
+          ...composed,
+          authorization: {
+            ...composed.authorization,
+            record: (intentId) => (intentId === INTENT ? intent : null),
+          },
+        };
+        expect(ports.claims.currentGeneration(ATLAS)).toBeNull();
+        expect(ports.decisions.currentVersions(ATLAS)).toBeNull();
+        const adaptation = adaptationModule(context, () => ports);
+        await adaptation.resume();
+        expect(adaptation.landing(INTENT)?.outcome).toBe("adapted");
+        expect(adaptation.adapted(ATLAS, decisionId)).toBe(true);
+      });
     } finally {
       errors.mockRestore();
     }

@@ -707,7 +707,7 @@ export function createTrain(
       // The adaptation is owed in the landing's own transaction, so neither commits without the
       // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
       // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
-      ports().adaptation.owe(intentId);
+      ports().adaptation.owe(intentId, batch.pins);
       try {
         ports().adaptation.recordLanding(intentId);
       } catch (error) {
