@@ -252,6 +252,7 @@ describe("events on the wire", () => {
     "claim.reopened": true,
     "claim.expired": true,
     "claim.reassigned": true,
+    "claim.adapted": true,
     "question.asked": true,
     "decision.recorded": true,
     "inbox.queued": true,
@@ -476,7 +477,8 @@ describe("unavailable ports", () => {
     ["artifacts.commitExists", () => unavailableArtifacts.commitExists("repo", sha)],
     ["artifacts.token", () => unavailableArtifacts.token("repo", "write", 60_000)],
     ["artifacts.revokeTokens", () => unavailableArtifacts.revokeTokens("repo")],
-    ["merge.compose", () => unavailableMerge.compose(sha, [pin])],
+    ["merge.compose", () => unavailableMerge.compose(sha, [pin], "mrg_attempt1")],
+    ["merge.discard", () => unavailableMerge.discard("mrg_attempt1")],
     [
       "checks.start",
       () =>

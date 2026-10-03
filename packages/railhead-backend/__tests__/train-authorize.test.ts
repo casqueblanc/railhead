@@ -7,7 +7,8 @@ import {
   type ClaimId,
   type DecisionRef,
 } from "@railhead/shared/events";
-import type { ClaimPin } from "../src/contracts/claims";
+import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
+import type { ReadyGate } from "../src/contracts/inbox";
 import type { PortErrorCode, PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -70,14 +71,29 @@ class World implements AuthorizationReaders {
   attempts = new Map<string, { attempt: CheckAttempt; report: CheckReport | null }>();
   generations = new Map<ClaimId, number>();
   versions = new Map<ClaimId, DecisionRef[] | null>();
+  ready = new Map<ClaimId, ReadyPin | null>();
+  /** Each claim's ready gate; a claim missing here is clear. */
+  gates = new Map<ClaimId, ReadyGate | null>();
   calls = 0;
 
   constructor(stored: CheckAttempt = attempt(), stored_report: CheckReport | null = report()) {
     this.attempts.set(stored.attemptId, { attempt: stored, report: stored_report });
-    for (const { claimId: id, generation } of stored.pins) {
-      this.generations.set(id, generation);
-      this.versions.set(id, stored.decisions);
+    for (const stored_pin of stored.pins) {
+      this.generations.set(stored_pin.claimId, stored_pin.generation);
+      this.versions.set(stored_pin.claimId, stored.decisions);
+      this.ready.set(stored_pin.claimId, {
+        pin: stored_pin,
+        episode: 1,
+        decisions: stored.decisions,
+      });
     }
+  }
+
+  /** Records `refs` as the claim's current versions and its pin as marked ready under them. */
+  decide(id: ClaimId, refs: DecisionRef[]): void {
+    this.versions.set(id, refs);
+    const ready = this.ready.get(id);
+    if (ready !== undefined && ready !== null) this.ready.set(id, { ...ready, decisions: refs });
   }
 
   attemptOutcome(attemptId: string): { attempt: CheckAttempt; report: CheckReport | null } | null {
@@ -94,6 +110,18 @@ class World implements AuthorizationReaders {
     this.calls += 1;
     return this.versions.get(id) ?? null;
   }
+
+  readyPin(id: ClaimId): ReadyPin | null {
+    this.calls += 1;
+    return this.ready.get(id) ?? null;
+  }
+
+  readyGateNow(id: ClaimId, generation: number): ReadyGate | null {
+    this.calls += 1;
+    if (this.generations.get(id) !== generation) return null;
+    const gate = this.gates.get(id);
+    return gate === undefined ? { kind: "clear" } : gate;
+  }
 }
 
 /** Readers of a missing module: they know nothing. */
@@ -101,6 +129,8 @@ const UNKNOWN: AuthorizationReaders = {
   attemptOutcome: () => null,
   currentGeneration: () => null,
   currentVersions: () => null,
+  readyPin: () => null,
+  readyGateNow: () => null,
 };
 
 function freshStub(): DurableObjectStub {
@@ -230,8 +260,8 @@ describe("authorize", () => {
 
   it("stores only the decisions current now, dropping one no longer required", async () => {
     const world = new World();
-    world.versions.set(claimId(1), [DEC_FORMAT]);
-    world.versions.set(claimId(2), []);
+    world.decide(claimId(1), [DEC_FORMAT]);
+    world.decide(claimId(2), []);
     await withHarness(world, async (h) => {
       const result = await h.authorize();
       expect(result).toEqual({ ok: true, value: { ...expectedRecord(), decisions: [DEC_FORMAT] } });
@@ -309,6 +339,49 @@ describe("authorize fences claim generations", () => {
       expect(await h.authorize()).toEqual({ ok: true, value: expectedRecord() });
       expect(h.log.head()).toBe(1);
     });
+  });
+});
+
+describe("authorize fences ready pins", () => {
+  it("refuses when a claim is no longer ready, or is ready with another commit", async () => {
+    const world = new World();
+    world.ready.set(claimId(1), null);
+    await withHarness(world, async (h) => {
+      await expectRefused(h, "decision_superseded");
+      world.ready.set(claimId(1), {
+        pin: { ...pin(1), commit: "9".repeat(40) },
+        episode: 2,
+        decisions: [],
+      });
+      await expectRefused(h, "decision_superseded");
+    });
+  });
+
+  it("refuses a pin marked ready under an older version than the check was scheduled under", async () => {
+    // The attempt and the current state name version 2, but the pin was marked ready under 1.
+    const current = { ...DEC_FORMAT, version: 2 };
+    const world = new World(attempt({ decisions: [current, DEC_LIMIT] }));
+    world.ready.set(claimId(1), { pin: pin(1), episode: 1, decisions: [DEC_FORMAT, DEC_LIMIT] });
+    await withHarness(world, (h) => expectRefused(h, "decision_superseded"));
+  });
+});
+
+describe("authorize fences the inbox gate", () => {
+  it("refuses while an item affecting a claim is unacknowledged, then authorizes once it clears", async () => {
+    // A rework obligation under the version the check ran under: no pin or version moved.
+    const world = new World();
+    world.gates.set(claimId(2), { kind: "blocked", items: [7] });
+    await withHarness(world, async (h) => {
+      await expectRefused(h, "unacked_decision");
+      world.gates.delete(claimId(2));
+      expect(await h.authorize()).toEqual({ ok: true, value: expectedRecord() });
+    });
+  });
+
+  it("refuses as unavailable while the inbox cannot answer", async () => {
+    const world = new World();
+    world.gates.set(claimId(1), null);
+    await withHarness(world, (h) => expectRefused(h, "unavailable"));
   });
 });
 

@@ -4,7 +4,7 @@
 import { forkRepoName, mainRepoName } from "../../artifacts/adapter";
 import type { MergePort } from "../../contracts/train";
 import type { ModuleFactory } from "../../repo/composeRepo";
-import { createMerge, mergeAttemptId } from "../../train/merge/compose";
+import { createMerge } from "../../train/merge/compose";
 import { parseRemote, type RemoteLocation } from "../../train/merge/script";
 
 /** Builds the merge module of one repository. */
@@ -21,7 +21,6 @@ export const merge: ModuleFactory<MergePort> = (context, ports) => {
     forkRepo: (claimId) => forkRepoName(context.repoId, claimId),
     commitExists: (repo, commit) => ports().artifacts.commitExists(repo, commit),
     clock: context.clock,
-    attemptId: mergeAttemptId,
   });
 };
 

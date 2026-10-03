@@ -5,9 +5,11 @@
 // storage the safety argument rests on: `MergeIntentRecord` is, and it is written in the Repo
 // transaction that authorizes the merge, before any write to main is attempted.
 
+import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
   CheckRunId,
+  ClaimId,
   CommitSha,
   DecisionRef,
   IntentId,
@@ -66,6 +68,25 @@ export interface CheckReport {
   finishedAt: number;
 }
 
+/**
+ * What the check workflow reports for one run, from outside the sandbox. The checks module accepts
+ * it only for its own started attempt, on the same candidate and definition.
+ */
+export interface CheckRunReport {
+  /** The attempt it reports on. */
+  attemptId: CheckRunId;
+  /** The candidate it ran on. */
+  candidate: CommitSha;
+  /** SHA-256 of the trusted definition the run used. */
+  digest: string;
+  /** The outcome: `fail` only when the check's own command failed, `error` when it could not run. */
+  result: CheckResult;
+  /** The run's output. Untrusted text: stored cut to its end, never logged. */
+  log: string;
+  /** When the run finished. */
+  finishedAt: number;
+}
+
 /** The result of composing pins on main. */
 export type MergeOutcome =
   /** Git merged every pin; `candidate` is the composed commit, published only for checking. */
@@ -112,10 +133,33 @@ export interface MergeIntentRecord {
   updatedAt: number;
 }
 
-/** Composes pins into a candidate in a sandbox. It never writes main. */
+/**
+ * How long after `MergePort.compose` is called it may still publish under its attempt, in
+ * milliseconds. An implementation never pushes later, so a discard after it is final.
+ */
+export const MERGE_PUSH_WINDOW_MS = 90_000;
+
+/**
+ * Composes pins into a candidate in a sandbox. It never writes main.
+ *
+ * Each compose publishes under the candidate prefix of one merge attempt, a `mrg_` ID the caller
+ * chooses and records before calling, so it can discard that prefix whatever the compose's outcome.
+ * A caller gives each compose a fresh attempt and never composes under one it has discarded.
+ */
 export interface MergePort {
-  /** Merges `pins`, in order, onto `expectedMain`. */
-  compose(expectedMain: CommitSha, pins: ClaimPin[]): Promise<PortResult<MergeOutcome>>;
+  /** Merges `pins`, in order, onto `expectedMain`, publishing a clean result under `attempt`. */
+  compose(
+    expectedMain: CommitSha,
+    pins: ClaimPin[],
+    attempt: string,
+  ): Promise<PortResult<MergeOutcome>>;
+  /**
+   * Deletes every ref under `attempt`'s candidate prefix and nothing else. Succeeds once none is
+   * left, including when there was none, so a repeat is harmless; `removed` counts this call's
+   * deletes. A compose under `attempt` may publish until `MERGE_PUSH_WINDOW_MS` after it was
+   * called, so a caller discards an attempt only after that.
+   */
+  discard(attempt: string): Promise<PortResult<{ removed: number }>>;
 }
 
 /** Starts trusted check runs. Results arrive later through `TrainPort.recordCheck`. */
@@ -125,8 +169,24 @@ export interface CheckPort {
    * `source` is `main`; nothing is read from the candidate.
    */
   definitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
-  /** Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. */
+  /**
+   * Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. A
+   * candidate that edits the definition or a path it protects is refused with `check_held` and
+   * never run.
+   */
   start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
+  /**
+   * Records a run's report for its started attempt and passes it to `TrainPort.recordCheck`. A
+   * report for an attempt it did not start, on another candidate or definition, or with another
+   * result than one already recorded, is refused with `check_mismatch`.
+   */
+  report(run: CheckRunReport): Promise<PortResult<CheckAttempt>>;
+  /**
+   * What was recorded for an attempt this module held or started: its candidate, the command its
+   * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its output.
+   * An attempt it never recorded, or no longer keeps, is `not_found`.
+   */
+  detail(attemptId: CheckRunId): Promise<PortResult<CheckDetail>>;
 }
 
 /** A persisted check attempt and the report recorded for it, if one has been. */
@@ -140,7 +200,7 @@ export interface AttemptOutcome {
 /**
  * The train's queue and its check bookkeeping.
  *
- * `attemptOutcome` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * `attemptOutcome` and `holdsLiveEntry` are fence readers: each is synchronous and reads only the Repo's storage, so a
  * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
  * until that transaction commits. Read outside a transaction, the result may already be stale.
  */
@@ -151,13 +211,14 @@ export interface TrainPort {
    * Each call is a new ready episode of the claim, numbered by the claim's `episode`, which the
    * entry records: a pin already waiting is a no-op apart from that number, a waiting entry of the
    * same claim and generation takes the new commit, a dropped or parked one is queued again, a
-   * landed one is queued again with another commit and refused with `decision_superseded` with the
-   * same one, and a batched one takes the new commit and episode once its batch settles. A drive
+   * landed one is queued again with another commit, answered as done for a repeat of the episode it
+   * landed for, and refused with `decision_superseded` for a later episode of the same commit, and a batched one takes the new commit and episode once its batch settles. A drive
    * settles or drops a waiting entry only at the episode it read, so a newer episode is never lost
    * to an older read. Every accepted pin asks for a drive, restarting a wake whose retries ran out.
    * A pin of an older generation than one queued is `stale_generation`. A refusal writes nothing; a
    * missing module throws, so the caller's transaction rolls back. Only the claims module calls it,
-   * in the transaction that records `ready`.
+   * in the transaction that records `ready`, or that answers a repeated `ready` when `holdsLiveEntry`
+   * finds no live entry.
    */
   queue(tx: EventTransaction, pin: ClaimPin, episode: number): PortResult<{ queued: boolean }>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
@@ -168,6 +229,23 @@ export interface TrainPort {
    * between this read and the write that relies on it is not a fence.
    */
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
+  /**
+   * Whether the queue holds a live entry for the claim at `generation`: waiting, batched or parked.
+   * A landed or dropped entry settled an earlier attempt or episode and does not count. `null` when
+   * the module is missing; `null` is a refusal. Call it only inside the caller's transaction. The
+   * claims module reads it when a ready claim is marked ready again, to queue a pin the train no
+   * longer holds.
+   */
+  holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
+  /**
+   * Asks the Repo's alarm again for the wake the train owes, and resolves whether storage holds it:
+   * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is
+   * missing. A wake whose retries ran out owes no alarm unless the active batch's merge intent is
+   * unsettled. The claims module awaits it once `ready` commits, so a `ready` answered with success
+   * never leaves its pin without a scheduled drive, and a `ready` repeated after a failed write asks
+   * again. It writes nothing, so a repeat is harmless.
+   */
+  armWake(): Promise<boolean>;
   /**
    * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
    * for the next wake itself. It never throws for a port's failure.

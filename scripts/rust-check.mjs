@@ -3,6 +3,9 @@
 // failure always fails the root gate. A missing `cargo` is a failure too, never a skip.
 //
 // `--locked` makes Cargo refuse to change `Cargo.lock`, as the pnpm side uses a frozen install.
+//
+// There is no separate `cargo check`: Clippy compiles every target and reports every compiler error
+// a check would, and a check first would only type-check the same targets twice.
 
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -11,9 +14,8 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 
 const steps = [
   ["fmt", "--all", "--check"],
-  ["check", "--workspace", "--all-targets", "--locked"],
-  ["test", "--workspace", "--locked"],
   ["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
+  ["test", "--workspace", "--locked"],
 ];
 
 for (const args of steps) {

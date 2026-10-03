@@ -115,7 +115,7 @@ export async function checkElevenMegabytesRejected(target: UploadTarget): Promis
 /**
  * B: an 11 MB file is accepted in parts and the reassembled file matches the original.
  *
- * The protocol: `POST /api/uploads/chunked` with `{ "size": n }` returns 201 and
+ * The protocol: `POST /api/uploads/chunked` with `{ "size", "sha256" }` returns 201 and
  * `{ "id", "partSize" }`; each part `i` is sent as `PUT /api/uploads/chunked/<id>/parts/<i>`; then
  * `POST /api/uploads/chunked/<id>/complete` returns 201 and `{ "id", "size" }`, and the file reads
  * back from `GET /api/uploads/<id>`.

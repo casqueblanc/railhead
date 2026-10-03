@@ -1287,6 +1287,7 @@ function statusFor(code: PortErrorCode): number {
     case "decision_superseded":
     case "check_mismatch":
     case "check_not_passed":
+    case "check_held":
     case "main_moved":
       return 403;
     default:

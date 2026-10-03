@@ -68,7 +68,7 @@ export const MAX_SYSTEM_QUESTION_KEY_LENGTH = 128;
 /**
  * Questions and decisions. Only a human grant records a decision version.
  *
- * `currentVersions` and `obligations` are fence readers: they are synchronous and read only the
+ * `currentVersions`, `currentDecision` and `obligations` are fence readers: they are synchronous and read only the
  * Repo's storage, so a caller calls them inside its own `log.transaction` or `atomically` body, and
  * what they return holds until that transaction commits. Read outside a transaction, the result may
  * already be stale. `transfer` and `relied` write inside the caller's transaction and throw on
@@ -119,6 +119,13 @@ export interface DecisionsPort {
    * recorded decision version is current only if it appears here, and `null` is a refusal.
    */
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
+  /**
+   * The decision's current version and the key of the option it chose, or `null` when the decision
+   * is unknown, still open, or the module is missing; `null` is a refusal. It reads the decision,
+   * not a claim, so it answers for decisions whose claims have merged. Call it only inside the
+   * caller's transaction.
+   */
+  currentDecision(decisionId: DecisionId): { version: number; option: string } | null;
   /**
    * Moves the claim's dependencies to its new holder inside the caller's transaction, which also
    * records the takeover, and queues to it the current version of each recorded decision: `rework`

@@ -51,6 +51,7 @@ export const unavailableClaims: ClaimsPort = {
   currentGeneration: () => null,
   workingGeneration: () => null,
   workingEpisode: () => null,
+  readyPin: () => null,
   holder: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
@@ -79,6 +80,7 @@ export const unavailableDecisions: DecisionsPort = {
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  currentDecision: () => null,
   transfer: () => {
     throw new UnavailableError("decisions");
   },
@@ -99,12 +101,15 @@ export const unavailableArtifacts: ArtifactsPort = {
 /** Merging while its module is missing. */
 export const unavailableMerge: MergePort = {
   compose: refuse("merge"),
+  discard: refuse("merge"),
 };
 
 /** Checks while their module is missing: nothing runs, so nothing passes. */
 export const unavailableChecks: CheckPort = {
   definitions: refuse("checks"),
   start: refuse("checks"),
+  report: refuse("checks"),
+  detail: refuse("checks"),
 };
 
 /**
@@ -117,6 +122,8 @@ export const unavailableTrain: TrainPort = {
   },
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  holdsLiveEntry: () => null,
+  armWake: async () => false,
   resume: async () => {},
 };
 

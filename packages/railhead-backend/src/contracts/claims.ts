@@ -3,7 +3,7 @@
 // transaction, so a stale owner is refused at the time of use.
 
 import type { ClaimResult, ClaimView, ReadyRequest, ReadyResult } from "@railhead/shared/agent-api";
-import type { ClaimId, CommitSha, IssueId } from "@railhead/shared/events";
+import type { ClaimId, CommitSha, DecisionRef, IssueId } from "@railhead/shared/events";
 import type { ArtifactsRepoName } from "./artifacts";
 import type { InboxTarget } from "./inbox";
 import type { AgentPrincipal, GrantFor } from "./principals";
@@ -17,6 +17,16 @@ export interface ClaimPin {
   generation: number;
   /** The pinned commit. */
   commit: CommitSha;
+}
+
+/** A ready claim's stored pin, as `ClaimsPort.readyPin` reads it. */
+export interface ReadyPin {
+  /** The pin at the claim's current generation. */
+  pin: ClaimPin;
+  /** The ready episode the pin was recorded in. */
+  episode: number;
+  /** The decision versions the pin was recorded under. */
+  decisions: DecisionRef[];
 }
 
 /** What a Git request asks to do. */
@@ -46,7 +56,7 @@ export interface GitGrant {
 /**
  * Issues and claims.
  *
- * `currentGeneration`, `workingGeneration` and `workingEpisode` are fence readers: each is synchronous and reads only
+ * `currentGeneration`, `workingGeneration`, `workingEpisode` and `readyPin` are fence readers: each is synchronous and reads only
  * the Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body,
  * and what it returns holds until that transaction commits. Read outside a transaction, the result may already be stale.
  */
@@ -59,7 +69,8 @@ export interface ClaimsPort {
   claim(agent: AgentPrincipal, issueId: IssueId): Promise<PortResult<ClaimResult>>;
   /**
    * Pins a commit at the agent's current generation. Refuses a stale generation, an unacknowledged
-   * affecting decision, an unknown commit or a different commit after ready.
+   * affecting decision, an unknown commit or a different commit after ready. If the train's alarm
+   * write fails after the pin commits, it fails with `unavailable` and the repeat asks again.
    */
   ready(
     agent: AgentPrincipal,
@@ -90,6 +101,14 @@ export interface ClaimsPort {
    * the push's fence episode. A fence reader like `workingGeneration`.
    */
   workingEpisode(claimId: ClaimId): number | null;
+  /**
+   * The ready claim's pin, episode and recorded decision versions, or `null` once the claim is
+   * anything but ready, such as working, closed or unknown, or for a missing module. A fence reader
+   * like `currentGeneration`: call it inside the caller's transaction. It only reads, so it never
+   * reopens a superseded pin; the caller compares `decisions` with the current versions, and a pin is
+   * mergeable only while they are equal.
+   */
+  readyPin(claimId: ClaimId): ReadyPin | null;
   /**
    * The agent holding the claim and its current generation, or `null` whenever `currentGeneration`
    * is `null`. A fence reader like `currentGeneration`: call it inside the caller's transaction.

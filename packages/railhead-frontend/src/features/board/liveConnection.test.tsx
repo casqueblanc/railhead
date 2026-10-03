@@ -1,9 +1,10 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CheckDetail } from "@railhead/shared/board-api";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
-import { SYNTH_REPO } from "../../../../../fixtures/board/syntheticLog";
+import { SYNTH_REPO, synthCommit } from "../../../../../fixtures/board/syntheticLog";
 import { CALL_DEADLINE_MS } from "../../rpc/deadline";
 import { FakeApi, FakeBoard, type Fault } from "../../rpc/fakeApi";
 import type { RecordDecisionRequest } from "../decisions/decisionActions";
@@ -105,6 +106,12 @@ describe("useLiveBoardPorts", () => {
       signal: new AbortController().signal,
       onSent: () => {},
     });
+  };
+
+  /** Reads a check run through the checks port, failing the test when it is unavailable. */
+  const read = (checkRunId: string) => {
+    if (ports.checks.kind !== "available") throw new Error("checks unavailable");
+    return ports.checks.onReadCheck(checkRunId);
   };
 
   beforeEach(() => {
@@ -444,6 +451,75 @@ describe("useLiveBoardPorts", () => {
       await expire();
 
       expect(await pending).toMatchObject({ ok: false, code: "internal" });
+    });
+  });
+
+  describe("reading a check run", () => {
+    let board: FakeBoard;
+    const DETAIL: CheckDetail = {
+      checkRunId: "chk_synth11",
+      candidate: synthCommit(3),
+      expectedMain: synthCommit(0),
+      definitionDigest: "d".repeat(64),
+      command: "pnpm test",
+      state: {
+        kind: "reported",
+        result: "fail",
+        finishedAt: 1,
+        logTail: "1 failed",
+        logCut: false,
+      },
+    };
+
+    beforeEach(() => {
+      board = new FakeBoard(SYNTH_REPO, LOG);
+      board.checks.set(DETAIL.checkRunId, DETAIL);
+      opens = [board];
+    });
+
+    it("reads what the backend recorded for the run, from the open board", async () => {
+      await start();
+
+      expect(await read("chk_synth11")).toEqual({ ok: true, value: DETAIL });
+      expect(board.checkReads).toEqual(["chk_synth11"]);
+    });
+
+    it("passes on a refusal for a run the backend does not keep", async () => {
+      await start();
+
+      expect(await read("chk_synthgone")).toMatchObject({ ok: false, code: "not_found" });
+    });
+
+    it("turns a call that breaks or never answers into a failure instead of throwing", async () => {
+      await start();
+      board.checkFault = "throw";
+      expect(await read("chk_synth11")).toMatchObject({ ok: false, code: "internal" });
+
+      board.checkFault = null;
+      board.stalls.names.add("checkDetail");
+      vi.useFakeTimers();
+      try {
+        const pending = read("chk_synth11");
+        await expire();
+        expect(await pending).toMatchObject({ ok: false, code: "internal" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("withdraws the read while the session is lost", async () => {
+      await start();
+      await act(async () => session(0).break());
+
+      expect(gateOnConnection(ports).checks).toEqual({ kind: "unavailable", reason: "offline" });
+    });
+
+    it("offers no read before the board opens", async () => {
+      stalled = ["openBoard"];
+      await start();
+
+      expect(ports.checks).toEqual({ kind: "unavailable", reason: "offline" });
+      expect(board.checkReads).toEqual([]);
     });
   });
 

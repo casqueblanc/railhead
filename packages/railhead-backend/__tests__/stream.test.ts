@@ -23,6 +23,7 @@ import {
   MAX_SUBSCRIPTIONS,
   streamPort,
   type StreamListener,
+  type StreamSubscription,
 } from "../src/modules/stream/entry";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
@@ -613,16 +614,13 @@ describe("subscriptions through the Repo binding", () => {
     const { stub, repoId } = await freshRepo();
     const released = new NativeRecorder();
     const handle = value(await stub.subscribe(0, released, null));
-    const others = [];
-    for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
-      others.push(value(await stub.subscribe(0, new NativeRecorder(), null)));
-    }
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     expect(await stub.subscribe(0, new NativeRecorder(), null)).toMatchObject({
       ok: false,
       code: "quota_exceeded",
     });
 
-    // The Repo stays resident through the held stubs, and no event is appended to wake anything.
+    // No event is appended to wake anything: the release alone must free the slot.
     dispose(handle);
     const reused = await subscribeWhenFree(stub);
     await appendIn(stub, repoId, 1);
@@ -633,10 +631,9 @@ describe("subscriptions through the Repo binding", () => {
       ok: false,
       code: "quota_exceeded",
     });
-    for (const other of [reused, ...others]) {
-      await other.cancel();
-      dispose(other);
-    }
+    await reused.cancel();
+    dispose(reused);
+    await freeSlots(taken);
   });
 });
 
@@ -845,34 +842,92 @@ async function waitFor(condition: () => boolean, ms = 5_000): Promise<void> {
   }
 }
 
-/** What the delivery timeout lasts in a test that shortens it. */
-const SHORT_TIMEOUT_MS = 400;
+/** A held delivery timeout. */
+interface HeldTimeout {
+  expired: boolean;
+}
+
+/** Delivery timeouts held and not yet fired or cleared, by id, oldest first. */
+const heldTimeouts = new Map<number, HeldTimeout>();
 
 /**
- * Shortens every timer set for the delivery timeout to `SHORT_TIMEOUT_MS`, in the Repo and the
- * Worker alike. Each timer is still started by the code that sets it, so it fires in that code's
- * context; fake timers cannot do that, as the Repo and the Worker share the test's isolate.
+ * Holds every timer set for the delivery timeout, in the Repo and the Worker alike, until the test
+ * expires it, so a test asserts what holds before a timeout without racing it. The code that sets
+ * a held timer also checks it, on a 1 ms timer, so its callback runs in that code's context; fake
+ * timers cannot do that, as the Repo and the Worker share the test's isolate. The check reads only
+ * whether the test expired the timer, so a loaded machine delays a timeout but never brings it on.
  */
-function shortenDeliveryTimeout(): void {
+function holdDeliveryTimeouts(): void {
   const realSet = globalThis.setTimeout;
-  vi.stubGlobal("setTimeout", (callback: () => void, ms?: number) =>
-    realSet(callback, ms === DELIVERY_TIMEOUT_MS ? SHORT_TIMEOUT_MS : ms),
-  );
+  const realClear = globalThis.clearTimeout;
+  let lastId = 0;
+  vi.stubGlobal("setTimeout", (callback: () => void, ms?: number) => {
+    if (ms !== DELIVERY_TIMEOUT_MS) return realSet(callback, ms);
+    // Below zero, so a held timer's id never matches a real one.
+    lastId -= 1;
+    const id = lastId;
+    const held: HeldTimeout = { expired: false };
+    heldTimeouts.set(id, held);
+    const check = () => {
+      if (heldTimeouts.get(id) !== held) return;
+      if (!held.expired) {
+        realSet(check, 1);
+        return;
+      }
+      heldTimeouts.delete(id);
+      callback();
+    };
+    realSet(check, 1);
+    return id;
+  });
+  vi.stubGlobal("clearTimeout", (id: number | null) => {
+    if (id === null || !heldTimeouts.delete(id)) realClear(id);
+  });
 }
 
-/** Takes `count` of the Repo's slots with native subscriptions the test cancels afterwards. */
-async function takeSlots(stub: DurableObjectStub<Repo>, count: number) {
-  const taken = [];
-  for (let n = 0; n < count; n += 1)
-    taken.push(value(await stub.subscribe(0, new NativeRecorder(), null)));
-  return taken;
-}
-
-async function freeSlots(taken: Awaited<ReturnType<typeof takeSlots>>): Promise<void> {
-  for (const subscription of taken) {
-    await subscription.cancel();
-    dispose(subscription);
+/** Expires the oldest delivery timeout still held; it fires on its next check. */
+function expireOldestTimeout(): void {
+  for (const held of heldTimeouts.values()) {
+    if (held.expired) continue;
+    held.expired = true;
+    return;
   }
+  throw new Error("no delivery timeout is held");
+}
+
+/** Slots taken inside a Repo, to be freed there. */
+interface TakenSlots {
+  stub: DurableObjectStub<Repo>;
+  handles: StreamSubscription[];
+}
+
+/**
+ * Takes `count` of the Repo's slots, inside the Repo, with subscriptions it cancels at once. A
+ * cancelled subscription holds its slot until its handle is released and delivers nothing, so the
+ * slots cost no RPC round trip to take and no work on a commit.
+ */
+async function takeSlots(
+  stub: DurableObjectStub<Repo>,
+  repoId: string,
+  count: number,
+): Promise<TakenSlots> {
+  const handles = await runInDurableObject(stub, async (instance, state) => {
+    const head = EventLog.open(state.storage, repoId).head();
+    const taken = [];
+    for (let n = 0; n < count; n += 1) {
+      const handle = value(await instance.subscribe(head, new Recorder(), null));
+      await handle.cancel();
+      taken.push(handle);
+    }
+    return taken;
+  });
+  return { stub, handles };
+}
+
+async function freeSlots({ stub, handles }: TakenSlots): Promise<void> {
+  await runInDurableObject(stub, () => {
+    for (const handle of handles) dispose(handle);
+  });
 }
 
 /** Subscribes `listener` from `cursor` once the board's last slot frees, retrying for at most `ms`. */
@@ -895,16 +950,17 @@ async function boardSubscribeWhenFree(
 describe("board subscriptions the Repo ends, over the RPC session", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    heldTimeouts.clear();
   });
 
   it("cancels a delivery that timed out on the board's session, and frees its slot", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 1);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;
-    shortenDeliveryTimeout();
+    holdDeliveryTimeouts();
 
     const listeners = [];
     const handles = [];
@@ -919,9 +975,13 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
         code: "quota_exceeded",
       });
 
+      // The Repo's timeout is the oldest: it starts before the Worker forwards the delivery.
+      expireOldestTimeout();
       // The stalled call and the listener are released on the board's session, which stays open.
       await waitFor(() => session.getStats().exports === baseline);
       expect(listener.ends).toEqual(["slow"]);
+      // Every timer the subscription started is cleared, so the next cycle's are the oldest.
+      await waitFor(() => heldTimeouts.size === 0);
     }
     vi.unstubAllGlobals();
     const last = await boardSubscribeWhenFree(board, new ScriptedBoard(async () => {}));
@@ -938,21 +998,23 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
     last[Symbol.dispose]();
     await freeSlots(taken);
     api[Symbol.dispose]();
-  }, 20_000);
+  });
 
   it("cancels an ending that never settles, and frees its slot", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 1);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;
-    shortenDeliveryTimeout();
+    holdDeliveryTimeouts();
 
     for (let cycle = 0; cycle < 3; cycle += 1) {
       const listener = new ScriptedBoard(never, never);
       await boardSubscribeWhenFree(board, listener);
       await waitFor(() => listener.deliveries === 1);
+      // The Repo's delivery timeout, as above.
+      expireOldestTimeout();
       await waitFor(() => listener.ends.length === 1);
       // The stalled delivery is cancelled; the ending is in flight, so the slot is still held.
       await waitFor(() => session.getStats().exports === baseline + 2);
@@ -961,8 +1023,13 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
         code: "quota_exceeded",
       });
 
+      // The ending's timeouts are left, the Repo's and then the Worker's, and both expire.
+      await waitFor(() => heldTimeouts.size === 2);
+      expireOldestTimeout();
+      expireOldestTimeout();
       await waitFor(() => session.getStats().exports === baseline);
       expect(listener.ends).toEqual(["slow"]);
+      await waitFor(() => heldTimeouts.size === 0);
     }
     vi.unstubAllGlobals();
     using last = await boardSubscribeWhenFree(board, new ScriptedBoard(async () => {}));
@@ -970,12 +1037,12 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
     expect(last).toBeDefined();
     await freeSlots(taken);
     api[Symbol.dispose]();
-  }, 20_000);
+  });
 
   it("releases the Repo's side of a subscription whose delivery the board rejected", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 1);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;
@@ -1007,7 +1074,7 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
   it("cancels the stalled delivery of a subscription that fell behind, without waiting it out", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 1);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;
@@ -1068,7 +1135,7 @@ describe("board subscriptions over a log the Repo cannot read", () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 3);
     await setSchemaVersion(stub, 3, 2);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;
@@ -1109,7 +1176,7 @@ describe("board subscriptions over a log the Repo cannot read", () => {
   it("ends an established subscription with restart when a later event is unreadable", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 2);
-    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));
     const baseline = session.getStats().exports;

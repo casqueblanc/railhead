@@ -5,17 +5,23 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
+    types:
+      - checks_requested
 
 permissions:
   contents: read
 
+# Cancels a superseded pull request run and never a `main` or merge-group run; see ci.yml.
 concurrency:
-  group: rust-${{ github.workflow }}-${{ github.ref }}
+  group: rust-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The same gate `pnpm check` runs locally. It needs Node only to run the script, so it skips the
-  # pnpm install the other jobs pay for.
+  # pnpm install the other jobs pay for. On a pull request that changes no Rust input it skips its
+  # remaining steps and still reports success; a push to `main` and a merge group always run it. See
+  # ci.yml.
   check:
     name: Cargo check, test and Clippy
     runs-on: ubuntu-latest
@@ -25,13 +31,30 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
+
+      - name: Detect Rust inputs
+        id: changes
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs rust "$EVENT" >> "$GITHUB_OUTPUT"
 
       # With no argument, rustup installs the toolchain and components rust-toolchain.toml names.
       - name: Install the pinned Rust toolchain
+        if: steps.changes.outputs.run != 'false'
         run: rustup toolchain install
 
+      # Only `main` saves, under a key that does not depend on the job's name, and every pull
+      # request and merge group restores that entry. A cache a pull request saved would be visible
+      # to that pull request alone, and one a merge group saved to nothing at all.
       - name: Cache Cargo registry and build
+        if: steps.changes.outputs.run != 'false'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rust-gate
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run the Rust gate
+        if: steps.changes.outputs.run != 'false'
         run: node scripts/rust-check.mjs

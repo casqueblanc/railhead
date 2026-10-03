@@ -957,7 +957,7 @@ async function withRepoOwner(
       log,
       clock: () => clock.now,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const grants: Dispatch[] = [];
     const ports = recordingPorts(
@@ -1387,8 +1387,11 @@ describe("owner actions", () => {
 
   it("issues challenges to any caller without storing them, and still serves the owner", async () => {
     await withRepoOwner(async ({ owner, auth, userHandle, grants, state }) => {
-      // Far more than any open-challenge quota would have allowed.
-      for (let n = 0; n < 200; n += 1) value(await owner.prepare(REVOKE));
+      // More than the 32 open challenges the removed quota allowed, as many as the RPC test floods.
+      // Issued together: each prepare reads the enrolled credential from the `Owner` object, and a
+      // long run of round trips in sequence passed the test timeout on a loaded machine.
+      const issued = await Promise.all(Array.from({ length: 40 }, () => owner.prepare(REVOKE)));
+      expect(new Set(issued.map((result) => value(result).challengeId)).size).toBe(40);
       expect(rows(state, "owner_spent_challenge")).toBe(0);
       expect(rows(state, "owner_seal_key")).toBe(1);
       const challenge = value(await owner.prepare(REVOKE));
@@ -1547,7 +1550,7 @@ describe("owner actions", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
-        wake: () => {},
+        wake: async () => true,
       };
       const owner = createOwner(context, () => composeRepo(context), {
         instance: env.OWNER.getByName(unique("owner-")),

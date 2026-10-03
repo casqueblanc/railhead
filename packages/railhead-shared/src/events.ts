@@ -224,6 +224,13 @@ export type EventPayload =
       type: "claim.reassigned";
       data: { claimId: ClaimId; from: AgentId; to: AgentId; generation: number };
     }
+  | {
+      // The claim's work landed by `intentId` passed the acceptance check of `decision` on the
+      // landed commit, and the claim depended on that version when it landed. It stays adapted only
+      // while `decision` is the decision's current version.
+      type: "claim.adapted";
+      data: { claimId: ClaimId; intentId: IntentId; decision: DecisionRef };
+    }
   // Decisions
   | {
       type: "question.asked";
@@ -331,6 +338,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "claim.reopened",
   "claim.expired",
   "claim.reassigned",
+  "claim.adapted",
   "inbox.queued",
   "inbox.delivered",
   "train.check",
@@ -488,6 +496,11 @@ function validatePayload(event: EventPayload): void {
       if (event.data.from === event.data.to) {
         throw new Error("a claim cannot be reassigned to the agent that holds it");
       }
+      return;
+    case "claim.adapted":
+      requireId("claim", event.data.claimId, "claimId");
+      requireId("intent", event.data.intentId, "intentId");
+      requireDecisionRef(event.data.decision, "decision");
       return;
     case "question.asked":
       requireId("question", event.data.questionId, "questionId");

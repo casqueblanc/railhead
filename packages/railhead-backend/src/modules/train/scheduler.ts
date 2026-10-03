@@ -10,9 +10,10 @@
 // while the train reads main never schedules a pin that decision superseded. While a pin's current
 // versions cannot be read, no batch is formed and the drive stops blocked, for the alarm to retry.
 //
-// A pin is queued only inside the transaction that records `ready`, and the Repo's alarm drives
-// the train once it commits; each `recordCheck` drives it at once. A drive runs until the train
-// waits for a check report or a port, or the queue is empty. Whenever storage holds work the train
+// A pin is queued only inside the transaction that records `ready`, or that repeats it for a pin
+// with no entry, and the Repo's alarm drives the train once it commits; each `recordCheck` drives
+// it at once. A drive runs until the train waits for a check report or a port, or the queue is
+// empty. Whenever storage holds work the train
 // owes (an active batch or a queued pin), it also holds a wake row and the Repo's alarm is set for
 // it. `recordDebt` is the only writer of that row, and it writes inside the transaction that
 // creates or restarts the debt: accepting work records it due now with the alarm due now, and
@@ -29,6 +30,7 @@
 // write attempt counted, or settled without the batch recording it: that write may have moved main
 // unheard, and no call may come to read main back or record the outcome. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
 // exhausted, so the intent settles once Git answers or the write's outcome window has passed.
+// Settling any batch restores a fresh count, so the work that settlement exposes has its own retries.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
 // exhausted one only while such an intent is unsettled.
@@ -41,7 +43,11 @@
 // the decision versions it was scheduled under are no longer current.
 // Each entry records the episode it was queued for, and a drive settles or batches a waiting entry
 // only while that episode and its commit are the ones it read, so a claim re-readied with the same
-// commit during the drive's reads stays queued for the next pass.
+// commit during the drive's reads stays queued for the next pass. A batched entry re-readied with
+// its batched commit is a newer episode than the batch was formed for: the batch's failure, conflict
+// or landing never drops, parks or fails it, and it returns to the front of the queue as fresh work.
+// A landing settles it as landed only when the claim's current decision versions are among the
+// batch's, so a commit is never marked landed for an episode whose versions were not checked.
 //
 // Every port call is bounded by `PORT_TIMEOUT_MS`; a call that does not answer in time stops the
 // drive as if the port were unavailable, and the alarm retries it under the same attempt or intent.
@@ -55,7 +61,19 @@
 // attempt the runner never reports, whether or not the port acknowledged it, expires at that
 // deadline: the batch fails with `check_timeout`, its pins return to the queue as after a check
 // error, and a report arriving at or after the deadline is refused, so a late pass can never
-// authorize a landing.
+// authorize a landing. An attempt the check port holds for a person (`check_held`: the candidate
+// edits protected check paths) is not an outage: the train records it, asks the port nothing more,
+// waits for the deadline without backing off, and then fails the batch with `check_held`, counting
+// no retry, so a held pin is never dropped for waiting. A shared batch goes back split into isolated
+// pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
+// queue, so it cannot hold the pins behind it.
+//
+// Each compose runs under a fresh merge attempt, recorded on the batch before the merge port is
+// called. When the batch settles, or a new compose of it supersedes that attempt, the attempt is
+// queued for discard, and the Repo's alarm asks the merge port to delete its candidate refs once
+// its compose can no longer push. A failed discard is tried again on the alarm, with a delay that
+// doubles from `DISCARD_BASE_MS` up to `DISCARD_MAX_MS`, until it succeeds; each wake tries at most
+// `MAX_DISCARDS_PER_WAKE`, outside any drive, so cleanup never holds up a batch.
 //
 // A conflict parks its pair and owes the owner a question, the conservative route while no
 // classifier tells overlap from disagreement. The park commits first; each drive then asks the
@@ -75,9 +93,11 @@ import {
   MAX_CHECK_NAME_LENGTH,
   MAX_PATH_LENGTH,
   type Actor,
+  type ClaimId,
   type CommitSha,
   type CheckRunId,
   type DecisionRef,
+  type IntentId,
 } from "@railhead/shared/events";
 import type { SystemQuestion } from "../../contracts/decisions";
 import type { ClaimPin } from "../../contracts/claims";
@@ -99,21 +119,27 @@ import type {
 } from "../../contracts/train";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import type { EventTransaction } from "../../repo/eventLog";
+import { checkFence, type FenceReaders } from "../../train/authorize";
+import { sameVersions } from "../claims/module";
 import {
   activeBatch,
   batchByAttempt,
   batchedEntries,
   clearWake,
+  completeDiscard,
   conflictsIn,
   countPending,
   deferCommit,
+  dueDiscards,
   hasMovableWork,
   highestGeneration,
   insertBatch,
   insertConflict,
   insertEntry,
+  markCheckHeld,
   markCheckStarted,
   migrateTrain,
+  nextDiscardAt,
   openConflictOf,
   owesWork,
   promoteDeferred,
@@ -127,10 +153,11 @@ import {
   recordCandidate,
   recordCheckResult,
   recordIntent,
-  renewEpisode,
+  recordMergeAttempt,
   requeueEntry,
   requeueFront,
   requestCheck,
+  retryDiscard,
   settleBatch,
   settleConflict,
   settleEntry,
@@ -199,6 +226,12 @@ export const SETTLE_WAKE_MS = 60 * 60_000;
  */
 export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
 
+/** How many times a restarted train tries to confirm the alarm for the wake it owes. */
+export const STARTUP_WAKE_ATTEMPTS = 5;
+
+/** The delay before the second of those attempts; each later delay doubles, about 3 seconds in all. */
+export const STARTUP_WAKE_BASE_MS = 200;
+
 /**
  * Most state transitions one call drives. Every transition that does not stop the drive settles or
  * consumes queue state: a batch costs at most five (form, compose, start or land, a drop of stale
@@ -215,6 +248,15 @@ export const MAX_STEPS = 5 * MAX_QUEUE * (MAX_RETRIES + 3);
  * entries wait for an answer.
  */
 export const MAX_ANSWER_READS = MAX_QUEUE;
+
+/** The first delay after a discard fails. Each failure in a row doubles it. */
+export const DISCARD_BASE_MS = 60_000;
+
+/** The longest delay between discards of one attempt that fail. */
+export const DISCARD_MAX_MS = 60 * 60_000;
+
+/** Most discards one wake of the Repo's alarm tries, so cleanup holds few sandboxes at once. */
+export const MAX_DISCARDS_PER_WAKE = 4;
 
 /** Most rows a diagnostic read returns. */
 export const MAX_DIAGNOSTIC_ROWS = 64;
@@ -239,6 +281,11 @@ export type BlockReason =
   | "merge_unavailable"
   /** The check port did not accept the attempt. */
   | "checks_unavailable"
+  /**
+   * The check port held the attempt for a person: the candidate edits protected check paths. Not
+   * an outage: the train waits for the attempt's deadline without backing off.
+   */
+  | "check_held"
   /** The authorization port did not answer. */
   | "authorization_unavailable"
   /** The main writer did not answer, or left the intent unsettled. */
@@ -267,6 +314,12 @@ export interface Train extends TrainPort {
   batches(limit: number): BatchRecord[];
   /** Up to `limit` queue entries in any state, most recently changed first. */
   entries(limit: number): QueueEntry[];
+  /**
+   * Settles once the train has confirmed the alarm for the wake it found in storage when it was
+   * built: `true` when storage holds that alarm or the train owes none, `false` when every one of
+   * `STARTUP_WAKE_ATTEMPTS` failed. It never rejects.
+   */
+  readonly startup: Promise<boolean>;
   /** Up to `limit` parked pairs in any state, newest first. */
   conflicts(limit: number): ConflictRecord[];
 }
@@ -323,11 +376,17 @@ export function createTrain(
   const { log, clock } = context;
   const sql = context.storage.sql;
   let running: Running | null = null;
+  const fenceReaders: FenceReaders = {
+    currentGeneration: (claimId) => ports().claims.currentGeneration(claimId),
+    currentVersions: (claimId) => ports().decisions.currentVersions(claimId),
+    readyPin: (claimId) => ports().claims.readyPin(claimId),
+    readyGateNow: (claimId, generation) => ports().inbox.readyGateNow(claimId, generation),
+  };
+  let discarding: Promise<void> | null = null;
 
-  // A restarted train asks again for the wake it owes: the alarm may never have been set. Whether
-  // an exhausted wake is still owed needs the authorization port, which `resume` reads.
-  const owed = readWake(sql);
-  if (owed !== null) context.wake(owed.dueAt);
+  // A restarted train asks again for the wake it owes: the alarm may never have been set.
+  const startup = confirmStartupWake();
+  wakeForDiscards();
 
   /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
   function drive(settling = false): Promise<DriveOutcome> {
@@ -409,6 +468,14 @@ export function createTrain(
     call: () => Promise<PortResult<T>>,
   ): Promise<PortResult<T>> {
     if (!holds(generation)) throw new DriveSuperseded();
+    return withTimeout(port, call);
+  }
+
+  /** Waits at most `portTimeoutMs` for a port call; one that does not answer fails as `unavailable`. */
+  async function withTimeout<T>(
+    port: PortName,
+    call: () => Promise<PortResult<T>>,
+  ): Promise<PortResult<T>> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<PortResult<T>>((resolve) => {
       timer = setTimeout(() => {
@@ -430,14 +497,17 @@ export function createTrain(
    */
   function settleWake(generation: number, outcome: DriveOutcome | null): void {
     const now = clock();
+    // A held attempt is not a failure: it waits for its deadline without backing off.
     const failed =
       outcome === null ||
-      outcome.kind === "blocked" ||
+      (outcome.kind === "blocked" && outcome.reason !== "check_held") ||
       outcome.kind === "yielded" ||
       outcome.kind === "superseded";
-    const exhausted = context.storage.transactionSync(
-      (): boolean => holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" }),
-    );
+    const exhausted = context.storage.transactionSync((): boolean => {
+      // A batch the drive settled, or a compose it superseded, may have queued a discard.
+      wakeForDiscards();
+      return holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" });
+    });
     if (exhausted) {
       console.error(
         JSON.stringify({
@@ -693,12 +763,17 @@ export function createTrain(
           return "moved";
         }
         const versions = ports().decisions.currentVersions(claimId);
+        const pinnedUnder = required.get(claimId);
         if (versions === null) unknown = true;
-        else if (!sameVersions(versions, required.get(claimId))) return "moved";
+        else if (pinnedUnder === undefined || !sameVersions(versions, pinnedUnder)) return "moved";
       }
       if (unknown) return "unknown";
       if (activeBatch(sql) !== null) return "moved";
       const decisions = uniqueDecisions([...required.values()].flat());
+      // Each claim must also still be ready at its entry's episode with a clear inbox gate, its pin
+      // recorded under exactly `decisions`.
+      if (!members.every((entry) => stillReady(entry))) return "moved";
+      if (!checkFence(fenceReaders, pins, decisions, null).ok) return "moved";
       insertBatch(sql, { expectedMain: main.value, pins, decisions, definition }, now);
       return "formed";
     });
@@ -730,8 +805,12 @@ export function createTrain(
   }
 
   async function compose(generation: number, batch: BatchRecord): Promise<Step> {
+    // The attempt commits before the port is asked, so its candidate refs are discarded whatever
+    // the compose does; an attempt it supersedes is queued for discard.
+    const attempt = `mrg_${crypto.randomUUID().replaceAll("-", "")}`;
+    fenced(generation, () => recordMergeAttempt(sql, batch.batchId, attempt, clock()));
     const result = await bounded(generation, "merge", () =>
-      ports().merge.compose(batch.expectedMain, batch.pins),
+      ports().merge.compose(batch.expectedMain, batch.pins, attempt),
     );
     if (!result.ok) return blocked(batch.batchId, "merge_unavailable", result.code);
     const outcome = result.value;
@@ -767,8 +846,13 @@ export function createTrain(
     // The deadline commits before the port is asked, so an attempt whose start never answers
     // still expires.
     const deadline = batch.checkDeadline ?? requestDeadline(generation, batch);
+    if (batch.checkHeld) return blocked(batch.batchId, "check_held", "check_held");
     if (!batch.checkStarted) {
       const started = await bounded(generation, "checks", () => ports().checks.start(attempt));
+      if (!started.ok && started.code === "check_held") {
+        fenced(generation, () => markCheckHeld(sql, batch.batchId, clock()));
+        return blocked(batch.batchId, "check_held", "check_held");
+      }
       if (!started.ok) return blocked(batch.batchId, "checks_unavailable", started.code);
       if (started.value.attemptId !== attempt.attemptId) {
         throw new Error("the check port acknowledged another attempt");
@@ -797,7 +881,7 @@ export function createTrain(
     const expired = fenced(generation, () => {
       const current = activeBatch(sql);
       if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
-      failBatchIn(current, "check_timeout", now);
+      failBatchIn(current, current.checkHeld ? "check_held" : "check_timeout", now);
       return true;
     });
     if (expired) {
@@ -862,10 +946,10 @@ export function createTrain(
   ): Step {
     switch (record.status) {
       case "updated":
-        landBatch(generation, batch);
+        landBatch(generation, batch, record.intentId);
         return CONTINUE;
       case "reconciled":
-        if (record.main === batch.candidate) landBatch(generation, batch);
+        if (record.main === batch.candidate) landBatch(generation, batch, record.intentId);
         else failBatch(generation, batch, "main_rejected");
         return CONTINUE;
       case "rejected":
@@ -878,13 +962,46 @@ export function createTrain(
     }
   }
 
-  function landBatch(generation: number, batch: BatchRecord): void {
+  function landBatch(generation: number, batch: BatchRecord, intentId: IntentId): void {
     const now = clock();
     fenced(generation, () => {
-      for (const pin of batch.pins) settleEntry(sql, pin, "landed", null, now);
-      settleBatch(sql, batch.batchId, { state: "landed" }, now);
+      const unchecked = orderAsBatch(batch, batchedEntries(sql)).filter(
+        (entry) => renewed(entry) && !checkedUnder(batch, entry.pin.claimId),
+      );
+      for (const pin of batch.pins) {
+        if (!unchecked.some((entry) => samePin(entry.pin, pin))) {
+          settleEntry(sql, pin, "landed", null, now);
+        }
+      }
+      requeueFront(sql, unchecked.map(asFreshWork), now);
+      closeBatch(batch.batchId, { state: "landed" }, now);
       promoteDeferred(sql, now);
+      // The adaptation is owed in the landing's own transaction, so neither commits without the
+      // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
+      // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
+      ports().adaptation.owe(intentId, batch.pins);
+      try {
+        ports().adaptation.recordLanding(intentId);
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "unknown";
+        console.error(
+          JSON.stringify({ event: "train.adaptation_failed", repo: context.repoId, error: name }),
+        );
+      }
     });
+  }
+
+  /** Whether the claim's current decision versions are all among those `batch` was checked under. */
+  function checkedUnder(batch: BatchRecord, claimId: string): boolean {
+    const current = ports().decisions.currentVersions(claimId);
+    return (
+      current !== null &&
+      current.every((ref) =>
+        batch.decisions.some(
+          (checked) => checked.decisionId === ref.decisionId && checked.version === ref.version,
+        ),
+      )
+    );
   }
 
   /** Settles a failed batch and sends each pin back, isolated, retried or dropped. */
@@ -898,35 +1015,51 @@ export function createTrain(
     promoteDeferred(sql, now);
   }
 
+  /**
+   * Settles the active batch inside the caller's transaction. The failures counted so far belonged
+   * to that batch, so the wake keeps its due time with a fresh count: work the settlement exposes
+   * gets its own retries, even in a settle drive that started exhausted.
+   */
+  function closeBatch(
+    batchId: number,
+    outcome: { state: "landed" } | { state: "failed"; failure: BatchFailure },
+    now: number,
+  ): void {
+    settleBatch(sql, batchId, outcome, now);
+    const wake = readWake(sql);
+    if (wake !== null && wake.failures !== 0) writeWake(sql, { dueAt: wake.dueAt, failures: 0 });
+  }
+
   /** Settles a failed batch's entries, before any newer commit they held is queued. */
   function requeueFailed(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
-    settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
+    closeBatch(batch.batchId, { state: "failed", failure }, now);
+    const held = failure === "check_held";
     const definitive = isDefinitive(failure);
-    if (definitive && entries.length === 1) {
-      for (const entry of entries) settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
-      return;
-    }
-    if (definitive) {
-      // A shared batch failed on the pins themselves: check each alone, never a subset's share.
-      requeueFront(
-        sql,
-        entries.map((entry) => ({ pin: entry.pin, isolate: true, retries: entry.retries })),
-        now,
-      );
-      return;
-    }
-    const retried = entries.map((entry) => ({ ...entry, retries: entry.retries + 1 }));
-    for (const entry of retried) {
-      if (entry.retries > MAX_RETRIES) {
+    const returned: Returned[] = [];
+    for (const entry of entries) {
+      if (renewed(entry)) {
+        returned.push(asFreshWork(entry));
+      } else if (held && entries.length === 1) {
+        // Held alone, the pin is the one that edits a protected path. It is parked, keeping its
+        // pin, so the queue behind it moves. A new push enqueues the claim's next generation as a
+        // new entry. The approval action (#174) is the other way back: it will requeue this entry.
+        settleEntry(sql, entry.pin, "parked", "check_held", now);
+      } else if (held) {
+        // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
+        returned.push({ pin: entry.pin, isolate: true, retries: entry.retries });
+      } else if (definitive && entries.length === 1) {
+        settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
+      } else if (definitive) {
+        // A shared batch failed on the pins themselves: check each alone, never a subset's share.
+        returned.push({ pin: entry.pin, isolate: true, retries: entry.retries });
+      } else if (entry.retries + 1 > MAX_RETRIES) {
         settleEntry(sql, entry.pin, "dropped", "retries_exhausted", now);
+      } else {
+        returned.push({ pin: entry.pin, isolate: entry.isolate, retries: entry.retries + 1 });
       }
     }
-    requeueFront(
-      sql,
-      retried.filter((entry) => entry.retries <= MAX_RETRIES),
-      now,
-    );
+    requeueFront(sql, returned, now);
   }
 
   /**
@@ -956,14 +1089,17 @@ export function createTrain(
     log.transaction((tx) => {
       if (!holds(generation)) throw new DriveSuperseded();
       const entries = orderAsBatch(batch, batchedEntries(sql));
-      settleBatch(sql, batch.batchId, { state: "failed", failure: "conflict" }, now);
-      const parked = (entry: QueueEntry) => samePin(entry.pin, first) || samePin(entry.pin, second);
+      closeBatch(batch.batchId, { state: "failed", failure: "conflict" }, now);
+      const parked = (entry: QueueEntry) =>
+        !renewed(entry) && (samePin(entry.pin, first) || samePin(entry.pin, second));
       for (const entry of entries.filter(parked)) {
         settleEntry(sql, entry.pin, "parked", "conflict", now);
       }
       requeueFront(
         sql,
-        entries.filter((entry) => !parked(entry)),
+        entries
+          .filter((entry) => !parked(entry))
+          .map((entry) => (renewed(entry) ? asFreshWork(entry) : entry)),
         now,
       );
       promoteDeferred(sql, now);
@@ -1019,6 +1155,19 @@ export function createTrain(
   }
 
   /**
+   * Whether the claim of the waiting entry `observed` is still ready at the entry's episode with a
+   * clear inbox gate. A fence read: call it inside the transaction whose write relies on it.
+   */
+  function stillReady(observed: QueueEntry): boolean {
+    const { claimId, generation } = observed.pin;
+    const ready = ports().claims.readyPin(claimId);
+    return (
+      ready?.episode === observed.episode &&
+      ports().inbox.readyGateNow(claimId, generation)?.kind === "clear"
+    );
+  }
+
+  /**
    * Drives without throwing, so a port that rejects or a broken invariant cannot turn a committed
    * result into a thrown error; the drive has already asked for its retry. The error is logged by
    * name only, never with its message, which may carry a port's text.
@@ -1034,20 +1183,106 @@ export function createTrain(
     }
   }
 
+  /**
+   * Called by the Repo's alarm: drives the train if it is due, then discards what was due when the
+   * alarm fired.
+   */
   async function resume(): Promise<void> {
+    const firedAt = await resumeDrive();
+    if (nextDiscardAt(sql) === null) return;
+    await discardDue(firedAt ?? clock());
+  }
+
+  /**
+   * Asks the merge port to delete the candidate refs of up to `MAX_DISCARDS_PER_WAKE` attempts due
+   * at `now`, one at a time, and asks the alarm for the next one due. A failure is logged with its
+   * code and tried again after a delay; it never throws. A call while discards run waits for them.
+   */
+  function discardDue(now: number): Promise<void> {
+    discarding ??= discardBatch(now).finally(() => {
+      discarding = null;
+    });
+    return discarding;
+  }
+
+  async function discardBatch(dueAt: number): Promise<void> {
+    try {
+      for (const discard of dueDiscards(sql, dueAt, MAX_DISCARDS_PER_WAKE)) {
+        // A port that throws counts as a failure, so the row moves on and the alarm cannot spin.
+        const result = await withTimeout("merge", () =>
+          ports().merge.discard(discard.attempt),
+        ).catch(() => fail("internal", "The merge module failed while discarding."));
+        const failures = discard.failures + 1;
+        // Each row change commits with the wake it needs, as every other write here does.
+        context.storage.transactionSync(() => {
+          if (result.ok) completeDiscard(sql, discard.attempt);
+          else retryDiscard(sql, { ...discard, dueAt: clock() + discardDelay(failures), failures });
+          wakeForDiscards();
+        });
+        if (!result.ok) {
+          console.error(
+            JSON.stringify({
+              event: "train.discard_failed",
+              repo: context.repoId,
+              attempt: discard.attempt,
+              code: result.code,
+              failures,
+            }),
+          );
+        }
+      }
+    } finally {
+      context.storage.transactionSync(() => wakeForDiscards());
+    }
+  }
+
+  /**
+   * Asks the Repo's alarm for the wake stored when the train was built until a write is confirmed,
+   * with `STARTUP_WAKE_ATTEMPTS` attempts. Each attempt reads the wake again. An idle repository
+   * gets no other call that would ask, so an owed settlement depends on this alarm.
+   */
+  async function confirmStartupWake(): Promise<boolean> {
+    // An exhausted wake is owed only while a write to main may have landed unheard, which needs
+    // the authorization port. Ports exist once the composition building this train has returned,
+    // so only that first attempt waits for it; any other is asked for while the train is built.
+    const stored = readWake(sql);
+    if (stored !== null && isExhausted(stored)) await Promise.resolve();
+    for (let attempt = 1; attempt <= STARTUP_WAKE_ATTEMPTS; attempt += 1) {
+      if (attempt > 1) await sleep(STARTUP_WAKE_BASE_MS * 2 ** (attempt - 2));
+      try {
+        if (await armWake()) return true;
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "unknown";
+        console.error(
+          JSON.stringify({ event: "train.startup_wake_failed", repo: context.repoId, error: name }),
+        );
+      }
+    }
+    console.error(JSON.stringify({ event: "train.startup_wake_exhausted", repo: context.repoId }));
+    return false;
+  }
+
+  /** Asks the Repo's alarm for the earliest pending discard, if any. */
+  function wakeForDiscards(): void {
+    const next = nextDiscardAt(sql);
+    if (next !== null) context.wake(next);
+  }
+
+  /** Drives the train if its wake is due. Returns the time it read, or `null` when it read none. */
+  async function resumeDrive(): Promise<number | null> {
     // An answer asks for the alarm without knowing the train's wake, so look for one first.
     unparkAnswered();
     const owedNow = readWake(sql);
-    if (owedNow === null) return;
+    if (owedNow === null) return null;
     // Exhausted work waits for a call, and an alarm another module asked for does not restart it,
     // unless a write to main may have landed unheard.
     const settling = isExhausted(owedNow);
-    if (settling && !owesSettlement()) return;
+    if (settling && !owesSettlement()) return null;
     const now = clock();
     // Another module's alarm may fire first; ask again for this train's own time.
     if (owedNow.dueAt > now) {
       context.wake(owedNow.dueAt);
-      return;
+      return now;
     }
     const current = running?.drive ?? null;
     if (current !== null) {
@@ -1057,7 +1292,7 @@ export function createTrain(
         // ends, without waiting on it here.
         current.again = true;
         context.wake(lease.leaseUntil);
-        return;
+        return now;
       }
       // The drive outlived its lease, so it is waiting on something that will not answer in time.
       // The next generation takes over, and the earlier drive's writes are refused from here on.
@@ -1071,6 +1306,7 @@ export function createTrain(
       );
     }
     await driveLogged(settling);
+    return now;
   }
 
   function attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null {
@@ -1089,6 +1325,30 @@ export function createTrain(
         finishedAt: batch.finishedAt,
       },
     };
+  }
+
+  function holdsLiveEntry(claimId: ClaimId, generation: number): boolean {
+    const entry = readEntry(sql, claimId, generation);
+    if (entry === null) return false;
+    switch (entry.state) {
+      case "queued":
+      case "batched":
+      case "parked":
+        return true;
+      // A settled entry judged an earlier attempt or episode, so it holds nothing still owed.
+      case "landed":
+      case "dropped":
+        return false;
+      default:
+        return unreachable(entry.state);
+    }
+  }
+
+  function armWake(): Promise<boolean> {
+    const wake = readWake(sql);
+    // An exhausted wake owes its alarm only while a write to main may have landed unheard.
+    if (wake === null || (isExhausted(wake) && !owesSettlement())) return Promise.resolve(true);
+    return context.wake(wake.dueAt);
   }
 
   function queue(
@@ -1116,18 +1376,19 @@ export function createTrain(
           queued = false;
           break;
         case "queued":
-          if (existing.pin.commit === pin.commit) {
-            // Still waiting with this commit, but a drive reading it judged the earlier episode.
-            renewEpisode(sql, pin, episode, now);
-            queued = false;
-          } else {
-            requeueEntry(sql, pin, episode, now);
-          }
+          // A new episode is fresh work, even with the commit the entry already holds: retries
+          // counted for the earlier episode must not drop this one. A drive reading the entry
+          // judged the earlier episode, so it leaves the entry queued.
+          requeueEntry(sql, pin, episode, now);
+          queued = existing.pin.commit !== pin.commit;
           break;
         case "landed":
-          // Main already holds this commit, merged under the decision versions of an earlier
-          // episode. A new episode must bring a new commit, which is merged and checked under its
-          // own versions.
+          // Main already holds this commit. A repeat of the episode it landed for is answered as
+          // done, with no new work or wake. A new episode must bring a new commit, which is merged
+          // and checked under its own versions.
+          if (existing.pin.commit === pin.commit && existing.episode === episode) {
+            return ok({ queued: false });
+          }
           if (existing.pin.commit === pin.commit) {
             return fail(
               "decision_superseded",
@@ -1218,6 +1479,9 @@ export function createTrain(
     queue,
     recordCheck,
     attemptOutcome,
+    holdsLiveEntry,
+    armWake,
+    startup,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
@@ -1229,6 +1493,11 @@ export function createTrain(
 /** Whether the wake's retries ran out, so only a call drives its work again. */
 function isExhausted(wake: PendingWake): boolean {
   return wake.failures >= EXHAUSTED_FAILURES;
+}
+
+/** `DISCARD_BASE_MS` doubled for each failure after the first, at most `DISCARD_MAX_MS`. */
+function discardDelay(failures: number): number {
+  return Math.min(DISCARD_BASE_MS * 2 ** Math.min(failures - 1, 20), DISCARD_MAX_MS);
 }
 
 /** `WAKE_BASE_MS` doubled for each failure after the first, at most `WAKE_MAX_MS`. */
@@ -1251,6 +1520,22 @@ function attemptOf(batch: BatchRecord): CheckAttempt {
   };
 }
 
+/** An entry sent back to the queue's front, with the counters it keeps. */
+type Returned = { pin: ClaimPin; isolate: boolean; retries: number };
+
+/**
+ * Whether a batched entry was readied again with its batched commit after its batch was formed, so
+ * it holds a newer episode than the one the batch's result belongs to.
+ */
+function renewed(entry: QueueEntry): boolean {
+  return entry.episode !== entry.batchedEpisode;
+}
+
+/** A renewed entry returned to the queue as fresh work for its newer episode. */
+function asFreshWork(entry: QueueEntry): Returned {
+  return { pin: entry.pin, isolate: false, retries: 0 };
+}
+
 /** The batched entries in the batch's merge order. */
 function orderAsBatch(batch: BatchRecord, entries: QueueEntry[]): QueueEntry[] {
   return batch.pins.flatMap((pin) => entries.filter((entry) => samePin(entry.pin, pin)));
@@ -1267,6 +1552,7 @@ function isDefinitive(failure: BatchFailure): boolean {
     case "compose_infrastructure":
     case "check_error":
     case "check_timeout":
+    case "check_held":
     case "authorization_refused":
     case "main_rejected":
     case "publish_refused":
@@ -1360,21 +1646,6 @@ function isRepoPath(path: string): boolean {
   return !path.split("/").some((segment) => segment === "" || segment === "." || segment === "..");
 }
 
-/** True when both lists name the same version of the same decisions, in any order. */
-function sameVersions(
-  current: readonly DecisionRef[],
-  required: readonly DecisionRef[] | undefined,
-): boolean {
-  if (required === undefined || current.length !== required.length) {
-    return false;
-  }
-  const versions = new Map(required.map((ref) => [ref.decisionId, ref.version]));
-  return (
-    versions.size === required.length &&
-    current.every((ref) => versions.get(ref.decisionId) === ref.version)
-  );
-}
-
 /** The train's own question about a parked pair. Its key makes a repeat return the same question. */
 function conflictQuestion(conflict: ConflictRecord): SystemQuestion {
   const [first, second] = conflict.pins;
@@ -1422,4 +1693,8 @@ function stop(outcome: DriveOutcome): Step {
 
 function unreachable(value: never): never {
   throw new Error(`unhandled train state: ${String(value)}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
