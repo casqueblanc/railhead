@@ -403,16 +403,14 @@ describe("train batches", () => {
     }, fakes);
   });
 
-  it("treats a duplicate ready as a no-op and refuses a changed or older pin", async () => {
+  it("treats a duplicate pin as a no-op, holds a newer commit of a batched one and refuses an older generation", async () => {
     const fakes = new Fakes();
     await withTrain(async ({ train }) => {
       fakes.ready(pin(1, 2));
       expect(await train.enqueue(pin(1, 2))).toEqual(ok({ queued: true }));
       expect(await train.enqueue(pin(1, 2))).toEqual(ok({ queued: false }));
-      expect(await train.enqueue(pin(1, 2, sha("f")))).toMatchObject({
-        ok: false,
-        code: "after_ready",
-      });
+      expect(await train.enqueue(pin(1, 2, sha("f")))).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched", nextCommit: sha("f") });
       expect(await train.enqueue(pin(1, 1))).toMatchObject({
         ok: false,
         code: "stale_generation",
@@ -713,12 +711,14 @@ describe("train failures", () => {
         "clm_claim003@1": "parked",
       });
       expect(lastStarted(fakes).pins).toEqual([pin(2)]);
-      // No question exists yet (#118): a parked pin stays parked, and a repeat does not requeue it.
+      // No question exists yet (#118): a parked pin stays parked until a new ready episode of its
+      // claim queues it again.
       expect(train.entries(64).find((e) => e.state === "parked")).toMatchObject({
         reason: "conflict",
       });
-      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
-      expect(states(train)["clm_claim001@1"]).toBe("parked");
+      expect(states(train)["clm_claim003@1"]).toBe("parked");
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(states(train)["clm_claim001@1"]).toBe("queued");
     }, fakes);
   });
 
@@ -1454,6 +1454,85 @@ describe("train hung ports", () => {
       }, fakes);
     },
   );
+});
+
+describe("train ready episodes", () => {
+  it("gives a waiting entry a newer episode's commit in place and queues a dropped one again", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train }) => {
+      fakes.head = () => fail("unavailable", "Main is down.");
+      fakes.ready(pin(1), pin(2));
+      await train.enqueue(pin(1));
+      await train.enqueue(pin(2));
+
+      const newer = pin(1, 1, sha("f"));
+      fakes.ready(newer);
+      expect(await train.enqueue(newer)).toEqual(ok({ queued: true }));
+      expect(train.entries(64).find((e) => e.pin.claimId === newer.claimId)?.pin).toEqual(newer);
+
+      // Claim 2 is no longer ready, so the next drive drops its pin.
+      fakes.pins.delete(pin(2).claimId);
+      await train.drive();
+      expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim002@1": "dropped" });
+
+      fakes.ready(pin(2));
+      expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
+      fakes.head = () => ok(fakes.main);
+      await train.drive();
+
+      expect(fakes.composeCalls).toEqual([{ main: MAIN, pins: [newer, pin(2)] }]);
+    }, fakes);
+  });
+
+  it("holds a newer commit of a batched entry until the batch lands, then schedules it", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const first = lastStarted(fakes);
+
+      const newer = pin(1, 1, sha("f"));
+      expect(await train.enqueue(newer)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({
+        pin: pin(1),
+        state: "batched",
+        nextCommit: newer.commit,
+      });
+      // Pinning the batched commit again forgets the held one.
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched", nextCommit: null });
+      expect(await train.enqueue(newer)).toEqual(ok({ queued: false }));
+
+      fakes.ready(newer);
+      await train.recordCheck(report(first, "pass"));
+
+      expect(train.batches(2).map((batch) => batch.state)).toEqual(["checking", "landed"]);
+      expect(lastStarted(fakes).pins).toEqual([newer]);
+      expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", nextCommit: null });
+      // A landed commit is not work again.
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      expect(await train.enqueue(newer)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "landed" });
+    }, fakes);
+  });
+
+  it("schedules the held commit when the batch fails and drops the old one", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const first = lastStarted(fakes);
+      const newer = pin(1, 1, sha("f"));
+      await train.enqueue(newer);
+      fakes.ready(newer);
+
+      await train.recordCheck(report(first, "fail"));
+
+      expect(train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_fail"]);
+      expect(lastStarted(fakes).pins).toEqual([newer]);
+      expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", retries: 0 });
+    }, fakes);
+  });
 });
 
 describe("train attempt outcome", () => {

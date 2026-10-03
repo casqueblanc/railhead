@@ -8,6 +8,6 @@ import { createTrain } from "./scheduler";
 
 /** Builds the train module of one repository. */
 export const train: ModuleFactory<TrainPort> = (context, ports) => {
-  const { enqueue, recordCheck, attemptOutcome, resume } = createTrain(context, ports);
-  return { enqueue, recordCheck, attemptOutcome, resume };
+  const { enqueue, queue, recordCheck, attemptOutcome, resume } = createTrain(context, ports);
+  return { enqueue, queue, recordCheck, attemptOutcome, resume };
 };

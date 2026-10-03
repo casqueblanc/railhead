@@ -53,6 +53,7 @@ const SYNC = new Map<string, unknown>([
   ["inbox.queue", "throws"],
   ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
+  ["train.queue", "throws"],
 ]);
 
 /** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */

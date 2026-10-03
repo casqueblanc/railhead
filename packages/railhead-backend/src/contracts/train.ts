@@ -12,6 +12,7 @@ import type {
   DecisionRef,
   IntentId,
 } from "@railhead/shared/events";
+import type { EventTransaction } from "../repo/eventLog";
 import type { ClaimPin } from "./claims";
 import type { PortResult } from "./result";
 
@@ -144,8 +145,20 @@ export interface AttemptOutcome {
  * until that transaction commits. Read outside a transaction, the result may already be stale.
  */
 export interface TrainPort {
-  /** Queues a ready pin. A repeat for the same claim and generation is a no-op. */
+  /**
+   * Queues a ready pin and drives the train. Each call is a new ready episode of the claim: a pin
+   * already waiting is a no-op, a waiting entry of the same claim and generation takes the new
+   * commit, a dropped, parked or landed one is queued again, and a batched one takes the new commit
+   * once its batch settles. A pin of an older generation than one queued is `stale_generation`.
+   */
   enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
+  /**
+   * `enqueue` inside the caller's transaction, without driving: the entry and the train's wake
+   * commit or roll back with that transaction, and the Repo's alarm drives once it commits. A
+   * refusal writes nothing; a missing module throws, so the caller's transaction rolls back. The
+   * claims module calls it in the transaction that records `ready`.
+   */
+  queue(tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
   recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>>;
   /**

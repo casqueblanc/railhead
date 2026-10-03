@@ -11,7 +11,8 @@
 // `ready` pins an exact commit. The commit's existence in the fork is checked first, since that
 // awaits Artifacts; then one transaction checks that the agent still holds the claim at the
 // generation it sent, that the inbox gate is clear and that the decision versions are known, and
-// records the pin with those versions. Only then are the fork's tokens revoked. A repeat of the
+// records the pin with those versions, and queues it on the train as that transaction's last write,
+// so the pin reaches the train exactly once. Only then are the fork's tokens revoked. A repeat of the
 // same pin passes the same gate and returns it, so a lost response is answered by retrying. `pin`,
 // the train's read, answers only while those versions are still the current ones and the inbox
 // gate is still clear. From the pin on, `authorizeGit` refuses every push to the fork; a push
@@ -43,7 +44,8 @@ import {
 import { forkRepoName, mainRepoName } from "../../artifacts/adapter";
 import type { ClaimPin, ClaimsPort, GitAccess, GitGrant } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
-import { fail, ok, type PortFailure, type PortResult } from "../../contracts/result";
+import { fail, ok, unavailable, type PortFailure, type PortResult } from "../../contracts/result";
+import { UnavailableError } from "../../contracts/unavailable";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { EventLogError, type EventTransaction } from "../../repo/eventLog";
 import {
@@ -181,6 +183,20 @@ export function createClaims(
       return row === null ? null : settle(tx, row);
     }).value;
 
+  /**
+   * Runs `body` in a transaction. A `RolledBack` it throws, or a missing module's
+   * `UnavailableError`, undoes its writes and is answered as a failure.
+   */
+  const rollingBack = <T>(body: (tx: EventTransaction) => PortResult<T>): PortResult<T> => {
+    try {
+      return log.transaction(body).value;
+    } catch (error) {
+      if (error instanceof RolledBack) return error.failure;
+      if (error instanceof UnavailableError) return unavailable(error.port);
+      throw error;
+    }
+  };
+
   const current = (row: ClaimRow): ClaimRow | null => {
     const now = activeClaimOf(context.storage.sql, row.agentId);
     return now?.claimId === row.claimId ? now : null;
@@ -299,7 +315,7 @@ export function createClaims(
       // Ownership, the inbox gate and the decision versions are read in the transaction that
       // records the pin, so a decision recorded or a takeover made during the commit lookup is
       // seen here and nothing else can run between these reads and the write.
-      const decided = log.transaction((tx): PortResult<ReadyResult> => {
+      const decided = rollingBack((tx): PortResult<ReadyResult> => {
         const held = standing(claimById(tx.sql, claimId), agent, request);
         if (held.kind === "refused") return refuse(tx, held);
         const row = settle(tx, held.row);
@@ -328,8 +344,11 @@ export function createClaims(
         );
         const pinned = claimById(tx.sql, claimId);
         if (pinned === null) throw new Error("a pinned claim cannot be read back");
+        // Last, since it asks for the train's wake. A refusal rolls the pin back.
+        const queued = ports().train.queue(tx, { claimId, generation, commit });
+        if (!queued.ok) throw new RolledBack(queued);
         return ok({ claim: view(pinned), repeated: false });
-      }).value;
+      });
       if (!decided.ok) return decided;
 
       // The fork is read only from the pin on, since `authorizeGit` refuses every later push;
@@ -368,6 +387,17 @@ export function createClaims(
       return decideGit(context.storage.sql, repoId, access, settleNow);
     },
   };
+}
+
+/** Thrown inside a transaction to roll it back and answer with `failure`. */
+class RolledBack extends Error {
+  readonly failure: PortFailure;
+
+  constructor(failure: PortFailure) {
+    super("the transaction was refused");
+    this.name = "RolledBack";
+    this.failure = failure;
+  }
 }
 
 /** Who records a refusal: the claims module, never the agent it refuses. */

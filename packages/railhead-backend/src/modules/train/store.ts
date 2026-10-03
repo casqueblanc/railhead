@@ -10,6 +10,12 @@
 // the attempt's deadline. Once the scheduler's retries run out, the row stays with its failures
 // marked exhausted, so work in storage always has a row.
 //
+// A queue entry is keyed by claim and generation, and each call to queue a pin is a new ready episode
+// of that claim: a claim reopened after a superseded decision keeps its generation, so its next pin
+// reuses the entry. A waiting entry takes the new commit, a settled one is queued again, and a
+// batched one keeps its commit for the active batch and holds the new one in `next_commit` until
+// that batch settles.
+//
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
 // latest one, so a drive that outlived its lease and was taken over cannot change state again.
@@ -71,6 +77,7 @@ const MIGRATIONS: readonly string[] = [
     generation INTEGER NOT NULL CHECK (generation > 0),
     lease_until INTEGER NOT NULL
   ) STRICT`,
+  "ALTER TABLE train_queue ADD COLUMN next_commit TEXT",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -118,6 +125,8 @@ export interface QueueEntry {
   retries: number;
   /** Why it left the queue, or `null`. */
   reason: DropReason | null;
+  /** While batched, the commit of a newer ready episode, queued once the batch settles; or `null`. */
+  nextCommit: CommitSha | null;
 }
 
 /** Where one batch stands. */
@@ -196,6 +205,7 @@ type QueueRow = {
   isolate: number;
   retries: number;
   reason: string | null;
+  next_commit: string | null;
 };
 
 type BatchRow = {
@@ -219,7 +229,8 @@ type BatchRow = {
   updated_at: number;
 };
 
-const QUEUE_COLUMNS = "claim_id, generation, commit_sha, state, isolate, retries, reason";
+const QUEUE_COLUMNS =
+  "claim_id, generation, commit_sha, state, isolate, retries, reason, next_commit";
 const BATCH_COLUMNS =
   "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
@@ -297,6 +308,56 @@ export function insertEntry(sql: SqlStorage, pin: ClaimPin, now: number): void {
     pin.generation,
     pin.commit,
     now,
+    now,
+  );
+}
+
+/**
+ * Queues a newer ready episode of a claim whose entry is waiting or settled: the entry takes the
+ * commit with fresh counters. A waiting entry keeps its place; a settled one goes to the back.
+ */
+export function requeueEntry(sql: SqlStorage, pin: ClaimPin, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET commit_sha = ?, isolate = 0, retries = 0, reason = NULL,
+       next_commit = NULL, updated_at = ?,
+       position = CASE WHEN state = 'queued' THEN position
+         ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue) END,
+       state = 'queued'
+     WHERE claim_id = ? AND generation = ? AND state <> 'batched'`,
+    pin.commit,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+}
+
+/**
+ * Holds the commit of a newer ready episode on a batched entry until its batch settles, or clears
+ * it when the episode pinned the batched commit again.
+ */
+export function deferCommit(sql: SqlStorage, pin: ClaimPin, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET next_commit = CASE WHEN commit_sha = ? THEN NULL ELSE ? END,
+       updated_at = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'batched'`,
+    pin.commit,
+    pin.commit,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+}
+
+/**
+ * Queues, at the back with fresh counters, the newer commit each entry held while it was batched.
+ * Call it after a batch's entries settle.
+ */
+export function promoteDeferred(sql: SqlStorage, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET commit_sha = next_commit, next_commit = NULL, state = 'queued',
+       isolate = 0, retries = 0, reason = NULL, updated_at = ?,
+       position = (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue)
+     WHERE next_commit IS NOT NULL AND state <> 'batched'`,
     now,
   );
 }
@@ -607,6 +668,7 @@ function toEntry(row: QueueRow): QueueEntry {
     isolate: row.isolate === 1,
     retries: row.retries,
     reason: row.reason === null ? null : parseDropReason(row.reason),
+    nextCommit: row.next_commit,
   };
 }
 

@@ -1,0 +1,396 @@
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { describe, expect, it } from "vitest";
+import type { ClaimView } from "@railhead/shared/agent-api";
+import type { CommitSha, DecisionRef } from "@railhead/shared/events";
+import {
+  ARTIFACTS_LIMITS,
+  createArtifactsAdapter,
+  forkRepoName,
+  mainRepoName,
+} from "../src/artifacts/adapter";
+import { FakeArtifacts } from "../src/artifacts/fake";
+import type { ClaimPin, ClaimsPort } from "../src/contracts/claims";
+import type { DecisionsPort } from "../src/contracts/decisions";
+import type { InboxPort } from "../src/contracts/inbox";
+import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
+import { ok } from "../src/contracts/result";
+import type { CheckAttempt, TrainPort } from "../src/contracts/train";
+import { unavailableTrain } from "../src/contracts/unavailable";
+import { createClaims } from "../src/modules/claims/module";
+import { createDecisions } from "../src/modules/decisions/decisions";
+import { createInbox } from "../src/modules/inbox/inbox";
+import { createTrain, MAX_QUEUE, type Train } from "../src/modules/train/scheduler";
+import { insertEntry } from "../src/modules/train/store";
+import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
+import { EventLog } from "../src/repo/eventLog";
+import { createAuthorization } from "../src/train/authorize";
+
+const REPO = "rep_handoff0001";
+const ROOT = "1".repeat(40);
+const MAIN = "2".repeat(40);
+const WORK = "4".repeat(40);
+const LATER = "5".repeat(40);
+const OWNER = "usr_owner0001";
+
+function agent(n: number): AgentPrincipal {
+  return { kind: "agent", agentId: `agt_agent000${n}`, ownerId: OWNER, repoId: REPO };
+}
+
+function candidateOf(pins: readonly ClaimPin[]): CommitSha {
+  return pins.length === 1 && pins[0]?.commit === LATER ? "8".repeat(40) : "7".repeat(40);
+}
+
+interface Setup {
+  sql: SqlStorage;
+  log: EventLog;
+  claims: ClaimsPort;
+  inbox: InboxPort;
+  decisions: DecisionsPort;
+  train: Train;
+  /** Every time the Repo's alarm was asked for, oldest first. */
+  wakes: number[];
+  /** Every pin list the merge port was asked to compose, oldest first. */
+  composed: ClaimPin[][];
+  /** Every check attempt started, oldest first. */
+  started: CheckAttempt[];
+  /** The claim's queue entries and their states. */
+  entries(): { commit: string; state: string; next: string | null }[];
+  /** Files an issue and claims it for agent 1, with `commits` pushed to its fork. */
+  open(...commits: string[]): Promise<ClaimView>;
+  /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
+  decide(claimId: string, decisionId?: string): Promise<DecisionRef>;
+  /** Acknowledges every inbox item agent 1 has pending. */
+  ackAll(): Promise<void>;
+  /** Pushes `commit` to the claim's fork. */
+  push(claimId: string, commit: string): Promise<void>;
+}
+
+/**
+ * Runs `body` in a fresh Repo with the real claims, inbox, decisions, train and authorization
+ * modules. Artifacts is the fake behind the real adapter; main, the check definitions, merging and
+ * check runs are fakes the train reaches through its ports.
+ */
+function withHandoff<T>(
+  body: (setup: Setup) => Promise<T>,
+  install: (train: TrainPort) => TrainPort = (train) => train,
+): Promise<T> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const fake = new FakeArtifacts();
+    fake.seed(await mainRepoName(REPO), [ROOT, MAIN]);
+    const log = EventLog.open(state.storage, REPO, fake.clock);
+    const wakes: number[] = [];
+    const context = {
+      repoId: REPO,
+      storage: state.storage,
+      log,
+      clock: fake.clock,
+      env,
+      wake: (at: number) => wakes.push(at),
+    };
+    const composed: ClaimPin[][] = [];
+    const started: CheckAttempt[] = [];
+    const base = composeRepo(context);
+    const claims = createClaims(context, () => ports);
+    const inbox = createInbox(context);
+    const decisions = createDecisions(context, () => ports);
+    const train = createTrain(context, () => ports);
+    const authorization = createAuthorization(context, {
+      attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
+      currentGeneration: (claimId) => claims.currentGeneration(claimId),
+      currentVersions: (claimId) => decisions.currentVersions(claimId),
+    });
+    const ports: RepoPorts = {
+      ...base,
+      artifacts: createArtifactsAdapter(
+        { ...context, namespace: fake },
+        { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
+      ),
+      claims,
+      inbox,
+      decisions,
+      train: install(train),
+      authorization,
+      mainWriter: { ...base.mainWriter, head: async () => ok(MAIN) },
+      checks: {
+        definitions: async (main) =>
+          ok([{ name: "test", source: main, digest: "d".repeat(64), acceptance: null }]),
+        start: async (attempt) => {
+          started.push(attempt);
+          return ok({ attemptId: attempt.attemptId });
+        },
+      },
+      merge: {
+        compose: async (_main, pins) => {
+          composed.push(pins);
+          return ok({ kind: "clean", candidate: candidateOf(pins) });
+        },
+      },
+    };
+    const push = async (claimId: string, commit: string) => {
+      const repo = fake.repos.get(await forkRepoName(REPO, claimId));
+      if (repo === undefined) throw new Error("no such fork");
+      repo.commits.push(commit);
+    };
+    let asked = 0;
+    const setup: Setup = {
+      sql: state.storage.sql,
+      log,
+      claims,
+      inbox,
+      decisions,
+      train,
+      wakes,
+      composed,
+      started,
+      entries: () =>
+        train.entries(64).map((entry) => ({
+          commit: entry.pin.commit,
+          state: entry.state,
+          next: entry.nextCommit,
+        })),
+      async open(...commits) {
+        const grant: GrantFor<"issue.file"> = {
+          kind: "human",
+          userId: OWNER,
+          repoId: REPO,
+          grantId: crypto.randomUUID(),
+          action: { kind: "issue.file", title: "Add uploads", body: "Do it." },
+        };
+        const filed = await claims.fileIssue(grant);
+        if (!filed.ok) throw new Error(`filing refused: ${filed.code}`);
+        const claimed = await claims.work(agent(1));
+        if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
+        for (const commit of commits) await push(claimed.value.claim.claimId, commit);
+        return claimed.value.claim;
+      },
+      async decide(claimId, existing) {
+        let decisionId = existing;
+        if (decisionId === undefined) {
+          asked += 1;
+          const question = await decisions.ask(agent(1), claimId, {
+            generation: 1,
+            requestId: `req_upload000000000${asked}`,
+            text: "Should uploads above 10 MB be rejected or chunked?",
+            options: [
+              { key: "reject", label: "Reject them" },
+              { key: "chunk", label: "Upload them in chunks" },
+            ],
+            scope: ["src/upload.ts"],
+          });
+          if (!question.ok) throw new Error(`ask refused: ${question.code}`);
+          decisionId = question.value.decisionId;
+        }
+        const current = decisions
+          .currentVersions(claimId)
+          ?.find((d) => d.decisionId === decisionId);
+        const recorded = await decisions.record({
+          kind: "human",
+          userId: OWNER,
+          repoId: REPO,
+          grantId: crypto.randomUUID(),
+          action: {
+            kind: "decision.record",
+            decisionId,
+            option: current === undefined ? "chunk" : "reject",
+            expectedVersion: current?.version ?? null,
+          },
+        });
+        if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
+        return recorded.value;
+      },
+      async ackAll() {
+        const delivered = await inbox.pending(agent(1), 16);
+        if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
+        for (const { item } of delivered.value.items) {
+          const acked = await inbox.ack(agent(1), item, "Follow the decision.");
+          if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
+        }
+      },
+      push,
+    };
+    return body(setup);
+  });
+}
+
+function claimState(sql: SqlStorage, claimId: string): string {
+  return sql
+    .exec<{ state: string }>("SELECT state FROM claims_claims WHERE claim_id = ?", claimId)
+    .one().state;
+}
+
+describe("ready hands its pin to the train", () => {
+  it("queues the pin in ready's transaction and the alarm's drive schedules it", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const before = setup.wakes.length;
+
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+      // The pin asks for the alarm, and nothing drives before the alarm does.
+      expect(setup.wakes.length).toBe(before + 1);
+      expect(setup.composed).toEqual([]);
+
+      await setup.train.resume();
+
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.composed).toEqual([[pin]]);
+      expect(setup.started).toHaveLength(1);
+      expect(setup.started[0]).toMatchObject({ expectedMain: MAIN, pins: [pin], decisions: [] });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+    });
+  });
+
+  it("queues nothing for a repeated ready of the same pin", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      await setup.train.resume();
+      const wakes = setup.wakes.length;
+
+      const again = await setup.claims.ready(agent(1), claim.claimId, request);
+
+      expect(again).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      expect(setup.wakes.length).toBe(wakes);
+      expect(setup.composed).toHaveLength(1);
+    });
+  });
+
+  it("records no ready when the train's queue is full, and pins once it has room", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      setup.sql.exec("DELETE FROM train_wake");
+      for (let n = 0; n < MAX_QUEUE; n += 1) {
+        const other = { claimId: `clm_filler${String(n).padStart(4, "0")}`, generation: 1 };
+        insertEntry(setup.sql, { ...other, commit: ROOT }, 0);
+      }
+      const head = setup.log.head();
+      const request = { generation: 1, commit: WORK };
+
+      expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.log.head()).toBe(head);
+      expect(setup.entries().filter((entry) => entry.commit === WORK)).toEqual([]);
+
+      setup.sql.exec("DELETE FROM train_queue WHERE claim_id = 'clm_filler0000'");
+      expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+        ok: true,
+        value: { repeated: false },
+      });
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+    });
+  });
+
+  it("records no ready while the train is missing", async () => {
+    await withHandoff(
+      async (setup) => {
+        const claim = await setup.open(WORK);
+        const head = setup.log.head();
+
+        expect(
+          await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+        ).toMatchObject({ ok: false, code: "unavailable" });
+        expect(claimState(setup.sql, claim.claimId)).toBe("working");
+        expect(setup.log.head()).toBe(head);
+      },
+      () => unavailableTrain,
+    );
+  });
+});
+
+/** Agent 1's claim, ready at `WORK` under version 1 of a decision. */
+async function readyUnderFirst(setup: Setup) {
+  const claim = await setup.open(WORK);
+  const first = await setup.decide(claim.claimId);
+  await setup.ackAll();
+  const ready = await setup.claims.ready(agent(1), claim.claimId, {
+    generation: 1,
+    commit: WORK,
+  });
+  expect(ready.ok).toBe(true);
+  return { claim, first };
+}
+
+describe("a re-ready after a superseded decision", () => {
+  it("queues the same commit again after the train dropped the superseded pin", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const second = await setup.decide(claim.claimId, first.decisionId);
+
+      // The train's read finds the pin superseded: the claim reopens and the entry is dropped.
+      await setup.train.resume();
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
+      expect(setup.composed).toEqual([]);
+
+      await setup.ackAll();
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+
+      await setup.train.resume();
+
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.composed).toEqual([[pin]]);
+      expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
+    });
+  });
+
+  it("schedules the new commit once the batch formed for the old one fails authorization", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await setup.train.resume();
+      const old = setup.started[0];
+      if (old === undefined) throw new Error("no check was started for the first pin");
+      expect(old.decisions).toEqual([first]);
+
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      // The holder's status read reopens the claim; it adapts, acknowledges and marks it ready.
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { state: "working" },
+      });
+      await setup.push(claim.claimId, LATER);
+      await setup.ackAll();
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: LATER,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: LATER }]);
+
+      // The old batch's check passes, but authorization refuses the superseded version.
+      const recorded = await setup.train.recordCheck({
+        attemptId: old.attemptId,
+        candidate: old.candidate,
+        result: "pass",
+        logDigest: null,
+        finishedAt: old.createdAt,
+      });
+      expect(recorded.ok).toBe(true);
+
+      expect(setup.train.batches(2).map((batch) => batch.failure)).toEqual([
+        null,
+        "authorization_refused",
+      ]);
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: LATER };
+      expect(setup.composed.at(-1)).toEqual([pin]);
+      expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
+      expect(setup.entries()).toEqual([{ commit: LATER, state: "batched", next: null }]);
+    });
+  });
+});

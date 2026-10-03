@@ -104,11 +104,14 @@ export const unavailableChecks: CheckPort = {
 };
 
 /**
- * The train while its module is missing: no report is recorded, no attempt is known and nothing is
- * owed, so `resume` does nothing.
+ * The train while its module is missing: no pin is queued, so no ready is recorded, no report is
+ * recorded, no attempt is known and nothing is owed, so `resume` does nothing.
  */
 export const unavailableTrain: TrainPort = {
   enqueue: refuse("train"),
+  queue: () => {
+    throw new UnavailableError("train");
+  },
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
   resume: async () => {},

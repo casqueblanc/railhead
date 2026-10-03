@@ -23,6 +23,13 @@
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes.
 //
+// The claims module queues a pin inside the transaction that records `ready`, so a pin and its
+// queue entry commit together and a repeated `ready` queues nothing. Each such call is a new ready
+// episode: a claim reopened by a superseded decision keeps its generation, so its next pin replaces
+// the commit of its waiting entry or queues its settled entry again, and a batched entry takes the
+// new commit once its batch settles. A batch formed for the earlier episode cannot land it, since
+// the decision versions it was scheduled under are no longer current.
+//
 // Every port call is bounded by `PORT_TIMEOUT_MS`; a call that does not answer in time stops the
 // drive as if the port were unavailable, and the alarm retries it under the same attempt or intent.
 // Each drive also takes a new generation in storage with a lease of `DRIVE_LEASE_MS`. An alarm that
@@ -65,12 +72,14 @@ import type {
   TrainPort,
 } from "../../contracts/train";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
+import type { EventTransaction } from "../../repo/eventLog";
 import {
   activeBatch,
   batchByAttempt,
   batchedEntries,
   clearWake,
   countPending,
+  deferCommit,
   hasMovableWork,
   highestGeneration,
   insertBatch,
@@ -78,6 +87,7 @@ import {
   markCheckStarted,
   migrateTrain,
   owesWork,
+  promoteDeferred,
   readDrive,
   readEntry,
   readWake,
@@ -86,6 +96,7 @@ import {
   recordCandidate,
   recordCheckResult,
   recordIntent,
+  requeueEntry,
   requeueFront,
   requestCheck,
   settleBatch,
@@ -503,9 +514,10 @@ export function createTrain(
     const now = clock();
     fenced(generation, () => {
       // An enqueue during the reads above may have settled an entry; form again from storage.
-      const unchanged = pins.every(
-        (pin) => readEntry(sql, pin.claimId, pin.generation)?.state === "queued",
-      );
+      const unchanged = pins.every((pin) => {
+        const entry = readEntry(sql, pin.claimId, pin.generation);
+        return entry?.state === "queued" && entry.pin.commit === pin.commit;
+      });
       if (!unchanged || activeBatch(sql) !== null) return;
       insertBatch(
         sql,
@@ -686,6 +698,7 @@ export function createTrain(
     fenced(generation, () => {
       for (const pin of batch.pins) settleEntry(sql, pin, "landed", null, now);
       settleBatch(sql, batch.batchId, { state: "landed" }, now);
+      promoteDeferred(sql, now);
     });
   }
 
@@ -696,6 +709,12 @@ export function createTrain(
 
   /** `failBatch` inside a transaction the caller holds. */
   function failBatchIn(batch: BatchRecord, failure: BatchFailure, now: number): void {
+    requeueFailed(batch, failure, now);
+    promoteDeferred(sql, now);
+  }
+
+  /** Settles a failed batch's entries, before any newer commit they held is queued. */
+  function requeueFailed(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
     settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
     const definitive = isDefinitive(failure);
@@ -762,6 +781,7 @@ export function createTrain(
         entries.filter((entry) => !parked(entry)),
         now,
       );
+      promoteDeferred(sql, now);
       tx.append(TRAIN_ACTOR, {
         type: "train.conflict",
         data: {
@@ -783,7 +803,9 @@ export function createTrain(
     const now = clock();
     fenced(generation, () => {
       for (const entry of entries) {
-        if (readEntry(sql, entry.pin.claimId, entry.pin.generation)?.state === "queued") {
+        // A newer ready episode may have replaced the commit during the reads; keep that one.
+        const stored = readEntry(sql, entry.pin.claimId, entry.pin.generation);
+        if (stored?.state === "queued" && stored.pin.commit === entry.pin.commit) {
           settleEntry(sql, entry.pin, "dropped", reason, now);
         }
       }
@@ -858,32 +880,60 @@ export function createTrain(
     };
   }
 
-  async function enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>> {
+  /**
+   * Queues a ready episode's pin inside the caller's transaction and asks the Repo's alarm for the
+   * drive at `alarmAt`. Writes nothing when it refuses.
+   */
+  function admit(pin: ClaimPin, now: number, alarmAt: number): PortResult<{ queued: boolean }> {
     if (!validPin(pin)) {
       return fail("invalid_request", "The pin needs a claim, a positive generation and a commit.");
     }
+    if (highestGeneration(sql, pin.claimId) > pin.generation) {
+      return fail("stale_generation", "A newer generation of this claim is queued.");
+    }
+    const existing = readEntry(sql, pin.claimId, pin.generation);
+    if (existing !== null) {
+      switch (existing.state) {
+        case "batched":
+          // The active batch keeps the commit it was formed with; the newer one waits for it.
+          deferCommit(sql, pin, now);
+          return ok({ queued: false });
+        case "queued":
+          if (existing.pin.commit === pin.commit) return ok({ queued: false });
+          requeueEntry(sql, pin, now);
+          return ok({ queued: true });
+        case "landed":
+          // Main already holds this commit; only a newer one is work.
+          if (existing.pin.commit === pin.commit) return ok({ queued: false });
+          break;
+        case "dropped":
+        case "parked":
+          break;
+        default:
+          return unreachable(existing.state);
+      }
+    }
+    if (countPending(sql) >= MAX_QUEUE) {
+      return fail("busy", "The train's queue is full.");
+    }
+    if (existing === null) insertEntry(sql, pin, now);
+    else requeueEntry(sql, pin, now);
+    recordDebt(now, { kind: "start", alarmAt });
+    return ok({ queued: true });
+  }
+
+  async function enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>> {
     const now = clock();
-    const result = context.storage.transactionSync((): PortResult<{ queued: boolean }> => {
-      const existing = readEntry(sql, pin.claimId, pin.generation);
-      if (existing !== null) {
-        if (existing.pin.commit !== pin.commit) {
-          return fail("after_ready", "This generation was queued with another commit.");
-        }
-        return ok({ queued: false });
-      }
-      if (highestGeneration(sql, pin.claimId) > pin.generation) {
-        return fail("stale_generation", "A newer generation of this claim is queued.");
-      }
-      if (countPending(sql) >= MAX_QUEUE) {
-        return fail("busy", "The train's queue is full.");
-      }
-      insertEntry(sql, pin, now);
-      recordDebt(now, { kind: "start", alarmAt: now + DRIVE_LEASE_MS });
-      return ok({ queued: true });
-    });
+    const result = context.storage.transactionSync(() => admit(pin, now, now + DRIVE_LEASE_MS));
     if (!result.ok) return result;
     await driveLogged();
     return result;
+  }
+
+  function queue(_tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }> {
+    // The Repo's alarm starts the drive once the caller's transaction commits.
+    const now = clock();
+    return admit(pin, now, now);
   }
 
   async function recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>> {
@@ -941,6 +991,7 @@ export function createTrain(
 
   return {
     enqueue,
+    queue,
     recordCheck,
     attemptOutcome,
     resume,
