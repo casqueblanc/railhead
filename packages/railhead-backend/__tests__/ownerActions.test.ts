@@ -571,6 +571,8 @@ interface Harness {
   userId: string;
   userHandle: string;
   repoId: string;
+  /** The enrolled credential's stored signature counter. */
+  signCount(): Promise<number>;
   /** Every grant an action port received, in order. */
   grants: Dispatch[];
   clock: Clock;
@@ -624,6 +626,14 @@ async function withRepoOwner(
       userId,
       userHandle,
       repoId,
+      signCount: () =>
+        runInDurableObject(
+          env.OWNER.getByName(ownerName),
+          (_owner, ownerState) =>
+            ownerState.storage.sql
+              .exec<{ sign_count: number }>("SELECT sign_count FROM owner_credential")
+              .one().sign_count,
+        ),
       grants,
       clock,
       state,
@@ -1090,6 +1100,88 @@ describe("owner actions", () => {
       });
       expect(grants).toHaveLength(1);
     });
+  });
+
+  it("performs with an authenticator that does not count, one use per proof", async () => {
+    await withRepoOwner(
+      async ({ owner, auth, userId, userHandle, repoId, grants, signCount, restart }) => {
+        const zero = { signCount: 0 };
+        const grantFor = (challengeId: string, action: OwnerAction) => ({
+          kind: "human",
+          userId,
+          repoId,
+          grantId: grantId(challengeId),
+          action,
+        });
+        // Two independently prepared actions both succeed with a counter that stays at zero.
+        const first = value(await owner.prepare(CONFIRM));
+        expect(
+          await owner.perform(
+            first.challengeId,
+            await auth.assert(first.challenge, userHandle, zero),
+          ),
+        ).toEqual({ ok: true, value: { kind: "agent.confirm", agentId: "agt_atlas01" } });
+        const second = value(await owner.prepare(REVOKE));
+        expect(
+          await owner.perform(
+            second.challengeId,
+            await auth.assert(second.challenge, userHandle, zero),
+          ),
+        ).toEqual({ ok: true, value: { kind: "agent.revoke", agentId: "agt_atlas01" } });
+        expect(grants).toEqual([
+          { port: "identity.confirm", grant: grantFor(first.challengeId, CONFIRM) },
+          { port: "identity.revoke", grant: grantFor(second.challengeId, REVOKE) },
+        ]);
+        expect(await signCount()).toBe(0);
+
+        // The counter cannot tell a replay apart, so the spent challenge alone stops one.
+        const third = value(await owner.prepare(REVOKE));
+        const proof = await auth.assert(third.challenge, userHandle, zero);
+        const results = await Promise.all(
+          Array.from({ length: 5 }, () => owner.perform(third.challengeId, proof)),
+        );
+        expect(results.filter((r) => r.ok)).toEqual([
+          { ok: true, value: { kind: "agent.revoke", agentId: "agt_atlas01" } },
+        ]);
+        for (const refused of results.filter((r) => !r.ok)) {
+          expect(refused).toMatchObject({ ok: false, code: "proof_expired" });
+        }
+        expect(grants).toHaveLength(3);
+        expect(grants[2]).toEqual({
+          port: "identity.revoke",
+          grant: grantFor(third.challengeId, REVOKE),
+        });
+        for (const spent of [first, second, third]) {
+          expect(
+            await restart().perform(
+              spent.challengeId,
+              await auth.assert(spent.challenge, userHandle, zero),
+            ),
+          ).toMatchObject({ ok: false, code: "proof_expired" });
+        }
+        expect(grants).toHaveLength(3);
+        expect(await signCount()).toBe(0);
+
+        // Once a counting proof advances the counter, a zero counter is a regression.
+        const counting = value(await owner.prepare(CONFIRM));
+        value(
+          await owner.perform(
+            counting.challengeId,
+            await auth.assert(counting.challenge, userHandle, { signCount: 5 }),
+          ),
+        );
+        expect(await signCount()).toBe(5);
+        const regressed = value(await owner.prepare(CONFIRM));
+        expect(
+          await owner.perform(
+            regressed.challengeId,
+            await auth.assert(regressed.challenge, userHandle, zero),
+          ),
+        ).toMatchObject({ ok: false, code: "proof_invalid" });
+        expect(grants).toHaveLength(4);
+        expect(await signCount()).toBe(5);
+      },
+    );
   });
 
   it("refuses to issue a challenge before any owner is enrolled", async () => {
