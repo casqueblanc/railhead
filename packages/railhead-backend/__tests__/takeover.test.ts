@@ -26,6 +26,7 @@ import {
   createClaims,
   type ClaimsLimits,
 } from "../src/modules/claims/module";
+import { beginRevocation } from "../src/modules/claims/store";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
@@ -346,6 +347,31 @@ async function record(
     action: { kind: "decision.record", decisionId, option, expectedVersion },
   });
   if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
+}
+
+/**
+ * Asks a question on the claim for `principal`, records the owner's first answer and has the
+ * holder acknowledge it, so the claim can be marked ready under version 1.
+ */
+async function decideOnce(
+  setup: Setup,
+  principal: AgentPrincipal,
+  claimId: string,
+): Promise<DecisionId> {
+  const asked = await setup.decisions.ask(principal, claimId, {
+    generation: 1,
+    requestId: "req_upload0000000001",
+    text: "Should uploads above 10 MB be rejected or chunked?",
+    options: [
+      { key: "reject", label: "Reject them" },
+      { key: "chunk", label: "Upload them in chunks" },
+    ],
+    scope: ["src/upload.ts"],
+  });
+  if (!asked.ok) throw new Error(`ask refused: ${asked.code}`);
+  await record(setup, asked.value.decisionId, "chunk", null);
+  await ackAll(setup, principal);
+  return asked.value.decisionId;
 }
 
 /** Acknowledges every item delivered to `principal`. */
@@ -1609,6 +1635,160 @@ describe("revocation at ready", () => {
         ok: true,
         value: { scope: "write", fence: { generation: 1 } },
       });
+    });
+  });
+
+  it("skips a later claim of the alarm's batch that a newer decision reopened during an earlier sweep", async () => {
+    await withTakeover(async (setup) => {
+      const { claims } = await claimInFilingOrder(setup, 2);
+      const [first, second] = claims;
+      if (first === undefined || second === undefined) throw new Error("two claims expected");
+      const decisionId = await decideOnce(setup, agent(2), second.claimId);
+      setup.push(first.fork, WORK);
+      setup.push(second.fork, SUCCESSOR);
+      setup.fake.mintFor(first.fork, "write", 3600);
+      setup.fake.mintFor(second.fork, "write", 3600);
+      // Both listings are partial, so both pins owe a revocation the alarm retries.
+      setup.fake.pageTokens(1, "creation");
+      for (const [n, { claimId }, commit] of [
+        [1, first, WORK],
+        [2, second, SUCCESSOR],
+      ] as const) {
+        expectFailure(await setup.port.ready(agent(n), claimId, { generation: 1, commit }), "busy");
+      }
+      expect(setup.revoked).toEqual([first.fork, second.fork]);
+      setup.fake.pageTokens(null);
+      setup.fake.advance(REVOKE_RETRY_MS);
+
+      // The alarm reads both due claims, then waits on the first claim's sweep.
+      const held = deferred();
+      setup.holdRevocation = () => held.promise;
+      const alarm = setup.port.resume();
+      await vi.waitFor(() => expect(setup.revoked).toHaveLength(3), { timeout: 1000 });
+
+      // Meanwhile a newer decision reopens the second claim, whose holder pushes with a new token.
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(2));
+      expect(await setup.port.authorizeGit(push(agent(2), second.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+      const fresh = setup.fake.mintFor(second.fork, "write", 3600);
+      held.resolve();
+      await alarm;
+
+      expect(setup.revoked).toEqual([first.fork, second.fork, first.fork]);
+      expect(setup.fake.accepts(fresh.plaintext)).toBe(true);
+      expect(stored(setup.sql, first.claimId)).toMatchObject({ state: "ready", revoke_due: null });
+      expect(stored(setup.sql, second.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+    });
+  });
+
+  it("answers a ready from the stored claim when a newer decision reopens it during the sweep", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const held = deferred();
+      setup.holdRevocation = () => held.promise;
+      const ready = { generation: 1, commit: WORK };
+      const pending = setup.port.ready(agent(1), claim.claimId, ready);
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+
+      // The holder's push reopens the superseded pin, but waits for the running sweep to end.
+      await record(setup, decisionId, "reject", 1);
+      expectFailure(await setup.port.authorizeGit(push(agent(1), claim.claimId)), "busy");
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+      held.resolve();
+
+      // The sweep settled, but the pin it was for is gone: the holder must acknowledge and adapt.
+      expectFailure(await pending, "unacked_decision");
+      expect(types(setup.events()).filter((type) => type === "claim.reopened")).toHaveLength(1);
+      expect(await setup.port.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+      expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+    });
+  });
+
+  it("answers busy, then pins under the new version, when the holder acknowledges it during the sweep", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const held = deferred();
+      setup.holdRevocation = () => held.promise;
+      const ready = { generation: 1, commit: WORK };
+      const pending = setup.port.ready(agent(1), claim.claimId, ready);
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+
+      // Nothing reopens the claim before the sweep ends; the ready's own answer does.
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      held.resolve();
+      expectFailure(await pending, "busy");
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+
+      setup.holdRevocation = null;
+      expect(await setup.port.ready(agent(1), claim.claimId, ready)).toMatchObject({
+        ok: true,
+        value: { repeated: false, claim: { readyCommit: WORK } },
+      });
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
+      );
+    });
+  });
+
+  it("starts a sweep only while the claim still owes the revocation the caller read", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.pageTokens(1, "creation");
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+        "busy",
+      );
+      const owedAt = setup.fake.clock() + REVOKE_RETRY_MS;
+      const read = {
+        claimId: claim.claimId,
+        generation: 1,
+        state: "ready",
+        revokeDue: owedAt,
+      } as const;
+      const attempts = () =>
+        setup.sql
+          .exec<{ n: number }>(
+            "SELECT revoke_attempt AS n FROM claims_claims WHERE claim_id = ?",
+            claim.claimId,
+          )
+          .one().n;
+      const before = attempts();
+
+      for (const changed of [
+        { generation: 2 },
+        { state: "expired" },
+        { revokeDue: owedAt - 1 },
+        { revokeDue: null },
+      ] as const) {
+        expect(beginRevocation(setup.sql, { ...read, ...changed })).toBe("stale");
+      }
+      expect(beginRevocation(setup.sql, { ...read, claimId: "clm_unknown00000000001" })).toBe(
+        "stale",
+      );
+      expect(attempts()).toBe(before);
+      expect(beginRevocation(setup.sql, read)).toBe(before + 1);
     });
   });
 

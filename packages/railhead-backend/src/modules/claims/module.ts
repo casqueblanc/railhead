@@ -60,6 +60,14 @@
 // newer issue by `work` or `claim`, and no claim on a newer issue is taken over: each answers
 // `busy` until every older revocation is settled, so the expired claim stays first in line.
 //
+// Every await here (main's head, a fork, a commit lookup, a fork's name, a revocation sweep) lets
+// other calls change the claim, so nothing read before one is acted on after it. A sweep starts
+// only if the claim still has the generation, state and due revocation its caller read, so a pin
+// reopened since then is never swept and its holder's new tokens stay valid; while a sweep runs,
+// the holder of the reopened claim gets no write grant. The alarm reads each claim of its batch
+// again just before that claim's sweep. `ready` answers from the stored claim after its sweep:
+// a pin a newer decision superseded meanwhile is reopened and refused, never reported as pinned.
+//
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
@@ -245,33 +253,38 @@ export function createClaims(
   const owed = (): RevocationOutcome => ({ kind: "owed", retryAt: clock() + REVOKE_RETRY_MS });
 
   /** The revocation sweep running for each claim, which a second caller joins. */
-  const revoking = new Map<ClaimId, Promise<PortResult<TokenRevocation>>>();
+  const revoking = new Map<ClaimId, Promise<Sweep>>();
 
   /**
-   * Revokes the fork tokens of the claim at `generation` and records the outcome, joining the sweep
-   * already running for the claim rather than starting another. A revocation that fails, or that
-   * Artifacts reports as `pending_debt`, is not settled and is due again after `REVOKE_RETRY_MS`.
+   * Revokes the fork tokens of `row`, an expired or ready claim as the caller read it, and records
+   * the outcome, joining the sweep already running for the claim rather than starting another. A
+   * revocation that fails, or that Artifacts reports as `pending_debt`, is not settled and is due
+   * again after `REVOKE_RETRY_MS`. Answers `stale`, having called nothing, when the claim no longer
+   * owes that revocation.
    */
-  const revoke = (claimId: ClaimId, generation: number): Promise<PortResult<TokenRevocation>> => {
-    const running = revoking.get(claimId);
+  const revoke = (row: ClaimRow): Promise<Sweep> => {
+    const running = revoking.get(row.claimId);
     if (running !== undefined) return running;
-    const sweep = sweepTokens(claimId, generation).finally(() => revoking.delete(claimId));
-    revoking.set(claimId, sweep);
+    const sweep = sweepTokens(row).finally(() => revoking.delete(row.claimId));
+    revoking.set(row.claimId, sweep);
     return sweep;
   };
 
   /**
-   * One revocation sweep under a new attempt. The attempt is stored before Artifacts is called, so
-   * a sweep this one overlaps, after an eviction lost the running one, cannot settle the claim.
+   * One revocation sweep under a new attempt. The attempt starts only if the claim still stands as
+   * `row` after the fork's name is derived, the sweep's last await before Artifacts, so a claim
+   * reopened since the caller read it is never swept. The attempt is stored before Artifacts is
+   * called, so a sweep this one overlaps, after an eviction lost the running one, cannot settle the
+   * claim.
    */
-  const sweepTokens = async (
-    claimId: ClaimId,
-    generation: number,
-  ): Promise<PortResult<TokenRevocation>> => {
-    const attempt = log.transaction((tx) => beginRevocation(tx.sql, claimId)).value;
+  const sweepTokens = async (row: ClaimRow): Promise<Sweep> => {
+    const { claimId, generation } = row;
+    const repo = await forkRepoName(repoId, claimId);
+    const attempt = log.transaction((tx) => beginRevocation(tx.sql, row)).value;
+    if (attempt === "stale") return { kind: "stale" };
     let revoked: PortResult<TokenRevocation>;
     try {
-      revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, claimId));
+      revoked = await ports().artifacts.revokeTokens(repo);
     } catch (error) {
       // A revocation that throws is retried like a failed one, rather than at once by every wake.
       log.transaction((tx) => {
@@ -281,18 +294,25 @@ export function createClaims(
       throw error;
     }
     log.transaction((tx) => {
-      const outcome: RevocationOutcome =
-        revocationSettled(revoked) && attempt !== null ? { kind: "settled", attempt } : owed();
+      const outcome: RevocationOutcome = revocationSettled(revoked)
+        ? { kind: "settled", attempt }
+        : owed();
       recordRevocation(tx.sql, claimId, generation, outcome);
       wakeForDeadline(tx.sql);
     });
-    return revoked;
+    return { kind: "swept", result: revoked };
   };
 
-  /** Revokes the fork tokens of expired and ready claims whose revocation is due, up to `limit`. */
+  /**
+   * Revokes the fork tokens of expired and ready claims whose revocation is due, up to `limit`.
+   * Each sweep awaits Artifacts, during which a later claim of the batch may be reopened, so each
+   * claim is read again just before its own sweep and skipped once it no longer owes one.
+   */
   const releaseDue = async (limit: number): Promise<void> => {
-    for (const row of dueRevocations(context.storage.sql, clock(), limit)) {
-      await revoke(row.claimId, row.generation);
+    for (const due of dueRevocations(context.storage.sql, clock(), limit)) {
+      const row = claimById(context.storage.sql, due.claimId);
+      if (row === null || row.revokeDue === null || row.revokeDue > clock()) continue;
+      await revoke(row);
     }
   };
 
@@ -420,6 +440,43 @@ export function createClaims(
       const row = claimById(tx.sql, claimId);
       return row === null ? null : settle(tx, row);
     }).value;
+
+  /**
+   * The answer to a `ready` whose pin was recorded before an awaited revocation, read from the
+   * stored claim. A pin still current with its revocation settled is the success. A claim closed or
+   * taken over meanwhile is refused as `standing` refuses it, and a pin another `ready` replaced
+   * answers `after_ready`. A pin a newer decision superseded is reopened, as `settle` does, and
+   * answers `unacked_decision` while the holder has the new version to acknowledge, or `busy` once
+   * it has, so a repeat pins the work under the new versions. Runs in the caller's transaction.
+   */
+  const answerPinned = (
+    tx: EventTransaction,
+    agent: AgentPrincipal,
+    claimId: ClaimId,
+    request: ReadyRequest,
+    repeated: boolean,
+  ): PortResult<ReadyResult> => {
+    const held = standing(claimById(tx.sql, claimId), agent, request);
+    if (held.kind === "refused") return refuse(tx, held);
+    if (ports().decisions.currentVersions(held.row.claimId) === null) {
+      return fail("unavailable", "The claim's decision versions are unknown.");
+    }
+    const row = settle(tx, held.row);
+    if (row.state === "working") {
+      const gate = ports().inbox.readyGateNow(row.claimId, row.generation);
+      if (gate === null) return fail("unavailable", "The inbox cannot confirm acknowledgements.");
+      if (gate.kind === "blocked") {
+        return refuse(tx, { kind: "refused", reason: "unacked_decision", row });
+      }
+      return fail("busy", "A newer decision reopened the claim; repeat the request.");
+    }
+    if (row.readyCommit !== request.commit) {
+      return refuse(tx, { kind: "refused", reason: "after_ready", row });
+    }
+    return row.revokeDue === null
+      ? ok({ claim: view(row), repeated })
+      : fail("busy", "The fork's tokens are not yet revoked; repeat the request.");
+  };
 
   const current = (row: ClaimRow): ClaimRow | null => {
     const now = activeClaimOf(context.storage.sql, row.agentId);
@@ -628,14 +685,15 @@ export function createClaims(
       // The fork is read only from the pin on, since `authorizeGit` refuses every later push;
       // revoking its tokens ends a write already granted. Nothing awaits since the transaction, so
       // this read sees the pin it recorded. A repeat while the revocation is owed revokes again.
-      if (claimById(context.storage.sql, claimId)?.revokeDue === null) return decided;
-      const revoked = await revoke(claimId, request.generation);
-      if (!revoked.ok) return revoked;
-      // The stored claim, not this sweep's answer, says whether the revocation settled: a sweep
-      // overlapped by a later one settles nothing.
-      return claimById(context.storage.sql, claimId)?.revokeDue === null
-        ? decided
-        : fail("busy", "The fork's tokens are not yet revoked; repeat the request.");
+      const pinned = claimById(context.storage.sql, claimId);
+      if (pinned === null || pinned.revokeDue === null) return decided;
+      const revoked = await revoke(pinned);
+      if (revoked.kind === "swept" && !revoked.result.ok) return revoked.result;
+      // A decision, a reopen or another `ready` may have run during the sweep, so the answer comes
+      // from the stored claim, not from `decided`.
+      return log.transaction((tx) =>
+        answerPinned(tx, agent, claimId, request, decided.value.repeated),
+      ).value;
     },
 
     async pin(claimId) {
@@ -677,6 +735,7 @@ export function createClaims(
             const leased = hold(tx, row);
             return reopen ? settle(tx, leased) : leased;
           }).value,
+        sweeping: (claimId) => revoking.has(claimId),
       });
     },
 
@@ -749,6 +808,13 @@ function revocationSettled(result: PortResult<TokenRevocation>): boolean {
       return result.value satisfies never;
   }
 }
+
+/** How one call to revoke a claim's fork tokens ended. */
+type Sweep =
+  /** The claim no longer owed the revocation it was read with, so Artifacts was not called. */
+  | { kind: "stale" }
+  /** Artifacts was called; its answer is recorded. */
+  | { kind: "swept"; result: PortResult<TokenRevocation> };
 
 /** Who records a refusal: the claims module, never the agent it refuses. */
 const CLAIMS_ACTOR: Actor = { kind: "system", id: "sys_claims" };
@@ -840,6 +906,8 @@ interface GitHolder {
    * returns it to working if a newer decision superseded its pin.
    */
   holderRead(claimId: ClaimId, agentId: AgentId, reopen: boolean): ClaimRow | null;
+  /** Whether a revocation sweep of the claim's fork tokens is running in this Repo. */
+  sweeping(claimId: ClaimId): boolean;
 }
 
 /**
@@ -880,6 +948,11 @@ async function decideGit(
     case "fetch":
       return ok({ repo, scope: "read", fence: null });
     case "push":
+      // A sweep that started before a newer decision reopened the claim may still reach a token
+      // minted now, so the holder waits for it to end.
+      if (row.state === "working" && holder.sweeping(claimId)) {
+        return fail("busy", "The fork's earlier tokens are still being revoked; repeat the push.");
+      }
       return pushGrant(row, principal, repo);
     default:
       return operation satisfies never;
