@@ -21,6 +21,8 @@ clap = { version = "=4.6.7", features = ["derive"] }
 dirs = "=7.0.0"
 # rustls with the platform verifier: no OpenSSL to link, and the OS trust store is honoured.
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+# Unix only: the effective user id that key store owners are compared against. Latest stable.
+rustix = { version = "=1.1.5", default-features = false, features = ["process"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 # Not 0.11: ssh-key 0.6 is built on the 0.10 digest traits, and the confirmation code hashes
