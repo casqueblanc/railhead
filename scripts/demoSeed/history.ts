@@ -26,7 +26,7 @@ export const MAIN_BRANCH = "main";
 export const MAX_IMPORT_COMMITS = 500;
 /**
  * The largest bundle the seed sends. It restates the backend's `MAX_DEMO_BUNDLE_BYTES` (#149),
- * which refuses a larger one; the scripts do not depend on `@railhead/shared`.
+ * which refuses a larger one; `liveTarget.test.ts` checks the two are equal.
  */
 export const MAX_BUNDLE_BYTES = 8 * 1024 * 1024;
 

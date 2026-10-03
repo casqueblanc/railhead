@@ -29,7 +29,7 @@ import type {
   RailheadEvent,
   RepoId,
   UserId,
-} from "./events";
+} from "./events.ts";
 
 /** Largest event page `readEvents` returns. */
 export const MAX_EVENT_PAGE = 256;
