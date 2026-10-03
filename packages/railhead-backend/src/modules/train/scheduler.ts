@@ -1100,8 +1100,21 @@ export function createTrain(
     };
   }
 
-  function hasEntry(claimId: ClaimId, generation: number): boolean {
-    return readEntry(sql, claimId, generation) !== null;
+  function holdsLiveEntry(claimId: ClaimId, generation: number): boolean {
+    const entry = readEntry(sql, claimId, generation);
+    if (entry === null) return false;
+    switch (entry.state) {
+      case "queued":
+      case "batched":
+      case "parked":
+        return true;
+      // A settled entry judged an earlier attempt or episode, so it holds nothing still owed.
+      case "landed":
+      case "dropped":
+        return false;
+      default:
+        return unreachable(entry.state);
+    }
   }
 
   function queue(
@@ -1224,7 +1237,7 @@ export function createTrain(
     queue,
     recordCheck,
     attemptOutcome,
-    hasEntry,
+    holdsLiveEntry,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
