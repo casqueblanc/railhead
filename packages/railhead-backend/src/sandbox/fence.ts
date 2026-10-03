@@ -45,10 +45,10 @@
 // A retired incarnation's record is needed only while a start for it could still arrive. Every
 // start carries its slot's deadline, and one that arrives at or after that deadline starts nothing,
 // so once retirement is confirmed and the deadline has passed the object may forget the record and
-// all its storage (`disposable`); a retirement confirmed early asks to be woken at the deadline for
-// that. A sandbox retired before it ever started records a deadline `MAX_SANDBOX_LIFETIME_MS` from
-// then: its slot was admitted earlier, so its deadline, and that of any start still on the way, is no
-// later.
+// all its storage (`disposable`); the destroy that confirms it asks to be woken at the deadline for
+// that, whatever its retry budget, and fails when it cannot. A sandbox retired before it ever
+// started records a deadline `MAX_SANDBOX_LIFETIME_MS` from then: its slot was admitted earlier, so
+// its deadline, and that of any start still on the way, is no later.
 
 import { MAX_SANDBOX_LIFETIME_MS } from "./admission";
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
@@ -435,9 +435,11 @@ export class SandboxFence {
     try {
       await this.#destroy(deadline);
     } catch (destroyError) {
-      throw new AggregateError([error, destroyError], "the sandbox failed and was not destroyed", {
-        cause: destroyError,
-      });
+      throw new AggregateError(
+        [error, destroyError],
+        "the sandbox failed and its teardown did not complete",
+        { cause: destroyError },
+      );
     }
     throw error;
   }
@@ -500,6 +502,14 @@ export class SandboxFence {
     // destroy that follows the last settlement confirms.
     if (this.#effects.size > 0 || this.#settlements !== settlements) return false;
     this.#write({ phase: "retired", deadline });
+    // The wake-up that ran this attempt is spent, and a retry wake-up, when one was scheduled, may
+    // come before the deadline or not at all: without one at the deadline nothing deletes the
+    // object's storage. One that cannot be scheduled fails the attempt, so a release or the next
+    // wake-up confirms the retirement again and schedules it.
+    const retryPending = attempts < MAX_TEARDOWN_ATTEMPTS && unscheduled === null;
+    if (this.#clock() < deadline || !retryPending) {
+      await this.#container.wake(Math.max(deadline, this.#clock()));
+    }
     return true;
   }
 

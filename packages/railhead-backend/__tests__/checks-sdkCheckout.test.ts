@@ -36,6 +36,7 @@ import {
   RailheadSandbox,
   admitSandboxClient,
   fenceSandbox,
+  wakeTime,
   type FencedSandboxCalls,
 } from "../src/sandbox/sandboxObject";
 
@@ -738,6 +739,75 @@ describe("RailheadSandbox's storage after retirement", () => {
     });
   });
 
+  it("deletes its storage past the deadline after its last destroy attempt confirms before it", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 200;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+      for (let failure = 1; failure < MAX_TEARDOWN_ATTEMPTS; failure += 1) {
+        destroy.mockRejectedValueOnce(new Error("scripted destroy failure"));
+        await expect(sandbox.railheadRetire()).rejects.toThrow("scripted destroy failure");
+      }
+      expect(stored(state).fence).toEqual({
+        phase: "retiring",
+        deadline,
+        attempts: MAX_TEARDOWN_ATTEMPTS - 1,
+      });
+      // The last retry wake-up is due, and no other is left: the start's ran early.
+      state.storage.sql.exec("DELETE FROM container_schedules");
+      await sandbox.schedule(new Date(Date.now() - 1_000), "railheadExpire");
+
+      await sandbox.alarm();
+
+      expect(destroy).toHaveBeenCalledTimes(MAX_TEARDOWN_ATTEMPTS);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      const wake = wakeTime(deadline).getTime();
+      expect(scheduledWakes(state)).toEqual([wake]);
+      expect(await state.storage.getAlarm()).toBe(wake);
+
+      await pastDeadline(wake);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("fails a release whose deadline wake-up cannot be scheduled, and the retried release schedules it", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 200;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      state.storage.sql.exec("DELETE FROM container_schedules");
+      const wake = wakeTime(deadline).getTime();
+      const schedule = sandbox.schedule.bind(sandbox);
+      let failed = false;
+      vi.spyOn(sandbox, "schedule").mockImplementation(async (when, callback, payload) => {
+        if (!failed && when instanceof Date && when.getTime() === wake) {
+          failed = true;
+          throw new Error("scripted schedule failure");
+        }
+        return schedule(when, callback, payload);
+      });
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+
+      await expect(sandbox.railheadRetire()).rejects.toThrow("scripted schedule failure");
+
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(scheduledWakes(state)).not.toContain(wake);
+
+      // The repository keeps the slot and releases the sandbox again.
+      await sandbox.railheadRetire();
+
+      expect(scheduledWakes(state)).toContain(wake);
+      await pastDeadline(wake);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
   it("keeps its record and a wake-up at an alarm before the deadline", async () => {
     await withRailheadSandbox(null, async (sandbox, _container, state) => {
       const deadline = Date.now() + 60_000;
@@ -857,6 +927,16 @@ function stored(state: DurableObjectState): { tables: string[]; fence: unknown }
     .toArray()
     .map((row) => row.name);
   return { tables, fence: state.storage.kv.get("railhead:fence") };
+}
+
+/** The times, in milliseconds, of the fence's wake-ups still scheduled with the SDK. */
+function scheduledWakes(state: DurableObjectState): number[] {
+  return state.storage.sql
+    .exec<{ time: number }>(
+      "SELECT time FROM container_schedules WHERE callback = 'railheadExpire' ORDER BY time",
+    )
+    .toArray()
+    .map((row) => row.time * 1_000);
 }
 
 /** The deadline of a stored fence record. */

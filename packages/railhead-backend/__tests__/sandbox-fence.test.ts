@@ -54,6 +54,8 @@ class FakeContainer {
   destroyHangs = false;
   /** Whether scheduling a wake-up fails. */
   wakeFails = false;
+  /** A wake-up time whose next scheduling fails, once. */
+  wakeFailsOnceAt: number | null = null;
   /** What the next command does instead of succeeding. */
   nextExec: "fails" | "exits_1" | "ignores_timeout" | null = null;
   grants: SandboxGrant[] = [];
@@ -109,6 +111,10 @@ class FakeContainer {
     },
     wake: async (at) => {
       if (this.wakeFails) throw new Error("scripted wake failure");
+      if (this.wakeFailsOnceAt === at) {
+        this.wakeFailsOnceAt = null;
+        throw new Error("scripted wake failure");
+      }
       this.wakes.push(at);
       this.scheduled.push({ seconds: Math.floor(at / 1_000) });
     },
@@ -544,6 +550,83 @@ describe("sandbox fence disposal", () => {
     });
   });
 
+  it("asks to be woken at the deadline when the last destroy attempt confirms early", async () => {
+    await withFence(async ({ fence, fake, advance, alarm, phase }) => {
+      // The longest lifetime: every retry fits before it.
+      const deadline = START + MAX_SANDBOX_LIFETIME_MS;
+      await fence.start(POLICY, deadline);
+      // The start's deadline wake-up ran early, as a scheduler may, and is spent.
+      fake.scheduled.length = 0;
+      fake.destroyFails = true;
+      await fence.retire().catch(noop);
+      for (let attempt = 1; attempt < MAX_TEARDOWN_ATTEMPTS - 1; attempt += 1) {
+        advance(teardownRetryDelay(attempt));
+        await alarm();
+      }
+      expect(fake.destroys).toBe(MAX_TEARDOWN_ATTEMPTS - 1);
+      expect(phase()).toBe("retiring");
+
+      fake.destroyFails = false;
+      advance(teardownRetryDelay(MAX_TEARDOWN_ATTEMPTS - 1));
+      await alarm();
+
+      expect(fake.destroys).toBe(MAX_TEARDOWN_ATTEMPTS);
+      expect(phase()).toBe("retired");
+      expect(fake.scheduled).toEqual([{ seconds: Math.floor(deadline / 1_000) }]);
+      expect(fence.disposable()).toBe(false);
+
+      // Past the deadline, that wake-up runs and the object may delete its storage.
+      advance(MAX_SANDBOX_LIFETIME_MS);
+      await alarm();
+      expect(fake.scheduled).toEqual([]);
+      expect(fence.disposable()).toBe(true);
+    });
+  });
+
+  it("fails a confirmed release whose deadline wake-up cannot be scheduled, then schedules it at the next wake-up", async () => {
+    await withFence(async ({ fence, fake, advance, alarm, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.scheduled.length = 0;
+      fake.wakes.length = 0;
+      fake.wakeFailsOnceAt = DEADLINE;
+
+      await expect(fence.retire()).rejects.toThrow("scripted wake failure");
+      expect(fake.destroys).toBe(1);
+      expect(phase()).toBe("retired");
+      expect(fake.wakes).not.toContain(DEADLINE);
+
+      // The retry wake-up the destroy scheduled first finds it retired and asks for the deadline.
+      advance(teardownRetryDelay(1));
+      await alarm();
+      expect(fake.wakes.at(-1)).toBe(DEADLINE);
+      expect(fence.disposable()).toBe(false);
+
+      advance(DEADLINE - START - teardownRetryDelay(1));
+      await alarm();
+      expect(fence.disposable()).toBe(true);
+    });
+  });
+
+  it("asks to be woken at once when the last destroy attempt confirms past the deadline", async () => {
+    await withFence(async ({ fence, fake, advance, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyFails = true;
+      for (let attempt = 1; attempt < MAX_TEARDOWN_ATTEMPTS; attempt += 1) {
+        await fence.retire().catch(noop);
+      }
+      fake.destroyFails = false;
+      advance(DEADLINE - START + 1_000);
+      fake.scheduled.length = 0;
+
+      await fence.retire();
+
+      expect(fake.destroys).toBe(MAX_TEARDOWN_ATTEMPTS);
+      expect(phase()).toBe("retired");
+      expect(fake.scheduled).toEqual([{ seconds: Math.floor((DEADLINE + 1_000) / 1_000) }]);
+      expect(fence.disposable()).toBe(true);
+    });
+  });
+
   it("is not disposable while a destroy is unconfirmed, though the deadline passed", async () => {
     await withFence(async ({ fence, fake, advance, phase }) => {
       await fence.start(POLICY, DEADLINE);
@@ -728,12 +811,12 @@ describe("sandbox fence failures", () => {
     });
   });
 
-  it("still destroys on release when the retry wake-up cannot be scheduled", async () => {
+  it("still destroys on release when no wake-up can be scheduled, and reports the lost deadline wake-up", async () => {
     await withFence(async ({ fence, fake, phase }) => {
       await fence.start(POLICY, DEADLINE);
       fake.wakeFails = true;
 
-      await fence.retire();
+      await expect(fence.retire()).rejects.toThrow("scripted wake failure");
 
       expect(fake.destroys).toBe(1);
       expect(fake.running).toBe(false);
