@@ -16,7 +16,10 @@
 // batched one keeps its commit for the active batch and holds the new one in `next_commit` until
 // that batch settles. `episode` records the claim's episode of the pin the entry holds, and
 // `next_episode` that of `next_commit`; a drive that read an entry settles it only while its
-// episode is unchanged, so a ready episode queued during the drive's reads is kept.
+// episode is unchanged, so a ready episode queued during the drive's reads is kept. A batched entry
+// also records in `batched_episode` the episode its batch was formed for. A re-ready of the batched
+// commit raises `episode` past it, and the batch's result then belongs to the older episode only:
+// the entry goes back to the queue as fresh work rather than taking that result.
 //
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
@@ -82,6 +85,8 @@ const MIGRATIONS: readonly string[] = [
   "ALTER TABLE train_queue ADD COLUMN next_commit TEXT",
   "ALTER TABLE train_queue ADD COLUMN episode INTEGER NOT NULL DEFAULT 0 CHECK (episode >= 0)",
   "ALTER TABLE train_queue ADD COLUMN next_episode INTEGER",
+  "ALTER TABLE train_queue ADD COLUMN batched_episode INTEGER",
+  "UPDATE train_queue SET batched_episode = episode WHERE state = 'batched'",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -133,6 +138,8 @@ export interface QueueEntry {
   episode: number;
   /** While batched, the commit of a newer ready episode, queued once the batch settles; or `null`. */
   nextCommit: CommitSha | null;
+  /** The ready episode its latest batch was formed for, or `null` before it was first batched. */
+  batchedEpisode: number | null;
 }
 
 /** Where one batch stands. */
@@ -213,6 +220,7 @@ type QueueRow = {
   reason: string | null;
   episode: number;
   next_commit: string | null;
+  batched_episode: number | null;
 };
 
 type BatchRow = {
@@ -237,7 +245,7 @@ type BatchRow = {
 };
 
 const QUEUE_COLUMNS =
-  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit";
+  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit, batched_episode";
 const BATCH_COLUMNS =
   "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
@@ -361,7 +369,8 @@ export function renewEpisode(sql: SqlStorage, pin: ClaimPin, episode: number, no
 
 /**
  * Holds the commit of ready episode `episode` on a batched entry until its batch settles, or, when
- * the episode pinned the batched commit again, clears any held commit and takes the episode.
+ * the episode pinned the batched commit again, clears any held commit and takes the episode, which
+ * the batch's result then no longer settles.
  */
 export function deferCommit(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
@@ -466,7 +475,10 @@ export function recentBatches(sql: SqlStorage, limit: number): BatchRecord[] {
     .map(toBatch);
 }
 
-/** Records a new active batch over `pins` and marks their entries batched. Returns its id. */
+/**
+ * Records a new active batch over `pins` and marks their entries batched for the episode each
+ * holds. Returns its id.
+ */
 export function insertBatch(
   sql: SqlStorage,
   batch: {
@@ -493,7 +505,8 @@ export function insertBatch(
   if (row === undefined) throw new Error("the batch insert returned no row");
   for (const pin of batch.pins) {
     sql.exec(
-      "UPDATE train_queue SET state = 'batched', updated_at = ? WHERE claim_id = ? AND generation = ?",
+      `UPDATE train_queue SET state = 'batched', batched_episode = episode, updated_at = ?
+       WHERE claim_id = ? AND generation = ?`,
       now,
       pin.claimId,
       pin.generation,
@@ -705,6 +718,7 @@ function toEntry(row: QueueRow): QueueEntry {
     reason: row.reason === null ? null : parseDropReason(row.reason),
     episode: row.episode,
     nextCommit: row.next_commit,
+    batchedEpisode: row.batched_episode,
   };
 }
 

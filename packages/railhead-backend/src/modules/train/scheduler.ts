@@ -33,7 +33,11 @@
 // the decision versions it was scheduled under are no longer current.
 // Each entry records the episode it was queued for, and a drive settles or batches a waiting entry
 // only while that episode and its commit are the ones it read, so a claim re-readied with the same
-// commit during the drive's reads stays queued for the next pass.
+// commit during the drive's reads stays queued for the next pass. A batched entry re-readied with
+// its batched commit is a newer episode than the batch was formed for: the batch's failure, conflict
+// or landing never drops, parks or fails it, and it returns to the front of the queue as fresh work.
+// A landing settles it as landed only when the claim's current decision versions are among the
+// batch's, so a commit is never marked landed for an episode whose versions were not checked.
 //
 // Every port call is bounded by `PORT_TIMEOUT_MS`; a call that does not answer in time stops the
 // drive as if the port were unavailable, and the alarm retries it under the same attempt or intent.
@@ -698,10 +702,31 @@ export function createTrain(
   function landBatch(generation: number, batch: BatchRecord): void {
     const now = clock();
     fenced(generation, () => {
-      for (const pin of batch.pins) settleEntry(sql, pin, "landed", null, now);
+      const unchecked = orderAsBatch(batch, batchedEntries(sql)).filter(
+        (entry) => renewed(entry) && !checkedUnder(batch, entry.pin.claimId),
+      );
+      for (const pin of batch.pins) {
+        if (!unchecked.some((entry) => samePin(entry.pin, pin))) {
+          settleEntry(sql, pin, "landed", null, now);
+        }
+      }
+      requeueFront(sql, unchecked.map(fresh), now);
       settleBatch(sql, batch.batchId, { state: "landed" }, now);
       promoteDeferred(sql, now);
     });
+  }
+
+  /** Whether the claim's current decision versions are all among those `batch` was checked under. */
+  function checkedUnder(batch: BatchRecord, claimId: string): boolean {
+    const current = ports().decisions.currentVersions(claimId);
+    return (
+      current !== null &&
+      current.every((ref) =>
+        batch.decisions.some(
+          (checked) => checked.decisionId === ref.decisionId && checked.version === ref.version,
+        ),
+      )
+    );
   }
 
   /** Settles a failed batch and sends each pin back, isolated, retried or dropped. */
@@ -720,30 +745,22 @@ export function createTrain(
     const entries = orderAsBatch(batch, batchedEntries(sql));
     settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
     const definitive = isDefinitive(failure);
-    if (definitive && entries.length === 1) {
-      for (const entry of entries) settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
-      return;
-    }
-    if (definitive) {
-      // A shared batch failed on the pins themselves: check each alone, never a subset's share.
-      requeueFront(
-        sql,
-        entries.map((entry) => ({ pin: entry.pin, isolate: true, retries: entry.retries })),
-        now,
-      );
-      return;
-    }
-    const retried = entries.map((entry) => ({ ...entry, retries: entry.retries + 1 }));
-    for (const entry of retried) {
-      if (entry.retries > MAX_RETRIES) {
+    const returned: Returned[] = [];
+    for (const entry of entries) {
+      if (renewed(entry)) {
+        returned.push(fresh(entry));
+      } else if (definitive && entries.length === 1) {
+        settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
+      } else if (definitive) {
+        // A shared batch failed on the pins themselves: check each alone, never a subset's share.
+        returned.push({ pin: entry.pin, isolate: true, retries: entry.retries });
+      } else if (entry.retries + 1 > MAX_RETRIES) {
         settleEntry(sql, entry.pin, "dropped", "retries_exhausted", now);
+      } else {
+        returned.push({ pin: entry.pin, isolate: entry.isolate, retries: entry.retries + 1 });
       }
     }
-    requeueFront(
-      sql,
-      retried.filter((entry) => entry.retries <= MAX_RETRIES),
-      now,
-    );
+    requeueFront(sql, returned, now);
   }
 
   /**
@@ -774,13 +791,16 @@ export function createTrain(
       if (!holds(generation)) throw new DriveSuperseded();
       const entries = orderAsBatch(batch, batchedEntries(sql));
       settleBatch(sql, batch.batchId, { state: "failed", failure: "conflict" }, now);
-      const parked = (entry: QueueEntry) => samePin(entry.pin, first) || samePin(entry.pin, second);
+      const parked = (entry: QueueEntry) =>
+        !renewed(entry) && (samePin(entry.pin, first) || samePin(entry.pin, second));
       for (const entry of entries.filter(parked)) {
         settleEntry(sql, entry.pin, "parked", "conflict", now);
       }
       requeueFront(
         sql,
-        entries.filter((entry) => !parked(entry)),
+        entries
+          .filter((entry) => !parked(entry))
+          .map((entry) => (renewed(entry) ? fresh(entry) : entry)),
         now,
       );
       promoteDeferred(sql, now);
@@ -1045,6 +1065,22 @@ function attemptOf(batch: BatchRecord): CheckAttempt {
     decisions: batch.decisions,
     createdAt: batch.attemptAt,
   };
+}
+
+/** An entry sent back to the queue's front, with the counters it keeps. */
+type Returned = { pin: ClaimPin; isolate: boolean; retries: number };
+
+/**
+ * Whether a batched entry was readied again with its batched commit after its batch was formed, so
+ * it holds a newer episode than the one the batch's result belongs to.
+ */
+function renewed(entry: QueueEntry): boolean {
+  return entry.episode !== entry.batchedEpisode;
+}
+
+/** A renewed entry returned to the queue as fresh work for its newer episode. */
+function fresh(entry: QueueEntry): Returned {
+  return { pin: entry.pin, isolate: false, retries: 0 };
 }
 
 /** The batched entries in the batch's merge order. */

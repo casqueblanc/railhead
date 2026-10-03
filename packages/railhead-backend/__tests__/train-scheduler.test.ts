@@ -144,6 +144,7 @@ class Fakes {
           await this.answer("decisions.requirements");
           return ok(this.requirements.get(claimId) ?? []);
         },
+        currentVersions: (claimId) => this.requirements.get(claimId) ?? [],
       },
       merge: {
         compose: async (main, pins) => {
@@ -1574,6 +1575,74 @@ describe("train ready episodes", () => {
       expect(train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_fail"]);
       expect(lastStarted(fakes).pins).toEqual([newer]);
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", retries: 0 });
+    }, fakes);
+  });
+
+  it("checks a same-commit re-ready again when the old batch lands under a superseded version", async () => {
+    const fakes = new Fakes();
+    const first: DecisionRef = { decisionId: "dec_upload01", version: 1 };
+    const second: DecisionRef = { decisionId: "dec_upload01", version: 2 };
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      fakes.requirements.set(pin(1).claimId, [first]);
+      await train.enqueue(pin(1));
+      const old = lastStarted(fakes);
+      expect(old.decisions).toEqual([first]);
+
+      // The claim is readied again with the same commit under a newer version.
+      fakes.requirements.set(pin(1).claimId, [second]);
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+      await train.recordCheck(report(old, "pass"));
+
+      // The old attempt landed, but the new episode's version was never checked.
+      expect(train.batches(2).map((batch) => batch.state)).toEqual(["checking", "landed"]);
+      expect(fakes.started).toHaveLength(2);
+      expect(lastStarted(fakes)).toMatchObject({ pins: [pin(1)], decisions: [second] });
+      expect(train.entries(1)[0]).toMatchObject({ pin: pin(1), state: "batched", retries: 0 });
+    }, fakes);
+  });
+
+  it("lands a same-commit re-ready with the old batch while its version is unchanged", async () => {
+    const fakes = new Fakes();
+    const first: DecisionRef = { decisionId: "dec_upload01", version: 1 };
+    await withTrain(async ({ train, sql }) => {
+      fakes.ready(pin(1));
+      fakes.requirements.set(pin(1).claimId, [first]);
+      await train.enqueue(pin(1));
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+
+      expect(train.batches(2).map((batch) => batch.state)).toEqual(["landed"]);
+      expect(fakes.started).toHaveLength(1);
+      expect(train.entries(1)[0]).toMatchObject({ pin: pin(1), state: "landed" });
+      expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+
+  it("returns a same-commit re-ready to the queue instead of parking it with a conflict", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Not yet.");
+    fakes.compose = (main, pins) =>
+      pins.length === 2
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        : ok({ kind: "clean", candidate: candidateOf(main, pins) });
+    await withTrain(async ({ train, events }) => {
+      fakes.ready(pin(1), pin(2));
+      for (const p of [pin(1), pin(2)]) await train.enqueue(p);
+      fakes.head = () => ok(fakes.main);
+      const release = fakes.hold("merge.compose");
+      const driving = train.drive();
+      await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(1));
+
+      // Claim 1 is readied again with its batched commit while the merge runs.
+      const queued = train.enqueue(pin(1));
+      release();
+      expect(await queued).toEqual(ok({ queued: false }));
+      await driving;
+
+      expect(events()).toMatchObject([{ type: "train.conflict" }]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "parked" });
+      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
     }, fakes);
   });
 });

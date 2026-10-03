@@ -578,6 +578,48 @@ describe("a re-ready after a superseded decision", () => {
       expect(setup.entries()).toEqual([{ commit: LATER, state: "batched", next: null }]);
     });
   });
+
+  it("schedules a same-commit re-ready under the new version when the old batch's check fails", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await setup.train.resume();
+      const old = setup.started[0];
+      if (old === undefined) throw new Error("no check was started for the first pin");
+      expect(old.decisions).toEqual([first]);
+
+      // A superseding version reopens the claim; the holder readies the same commit under it.
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { state: "working" },
+      });
+      await setup.ackAll();
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+
+      // The old attempt fails. It belongs to the old episode, so the new one is not dropped.
+      const recorded = await setup.train.recordCheck({
+        attemptId: old.attemptId,
+        candidate: old.candidate,
+        result: "fail",
+        logDigest: null,
+        finishedAt: old.createdAt,
+      });
+      expect(recorded.ok).toBe(true);
+
+      expect(setup.train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_fail"]);
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.started).toHaveLength(2);
+      expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
+      expect(setup.started.at(-1)?.attemptId).not.toBe(old.attemptId);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+    });
+  });
 });
 
 describe("a re-ready while the train's retries have run out", () => {
