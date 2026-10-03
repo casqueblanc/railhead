@@ -273,12 +273,12 @@ importers:
       '@cloudflare/kumo':
         specifier: 2.14.0
         version: 2.14.0(@date-fns/tz@1.5.0)(@phosphor-icons/react@2.1.10(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(@types/react@19.3.0)(date-fns@4.4.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(zod@4.6.5)
-      '@railhead/shared':
-        specifier: workspace:*
-        version: link:../railhead-shared
       '@phosphor-icons/react':
         specifier: 2.1.10
         version: 2.1.10(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+      '@railhead/shared':
+        specifier: workspace:*
+        version: link:../railhead-shared
       '@tailwindcss/vite':
         specifier: 4.3.3
         version: 4.3.3(vite@7.3.6(@types/node@24.19.0)(jiti@2.7.0)(lightningcss@1.33.0))
@@ -347,6 +347,9 @@ importers:
       '@cloudflare/config':
         specifier: 0.22.0
         version: 0.22.0
+      capnweb:
+        specifier: 'catalog:'
+        version: 0.12.0
     devDependencies:
       '@types/node':
         specifier: 24.19.0
