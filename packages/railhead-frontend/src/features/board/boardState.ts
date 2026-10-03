@@ -264,34 +264,17 @@ export const inboxKey = (agentId: AgentId, item: number): string => `${agentId}/
  * Applies one event. Returns `state` itself when the event changes nothing: a duplicate, or any
  * event after the fold halted. Never throws for a bad event; see `StreamStatus` and `BoardFault`.
  */
-export const foldEvent = (state: BoardState, event: RailheadEvent): BoardState => {
-  if (state.stream.kind === "halted") return state;
-  if (event.v !== EVENT_SCHEMA_VERSION) {
-    return halt(state, { kind: "unsupported_version", seq: event.seq, version: event.v });
-  }
-  try {
-    validateEvent(event);
-  } catch (error) {
-    return halt(state, { kind: "invalid_event", seq: event.seq, message: messageOf(error) });
-  }
-  if (event.repo !== state.repo) return halt(state, { kind: "foreign_repo", seq: event.seq });
-  if (event.seq <= state.cursor) return state;
-  if (event.seq > state.cursor + 1) return markGap(state, event.seq);
+export const foldEvent = (state: BoardState, event: RailheadEvent): BoardState =>
+  foldInto(state, event, new FoldDraft());
 
-  let next: BoardState;
-  try {
-    next = applyEvent(state, event);
-  } catch (error) {
-    if (!(error instanceof LogInconsistency)) throw error;
-    return halt(state, { kind: "inconsistent", seq: event.seq, message: error.message });
-  }
-  return { ...next, cursor: event.seq, stream: afterApplying(state.stream, event.seq) };
-};
-
-/** Applies events in order; see `foldEvent`. */
+/**
+ * Applies events in order; see `foldEvent`. Each record is copied at most once per call, so the
+ * time taken grows linearly with the number of events.
+ */
 export const foldEvents = (state: BoardState, events: Iterable<RailheadEvent>): BoardState => {
+  const draft = new FoldDraft();
   let next = state;
-  for (const event of events) next = foldEvent(next, event);
+  for (const event of events) next = foldInto(next, event, draft);
   return next;
 };
 
@@ -382,6 +365,69 @@ export const decisionRipple = (state: BoardState, decisionId: DecisionId): Rippl
 
 // Internals
 
+/**
+ * The records and lists one fold created, which later events of the same fold update in place.
+ *
+ * Copying a record for every event made a fold quadratic. Instead a record is copied the first time a
+ * fold writes to it and mutated afterwards. Nothing the caller passed in is ever registered, and the
+ * draft dies with its fold, so every state a caller holds stays unchanged. Only the latest state of
+ * a fold is returned; the intermediate states that share these objects are discarded. `applyEvent`
+ * makes all its checks before its first write, so a halting event leaves its input state intact.
+ */
+class FoldDraft {
+  readonly #records = new WeakMap<object, Record<string, unknown>>();
+  readonly #lists = new WeakMap<object, unknown[]>();
+
+  /** `record` with `key` set to `value`. */
+  put<T>(record: Readonly<Record<string, T>>, key: string, value: T): Readonly<Record<string, T>> {
+    const owned = this.#records.get(record);
+    if (owned !== undefined) {
+      owned[key] = value;
+      return record;
+    }
+    const copy = { ...record, [key]: value };
+    this.#records.set(copy, copy);
+    return copy;
+  }
+
+  /** `list` with `item` appended. */
+  append<T>(list: readonly T[], item: T): readonly T[] {
+    const owned = this.#lists.get(list);
+    if (owned !== undefined) {
+      owned.push(item);
+      return list;
+    }
+    const copy = [...list, item];
+    this.#lists.set(copy, copy);
+    return copy;
+  }
+}
+
+/** `foldEvent`, writing through `draft`. */
+const foldInto = (state: BoardState, event: RailheadEvent, draft: FoldDraft): BoardState => {
+  if (state.stream.kind === "halted") return state;
+  if (event.v !== EVENT_SCHEMA_VERSION) {
+    return halt(state, { kind: "unsupported_version", seq: event.seq, version: event.v });
+  }
+  try {
+    validateEvent(event);
+  } catch (error) {
+    return halt(state, { kind: "invalid_event", seq: event.seq, message: messageOf(error) });
+  }
+  if (event.repo !== state.repo) return halt(state, { kind: "foreign_repo", seq: event.seq });
+  if (event.seq <= state.cursor) return state;
+  if (event.seq > state.cursor + 1) return markGap(state, event.seq);
+
+  let next: BoardState;
+  try {
+    next = applyEvent(state, event, draft);
+  } catch (error) {
+    if (!(error instanceof LogInconsistency)) throw error;
+    return halt(state, { kind: "inconsistent", seq: event.seq, message: error.message });
+  }
+  return { ...next, cursor: event.seq, stream: afterApplying(state.stream, event.seq) };
+};
+
 const DELIVERY_RANK: Record<InboxDelivery, number> = { queued: 0, delivered: 1, acknowledged: 2 };
 
 /** Thrown by `applyEvent` when an event contradicts the folded log; becomes an `inconsistent` fault. */
@@ -421,12 +467,6 @@ const fresh = (record: Readonly<Record<string, unknown>>, key: string, what: str
 const check = (condition: boolean, message: string): void => {
   if (!condition) throw new LogInconsistency(message);
 };
-
-const put = <T>(
-  record: Readonly<Record<string, T>>,
-  key: string,
-  value: T,
-): Readonly<Record<string, T>> => ({ ...record, [key]: value });
 
 const knownDecisionVersion = (state: BoardState, ref: DecisionRef): DecisionVersionState => {
   const decision = known(state.decisions, ref.decisionId, "decision");
@@ -494,7 +534,7 @@ const landingOf = (intent: IntentState, outcome: MainOutcome, main: CommitSha): 
 };
 
 /** Applies a validated, in-order event. Throws `LogInconsistency` when it contradicts the log. */
-const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
+const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): BoardState => {
   const { seq } = event;
   switch (event.type) {
     case "agent.invited": {
@@ -502,7 +542,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       fresh(state.invites, inviteId, "invite");
       return {
         ...state,
-        invites: put(state.invites, inviteId, {
+        invites: draft.put(state.invites, inviteId, {
           inviteId,
           name,
           expiresAt: event.at + INVITE_TTL_MS,
@@ -518,8 +558,8 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       fresh(state.agents, agentId, "agent");
       return {
         ...state,
-        invites: put(state.invites, inviteId, { ...invite, agentId }),
-        agents: put(state.agents, agentId, {
+        invites: draft.put(state.invites, inviteId, { ...invite, agentId }),
+        agents: draft.put(state.agents, agentId, {
           agentId,
           name,
           inviteId,
@@ -535,7 +575,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       );
       return {
         ...state,
-        agents: put(state.agents, agent.agentId, { ...agent, status: "confirmed" }),
+        agents: draft.put(state.agents, agent.agentId, { ...agent, status: "confirmed" }),
       };
     }
     case "agent.revoked": {
@@ -543,13 +583,13 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(agent.status !== "revoked", `agent ${agent.agentId} was already revoked`);
       return {
         ...state,
-        agents: put(state.agents, agent.agentId, { ...agent, status: "revoked" }),
+        agents: draft.put(state.agents, agent.agentId, { ...agent, status: "revoked" }),
       };
     }
     case "issue.filed": {
       const { issueId, title, body } = event.data;
       fresh(state.issues, issueId, "issue");
-      return { ...state, issues: put(state.issues, issueId, { issueId, title, body }) };
+      return { ...state, issues: draft.put(state.issues, issueId, { issueId, title, body }) };
     }
     case "claim.opened": {
       const { claimId, issueId, agentId, generation, base } = event.data;
@@ -559,7 +599,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(generation === 1, `claim ${claimId} opened at generation ${generation}`);
       return {
         ...state,
-        claims: put(state.claims, claimId, {
+        claims: draft.put(state.claims, claimId, {
           claimId,
           issueId,
           agentId,
@@ -582,7 +622,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       const pushes = [...claim.pushes, { seq, ref, from, to }].slice(-MAX_LANE_PUSHES);
       return {
         ...state,
-        claims: put(state.claims, claimId, {
+        claims: draft.put(state.claims, claimId, {
           ...claim,
           head: to,
           phase: "working",
@@ -599,7 +639,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       for (const ref of decisions) knownDecisionVersion(state, ref);
       return {
         ...state,
-        claims: put(state.claims, claimId, {
+        claims: draft.put(state.claims, claimId, {
           ...claim,
           phase: "ready",
           ready: { commit, decisions },
@@ -612,7 +652,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(generation <= claim.generation, `claim ${claimId} refused a future generation`);
       return {
         ...state,
-        claims: put(state.claims, claimId, { ...claim, refusal: { generation, reason } }),
+        claims: draft.put(state.claims, claimId, { ...claim, refusal: { generation, reason } }),
       };
     }
     case "claim.reopened": {
@@ -623,7 +663,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       for (const ref of decisions) knownDecisionVersion(state, ref);
       return {
         ...state,
-        claims: put(state.claims, claimId, { ...claim, phase: "working", ready: null }),
+        claims: draft.put(state.claims, claimId, { ...claim, phase: "working", ready: null }),
       };
     }
     case "claim.expired": {
@@ -631,7 +671,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
       check(claim.phase !== "expired", `claim ${claimId} already expired`);
-      return { ...state, claims: put(state.claims, claimId, { ...claim, phase: "expired" }) };
+      return { ...state, claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }) };
     }
     case "claim.reassigned": {
       const { claimId, from, to, generation } = event.data;
@@ -641,7 +681,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       confirmedAgent(state, to);
       return {
         ...state,
-        claims: put(state.claims, claimId, {
+        claims: draft.put(state.claims, claimId, {
           ...claim,
           agentId: to,
           generation,
@@ -656,7 +696,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       known(state.claims, claimId, "claim");
       return {
         ...state,
-        questions: put(state.questions, questionId, {
+        questions: draft.put(state.questions, questionId, {
           questionId,
           claimId,
           decisionId,
@@ -683,9 +723,9 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       );
       return {
         ...state,
-        decisions: put(state.decisions, decisionId, {
+        decisions: draft.put(state.decisions, decisionId, {
           decisionId,
-          versions: [...previous, { version, questionId, option, scope, seq }],
+          versions: draft.append(previous, { version, questionId, option, scope, seq }),
         }),
       };
     }
@@ -708,7 +748,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       }
       return {
         ...state,
-        inbox: put(state.inbox, key, {
+        inbox: draft.put(state.inbox, key, {
           agentId,
           claimId,
           item,
@@ -726,7 +766,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(entry.claimId === claimId, `inbox item ${key} belongs to another claim`);
       // A redelivery after a reconnect never moves an acknowledged item back.
       if (entry.delivery !== "queued") return state;
-      return { ...state, inbox: put(state.inbox, key, { ...entry, delivery: "delivered" }) };
+      return { ...state, inbox: draft.put(state.inbox, key, { ...entry, delivery: "delivered" }) };
     }
     case "inbox.acked": {
       const { agentId, claimId, item, plan } = event.data;
@@ -735,7 +775,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(entry.claimId === claimId, `inbox item ${key} belongs to another claim`);
       return {
         ...state,
-        inbox: put(state.inbox, key, { ...entry, delivery: "acknowledged", plan }),
+        inbox: draft.put(state.inbox, key, { ...entry, delivery: "acknowledged", plan }),
       };
     }
     case "train.check": {
@@ -752,9 +792,9 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(run.candidate === candidate, `check run ${checkRunId} changed its candidate`);
       return {
         ...state,
-        checkRuns: put(state.checkRuns, checkRunId, {
+        checkRuns: draft.put(state.checkRuns, checkRunId, {
           ...run,
-          results: [...run.results, { seq, check: name, result, acceptance }],
+          results: draft.append(run.results, { seq, check: name, result, acceptance }),
         }),
       };
     }
@@ -763,10 +803,14 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       for (const claimId of claims) known(state.claims, claimId, "claim");
       return {
         ...state,
-        conflicts: [
-          ...state.conflicts,
-          { seq, claims, path, class: conflictClass, probability, route },
-        ],
+        conflicts: draft.append(state.conflicts, {
+          seq,
+          claims,
+          path,
+          class: conflictClass,
+          probability,
+          route,
+        }),
       };
     }
     case "train.intent": {
@@ -778,7 +822,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       check(run.candidate === candidate, `intent ${intentId} cites a check of another candidate`);
       return {
         ...state,
-        intents: put(state.intents, intentId, {
+        intents: draft.put(state.intents, intentId, {
           intentId,
           expectedMain,
           candidate,
@@ -794,15 +838,17 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
       const intent = known(state.intents, intentId, "intent");
       check(intent.landing.kind === "pending", `intent ${intentId} already has an outcome`);
       const landing = landingOf(intent, outcome, main);
+      // Every check precedes the first write; see `FoldDraft`.
+      for (const claimId of intent.claims) known(state.claims, claimId, "claim");
       let { claims } = state;
       if (landing.kind === "landed") {
         for (const claimId of intent.claims) {
           const claim = known(claims, claimId, "claim");
-          claims = put(claims, claimId, {
+          claims = draft.put(claims, claimId, {
             ...claim,
             // A claim that moved on since its ready, such as a reassigned one, keeps its phase.
             phase: claim.phase === "ready" ? "landed" : claim.phase,
-            landings: [...claim.landings, intentId],
+            landings: draft.append(claim.landings, intentId),
           });
         }
       }
@@ -810,7 +856,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
         ...state,
         main,
         claims,
-        intents: put(state.intents, intentId, { ...intent, landing }),
+        intents: draft.put(state.intents, intentId, { ...intent, landing }),
       };
     }
     default:
