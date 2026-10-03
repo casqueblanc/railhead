@@ -330,6 +330,13 @@ mod tests {
         );
         assert!(elapsed >= STARTUP, "stopped early: {elapsed:?}");
         assert!(elapsed < STARTUP + PATIENCE, "{elapsed:?}");
+        // `run` fixes its deadline before the child starts, so the test cannot wait for the
+        // grandchild first. One that never started within the allowance leaves no cleanup to check,
+        // and fails the test rather than passing it.
+        anyhow::ensure!(
+            grandchild.exists(),
+            "the grandchild did not start within {STARTUP:?}"
+        );
         pid(grandchild)
     }
 
