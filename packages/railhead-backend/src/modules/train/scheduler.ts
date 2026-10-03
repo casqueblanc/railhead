@@ -318,6 +318,7 @@ export function createTrain(
     currentGeneration: (claimId) => ports().claims.currentGeneration(claimId),
     currentVersions: (claimId) => ports().decisions.currentVersions(claimId),
     readyPin: (claimId) => ports().claims.readyPin(claimId),
+    readyGateNow: (claimId, generation) => ports().inbox.readyGateNow(claimId, generation),
   };
   let discarding: Promise<void> | null = null;
 

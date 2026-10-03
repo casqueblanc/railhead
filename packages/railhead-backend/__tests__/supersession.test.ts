@@ -360,6 +360,8 @@ function authorizer(h: Harness, scheduled: CheckAttempt): AuthorizationPort {
         const pin = scheduled.pins.find((scheduledPin) => scheduledPin.claimId === claimId);
         return pin === undefined ? null : { pin, episode: 1, decisions: scheduled.decisions };
       },
+      // Each pin was marked ready once its holder had acknowledged, as `ready` requires.
+      readyGateNow: () => ({ kind: "clear" }),
     },
     () => "int_intent01",
   );

@@ -8,6 +8,7 @@ import {
   type DecisionRef,
 } from "@railhead/shared/events";
 import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
+import type { ReadyGate } from "../src/contracts/inbox";
 import type { PortErrorCode, PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -71,6 +72,8 @@ class World implements AuthorizationReaders {
   generations = new Map<ClaimId, number>();
   versions = new Map<ClaimId, DecisionRef[] | null>();
   ready = new Map<ClaimId, ReadyPin | null>();
+  /** Each claim's ready gate; a claim missing here is clear. */
+  gates = new Map<ClaimId, ReadyGate | null>();
   calls = 0;
 
   constructor(stored: CheckAttempt = attempt(), stored_report: CheckReport | null = report()) {
@@ -112,6 +115,13 @@ class World implements AuthorizationReaders {
     this.calls += 1;
     return this.ready.get(id) ?? null;
   }
+
+  readyGateNow(id: ClaimId, generation: number): ReadyGate | null {
+    this.calls += 1;
+    if (this.generations.get(id) !== generation) return null;
+    const gate = this.gates.get(id);
+    return gate === undefined ? { kind: "clear" } : gate;
+  }
 }
 
 /** Readers of a missing module: they know nothing. */
@@ -120,6 +130,7 @@ const UNKNOWN: AuthorizationReaders = {
   currentGeneration: () => null,
   currentVersions: () => null,
   readyPin: () => null,
+  readyGateNow: () => null,
 };
 
 function freshStub(): DurableObjectStub {
@@ -352,6 +363,25 @@ describe("authorize fences ready pins", () => {
     const world = new World(attempt({ decisions: [current, DEC_LIMIT] }));
     world.ready.set(claimId(1), { pin: pin(1), episode: 1, decisions: [DEC_FORMAT, DEC_LIMIT] });
     await withHarness(world, (h) => expectRefused(h, "decision_superseded"));
+  });
+});
+
+describe("authorize fences the inbox gate", () => {
+  it("refuses while an item affecting a claim is unacknowledged, then authorizes once it clears", async () => {
+    // A rework obligation under the version the check ran under: no pin or version moved.
+    const world = new World();
+    world.gates.set(claimId(2), { kind: "blocked", items: [7] });
+    await withHarness(world, async (h) => {
+      await expectRefused(h, "unacked_decision");
+      world.gates.delete(claimId(2));
+      expect(await h.authorize()).toEqual({ ok: true, value: expectedRecord() });
+    });
+  });
+
+  it("refuses as unavailable while the inbox cannot answer", async () => {
+    const world = new World();
+    world.gates.set(claimId(1), null);
+    await withHarness(world, (h) => expectRefused(h, "unavailable"));
   });
 });
 
