@@ -14,6 +14,7 @@ import type {
   PasskeyAssertion,
 } from "@railhead/shared/board-api";
 import type { RepoId } from "@railhead/shared/events";
+import { equalBytes } from "../modules/owner/encoding";
 
 /** The hosts a Railhead instance may use as its relying party: submission, then development. */
 export const RELYING_PARTY_HOSTS = ["railhead.dev", "railhead.mashin.workers.dev"] as const;
@@ -484,11 +485,4 @@ function encodeBase64Url(bytes: Uint8Array): string {
 
 async function sha256(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes)));
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return diff === 0;
 }

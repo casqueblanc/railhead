@@ -5,11 +5,14 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
+    types:
+      - checks_requested
 
 permissions:
   contents: read
 
-# Cancels a superseded pull request run and never a `main` run; see ci.yml.
+# Cancels a superseded pull request run and never a `main` or merge-group run; see ci.yml.
 concurrency:
   group: rust-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -17,7 +20,8 @@ concurrency:
 jobs:
   # The same gate `pnpm check` runs locally. It needs Node only to run the script, so it skips the
   # pnpm install the other jobs pay for. On a pull request that changes no Rust input it skips its
-  # remaining steps and still reports success; see ci.yml.
+  # remaining steps and still reports success; a push to `main` and a merge group always run it. See
+  # ci.yml.
   check:
     name: Cargo check, test and Clippy
     runs-on: ubuntu-latest
@@ -31,9 +35,10 @@ jobs:
 
       - name: Detect Rust inputs
         id: changes
-        if: github.event_name == 'pull_request'
         shell: bash
-        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs rust >> "$GITHUB_OUTPUT"
+        env:
+          EVENT: ${{ github.event_name }}
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs rust "$EVENT" >> "$GITHUB_OUTPUT"
 
       # With no argument, rustup installs the toolchain and components rust-toolchain.toml names.
       - name: Install the pinned Rust toolchain
@@ -41,8 +46,8 @@ jobs:
         run: rustup toolchain install
 
       # Only `main` saves, under a key that does not depend on the job's name, and every pull
-      # request restores that entry. A cache a pull request saved would be visible to that pull
-      # request alone.
+      # request and merge group restores that entry. A cache a pull request saved would be visible
+      # to that pull request alone, and one a merge group saved to nothing at all.
       - name: Cache Cargo registry and build
         if: steps.changes.outputs.run != 'false'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

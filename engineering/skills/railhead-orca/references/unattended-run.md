@@ -116,8 +116,8 @@ needs a decision, not a guessed resolution.
 A gate starts report-only, posting nothing. Enable labels, comments, fix requests
 or merges only under their respective explicit grants. Name allowed repositories,
 authors and reviewer triggers; merge permission does not grant branch editing,
-review-bot invocation, deployment or secret access. Merge-queue branches require
-another workflow: a queued PR is not a completed merge.
+review-bot invocation, deployment or secret access. `main` merges through a
+merge queue; a queued PR is not a completed merge (see [merge queue](#merge-queue)).
 
 Take one bounded current snapshot, paginate and evaluate the oldest eligible
 PRs first. Pin base/head SHA. Stop at a scope or moving-head gate before claiming
@@ -136,8 +136,9 @@ All merge rules must hold at the same head:
 1. Open, same-repository, non-draft PR targeting the live default branch, with an
    allowed author and eligible stack layer.
 2. CLEAN merge state and branch protection satisfied without bypass.
-3. Head contains the current base tip (`behind_by == 0`); all required checks are
-   present and successful. Pending, failed or unavailable checks block merging.
+3. All required checks are present and successful at the head. Pending, failed
+   or unavailable checks block merging. The head need not contain the base tip:
+   the queue tests it merged with the current base before it lands.
 4. Every applicable expected reviewer completed at this head; no unresolved
    threads or outstanding change requests. Silence, skip, quota failure and an
    older review never count as approval. Use
@@ -152,11 +153,26 @@ All merge rules must hold at the same head:
    dependencies, weakened checks/tests, or over 500 authored changed lines.
    Other rules still apply after approval.
 
-Immediately reread base and head before merging; abort if they moved. Use
+Immediately reread the head before merging; abort if it moved. Enqueue with
 `gh pr merge <number> --repo casqueblanc/railhead --squash --match-head-commit <sha>`,
-never `--admin` or `--auto`. Required up-to-date branch protection closes the
-remaining base movement window. Verify merged state and commit; stop after at
-most three merges per run and refresh remaining state after each.
+never `--admin` or `--auto`. Verify merged state and commit once the queue lands
+it; stop after at most three merges per run and refresh remaining state after each.
+
+### Merge queue
+
+`main` uses a GitHub merge queue that squashes and that nobody can bypass. The
+gate above, with Codex review clean at the exact head, runs first; then
+`gh pr merge --squash` adds the PR to the queue instead of merging it. The queue
+builds a merge group from `main` and the PRs queued ahead, and runs CI on it in
+full, with no path-based skips. It lands the PR only when the required checks
+pass on that group: `Lint`, `Build and test`, and `Cargo check, test and Clippy`.
+A failed group removes the PR from the queue; treat that as a failed check.
+
+For a stack, enqueue only the bottom layer. After it lands, retarget the next
+layer to `main` (`gh pr edit <number> --base main`), bring it up to date as in
+[after a squash merge](../../railhead-gh-stack/references/troubleshooting.md#after-a-squash-merge),
+and run the gate again on its new head before enqueuing it. Repeat layer by
+layer.
 
 Fix requests go to the existing branch owner through runtime-supported messaging.
 Verify findings first. Never wake a second writer because the first looks quiet.
