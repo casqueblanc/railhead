@@ -135,6 +135,7 @@ const refusedAfterSending = (failure: BoardFailure): boolean => {
     case "invalid_request":
     case "not_found":
     case "bootstrap_closed":
+    case "busy":
       return true;
     case "cursor_ahead":
     case "internal":
@@ -160,6 +161,8 @@ export const failureMessage = (code: BoardErrorCode): string => {
       return "The issue limit was reached. Nothing was filed.";
     case "unavailable":
       return "This Railhead cannot file issues: its module is not installed.";
+    case "busy":
+      return "The backend is busy. Nothing was filed; try again shortly.";
     case "invalid_request":
       return "The backend refused the issue as invalid. Check the title and description.";
     case "not_found":
