@@ -41,6 +41,7 @@ import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/compo
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
 import { EarliestAlarm } from "../src/repo/storage";
+import { queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_train0001";
 const MAIN = sha("1");
@@ -235,10 +236,10 @@ function intentFor(attempt: CheckAttempt, n: number): MergeIntentRecord {
 }
 
 interface Harness {
-  train: Train;
+  train: QueueingTrain;
   fakes: Fakes;
   /** Builds another train over the same storage, as a restarted `Repo` does. */
-  restart(): Train;
+  restart(): QueueingTrain;
   events(): RailheadEvent[];
   sql: SqlStorage;
   /** Every time the train asked the Repo's alarm for, oldest first. */
@@ -265,7 +266,11 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       wake: (at) => wakes.push(at),
     };
     const ports = fakes.ports(composeRepo(context));
-    const build = () => createTrain(context, () => ports, fakes.portTimeoutMs);
+    const build = () =>
+      queueing(
+        createTrain(context, () => ports, fakes.portTimeoutMs),
+        log,
+      );
     return body({
       train: build(),
       fakes,
@@ -880,10 +885,10 @@ describe("train wake", () => {
       const accepted = now() + 1;
       expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
       expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
-      // The lease alarm set with the queue entry, the drive's own lease, then the backoff that
-      // moved the alarm earlier.
+      // The alarm due at once, set with the queue entry, the drive's own lease, then the backoff
+      // that moved the alarm earlier.
       expect(wakes).toEqual([
-        accepted + DRIVE_LEASE_MS,
+        accepted,
         accepted + 1 + DRIVE_LEASE_MS,
         now() + WAKE_BASE_MS,
       ]);
@@ -982,14 +987,16 @@ describe("train wake", () => {
       const asked = wakes.length;
       const composes = fakes.composeCalls.length;
 
-      // Duplicate ready: the existing pin restarts the drive, which commits a due wake with its
-      // lease before the merge port is asked, and the merge port then stops answering.
+      // Duplicate ready: the existing pin restores the wake due at once, and the drive that follows
+      // commits a due wake with its lease before the merge port is asked, which then stops
+      // answering.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       const release = fakes.hold("merge.compose");
+      const requeued = now() + 1;
       const duplicate = train.enqueue(pin(1));
       await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(composes + 1));
       expect(owed(sql)).toEqual({ dueAt: now(), failures: 0 });
-      expect(wakes.slice(asked)).toEqual([now() + DRIVE_LEASE_MS]);
+      expect(wakes.slice(asked)).toEqual([requeued, now() + DRIVE_LEASE_MS]);
       expectDebtCovered(sql, wakes, false);
 
       // Crash: the object stops mid-drive. The rebuilt train asks for the wake again.
@@ -1573,7 +1580,10 @@ describe("train module", () => {
       // The real claims module would drop a pin for a claim it never opened, so its port is the
       // missing one here: the pin must wait for it rather than be dropped.
       const ports: RepoPorts = { ...composeRepo(context), claims: unavailableClaims };
-      const train = createTrain(context, () => ports);
+      const train = queueing(
+        createTrain(context, () => ports),
+        log,
+      );
 
       expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
       expect(state.storage.sql.exec("SELECT state, reason FROM train_queue").toArray()).toEqual([
@@ -1664,7 +1674,10 @@ describe("train module", () => {
         },
       };
       const accepted = clock();
-      void createTrain(context, () => ports).enqueue(pin(1));
+      void queueing(
+        createTrain(context, () => ports),
+        context.log,
+      ).enqueue(pin(1));
       await hanging;
       return accepted + 1 + DRIVE_LEASE_MS;
     });

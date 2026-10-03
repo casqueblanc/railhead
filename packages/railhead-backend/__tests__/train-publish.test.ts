@@ -25,6 +25,7 @@ import { readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { createAuthorization } from "../src/train/authorize";
+import { queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_publish01";
 const MAIN = "1".repeat(40);
@@ -114,7 +115,7 @@ class FakeMain implements MainRefPort {
 }
 
 interface Harness {
-  train: Train;
+  train: QueueingTrain;
   ref: FakeMain;
   authorization: AuthorizationPort;
   /** Each claim's current pin; a test replaces one to model a change of owner. */
@@ -195,7 +196,10 @@ function withRepo<R>(
       authorization,
       mainWriter,
     };
-    const train = createTrain(context, () => ports);
+    const train = queueing(
+      createTrain(context, () => ports),
+      log,
+    );
     return body({
       train,
       ref,

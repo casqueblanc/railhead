@@ -7,12 +7,14 @@
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
 // again rather than inheriting any part of its result.
 //
-// Each `enqueue` and `recordCheck` drives the train until it waits for a check report or a port,
-// or the queue is empty. Whenever storage holds work the train owes (an active batch or a queued
+// A pin is queued only inside the transaction that records `ready`, and the Repo's alarm drives
+// the train once it commits; each `recordCheck` drives it at once. A drive runs until the train
+// waits for a check report or a port, or the queue is empty. Whenever storage holds work the train owes (an active batch or a queued
 // pin), it also holds a wake row and the Repo's alarm is set for it. `recordDebt` is the only
 // writer of that row, and it writes inside the transaction that creates or restarts the debt:
-// accepting work and starting a drive record it due now with the alarm `DRIVE_LEASE_MS` later, so
-// the work is resumed even if the object stops during the drive and nothing else wakes it. When a
+// accepting work records it due now with the alarm due now, and starting a drive records it with
+// the alarm `DRIVE_LEASE_MS` later, so the work is resumed even if the object stops before or
+// during the drive and nothing else wakes it. When a
 // drive ends, the train settles that debt from storage: it asks the alarm to drive again at once
 // when work arrived too late for the drive, waits for the active attempt's deadline while a
 // runner's report is due, backs off when a port refused or the drive threw, up to
@@ -111,7 +113,7 @@ import {
   type QueueEntry,
 } from "./store";
 
-/** Most pins waiting or batched at once. `enqueue` refuses with `busy` beyond it. */
+/** Most pins waiting or batched at once. `queue` refuses with `busy` beyond it. */
 export const MAX_QUEUE = 256;
 
 /** Most pins one batch composes. */
@@ -127,9 +129,8 @@ export const WAKE_BASE_MS = 1_000;
 export const WAKE_MAX_MS = 5 * 60_000;
 
 /**
- * How long a drive holds the train before the Repo's alarm may take over, and how long after
- * accepting work the alarm resumes it, in case the drive that follows never settles. A drive that
- * settles first moves or keeps the alarm as its outcome needs.
+ * How long a drive holds the train before the Repo's alarm may take over, in case the drive never
+ * settles. A drive that settles first moves or keeps the alarm as its outcome needs.
  */
 export const DRIVE_LEASE_MS = 60_000;
 
@@ -146,7 +147,7 @@ export const CHECK_DEADLINE_MS = 60 * 60_000;
 /**
  * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
  * all. After that the train stops asking and logs `train.wake_exhausted`; its work stays in storage
- * with a wake row marked `EXHAUSTED_FAILURES`, and the next `enqueue` or `recordCheck` drives it
+ * with a wake row marked `EXHAUSTED_FAILURES`, and the next `queue` or `recordCheck` drives it
  * again. A requested check attempt keeps one wake at its deadline, which expires it without a port.
  */
 export const MAX_WAKE_FAILURES = 24;
@@ -513,7 +514,7 @@ export function createTrain(
     const pins = members.map((entry) => entry.pin);
     const now = clock();
     fenced(generation, () => {
-      // An enqueue during the reads above may have settled an entry; form again from storage.
+      // A pin queued during the reads above may have settled an entry; form again from storage.
       const unchanged = pins.every((pin) => {
         const entry = readEntry(sql, pin.claimId, pin.generation);
         return entry?.state === "queued" && entry.pin.commit === pin.commit;
@@ -880,17 +881,8 @@ export function createTrain(
     };
   }
 
-  /**
-   * Queues a ready episode's pin inside the caller's transaction and asks the Repo's alarm for the
-   * drive at `alarmAt`, unless `driving`: the caller then drives at once, which records the same
-   * debt. Writes nothing when it refuses.
-   */
-  function admit(
-    pin: ClaimPin,
-    now: number,
-    alarmAt: number,
-    driving: boolean,
-  ): PortResult<{ queued: boolean }> {
+  function queue(_tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }> {
+    const now = clock();
     if (!validPin(pin)) {
       return fail("invalid_request", "The pin needs a claim, a positive generation and a commit.");
     }
@@ -936,25 +928,10 @@ export function createTrain(
       else requeueEntry(sql, pin, now);
     }
     // Every accepted episode is owed a drive, which also restarts a wake whose retries ran out,
-    // so work it leaves runnable is never stranded.
-    if (queued || !driving) recordDebt(now, { kind: "start", alarmAt });
+    // so work it leaves runnable is never stranded. The Repo's alarm starts the drive once the
+    // caller's transaction commits.
+    recordDebt(now, { kind: "start", alarmAt: now });
     return ok({ queued });
-  }
-
-  async function enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>> {
-    const now = clock();
-    const result = context.storage.transactionSync(() =>
-      admit(pin, now, now + DRIVE_LEASE_MS, true),
-    );
-    if (!result.ok) return result;
-    await driveLogged();
-    return result;
-  }
-
-  function queue(_tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }> {
-    // The Repo's alarm starts the drive once the caller's transaction commits.
-    const now = clock();
-    return admit(pin, now, now, false);
   }
 
   async function recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>> {
@@ -1011,7 +988,6 @@ export function createTrain(
   }
 
   return {
-    enqueue,
     queue,
     recordCheck,
     attemptOutcome,

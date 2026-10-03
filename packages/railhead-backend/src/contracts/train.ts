@@ -146,19 +146,16 @@ export interface AttemptOutcome {
  */
 export interface TrainPort {
   /**
-   * Queues a ready pin and drives the train. Each call is a new ready episode of the claim: a pin
-   * already waiting is a no-op, a waiting entry of the same claim and generation takes the new
-   * commit, a dropped or parked one is queued again, a landed one is queued again with another
-   * commit and refused with `decision_superseded` with the same one, and a batched one takes the
-   * new commit once its batch settles. Every accepted pin asks for a drive, restarting a wake whose
-   * retries ran out. A pin of an older generation than one queued is `stale_generation`.
-   */
-  enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
-  /**
-   * `enqueue` inside the caller's transaction, without driving: the entry and the train's wake
-   * commit or roll back with that transaction, and the Repo's alarm drives once it commits. A
-   * refusal writes nothing; a missing module throws, so the caller's transaction rolls back. The
-   * claims module calls it in the transaction that records `ready`.
+   * Queues a ready pin inside the caller's transaction, without driving: the entry and the train's
+   * wake commit or roll back with that transaction, and the Repo's alarm drives once it commits.
+   * Each call is a new ready episode of the claim: a pin already waiting is a no-op, a waiting entry
+   * of the same claim and generation takes the new commit, a dropped or parked one is queued again,
+   * a landed one is queued again with another commit and refused with `decision_superseded` with
+   * the same one, and a batched one takes the new commit once its batch settles. Every accepted pin
+   * asks for a drive, restarting a wake whose retries ran out. A pin of an older generation than
+   * one queued is `stale_generation`. A refusal writes nothing; a missing module throws, so the
+   * caller's transaction rolls back. Only the claims module calls it, in the transaction that
+   * records `ready`.
    */
   queue(tx: EventTransaction, pin: ClaimPin): PortResult<{ queued: boolean }>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */

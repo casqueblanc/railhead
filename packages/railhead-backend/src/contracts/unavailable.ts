@@ -110,7 +110,6 @@ export const unavailableChecks: CheckPort = {
  * recorded, no attempt is known and nothing is owed, so `resume` does nothing.
  */
 export const unavailableTrain: TrainPort = {
-  enqueue: refuse("train"),
   queue: () => {
     throw new UnavailableError("train");
   },
