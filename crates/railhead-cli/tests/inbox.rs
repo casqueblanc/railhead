@@ -9,8 +9,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ssh_key::rand_core::OsRng;
@@ -171,32 +171,52 @@ fn rh_in_clone(world: &World, args: &[&str]) -> anyhow::Result<Run> {
     finish(&command(world, world.clone.path(), None, args).output()?)
 }
 
-/// How long after a timed run starts `rh` its `--wait` begins: room for a loaded machine, or a
-/// first launch of a freshly built binary, to get the process running before the wait counts.
-const LEAD: Duration = Duration::from_secs(3);
+/// How long a loaded machine, or a first launch of a freshly built binary, may take to get `rh` to
+/// its `--wait`. Only a run that never gets there takes this long.
+const PATIENCE: Duration = Duration::from_secs(120);
 
-/// When a timed `rh` run's `--wait` starts, [`LEAD`] from when it is taken, as the test reads it
-/// and as `rh` is told through the debug-build seam `rh ask` reads. A test times the wait from
-/// here, so a shortened wait shows however long the process took to start.
-struct WaitStart {
-    at: Instant,
-    unix_ms: u128,
+/// The debug-build gate `rh ask` holds its `--wait` at: `rh` writes `ready` in the directory and
+/// starts its deadline only once `go` exists there. A test times the wait from the moment it
+/// creates `go`, however long the process took to start.
+struct Gate {
+    dir: tempfile::TempDir,
+    go: Arc<OnceLock<Instant>>,
 }
 
-impl WaitStart {
-    fn soon() -> anyhow::Result<Self> {
-        let at = Instant::now() + LEAD;
-        // Read after `at`, and one millisecond on, so `rh` starts the wait no earlier than `at`.
-        let unix_ms = (SystemTime::now().duration_since(UNIX_EPOCH)? + LEAD).as_millis() + 1;
-        Ok(Self { at, unix_ms })
+impl Gate {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            dir: tempfile::tempdir()?,
+            go: Arc::default(),
+        })
     }
 
-    /// Runs `command` with its wait starting then. Returns the run and when `rh` exited.
-    fn run(&self, mut command: Command) -> anyhow::Result<(Run, Instant)> {
-        command.env("RH_TEST_WAIT_FROM_UNIX_MS", self.unix_ms.to_string());
-        let output = command.output()?;
+    /// Runs `command` through the gate. Returns the run, when the test opened the gate, and when
+    /// `rh` exited.
+    fn run(&self, mut command: Command) -> anyhow::Result<(Run, Instant, Instant)> {
+        command.env("RH_TEST_WAIT_GATE", self.dir.path());
+        let mut child = command.spawn()?;
+        let ready = self.dir.path().join("ready");
+        let until = Instant::now() + PATIENCE;
+        while !ready.exists() {
+            if child.try_wait()?.is_some() || Instant::now() > until {
+                let output = child.wait_with_output()?;
+                anyhow::bail!(
+                    "rh never reached its wait: {:?} {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let go = Instant::now();
+        self.go
+            .set(go)
+            .map_err(|_| anyhow::anyhow!("a gate opens once"))?;
+        fs::write(self.dir.path().join("go"), b"")?;
+        let output = child.wait_with_output()?;
         let exited = Instant::now();
-        Ok((finish(&output)?, exited))
+        Ok((finish(&output)?, go, exited))
     }
 }
 
@@ -248,17 +268,16 @@ async fn answer(world: &World, verb: &str, route: &str, response: ResponseTempla
 
 /// How long a held response is delayed: far beyond any `--wait` a test passes.
 const HOLD: Duration = Duration::from_secs(20);
-/// Room for process exit after a wait ends. [`LEAD`] and a wait plus this stay well under [`HOLD`],
-/// so a CLI that waited for the held answer still fails.
+/// Room for process exit after a wait ends. A wait plus this stays well under [`HOLD`], so a CLI
+/// that waited for the held answer still fails.
 const EXIT_SLACK: Duration = Duration::from_secs(10);
 
-/// A response held for [`HOLD`], or until a set time, that records when each request arrived, so a
-/// test times the CLI's wait from the request it held, not from process start, which a loaded
-/// machine delays.
+/// A response held for [`HOLD`], or until a set time after a [`Gate`] opens, that records when each
+/// request arrived, so a test bounds how long the CLI held it open.
 #[derive(Clone)]
 struct Held {
     response: ResponseTemplate,
-    until: Option<Instant>,
+    until: Option<(Arc<OnceLock<Instant>>, Duration)>,
     arrivals: Arc<Mutex<Vec<Instant>>>,
 }
 
@@ -271,10 +290,11 @@ impl Held {
         }
     }
 
-    /// A response held until `until`, or sent at once when a request arrives after it.
-    fn until(response: ResponseTemplate, until: Instant) -> Self {
+    /// A response held until `after` past the moment `gate` opens, or sent at once when a request
+    /// arrives later than that.
+    fn after_go(response: ResponseTemplate, gate: &Gate, after: Duration) -> Self {
         Self {
-            until: Some(until),
+            until: Some((Arc::clone(&gate.go), after)),
             ..Self::new(response)
         }
     }
@@ -296,8 +316,11 @@ impl Respond for Held {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(now);
+        // A request before the gate opens has no time to be held until, so it is held in full.
         let delay = self
             .until
+            .as_ref()
+            .and_then(|(go, after)| go.get().map(|go| *go + *after))
             .map_or(HOLD, |until| until.saturating_duration_since(now));
         self.response.clone().set_delay(delay)
     }
@@ -1082,6 +1105,35 @@ async fn ask_wait_stops_when_the_wait_runs_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs only against a release build, as `cargo test --release` makes, which must compile none of
+/// the debug-build wait gate.
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn a_release_build_ignores_the_wait_gate() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        fixture("question.json", "a long poll that times out is still open")?,
+    )
+    .await;
+    let gate = tempfile::tempdir()?;
+    let mut command = command(
+        &world,
+        world.outside.path(),
+        Some("atlas"),
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+    );
+    command.env("RH_TEST_WAIT_GATE", gate.path());
+    // The gate never opens, yet the wait runs and ends on its own.
+    let run = finish(&command.output()?)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.at("/data/timedOut")?, json!(true));
+    assert!(!gate.path().join("ready").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn ask_wait_is_bounded_and_a_question_id_is_checked() -> anyhow::Result<()> {
     let world = world().await?;
@@ -1600,16 +1652,12 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     // Asked and waited on: the wait ends with the question as asked, before the held answer.
     let mut args = ask_args(QUESTION, "src/upload.ts");
     args.extend(["--wait", "2"]);
-    let start = WaitStart::soon()?;
-    let (run, exited) = start.run(command(&world, world.clone.path(), None, &args))?;
+    let (run, go, exited) = Gate::new()?.run(command(&world, world.clone.path(), None, &args))?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let elapsed = exited.duration_since(start.at);
+    let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     let open = stall.open_until(exited)?;
-    assert!(
-        open < LEAD + Duration::from_secs(2) + EXIT_SLACK,
-        "{open:?}"
-    );
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.at("/data/timedOut")?, json!(true));
     assert_eq!(run.at("/data/question/state")?, json!("open"));
     assert_eq!(run.at("/next")?, json!("rh ask"));
@@ -1620,24 +1668,20 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         .and_then(|poll| poll.url.query_pairs().find(|(key, _)| key == "waitMs"))
         .and_then(|(_, value)| value.parse::<u64>().ok())
         .unwrap_or(u64::MAX);
-    // Held for what was left of the lead and the wait, never longer.
-    assert!((1..=5_000).contains(&held), "{held}");
+    // Held for what was left of the wait less the margin for the answer to travel, never longer.
+    assert!((1..=1_500).contains(&held), "{held}");
 
     // Resumed: nothing of the question is known, so the timeout says how to wait again.
-    let start = WaitStart::soon()?;
-    let (run, exited) = start.run(command(
+    let (run, go, exited) = Gate::new()?.run(command(
         &world,
         world.outside.path(),
         Some("atlas"),
         &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
     ))?;
-    let elapsed = exited.duration_since(start.at);
+    let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     let open = stall.open_until(exited)?;
-    assert!(
-        open < LEAD + Duration::from_secs(1) + EXIT_SLACK,
-        "{open:?}"
-    );
+    assert!(open < Duration::from_secs(1) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/retryable")?, json!(true));
@@ -1705,15 +1749,13 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
         .await;
 
     let args = ["--json", "ask", "--question", "qst_upload1", "--wait", "2"];
-    let start = WaitStart::soon()?;
-    let (run, exited) = start.run(command(&world, world.outside.path(), Some("atlas"), &args))?;
-    let elapsed = exited.duration_since(start.at);
+    let gate = Gate::new()?;
+    let (run, go, exited) =
+        gate.run(command(&world, world.outside.path(), Some("atlas"), &args))?;
+    let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     let open = stall.open_until(exited)?;
-    assert!(
-        open < LEAD + Duration::from_secs(2) + EXIT_SLACK,
-        "{open:?}"
-    );
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
@@ -1757,12 +1799,13 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
     let world = world().await?;
     let (lapsed, challenge) = lapse_session(&world)?;
     let wait = Duration::from_secs(4);
-    // The challenge answers half a second before the deadline, however late the process starts.
-    let start = WaitStart::soon()?;
-    let near = start.at + wait.saturating_sub(Duration::from_millis(500));
+    // The challenge answers half a second before the deadline, timed from the moment the gate
+    // lets the wait start.
+    let gate = Gate::new()?;
+    let near = wait.saturating_sub(Duration::from_millis(500));
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(Held::until(challenge, near))
+        .respond_with(Held::after_go(challenge, &gate, near))
         .mount(&world.server)
         .await;
     // The session request then stalls: it fits one request timeout, but not the time left.
@@ -1778,17 +1821,16 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
         .mount(&world.server)
         .await;
 
-    let (run, exited) = start.run(command(
+    let (run, go, exited) = gate.run(command(
         &world,
         world.outside.path(),
         Some("atlas"),
         &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
     ))?;
-    let elapsed = exited.duration_since(start.at);
+    let elapsed = exited.duration_since(go);
     assert!(elapsed >= wait, "{elapsed:?}");
     // Half a second was left when the session request arrived. A login that gave it the request
-    // timeout instead would hold it for the lead and the wait less the process start, or the full
-    // stall.
+    // timeout instead would hold it for the full stall.
     let open = stall.open_until(exited)?;
     assert!(open < Duration::from_secs(3), "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
@@ -1812,8 +1854,8 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
         .mount(&world.server)
         .await;
     // Another process holds the session lock, as a login of its own would, until `rh` exits. It
-    // lets go after [`HOLD`] regardless, so that a wait the deadline does not end fails instead of
-    // hanging.
+    // lets go after [`PATIENCE`] and [`HOLD`] regardless, so that a wait the deadline does not end
+    // fails instead of hanging.
     let lock = world.home.path().join("agents/atlas/.session.lock");
     let held = fs::OpenOptions::new()
         .read(true)
@@ -1822,16 +1864,14 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
         .truncate(false)
         .open(&lock)?;
     held.lock()?;
-    let taken = Instant::now();
     let (exit, exited_rx) = std::sync::mpsc::channel::<()>();
     let release = std::thread::spawn(move || {
         // Either outcome lets go: `rh` exited, or the hold ran out.
-        let _ = exited_rx.recv_timeout(HOLD);
+        let _ = exited_rx.recv_timeout(PATIENCE + HOLD);
         drop(held);
     });
 
-    let start = WaitStart::soon()?;
-    let (run, exited) = start.run(command(
+    let (run, go, exited) = Gate::new()?.run(command(
         &world,
         world.outside.path(),
         Some("atlas"),
@@ -1841,14 +1881,11 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
     release
         .join()
         .map_err(|_| anyhow::anyhow!("the lock holder panicked"))?;
-    let elapsed = exited.duration_since(start.at);
+    // The lock is held from before the gate opens until `rh` exits, so the wait ends by the
+    // deadline counted from the gate, not when the lock is let go.
+    let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
-    // Held from before `rh` started: a wait that outlasted the deadline would end with the lock.
-    let held_for = exited.duration_since(taken);
-    assert!(
-        held_for < LEAD + Duration::from_secs(2) + EXIT_SLACK,
-        "{held_for:?}"
-    );
+    assert!(elapsed < Duration::from_secs(2) + EXIT_SLACK, "{elapsed:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));

@@ -37,11 +37,15 @@ const POLL_MARGIN: Duration = Duration::from_millis(500);
 /// not polled faster than this.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Test-only: when `--wait` starts, in Unix milliseconds, in place of the moment `rh` begins it.
-/// Read in debug builds alone, so integration tests can time a wait from a point they control
-/// rather than from whenever a loaded machine got the process running. Release builds ignore it.
+/// Test-only: a directory through which a test holds `--wait` until it is ready to time it. Read in
+/// debug builds alone, so integration tests can time a wait from a moment they observe rather than
+/// from whenever a loaded machine got the process running. Release builds compile none of it.
 #[cfg(debug_assertions)]
-const WAIT_FROM_ENV: &str = "RH_TEST_WAIT_FROM_UNIX_MS";
+const WAIT_GATE_ENV: &str = "RH_TEST_WAIT_GATE";
+
+/// Test-only: how long `--wait` stays held at the gate before giving up.
+#[cfg(debug_assertions)]
+const WAIT_GATE_LIMIT: Duration = Duration::from_secs(120);
 
 /// Arguments of `rh ask`.
 #[derive(Debug, Clone, clap::Args)]
@@ -338,14 +342,12 @@ fn wait_for(
         "waiting up to {seconds} s for the answer to {question_id}; if interrupted, resume with rh ask --question {question_id} --wait {seconds}"
     ))
     .map_err(Error::Output)?;
-    let start = Instant::now();
-    // A debug build lets a test set when the wait starts instead.
+    // A debug build lets a test hold the wait until it is ready to time it.
     #[cfg(debug_assertions)]
-    let start = match std::env::var_os(WAIT_FROM_ENV) {
-        Some(from) => wait_start_from(&from, start, std::time::SystemTime::now())?,
-        None => start,
-    };
-    let deadline = start + wait;
+    if let Some(gate) = std::env::var_os(WAIT_GATE_ENV) {
+        pass_wait_gate(std::path::Path::new(&gate), WAIT_GATE_LIMIT)?;
+    }
+    let deadline = Instant::now() + wait;
     loop {
         let started = Instant::now();
         let early = match poll(agent, question_id, deadline) {
@@ -389,34 +391,38 @@ fn wait_for(
     })
 }
 
-/// Test-only: the [`Instant`] for `from`, a Unix time in milliseconds, given that the monotonic
-/// clock read `now` when the system clock read `system_now`.
+/// Test-only: writes `ready` in `gate`, then blocks until `go` exists there, so the wait's deadline
+/// starts no earlier than the moment the test lets it go.
 ///
 /// # Errors
 ///
-/// [`LocalCode::InvalidInput`] when `from` names no time either clock can represent.
+/// [`LocalCode::InvalidInput`] when `ready` cannot be written, or `go` has not appeared within
+/// `limit`.
 #[cfg(debug_assertions)]
-fn wait_start_from(
-    from: &std::ffi::OsStr,
-    now: Instant,
-    system_now: std::time::SystemTime,
-) -> Result<Instant> {
-    let invalid = || Error::Local {
+fn pass_wait_gate(gate: &std::path::Path, limit: Duration) -> Result<()> {
+    let invalid = |message: String| Error::Local {
         code: LocalCode::InvalidInput,
-        message: format!("{WAIT_FROM_ENV} is not a time in Unix milliseconds"),
+        message,
         retryable: false,
         next: None,
     };
-    let from = from
-        .to_str()
-        .and_then(|ms| ms.parse().ok())
-        .and_then(|ms| std::time::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
-        .ok_or_else(invalid)?;
-    let start = match system_now.duration_since(from) {
-        Ok(since) => now.checked_sub(since),
-        Err(ahead) => now.checked_add(ahead.duration()),
-    };
-    start.ok_or_else(invalid)
+    std::fs::write(gate.join("ready"), b"").map_err(|error| {
+        invalid(format!(
+            "{WAIT_GATE_ENV} names no directory a wait can mark ready: {error}"
+        ))
+    })?;
+    let go = gate.join("go");
+    let until = Instant::now() + limit;
+    while !go.exists() {
+        if Instant::now() >= until {
+            return Err(invalid(format!(
+                "{WAIT_GATE_ENV} was not opened within {} ms",
+                limit.as_millis()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 /// How long to pause before polling again after `error`, or `None` when the poll must not be
@@ -613,29 +619,87 @@ mod tests {
         <Args as clap::FromArgMatches>::from_arg_matches(&matches)
     }
 
+    #[cfg(debug_assertions)]
+    fn gate_error(result: Result<()>) -> Option<String> {
+        match result {
+            Err(Error::Local {
+                code: LocalCode::InvalidInput,
+                message,
+                ..
+            }) => Some(message),
+            _ => None,
+        }
+    }
+
     #[test]
     #[cfg(debug_assertions)]
-    fn a_wait_counts_from_the_time_its_test_seam_names() -> anyhow::Result<()> {
-        let now = Instant::now();
-        let system_now = std::time::UNIX_EPOCH + Duration::from_millis(10_000);
-        let start = |from: &str| wait_start_from(std::ffi::OsStr::new(from), now, system_now);
-        // A time already past starts the wait earlier, and one still ahead later.
-        assert_eq!(start("8500")? + Duration::from_millis(1_500), now);
-        assert_eq!(start("10000")?, now);
-        assert_eq!(start("10250")?, now + Duration::from_millis(250));
-        for invalid in ["", "-1", "1.5", "soon", "18446744073709551616"] {
-            let error = start(invalid).err();
-            assert!(
-                matches!(
-                    &error,
-                    Some(Error::Local {
-                        code: LocalCode::InvalidInput,
-                        ..
-                    })
-                ),
-                "{invalid}: {error:?}"
-            );
-        }
+    fn a_gated_wait_marks_itself_ready_and_holds_until_go() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let ready = gate.path().join("ready");
+        let go = gate.path().join("go");
+        let test = std::thread::spawn({
+            let (ready, go) = (ready.clone(), go.clone());
+            move || -> std::io::Result<Instant> {
+                while !ready.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                let opened = Instant::now();
+                std::fs::write(&go, b"")?;
+                Ok(opened)
+            }
+        });
+        pass_wait_gate(gate.path(), Duration::from_secs(60))?;
+        let passed = Instant::now();
+        let opened = test
+            .join()
+            .map_err(|_| anyhow::anyhow!("the opener panicked"))??;
+        // Held until `go` existed, not merely until `ready` was written.
+        assert!(passed >= opened, "{:?}", opened.duration_since(passed));
+        assert!(ready.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_already_open_passes_at_once() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        std::fs::write(gate.path().join("go"), b"")?;
+        let started = Instant::now();
+        pass_wait_gate(gate.path(), Duration::ZERO)?;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(gate.path().join("ready").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_that_is_not_a_directory_is_refused() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let missing = gate.path().join("missing");
+        let message = gate_error(pass_wait_gate(&missing, Duration::from_secs(60)));
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("RH_TEST_WAIT_GATE names no directory")),
+            "{message:?}"
+        );
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_never_opened_gives_up_at_its_limit() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let limit = Duration::from_millis(200);
+        let started = Instant::now();
+        let message = gate_error(pass_wait_gate(gate.path(), limit));
+        assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+        assert_eq!(
+            message.as_deref(),
+            Some("RH_TEST_WAIT_GATE was not opened within 200 ms")
+        );
         Ok(())
     }
 
