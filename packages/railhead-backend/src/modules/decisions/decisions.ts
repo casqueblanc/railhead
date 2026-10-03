@@ -4,15 +4,19 @@
 //
 // - `ask` records the question, the decision it will open and the asking claim as the decision's
 //   first dependency, and appends `question.asked` with the agent as actor. A repeat with the same
-//   `requestId` returns the same question and appends nothing.
+//   `requestId` returns the same question and appends nothing. The claim's generation is read again
+//   inside the transaction, so a claim released or taken over while it was being read records
+//   nothing.
 // - `record` takes a consumed human grant, appends `decision.recorded` with the person as actor and
-//   queues one inbox item for each dependent claim, in the same transaction. If any item cannot be
-//   queued, nothing is recorded and nothing is queued. A repeat of the same grant returns the
-//   version it recorded; a stale `expectedVersion` records nothing.
+//   queues one inbox item for each dependent claim still held at its recorded generation, in the
+//   same transaction. If any item cannot be queued, nothing is recorded and nothing is queued. A
+//   repeat of the same grant returns the version it recorded; a stale `expectedVersion` records
+//   nothing.
 //
 // A decision's dependencies name the claim, and the agent and ownership generation the inbox item
-// goes to. Replacing a decision's version, and delivering it to a claim's later owner, belong to
-// supersession and are refused here.
+// goes to. A dependency whose claim has moved to another generation, or is no longer known, keeps
+// its row but gets no item: delivering the decision to the claim's later owner belongs to
+// supersession, as does replacing a decision's version, which is refused here.
 //
 // Question text and option labels are untrusted. They are stored and returned as bounded data,
 // never logged.
@@ -318,6 +322,15 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         // Another call with this key may have recorded it while the claim was being read.
         const raced = repeated(agent, claimId, request);
         if (raced !== null) return raced;
+        // The claim read above may have been released or taken over before this transaction began.
+        const generation = ports().claims.currentGeneration(claimId);
+        if (generation === null) return fail("claim_closed", "You do not hold that claim.");
+        if (generation !== request.generation) {
+          return fail(
+            "stale_generation",
+            "The claim has a newer generation than the one you sent.",
+          );
+        }
         const asked = tx.sql
           .exec<{ n: number }>("SELECT COUNT(*) AS n FROM questions WHERE claim_id = ?", claimId)
           .toArray()[0];
@@ -471,8 +484,12 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                 decisionId,
               )
               .toArray();
+            const claims = ports().claims;
             // Any refusal throws and rolls back the version, its event and every item before it.
             for (const target of targets) {
+              // An item for a generation the claim has left would go to its former owner; the
+              // dependency stays for supersession to deliver to the current one.
+              if (claims.currentGeneration(target.claim_id) !== target.generation) continue;
               inbox.queue(
                 tx,
                 {

@@ -70,6 +70,13 @@ interface Harness {
   ): GrantFor<"decision.record">;
   /** Sets what the claims module answers for `activeClaim` and, for that claim, `currentGeneration`. */
   holds(answer: PortResult<ClaimView | null>): void;
+  /**
+   * Makes `currentGeneration` answer with `reader` instead of following `holds`, so the claim's
+   * current authority can differ from the `activeClaim` snapshot. `null` restores the default.
+   */
+  fence(reader: ((claimId: string) => number | null) | null): void;
+  /** Runs `step` after `activeClaim` captures its answer and before that answer resolves. */
+  whileReading(step: (() => void) | null): void;
   /** Replaces the inbox the decisions module queues through. */
   useInbox(inbox: InboxPort): void;
   /** Asks `ASK` (with `fields`) as `AGENT` and returns the question's decision id. */
@@ -103,14 +110,22 @@ async function withDecisions<R>(
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let active: PortResult<ClaimView | null> = ok(claimView());
+    let fence: ((claimId: string) => number | null) | null = null;
+    let whileReading: (() => void) | null = null;
     let inbox: InboxPort = realInbox;
     const ports = (): RepoPorts => ({
       ...composed,
       claims: {
         ...unavailableClaims,
-        activeClaim: async () => active,
-        currentGeneration: (claimId) =>
-          active.ok && active.value?.claimId === claimId ? active.value.generation : null,
+        activeClaim: async () => {
+          const snapshot = active;
+          whileReading?.();
+          return snapshot;
+        },
+        currentGeneration: (claimId) => {
+          if (fence !== null) return fence(claimId);
+          return active.ok && active.value?.claimId === claimId ? active.value.generation : null;
+        },
       },
       inbox,
     });
@@ -136,6 +151,12 @@ async function withDecisions<R>(
       }),
       holds: (answer) => {
         active = answer;
+      },
+      fence: (reader) => {
+        fence = reader;
+      },
+      whileReading: (step) => {
+        whileReading = step;
       },
       useInbox: (replacement) => {
         inbox = replacement;
@@ -293,6 +314,31 @@ describe("ask", () => {
         code: "unauthenticated",
       });
       expect(h.events()).toEqual([]);
+    });
+  });
+
+  it("refuses when the claim is released or taken over while it is being read", async () => {
+    await withDecisions(async (h) => {
+      // `activeClaim` answers generation 1, working; by the time the write runs, it is not.
+      const moves: Array<[number | null, string]> = [
+        [2, "stale_generation"],
+        [null, "claim_closed"],
+      ];
+      for (const [current, code] of moves) {
+        h.fence(null);
+        h.whileReading(() => h.fence(() => current));
+        expect(await h.decisions.ask(h.agent(), CLAIM, ASK)).toMatchObject({ ok: false, code });
+        expect(h.events()).toEqual([]);
+        expect(h.count("questions")).toBe(0);
+        expect(h.count("decision_claims")).toBe(0);
+      }
+
+      // Authority unchanged across the read, the same request records the question.
+      h.fence(null);
+      h.whileReading(null);
+      const asked = await h.decisions.ask(h.agent(), CLAIM, ASK);
+      expect(asked).toMatchObject({ ok: true, value: { state: "open" } });
+      expect(types(h.events())).toEqual(["question.asked"]);
     });
   });
 
@@ -491,6 +537,72 @@ describe("record", () => {
   });
 });
 
+describe("record fence", () => {
+  it("records the answer but queues nothing to a claim that moved or is unknown", async () => {
+    await withDecisions(async (h) => {
+      const moved = await h.ask();
+      const unknown = await h.ask({ requestId: "req_upload0000000002" });
+      const cases: Array<[{ questionId: string; decisionId: string }, number | null, string]> = [
+        [moved, 2, "chl_grant0001"],
+        [unknown, null, "chl_grant0002"],
+      ];
+      for (const [asked, current, grantId] of cases) {
+        h.fence((claimId) => (claimId === CLAIM ? current : null));
+        const { decisionId } = asked;
+        expect(
+          await h.decisions.record(
+            h.grant({ decisionId, option: "chunk", expectedVersion: null }, grantId),
+          ),
+        ).toEqual(ok({ decisionId, version: 1 }));
+        expect(await h.decisions.question(h.agent(), asked.questionId, 0)).toMatchObject({
+          ok: true,
+          value: { state: "answered", decision: { version: 1 } },
+        });
+      }
+
+      // Both decisions are recorded, and no item went to generation 1's former owner.
+      expect(types(h.events())).toEqual([
+        "question.asked",
+        "question.asked",
+        "decision.recorded",
+        "decision.recorded",
+      ]);
+      expect(h.count("decision_versions")).toBe(2);
+      expect(await h.inbox.pending(h.agent(), MAX_INBOX_PAGE)).toEqual(
+        ok({ items: [], pending: 0 }),
+      );
+      expect(await h.inbox.readyGate(CLAIM, 1)).toEqual(ok({ kind: "clear" }));
+      // The dependencies remain for supersession to deliver to the claim's current owner.
+      expect(h.count("decision_claims")).toBe(2);
+      const requirements = await h.decisions.requirements(CLAIM);
+      // Both were asked at the same instant, so compare them without order.
+      expect(
+        requirements.ok &&
+          requirements.value.toSorted((x, y) => x.decisionId.localeCompare(y.decisionId)),
+      ).toEqual(
+        [
+          { decisionId: moved.decisionId, version: 1 },
+          { decisionId: unknown.decisionId, version: 1 },
+        ].toSorted((x, y) => x.decisionId.localeCompare(y.decisionId)),
+      );
+    });
+  });
+
+  it("queues to a claim still held at its recorded generation", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      // Only the claim's current generation matters, not whether `activeClaim` would answer.
+      h.holds(ok(null));
+      h.fence((claimId) => (claimId === CLAIM ? 1 : null));
+      expect(
+        await h.decisions.record(h.grant({ decisionId, option: "reject", expectedVersion: null })),
+      ).toEqual(ok({ decisionId, version: 1 }));
+      expect(types(h.events())).toEqual(["question.asked", "decision.recorded", "inbox.queued"]);
+      expect(await h.inbox.readyGate(CLAIM, 1)).toEqual(ok({ kind: "blocked", items: [1] }));
+    });
+  });
+});
+
 describe("question", () => {
   it("wakes a long poll when the answer is recorded", async () => {
     await withDecisions(async (h) => {
@@ -566,8 +678,8 @@ describe("requirements and currentVersions", () => {
     const asked = await withDecisions(async (h) => h.ask(), repo);
     await evictDurableObject(repo.stub);
     await withDecisions(async (h) => {
-      // The asking claim was recorded before the eviction, so the fanout still reaches it.
-      h.holds(ok(null));
+      // The asking claim was recorded before the eviction and is still held at generation 1, so
+      // the fanout still reaches it.
       expect(
         await h.decisions.record(
           h.grant({ decisionId: asked.decisionId, option: "chunk", expectedVersion: null }),
