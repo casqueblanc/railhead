@@ -53,7 +53,7 @@ const SYNC = new Map<string, unknown>([
 ]);
 
 /** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */
-const RESUMERS = new Set(["train.resume"]);
+const RESUMERS = new Set(["claims.resume", "train.resume"]);
 
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {

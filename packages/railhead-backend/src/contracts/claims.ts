@@ -77,4 +77,9 @@ export interface ClaimsPort {
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */
   fileIssue(grant: GrantFor<"issue.file">): Promise<PortResult<{ issueId: IssueId }>>;
+  /**
+   * Called by the Repo's alarm. Expires claims whose lease lapsed, retries the fork-token
+   * revocations expired claims still owe, and asks for the alarm again at the next deadline.
+   */
+  resume(): Promise<void>;
 }

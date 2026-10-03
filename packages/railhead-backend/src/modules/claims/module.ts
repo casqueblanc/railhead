@@ -27,6 +27,25 @@
 // A refusal the agent sees is recorded as `claim.refused` only when it differs from the claim's
 // last recorded refusal, so an agent that repeats a refused `ready` does not grow the log.
 //
+// An allocating or working claim is a lease of `CLAIM_LEASE_MS`, renewed by every call of its
+// holder that reaches this module: status, `work`, `claim`, `ready`, an `ask` (which reads the
+// active claim) and Git authorization. A ready claim does not lapse, since the train holds its pin;
+// a reopened claim starts a new lease. The lapse is checked at the time of use: a holder call after
+// it, the Repo's alarm or another agent's `work` or `claim` expires the claim and appends
+// `claim.expired`. From then on the former holder is refused, `currentGeneration` reads it as
+// unknown, and the fork's tokens are owed a revocation. The claim stays expired until that
+// revocation is settled; a failed revocation, or one Artifacts reports as `pending_debt`, is
+// retried by the Repo's alarm, and meanwhile nobody gets a write grant on the fork.
+//
+// Takeover gives a settled expired claim, before any new issue, to the next agent other than its
+// former holder that asks for work or names its issue. It keeps the claim, its issue's text and
+// its fork, raises the generation, appends `claim.reassigned`, and moves the claim's decisions to
+// the successor, which queues it the current version of each, in one transaction. The fork's head
+// is whatever its last push left; edits the former holder never pushed are not recovered. A push
+// the former holder had in flight can still move the fork's branch, but the successor's pin names
+// its own commit. An allocation whose holder's lease lapsed before the fork opened passes to the
+// successor at the next generation with no event, and the successor finishes the same fork intent.
+//
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
@@ -35,6 +54,7 @@ import {
   isCommitSha,
   isId,
   type Actor,
+  type AgentId,
   type ClaimId,
   type DecisionRef,
   type IssueId,
@@ -50,16 +70,26 @@ import {
   activeClaimOf,
   activeClaimsOfOwner,
   claimById,
+  claimOfIssue,
+  dueRevocations,
+  expireClaim,
   insertIntent,
   insertIssue,
   issueByGrant,
   issueStatus,
+  lapsedClaims,
   migrateClaims,
+  nextClaimsDeadline,
   nextOpenIssue,
+  nextTakeover,
   noteRefusal,
   openClaim,
   pinReady,
+  reassignClaim,
   recordForkBase,
+  recordRevocation,
+  releasePending,
+  renewLease,
   reopenReady,
   type ClaimRow,
 } from "./store";
@@ -73,6 +103,18 @@ export interface ClaimsLimits {
 /** The production limits. */
 export const CLAIMS_LIMITS: ClaimsLimits = { maxActiveClaimsPerOwner: 16 };
 
+/**
+ * How long a claim's lease lasts after its holder's last call. This is a design value, not a
+ * measured one, and the owner may change it.
+ */
+export const CLAIM_LEASE_MS = 30 * 60_000;
+
+/** How long after a failed or pending revocation the Repo's alarm tries it again. */
+export const REVOKE_RETRY_MS = 60_000;
+
+/** Most lapsed leases, or revocations, one call or alarm handles, so each stays bounded. */
+const RELEASE_BATCH = 16;
+
 /** Builds the claims port of one repository and migrates its tables. */
 export function createClaims(
   context: RepoContext,
@@ -80,7 +122,7 @@ export function createClaims(
   limits: ClaimsLimits = CLAIMS_LIMITS,
 ): ClaimsPort {
   migrateClaims(context.storage);
-  const { log, repoId } = context;
+  const { log, repoId, clock } = context;
 
   /** A step of allocation that either found the claim to finish or refused. */
   type Chosen = PortResult<{ row: ClaimRow; resumed: boolean }>;
@@ -96,10 +138,113 @@ export function createClaims(
       return fail("quota_exceeded", "This person's agents hold as many claims as allowed.");
     }
     const claimId: ClaimId = `clm_${crypto.randomUUID().replaceAll("-", "")}`;
-    insertIntent(sql, { claimId, issueId, agentId: agent.agentId, ownerId: agent.ownerId });
+    const lease = clock() + CLAIM_LEASE_MS;
+    insertIntent(sql, { claimId, issueId, agentId: agent.agentId, ownerId: agent.ownerId }, lease);
     const row = activeClaimOf(sql, agent.agentId);
     if (row === null) throw new Error("a recorded claim intent cannot be read back");
     return ok({ row, resumed: false });
+  };
+
+  /** Asks the Repo's alarm for the next lapse or revocation, if any waits. */
+  const wakeForDeadline = (sql: SqlStorage): void => {
+    const at = nextClaimsDeadline(sql);
+    if (at !== null) context.wake(at);
+  };
+
+  /**
+   * A call of the claim's holder: expires a working claim whose lease lapsed, and otherwise renews
+   * an allocating or working claim's lease. Answers the claim as it now stands. Runs in the caller's
+   * transaction.
+   */
+  const hold = (tx: EventTransaction, row: ClaimRow): ClaimRow => {
+    const now = clock();
+    switch (row.state) {
+      case "working":
+        if (row.leaseUntil !== null && row.leaseUntil <= now) {
+          expire(tx, row, now);
+          break;
+        }
+        renewLease(tx.sql, row.claimId, row.generation, now + CLAIM_LEASE_MS);
+        break;
+      case "allocating":
+        renewLease(tx.sql, row.claimId, row.generation, now + CLAIM_LEASE_MS);
+        break;
+      case "ready":
+      case "merged":
+      case "expired":
+        return row;
+      default:
+        return row.state satisfies never;
+    }
+    wakeForDeadline(tx.sql);
+    const held = claimById(tx.sql, row.claimId);
+    if (held === null) throw new Error("a held claim cannot be read back");
+    return held;
+  };
+
+  /** `hold` on the agent's active claim, in a transaction of its own; `null` without one. */
+  const holdActive = (agentId: AgentId): ClaimRow | null =>
+    log.transaction((tx) => {
+      const row = activeClaimOf(tx.sql, agentId);
+      return row === null ? null : hold(tx, row);
+    }).value;
+
+  /** Expires every claim whose lease lapsed, up to a batch, in one transaction. */
+  const expireLapsed = (): void => {
+    log.transaction((tx) => {
+      const now = clock();
+      for (const row of lapsedClaims(tx.sql, now, RELEASE_BATCH)) expire(tx, row, now);
+      wakeForDeadline(tx.sql);
+    });
+  };
+
+  /**
+   * Revokes the fork tokens of expired claims whose revocation is due, up to a batch. A revocation
+   * that fails, or that Artifacts reports as `pending_debt`, is not settled and is due again after
+   * `REVOKE_RETRY_MS`.
+   */
+  const releaseDue = async (): Promise<void> => {
+    for (const row of dueRevocations(context.storage.sql, clock(), RELEASE_BATCH)) {
+      const revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, row.claimId));
+      log.transaction((tx) => {
+        const next = revocationSettled(revoked) ? null : clock() + REVOKE_RETRY_MS;
+        recordRevocation(tx.sql, row.claimId, row.generation, next);
+        wakeForDeadline(tx.sql);
+      });
+    }
+  };
+
+  /**
+   * Gives `row`, a settled expired claim or a lapsed allocation, to `agent` at the next generation,
+   * after the per-owner limit. An expired claim's takeover appends `claim.reassigned` and moves its
+   * decisions to `agent`. Runs in a transaction.
+   */
+  const takeOver = (tx: EventTransaction, agent: AgentPrincipal, row: ClaimRow): Chosen => {
+    if (activeClaimsOfOwner(tx.sql, agent.ownerId) >= limits.maxActiveClaimsPerOwner) {
+      return fail("quota_exceeded", "This person's agents hold as many claims as allowed.");
+    }
+    const now = clock();
+    if (!reassignClaim(tx.sql, row.claimId, row.generation, agent, now, now + CLAIM_LEASE_MS)) {
+      throw new Error("a claim read in this transaction could not be reassigned");
+    }
+    const generation = row.generation + 1;
+    if (row.state === "expired") {
+      tx.append(CLAIMS_ACTOR, {
+        type: "claim.reassigned",
+        data: { claimId: row.claimId, from: row.agentId, to: agent.agentId, generation },
+      });
+      ports().decisions.transfer(tx, { agentId: agent.agentId, claimId: row.claimId, generation });
+    }
+    wakeForDeadline(tx.sql);
+    const taken = activeClaimOf(tx.sql, agent.agentId);
+    if (taken?.claimId !== row.claimId) throw new Error("a reassigned claim cannot be read back");
+    return ok({ row: taken, resumed: false });
+  };
+
+  /** Expires lapsed claims and revokes what is due, so a takeover sees them settled. */
+  const release = async (): Promise<void> => {
+    expireLapsed();
+    await releaseDue();
   };
 
   /** Opens an allocating claim's fork, or returns an opened claim as it is. */
@@ -158,7 +303,7 @@ export function createClaims(
     const decisions = ports().decisions.currentVersions(row.claimId);
     if (decisions === null) return row;
     if (row.readyDecisions !== null && sameVersions(row.readyDecisions, decisions)) return row;
-    if (!reopenReady(tx.sql, row.claimId, row.generation)) {
+    if (!reopenReady(tx.sql, row.claimId, row.generation, clock() + CLAIM_LEASE_MS)) {
       throw new Error("a ready claim read in this transaction could not be reopened");
     }
     tx.append(CLAIMS_ACTOR, {
@@ -169,6 +314,7 @@ export function createClaims(
         decisions: decisions.map(({ decisionId, version }) => ({ decisionId, version })),
       },
     });
+    wakeForDeadline(tx.sql);
     const reopened = claimById(tx.sql, row.claimId);
     if (reopened === null) throw new Error("a reopened claim cannot be read back");
     return reopened;
@@ -190,8 +336,8 @@ export function createClaims(
     async activeClaim(agent) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
-      const row = activeClaimOf(context.storage.sql, agent.agentId);
-      if (row === null) return ok(null);
+      const row = holdActive(agent.agentId);
+      if (row === null || row.state === "expired") return ok(null);
       const finished = await finish(ok({ row, resumed: true }));
       return finished.ok ? ok(finished.value.claim) : finished;
     },
@@ -199,12 +345,20 @@ export function createClaims(
     async work(agent) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
-      const chosen = log.transaction(({ sql }): Chosen => {
+      await release();
+      const chosen = log.transaction((tx): Chosen => {
+        const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
-        if (active !== null) return ok({ row: active, resumed: true });
+        const held = active === null ? null : hold(tx, active);
+        if (held !== null && held.state !== "expired") return ok({ row: held, resumed: true });
+        const takeover = nextTakeover(sql, agent.agentId, clock());
+        if (takeover !== null) return takeOver(tx, agent, takeover);
         const issueId = nextOpenIssue(sql);
-        if (issueId === null) return fail("no_work", "No issue is ready to claim.");
-        return intend(sql, agent, issueId);
+        if (issueId !== null) return intend(sql, agent, issueId);
+        if (releasePending(sql, agent.agentId)) {
+          return fail("busy", "An expired claim is still being released; repeat the request.");
+        }
+        return fail("no_work", "No issue is ready to claim.");
       }).value;
       return finish(chosen);
     },
@@ -213,17 +367,29 @@ export function createClaims(
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
       if (!isId("issue", issueId)) return fail("invalid_request", "The issue id is malformed.");
-      const chosen = log.transaction(({ sql }): Chosen => {
+      await release();
+      const chosen = log.transaction((tx): Chosen => {
+        const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
-        if (active !== null) {
-          return active.issueId === issueId
-            ? ok({ row: active, resumed: true })
+        const held = active === null ? null : hold(tx, active);
+        if (held !== null && held.state !== "expired") {
+          return held.issueId === issueId
+            ? ok({ row: held, resumed: true })
             : fail("claim_exists", "This agent already holds a claim on another issue.");
         }
-        if (issueStatus(sql, issueId) !== "open") {
-          return fail("issue_unavailable", "The issue does not exist or is already claimed.");
+        const existing = claimOfIssue(sql, issueId);
+        if (existing === null) {
+          return issueStatus(sql, issueId) === "open"
+            ? intend(sql, agent, issueId)
+            : fail("issue_unavailable", "The issue does not exist or is already claimed.");
         }
-        return intend(sql, agent, issueId);
+        if (existing.agentId !== agent.agentId) {
+          if (takeable(existing, clock())) return takeOver(tx, agent, existing);
+          if (existing.state === "expired") {
+            return fail("busy", "The expired claim is still being released; repeat the request.");
+          }
+        }
+        return fail("issue_unavailable", "The issue does not exist or is already claimed.");
       }).value;
       return finish(chosen);
     },
@@ -268,6 +434,8 @@ export function createClaims(
       if (row === null) return null;
       switch (row.state) {
         case "working":
+          // A lapsed lease is no longer held, even before anything records the expiry.
+          return row.leaseUntil !== null && row.leaseUntil <= clock() ? null : row.generation;
         case "ready":
           return row.generation;
         case "allocating":
@@ -302,7 +470,9 @@ export function createClaims(
       const decided = log.transaction((tx): PortResult<ReadyResult> => {
         const held = standing(claimById(tx.sql, claimId), agent, request);
         if (held.kind === "refused") return refuse(tx, held);
-        const row = settle(tx, held.row);
+        const leased = hold(tx, held.row);
+        if (leased.state === "expired") return fail("claim_closed", "The claim's lease expired.");
+        const row = settle(tx, leased);
         const { generation, commit } = request;
         const gate = ports().inbox.readyGateNow(claimId, generation);
         if (gate === null) return fail("unavailable", "The inbox cannot confirm acknowledgements.");
@@ -365,9 +535,58 @@ export function createClaims(
     },
 
     async authorizeGit(access) {
-      return decideGit(context.storage.sql, repoId, access, settleNow);
+      return decideGit(context.storage.sql, repoId, access, {
+        holdActive,
+        holderRead: (claimId, agentId, reopen) =>
+          log.transaction((tx) => {
+            const row = claimById(tx.sql, claimId);
+            if (row?.agentId !== agentId) return row;
+            const leased = hold(tx, row);
+            return reopen ? settle(tx, leased) : leased;
+          }).value,
+      });
+    },
+
+    async resume() {
+      await release();
+      wakeForDeadline(context.storage.sql);
     },
   };
+}
+
+/** Expires a working claim and appends `claim.expired`. Runs in the caller's transaction. */
+function expire(tx: EventTransaction, row: ClaimRow, now: number): void {
+  if (!expireClaim(tx.sql, row.claimId, row.generation, now)) {
+    throw new Error("a working claim read in this transaction could not be expired");
+  }
+  tx.append(CLAIMS_ACTOR, {
+    type: "claim.expired",
+    data: { claimId: row.claimId, generation: row.generation },
+  });
+}
+
+/** Whether another agent may take `row` over now: a settled expired claim or a lapsed allocation. */
+function takeable(row: ClaimRow, now: number): boolean {
+  switch (row.state) {
+    case "expired":
+      return row.revokeDue === null;
+    case "allocating":
+      return row.leaseUntil !== null && row.leaseUntil <= now;
+    case "working":
+    case "ready":
+    case "merged":
+      return false;
+    default:
+      return row.state satisfies never;
+  }
+}
+
+/**
+ * Whether a revocation is settled. A failure is not, and neither is the adapter's `pending_debt`,
+ * which means a partial token listing may still hide a live token.
+ */
+function revocationSettled(result: PortResult<unknown>): boolean {
+  return result.ok && result.value !== "pending_debt";
 }
 
 /** Who records a refusal: the claims module, never the agent it refuses. */
@@ -451,18 +670,30 @@ function invalidReady(claimId: ClaimId, request: ReadyRequest): PortFailure | nu
   return null;
 }
 
+/** What `decideGit` may change: the holder's lease, and a ready claim a newer decision superseded. */
+interface GitHolder {
+  /** Renews or expires the agent's active claim; see `hold`. */
+  holdActive(agentId: AgentId): ClaimRow | null;
+  /**
+   * Reads the claim and, when `agentId` holds it, renews or expires its lease and, with `reopen`,
+   * returns it to working if a newer decision superseded its pin.
+   */
+  holderRead(claimId: ClaimId, agentId: AgentId, reopen: boolean): ClaimRow | null;
+}
+
 /**
  * Decides one Git request against current state. Every remote needs an agent of this repository.
  * A fetch may read main or any opened claim's fork; a push may write only the fork of a claim the
  * agent holds while it is working, fenced to its current generation. Main takes no push here.
- * `settleNow` reopens the holder's ready claim when a newer decision superseded its pin, so the
- * holder can push the adapted work.
+ * A request of the claim's holder renews its lease, or expires it once lapsed; a push of the
+ * holder of a ready claim whose pin a newer decision superseded reopens it, so the holder can push
+ * the adapted work.
  */
 async function decideGit(
   sql: SqlStorage,
   repoId: string,
   access: GitAccess,
-  settleNow: (claimId: ClaimId) => ClaimRow | null,
+  holder: GitHolder,
 ): Promise<PortResult<GitGrant>> {
   const { principal, target, operation } = access;
   if (principal === null || principal.repoId !== repoId) {
@@ -472,26 +703,23 @@ async function decideGit(
     if (operation === "push") {
       return fail("invalid_request", "Main is written only by the train.");
     }
-    return ok({ repo: await mainRepoName(repoId), scope: "read", fence: null });
+    const repo = await mainRepoName(repoId);
+    holder.holdActive(principal.agentId);
+    return ok({ repo, scope: "read", fence: null });
   }
   const { claimId } = target;
   if (!isId("claim", claimId)) return fail("invalid_request", "The claim id is malformed.");
   const repo = await forkRepoName(repoId, claimId);
   // Nothing below awaits, so the grant is decided on the claim as it stands now.
-  const row = claimById(sql, claimId);
+  const row = holder.holderRead(claimId, principal.agentId, operation === "push");
   if (row === null || row.state === "allocating") {
     return fail("not_found", "The claim has no fork.");
   }
   switch (operation) {
     case "fetch":
       return ok({ repo, scope: "read", fence: null });
-    case "push": {
-      const now =
-        row.state === "ready" && row.agentId === principal.agentId ? settleNow(claimId) : row;
-      return now === null
-        ? fail("not_found", "The claim has no fork.")
-        : pushGrant(now, principal, repo);
-    }
+    case "push":
+      return pushGrant(row, principal, repo);
     default:
       return operation satisfies never;
   }

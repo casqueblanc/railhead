@@ -11,6 +11,10 @@
 // A ready claim keeps the decision versions its pin was recorded under, as JSON, so the train's
 // read of the pin can compare them with the current versions. A claim also keeps the last refusal
 // it recorded, so a repeated refusal is not recorded again.
+//
+// An allocating or working claim holds a lease until `lease_until`. A working claim whose lease
+// lapsed expires; the expiry owes a revocation of its fork's tokens, due at `revoke_due`, and the
+// claim is reassigned only once that revocation is settled and `revoke_due` is cleared.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -52,6 +56,11 @@ const MIGRATIONS: readonly string[] = [
     WHERE state IN ('allocating', 'working', 'ready')`,
   "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
   "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN lease_until INTEGER",
+  "ALTER TABLE claims_claims ADD COLUMN revoke_due INTEGER",
+  `CREATE INDEX claims_by_lease ON claims_claims (lease_until)
+    WHERE state IN ('allocating', 'working')`,
+  "CREATE INDEX claims_by_revocation ON claims_claims (revoke_due) WHERE revoke_due IS NOT NULL",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -78,6 +87,13 @@ export interface ClaimRow {
    * that cannot be read, which no pin is trusted with.
    */
   readyDecisions: DecisionRef[] | null;
+  /**
+   * When the lease of an allocating or working claim lapses, in milliseconds since the Unix epoch;
+   * `null` for a claim recorded before leases, until its holder's next call.
+   */
+  leaseUntil: number | null;
+  /** When the expired claim's fork tokens are next revoked; `null` when nothing is owed. */
+  revokeDue: number | null;
   title: string;
   body: string;
 }
@@ -93,12 +109,15 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   base: string | null;
   ready_commit: string | null;
   ready_decisions: string | null;
+  lease_until: number | null;
+  revoke_due: number | null;
   title: string;
   body: string;
 }
 
 const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.state,
-    c.fork_base, c.base, c.ready_commit, c.ready_decisions, i.title, i.body
+    c.fork_base, c.base, c.ready_commit, c.ready_decisions, c.lease_until, c.revoke_due, i.title,
+    i.body
   FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id`;
 
 /** Creates or migrates the claims tables. */
@@ -154,19 +173,194 @@ export function issueStatus(sql: SqlStorage, issueId: IssueId): "open" | "claime
   return row.claimed === 0 ? "open" : "claimed";
 }
 
-/** Records the fork intent: a claim at generation 1 with no fork yet. */
+/** Records the fork intent: a claim at generation 1 with no fork yet, leased until `leaseUntil`. */
 export function insertIntent(
   sql: SqlStorage,
   claim: { claimId: ClaimId; issueId: IssueId; agentId: AgentId; ownerId: UserId },
+  leaseUntil: number,
 ): void {
   sql.exec(
-    `INSERT INTO claims_claims (claim_id, issue_id, agent_id, owner_id, generation, state)
-     VALUES (?, ?, ?, ?, 1, 'allocating')`,
+    `INSERT INTO claims_claims
+       (claim_id, issue_id, agent_id, owner_id, generation, state, lease_until)
+     VALUES (?, ?, ?, ?, 1, 'allocating', ?)`,
     claim.claimId,
     claim.issueId,
     claim.agentId,
     claim.ownerId,
+    leaseUntil,
   );
+}
+
+/** Extends the lease of an allocating or working claim at `generation` to `leaseUntil`. */
+export function renewLease(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  leaseUntil: number,
+): void {
+  sql.exec(
+    `UPDATE claims_claims SET lease_until = ?
+     WHERE claim_id = ? AND generation = ? AND state IN ('allocating', 'working')`,
+    leaseUntil,
+    claimId,
+    generation,
+  );
+}
+
+/** Working claims whose lease lapsed at or before `now`, oldest lease first, at most `limit`. */
+export function lapsedClaims(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
+  return rows(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.state = 'working' AND c.lease_until <= ?
+       ORDER BY c.lease_until, c.claim_id LIMIT ?`,
+      now,
+      limit,
+    ),
+  );
+}
+
+/**
+ * Expires a working claim at `generation` and records that its fork's tokens are owed a revocation
+ * due at `now`. Returns `false`, and writes nothing, when the claim is no longer working at that
+ * generation.
+ */
+export function expireClaim(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  now: number,
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'expired', lease_until = NULL, revoke_due = ?
+       WHERE claim_id = ? AND generation = ? AND state = 'working'
+       RETURNING claim_id`,
+      now,
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/** Expired claims whose revocation is due at or before `now`, earliest first, at most `limit`. */
+export function dueRevocations(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
+  return rows(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.revoke_due <= ? ORDER BY c.revoke_due, c.claim_id LIMIT ?`,
+      now,
+      limit,
+    ),
+  );
+}
+
+/**
+ * Records the outcome of a revocation of an expired claim at `generation`: `null` when it is
+ * settled, otherwise when to try again.
+ */
+export function recordRevocation(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  nextDue: number | null,
+): void {
+  sql.exec(
+    `UPDATE claims_claims SET revoke_due = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'expired' AND revoke_due IS NOT NULL`,
+    nextDue,
+    claimId,
+    generation,
+  );
+}
+
+/** The earliest time a lease lapses or a revocation is due, or `null` when nothing waits. */
+export function nextClaimsDeadline(sql: SqlStorage): number | null {
+  const [row] = sql
+    .exec<{ at: number | null }>(
+      `SELECT MIN(at) AS at FROM (
+         SELECT MIN(lease_until) AS at FROM claims_claims WHERE state = 'working'
+         UNION ALL
+         SELECT MIN(revoke_due) AS at FROM claims_claims WHERE revoke_due IS NOT NULL
+       )`,
+    )
+    .toArray();
+  return row?.at ?? null;
+}
+
+/**
+ * The claim the agent may take over, in handover order: the expired claim of the oldest issue whose
+ * revocation is settled, then the oldest-leased allocation whose lease lapsed at or before `now`.
+ * A claim the agent itself held last is never offered back to it.
+ */
+export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): ClaimRow | null {
+  const expired = first(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.state = 'expired' AND c.revoke_due IS NULL AND c.agent_id != ?
+       ORDER BY i.filed_seq LIMIT 1`,
+      agentId,
+    ),
+  );
+  if (expired !== null) return expired;
+  return first(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.state = 'allocating' AND c.lease_until <= ? AND c.agent_id != ?
+       ORDER BY c.lease_until, c.claim_id LIMIT 1`,
+      now,
+      agentId,
+    ),
+  );
+}
+
+/** Whether an expired claim another agent held still owes the revocation of its fork's tokens. */
+export function releasePending(sql: SqlStorage, agentId: AgentId): boolean {
+  const [row] = sql
+    .exec<{ pending: number }>(
+      `SELECT EXISTS (SELECT 1 FROM claims_claims
+         WHERE state = 'expired' AND revoke_due IS NOT NULL AND agent_id != ?) AS pending`,
+      agentId,
+    )
+    .toArray();
+  return row?.pending === 1;
+}
+
+/** The claim on the issue, or `null`. */
+export function claimOfIssue(sql: SqlStorage, issueId: IssueId): ClaimRow | null {
+  return first(sql.exec<RawClaim>(`${SELECT_CLAIM} WHERE c.issue_id = ?`, issueId));
+}
+
+/**
+ * Gives an expired claim whose revocation is settled, or an allocation whose lease lapsed at or
+ * before `now`, to `agent` at the next generation, leased until `leaseUntil`, and forgets its last
+ * refusal. An expired claim becomes working. Returns `false`, and writes nothing, when the claim
+ * is no longer that claim at `generation`.
+ */
+export function reassignClaim(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  agent: { agentId: AgentId; ownerId: UserId },
+  now: number,
+  leaseUntil: number,
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET agent_id = ?, owner_id = ?, generation = generation + 1,
+         state = CASE state WHEN 'expired' THEN 'working' ELSE state END,
+         lease_until = ?, last_refusal = NULL
+       WHERE claim_id = ? AND generation = ? AND agent_id != ? AND (
+         (state = 'expired' AND revoke_due IS NULL)
+         OR (state = 'allocating' AND lease_until <= ?))
+       RETURNING claim_id`,
+      agent.agentId,
+      agent.ownerId,
+      leaseUntil,
+      claimId,
+      generation,
+      agent.agentId,
+      now,
+    )
+    .toArray();
+  return updated.length === 1;
 }
 
 /** Records the main commit the fork is requested at, unless one is already recorded. */
@@ -230,16 +424,23 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working, clears its pin and forgets its last refusal.
- * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
+ * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
+ * and forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer
+ * ready at that generation.
  */
-export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
+export function reopenReady(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  leaseUntil: number,
+): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         last_refusal = NULL
+         last_refusal = NULL, lease_until = ?
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
+      leaseUntil,
       claimId,
       generation,
     )
@@ -290,8 +491,14 @@ export function insertIssue(
 }
 
 function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
-  const [raw] = cursor.toArray();
-  if (raw === undefined) return null;
+  return rows(cursor)[0] ?? null;
+}
+
+function rows(cursor: SqlStorageCursor<RawClaim>): ClaimRow[] {
+  return cursor.toArray().map(claimRow);
+}
+
+function claimRow(raw: RawClaim): ClaimRow {
   return {
     claimId: raw.claim_id,
     issueId: raw.issue_id,
@@ -303,6 +510,8 @@ function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
     base: raw.base,
     readyCommit: raw.ready_commit,
     readyDecisions: raw.ready_decisions === null ? null : decisionList(raw.ready_decisions),
+    leaseUntil: raw.lease_until,
+    revokeDue: raw.revoke_due,
     title: raw.title,
     body: raw.body,
   };
