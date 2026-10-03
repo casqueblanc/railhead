@@ -38,7 +38,8 @@
   },
   "secrets": {
     "required": [
-      "OWNER_BOOTSTRAP_TOKEN"
+      "OWNER_BOOTSTRAP_TOKEN",
+      "SESSION_SIGNING_SECRET"
     ]
   },
   "assets": {

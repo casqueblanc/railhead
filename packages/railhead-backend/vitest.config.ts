@@ -15,6 +15,10 @@ export default defineConfig({
       // Tests never reach a live resource: the Artifacts binding is always remote, so without this
       // the pool opens a remote session for it. Tests that need Artifacts stub it.
       remoteBindings: false,
+      // A fixed test value, never a real secret, so agent logins over HTTP work in the pool.
+      miniflare: {
+        bindings: { SESSION_SIGNING_SECRET: "test-only-session-signing-secret-0123456789" },
+      },
     }),
   ],
   test: {

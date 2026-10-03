@@ -1,6 +1,6 @@
 import { Badge, Empty, LayerCard, SkeletonLine, Text } from "@cloudflare/kumo";
 import { RobotIcon, WarningCircleIcon } from "@phosphor-icons/react";
-import { useId, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import type { EnrollmentPort, OwnerPort } from "../board/boardPorts";
 import type { BoardState, StreamStatus } from "../board/boardState";
 import { feedView, type BoardFeed } from "../claims/boardFeed";
@@ -10,7 +10,7 @@ import { ConfirmedAgent } from "./ConfirmedAgent";
 import { InviteForm } from "./InviteForm";
 import { OwnerPasskeySetup } from "./OwnerPasskeySetup";
 import { unreachable } from "./ownerActions";
-import { roster } from "./roster";
+import { nextExpiry, roster } from "./roster";
 import type { ActionAccess } from "./useOwnerAction";
 import type { Authenticator } from "./webauthn";
 
@@ -98,10 +98,37 @@ export const EnrollmentPanel = ({
   );
 };
 
+/** The longest the roster waits before rereading the clock, so a clock moved forward shows soon. */
+const EXPIRY_RECHECK_MS = 60_000;
+
 const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) => {
-  const rows = roster(board);
+  const [now, setNow] = useState(Date.now);
+  const rows = roster(board, now);
+  const expiry = nextExpiry(rows.invites);
+  // No event records an expiry, so the clock moves the next invite to the expired rows. The wall
+  // clock can move while a timeout waits, so each callback rereads it and waits again, at most
+  // EXPIRY_RECHECK_MS at a time, until it reaches the expiry.
+  useEffect(() => {
+    if (expiry === null) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = () => {
+      const current = Date.now();
+      if (current < expiry) {
+        timer = setTimeout(check, Math.min(EXPIRY_RECHECK_MS, expiry - current));
+        return;
+      }
+      setNow(current);
+    };
+    timer = setTimeout(check, Math.min(EXPIRY_RECHECK_MS, Math.max(0, expiry - Date.now())));
+    return () => clearTimeout(timer);
+  }, [expiry]);
   const empty =
-    rows.invites.length + rows.awaiting.length + rows.confirmed.length + rows.revoked.length === 0;
+    rows.invites.length +
+      rows.expired.length +
+      rows.awaiting.length +
+      rows.confirmed.length +
+      rows.revoked.length ===
+    0;
   return (
     <>
       <div className="grid gap-3 px-4 py-3">
@@ -132,6 +159,24 @@ const Roster = ({ board, access }: { board: BoardState; access: ActionAccess }) 
               </Text>
               <Text as="span" variant="secondary">
                 Waiting for the agent to join.
+              </Text>
+            </li>
+          ))}
+        </Group>
+      )}
+      {rows.expired.length > 0 && (
+        <Group title="Expired invites">
+          {rows.expired.map((invite) => (
+            <li
+              key={invite.inviteId}
+              className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 py-3"
+            >
+              <Text variant="secondary" DANGEROUS_className="min-w-0 break-words">
+                {invite.name}
+              </Text>
+              <Badge variant="neutral">Expired</Badge>
+              <Text as="span" variant="secondary">
+                No agent joined in time. Create a new invite to add it.
               </Text>
             </li>
           ))}
