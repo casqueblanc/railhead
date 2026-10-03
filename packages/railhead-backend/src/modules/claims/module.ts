@@ -69,6 +69,7 @@ import { EventLogError, type EventTransaction } from "../../repo/eventLog";
 import {
   activeClaimOf,
   activeClaimsOfOwner,
+  backfillLeases,
   claimById,
   claimOfIssue,
   dueRevocations,
@@ -123,6 +124,7 @@ export function createClaims(
 ): ClaimsPort {
   migrateClaims(context.storage);
   const { log, repoId, clock } = context;
+  backfillLeases(context.storage.sql, clock() + CLAIM_LEASE_MS);
 
   /** A step of allocation that either found the claim to finish or refused. */
   type Chosen = PortResult<{ row: ClaimRow; resumed: boolean }>;

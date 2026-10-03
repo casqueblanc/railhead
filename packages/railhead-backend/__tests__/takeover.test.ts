@@ -49,6 +49,7 @@ interface Setup {
   decisions: DecisionsPort;
   log: EventLog;
   sql: SqlStorage;
+  storage: DurableObjectStorage;
   /** Every alarm time a module asked for, in order. */
   wakes: number[];
   events: () => RailheadEvent[];
@@ -98,6 +99,7 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       decisions,
       log,
       sql: state.storage.sql,
+      storage: state.storage,
       wakes,
       events: () => log.replay(0, 256).events,
       async file(title) {
@@ -250,6 +252,54 @@ describe("leases", () => {
         state: "expired",
         revoke_due: null,
       });
+    });
+  });
+
+  it("gives a claim recorded before leases a lease when the module starts", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+      const working = await setup.file("Add downloads");
+      setup.sql.exec(
+        `INSERT INTO claims_claims (claim_id, issue_id, agent_id, owner_id, generation, state, base)
+         VALUES ('clm_legacyclaim1', ?, 'agt_agent0009', 'usr_owner0001', 1, 'working', ?)`,
+        working,
+        HEAD,
+      );
+      setup.sql.exec("UPDATE claims_claims SET lease_until = NULL");
+      const unleased = setup.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM claims_claims WHERE lease_until IS NULL")
+        .toArray()[0];
+      expect(unleased?.n).toBe(2);
+
+      // A restarted module backfills from its clock; nothing else is touched.
+      createClaims(
+        {
+          repoId: REPO,
+          storage: setup.storage,
+          log: setup.log,
+          clock: setup.fake.clock,
+          env,
+          wake: () => {},
+        },
+        () => {
+          throw new Error("ports are not read while building");
+        },
+      );
+      const leases = setup.sql
+        .exec<{ lease_until: number | null }>(
+          "SELECT lease_until FROM claims_claims ORDER BY claim_id",
+        )
+        .toArray()
+        .map((row) => row.lease_until);
+      expect(leases).toEqual([
+        setup.fake.clock() + CLAIM_LEASE_MS,
+        setup.fake.clock() + CLAIM_LEASE_MS,
+      ]);
+
+      setup.fake.advance(CLAIM_LEASE_MS);
+      await setup.port.resume();
+      expect(stored(setup.sql, claim.claimId).state).toBe("expired");
+      expect(stored(setup.sql, "clm_legacyclaim1").state).toBe("expired");
     });
   });
 

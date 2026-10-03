@@ -89,7 +89,8 @@ export interface ClaimRow {
   readyDecisions: DecisionRef[] | null;
   /**
    * When the lease of an allocating or working claim lapses, in milliseconds since the Unix epoch;
-   * `null` for a claim recorded before leases, until its holder's next call.
+   * `null` for a claim in another state. A claim recorded before leases is given one when the
+   * module starts.
    */
   leaseUntil: number | null;
   /** When the expired claim's fork tokens are next revoked; `null` when nothing is owed. */
@@ -187,6 +188,18 @@ export function insertIntent(
     claim.issueId,
     claim.agentId,
     claim.ownerId,
+    leaseUntil,
+  );
+}
+
+/**
+ * Gives every allocating or working claim recorded before leases a lease until `leaseUntil`, so a
+ * holder that never calls again still lapses.
+ */
+export function backfillLeases(sql: SqlStorage, leaseUntil: number): void {
+  sql.exec(
+    `UPDATE claims_claims SET lease_until = ?
+     WHERE state IN ('allocating', 'working') AND lease_until IS NULL`,
     leaseUntil,
   );
 }
