@@ -227,11 +227,28 @@ const sessions: SessionsPort = {
   },
 };
 
-/** Runs `body` against a gateway over real storage, the real Artifacts adapter and a fake upstream. */
-function withGateway(
+/**
+ * Runs `body` against a gateway over real storage, the real Artifacts adapter and a fake upstream.
+ * Timers are fake for its duration: no time limit passes until a test advances them, so a loaded
+ * host cannot cut off an exchange that a test expects to complete.
+ */
+async function withGateway(
   body: (world: World) => Promise<void>,
   limits: GitGatewayLimits = FAST,
   wrapArtifacts: (base: ArtifactsPort) => ArtifactsPort = (base) => base,
+): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await inGateway(body, limits, wrapArtifacts);
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+function inGateway(
+  body: (world: World) => Promise<void>,
+  limits: GitGatewayLimits,
+  wrapArtifacts: (base: ArtifactsPort) => ArtifactsPort,
 ): Promise<void> {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
@@ -318,9 +335,9 @@ function withGateway(
           clock: () => Date.now() + world.skew,
           wake: (at) => {
             world.wakes.push(at);
-            // Resolved later, as the Repo's alarm write is.
+            // Resolved later, as the Repo's alarm write is, on a real timer.
             const answer = world.wakeAnswer(at);
-            return new Promise((resolve) => setTimeout(() => resolve(answer), 0));
+            return scheduler.wait(0).then(() => answer);
           },
           ports: () => ({ sessions, claims, artifacts }),
           remote: (repo) => world.remote(repo),
@@ -1216,13 +1233,39 @@ function pausedPush(cut: number): { body: ReadableStream<Uint8Array>; resume: ()
   return { body, resume };
 }
 
-/** Resolves once `condition` holds, polling briefly; fails the test rather than hanging. */
+/**
+ * Resolves once `condition` holds, polling on a real timer; fails the test rather than hanging. The
+ * bound is real time, which a loaded host may need for the storage and streams the gateway awaits.
+ */
 async function until(condition: () => boolean): Promise<void> {
-  for (let tries = 0; tries < 200; tries += 1) {
-    if (condition()) return;
-    await new Promise((resolve) => setTimeout(resolve, 1));
+  const giveUp = Date.now() + 2_000;
+  while (!condition()) {
+    if (Date.now() > giveUp) throw new Error("the condition never held");
+    await scheduler.wait(1);
   }
-  throw new Error("the condition never held");
+}
+
+/** `promise`, with whether it has settled yet. */
+function tracked<T>(promise: Promise<T>): { readonly promise: Promise<T>; settled: boolean } {
+  const state = { promise, settled: false };
+  promise.then(
+    () => {
+      state.settled = true;
+    },
+    () => {
+      state.settled = true;
+    },
+  );
+  return state;
+}
+
+/**
+ * Lets `ms` of the gateway's time pass, then lets the real work it set off (storage, streams) run.
+ * The time limits are fake timers, so this is the only way one passes.
+ */
+async function elapse(ms: number): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+  await scheduler.wait(1);
 }
 
 describe("a push decided again after it was admitted", () => {
@@ -1580,22 +1623,29 @@ describe("bounds", () => {
       await withGateway(async (world) => {
         world.claim.state = state;
         let cancelled = false;
+        let pulled = false;
         // A length and half a command, then nothing: the head never completes and the body never ends.
         const body = new ReadableStream<Uint8Array>({
-          start(controller) {
+          pull(controller) {
+            if (pulled) return new Promise<void>(() => undefined);
+            pulled = true;
             controller.enqueue(encoder.encode(`00b9${ZERO} ${HEAD} refs/he`));
+            return undefined;
           },
           cancel() {
             cancelled = true;
           },
         });
-        const started = Date.now();
-        const response = await world.gateway.serve(
-          rpc("git-receive-pack", body),
-          FORK,
-          "/git-receive-pack",
+        const serving = tracked(
+          world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
         );
-        expect(Date.now() - started, state).toBeLessThan(FAST.maxDurationMs);
+        await until(() => pulled);
+        await elapse(FAST.headTimeoutMs - 1);
+        expect(serving.settled, state).toBe(false);
+        // Cut off at the head's limit, well before the whole exchange's.
+        await elapse(1);
+        expect(serving.settled, state).toBe(true);
+        const response = await serving.promise;
         expect(response.status, state).toBe(status);
         expect(await response.text(), state).toContain(message);
         expect(cancelled, state).toBe(true);
@@ -1615,24 +1665,21 @@ describe("bounds", () => {
     for (const [state, status] of cases) {
       const armed = new Set<unknown>();
       const cleared = new Set<unknown>();
-      const setTimer = globalThis.setTimeout;
-      const clearTimer = globalThis.clearTimeout;
-      const setSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
-        handler: () => void,
-        ms?: number,
-      ) => {
-        const id = setTimer(handler, ms);
-        if (ms === slow.maxDurationMs) armed.add(id);
-        return id;
-      }) as typeof setTimeout);
-      const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
-        id?: Parameters<typeof clearTimeout>[0],
-      ) => {
-        cleared.add(id);
-        clearTimer(id);
-      }) as typeof clearTimeout);
-      try {
-        await withGateway(async (world) => {
+      await withGateway(async (world) => {
+        // Wrapped inside the gateway's world, where the timers it arms are the fake ones, and by
+        // hand: a spy would be restored again after the test, over the real timers.
+        const setTimer = globalThis.setTimeout;
+        const clearTimer = globalThis.clearTimeout;
+        globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+          const id = setTimer(handler, ms);
+          if (ms === slow.maxDurationMs) armed.add(id);
+          return id;
+        }) as typeof setTimeout;
+        globalThis.clearTimeout = ((id?: Parameters<typeof clearTimeout>[0]) => {
+          cleared.add(id);
+          clearTimer(id);
+        }) as typeof clearTimeout;
+        try {
           world.claim.state = state;
           // Half a command, then the client goes away.
           const body = new ReadableStream<Uint8Array>({
@@ -1650,11 +1697,11 @@ describe("bounds", () => {
           expect(world.minted(), state).toBe(0);
           expect(world.seen, state).toEqual([]);
           expect(pushedEvents(world), state).toEqual([]);
-        }, slow);
-      } finally {
-        setSpy.mockRestore();
-        clearSpy.mockRestore();
-      }
+        } finally {
+          globalThis.setTimeout = setTimer;
+          globalThis.clearTimeout = clearTimer;
+        }
+      }, slow);
       expect(armed.size, state).toBe(1);
       expect(
         [...armed].every((id) => cleared.has(id)),
@@ -1719,12 +1766,20 @@ describe("bounds", () => {
 
   it("answers 504 when the upstream does not answer in time, and logs no token", async () => {
     await withGateway(async (world) => {
-      world.respond = () => new Promise<Response>(() => undefined);
-      const response = await world.gateway.serve(
-        rpc("git-receive-pack", PUSH_REQUEST),
-        FORK,
-        "/git-receive-pack",
+      let asked = false;
+      world.respond = () => {
+        asked = true;
+        return new Promise<Response>(() => undefined);
+      };
+      const serving = tracked(
+        world.gateway.serve(rpc("git-receive-pack", PUSH_REQUEST), FORK, "/git-receive-pack"),
       );
+      // The upstream has read the whole push: from now on the headers wait runs.
+      await until(() => asked);
+      await elapse(FAST.headersTimeoutMs - 1);
+      expect(serving.settled).toBe(false);
+      await elapse(1);
+      const response = await serving.promise;
       expect(response.status).toBe(504);
       const text = await response.text();
       expect(pushedEvents(world)).toEqual([]);
@@ -1753,7 +1808,11 @@ describe("bounds", () => {
         "/git-receive-pack",
       );
       expect(response.status).toBe(200);
-      await expect(response.arrayBuffer()).rejects.toThrow();
+      const read = tracked(response.arrayBuffer());
+      await elapse(FAST.maxDurationMs - 1);
+      expect(read.settled).toBe(false);
+      await elapse(1);
+      await expect(read.promise).rejects.toThrow();
       expect(pushedEvents(world)).toEqual([]);
       expect(unknownOutcomes()).toBe(1);
     });
@@ -2044,7 +2103,9 @@ describe("an upstream that fails before reading the upload", () => {
   it("cuts off a push whose pack stalls after its head while the upstream reads it", async () => {
     await withGateway(async (world) => {
       let cancelled = false;
+      let reading = false;
       world.upstream = async (request) => {
+        reading = true;
         await request.arrayBuffer();
         return gitResponse("git-receive-pack", "result", PUSH_RESULT);
       };
@@ -2056,15 +2117,16 @@ describe("an upstream that fails before reading the upload", () => {
           cancelled = true;
         },
       });
-      const started = Date.now();
-      const response = await world.gateway.serve(
-        rpc("git-receive-pack", body),
-        FORK,
-        "/git-receive-pack",
+      const serving = tracked(
+        world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
       );
-      expect(response.status).toBe(504);
+      await until(() => reading);
       // The stalled upload is bounded by the whole exchange's limit, not by the headers wait.
-      expect(Date.now() - started).toBeGreaterThanOrEqual(FAST.maxDurationMs);
+      await elapse(FAST.maxDurationMs - 1);
+      expect(serving.settled).toBe(false);
+      await elapse(1);
+      const response = await serving.promise;
+      expect(response.status).toBe(504);
       await until(() => cancelled);
       expect(pushedEvents(world)).toEqual([]);
     });
@@ -2079,24 +2141,30 @@ describe("a slow upload", () => {
     await withGateway(async (world) => {
       world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
       const size = Math.ceil(PUSH_REQUEST.length / pieces);
+      let sent = 0;
       const body = new ReadableStream<Uint8Array>({
         async start(controller) {
           for (let offset = 0; offset < PUSH_REQUEST.length; offset += size) {
             controller.enqueue(PUSH_REQUEST.slice(offset, offset + size));
+            sent += 1;
             await new Promise((resolve) => setTimeout(resolve, gapMs));
           }
           controller.close();
         },
       });
-      const started = Date.now();
-      const response = await world.gateway.serve(
-        rpc("git-receive-pack", body),
-        FORK,
-        "/git-receive-pack",
+      const serving = tracked(
+        world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
       );
+      let elapsed = 0;
+      for (let piece = 1; piece <= pieces; piece += 1) {
+        await until(() => sent >= piece);
+        await elapse(gapMs);
+        elapsed += gapMs;
+      }
+      const response = await serving.promise;
       expect(response.status).toBe(200);
       expect(await bytesOf(response)).toEqual(PUSH_RESULT);
-      expect(Date.now() - started).toBeGreaterThan(steady.headersTimeoutMs * 2);
+      expect(elapsed).toBeGreaterThan(steady.headersTimeoutMs * 2);
       expect(world.seen[0]?.body).toEqual(PUSH_REQUEST);
       expect(pushedEvents(world)).toHaveLength(1);
     }, steady);
@@ -2105,15 +2173,20 @@ describe("a slow upload", () => {
   it("still waits only the headers time once the whole upload has been sent", async () => {
     const steady: GitGatewayLimits = { ...FAST, maxDurationMs: 5_000 };
     await withGateway(async (world) => {
-      world.respond = () => new Promise<Response>(() => undefined);
-      const started = Date.now();
-      const response = await world.gateway.serve(
-        rpc("git-receive-pack", PUSH_REQUEST),
-        FORK,
-        "/git-receive-pack",
+      let asked = false;
+      world.respond = () => {
+        asked = true;
+        return new Promise<Response>(() => undefined);
+      };
+      const serving = tracked(
+        world.gateway.serve(rpc("git-receive-pack", PUSH_REQUEST), FORK, "/git-receive-pack"),
       );
+      await until(() => asked);
+      // Cut off at the headers wait, long before the whole exchange's limit.
+      await elapse(steady.headersTimeoutMs);
+      expect(serving.settled).toBe(true);
+      const response = await serving.promise;
       expect(response.status).toBe(504);
-      expect(Date.now() - started).toBeLessThan(steady.maxDurationMs);
       expect(pushedEvents(world)).toEqual([]);
     }, steady);
   });
@@ -2245,9 +2318,11 @@ describe("a client that stops reading a push's response", () => {
         "/git-receive-pack",
       );
       await response.body?.cancel();
-      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
+      await elapse(FAST.maxDurationMs - 1);
+      expect(unknownOutcomes()).toBe(0);
+      await elapse(1);
+      await until(() => unknownOutcomes() === 1);
       expect(pushedEvents(world)).toEqual([]);
-      expect(unknownOutcomes()).toBe(1);
     });
   });
 
@@ -2274,9 +2349,11 @@ describe("a client that stops reading a push's response", () => {
       );
       expect(response.status).toBe(200);
       // The client neither reads nor cancels.
-      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 100));
-      expect(unknownOutcomes()).toBe(1);
-      expect(upstreamCancelled).toBe(true);
+      await elapse(FAST.maxDurationMs - 1);
+      expect(unknownOutcomes()).toBe(0);
+      expect(upstreamCancelled).toBe(false);
+      await elapse(1);
+      await until(() => unknownOutcomes() === 1 && upstreamCancelled);
       expect(pushedEvents(world)).toEqual([]);
       await expect(bytesOf(response)).rejects.toThrow();
       expect(unknownOutcomes()).toBe(1);
@@ -2524,8 +2601,10 @@ describe("a push left pending", () => {
       expect(world.pending()).toHaveLength(1);
 
       await response.body?.cancel();
-      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
-      expect(unknownOutcomes()).toBe(1);
+      // The deadline ends the exchange, and the gateway's clock reaches the push's due time.
+      await elapse(FAST.maxDurationMs);
+      world.skew = FAST.maxDurationMs;
+      await until(() => unknownOutcomes() === 1);
       expect(world.pending()).toHaveLength(1);
 
       // `a` reached the commit the push sent; `b` did not move.
