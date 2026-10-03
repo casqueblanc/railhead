@@ -405,6 +405,22 @@
           "version": 1
         }
       }
+    },
+    {
+      "v": 1,
+      "seq": 23,
+      "at": 1790000000023,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.merged",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1,
+        "commit": "cccccccccccccccccccccccccccccccccccccccc"
+      }
     }
   ],
   "largestSafeSeq": {
@@ -698,6 +714,46 @@
         }
       },
       "error": "by a person"
+    },
+    {
+      "name": "merge naming a branch for its commit",
+      "value": {
+        "v": 1,
+        "seq": 23,
+        "at": 1790000000023,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "claim.merged",
+        "data": {
+          "claimId": "clm_42abcd",
+          "generation": 1,
+          "commit": "main"
+        }
+      },
+      "error": "commit"
+    },
+    {
+      "name": "merge recorded by an agent",
+      "value": {
+        "v": 1,
+        "seq": 23,
+        "at": 1790000000023,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.merged",
+        "data": {
+          "claimId": "clm_42abcd",
+          "generation": 1,
+          "commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "error": "recorded by the system"
     }
   ]
 }

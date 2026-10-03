@@ -737,6 +737,7 @@ def events_fixture() -> dict:
         ("agent.revoked", HUMAN, {"agentId": AGENT}),
         ("claim.reopened", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "decisions": [{"decisionId": "dec_upload1", "version": 2}]}),
         ("claim.adapted", SYSTEM, {"claimId": "clm_42abcd", "intentId": "int_merge01", "decision": {"decisionId": "dec_upload1", "version": 1}}),
+        ("claim.merged", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_OTHER}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -757,6 +758,8 @@ def events_fixture() -> dict:
         ("acknowledgement recorded by the system", {**events[10], "actor": SYSTEM}, "by the agent itself"),
         ("agent acknowledging another agent's item", {**events[10], "actor": {"kind": "agent", "id": "agt_ember01"}}, "its own inbox items"),
         ("decision recorded by an agent", {**events[7], "actor": AGENT_ACTOR}, "by a person"),
+        ("merge naming a branch for its commit", {**events[-1], "data": {**events[-1]["data"], "commit": "main"}}, "commit"),
+        ("merge recorded by an agent", {**events[-1], "actor": AGENT_ACTOR}, "recorded by the system"),
     ]
     return {
         "valid": events,

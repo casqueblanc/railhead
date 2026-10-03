@@ -9,6 +9,7 @@ import {
   inbox,
   intend,
   moveMain,
+  merge,
   push,
   ready,
   sizeDecision,
@@ -48,6 +49,7 @@ export const optionResults = syntheticLog(
       "chk_synth20",
     ),
     moveMain("int_synth20", "updated", synthCommit(5)),
+    merge(UPLOAD.atlasClaim, synthCommit(5)),
     checkResult("chk_synth21", synthCommit(5), "accept-reject", "pass", {
       decision: sizeDecision(1),
       option: "reject",
@@ -88,6 +90,7 @@ export const optionResults = syntheticLog(
       "chk_synth24",
     ),
     moveMain("int_synth24", "updated", synthCommit(8)),
+    merge(UPLOAD.birchClaim, synthCommit(8)),
     checkResult("chk_synth25", synthCommit(8), "accept-chunk", "fail", {
       decision: sizeDecision(2),
       option: "chunk",

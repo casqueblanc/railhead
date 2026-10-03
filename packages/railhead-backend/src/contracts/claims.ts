@@ -129,8 +129,9 @@ export interface ClaimsPort {
    */
   readyPin(claimId: ClaimId): ReadyPin | null;
   /**
-   * Merges the claim of each landed pin that is still ready with that pin in that episode, and
-   * records `main`, the commit the landing published, as each holder's closed claim. A pin whose
+   * Merges the claim of each landed pin that is still ready with that pin in that episode, appends
+   * `claim.merged` for it and records `main`, the commit the landing published, as each holder's
+   * closed claim. A pin whose
    * claim was reopened, re-pinned or taken over is left as it is. A merged claim no longer counts
    * as its holder's, so the holder may reopen a merged claim waiting for rework, as
    * `reopenMerged` does. Writes inside `tx`, the transaction that settles the landing, after

@@ -219,6 +219,26 @@ impl ClaimReopened {
     }
 }
 
+/// `claim.merged`: the train landed the claim's pin and the claim closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimMerged {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The generation that merged.
+    pub generation: SafeInteger,
+    /// The main commit the landing published.
+    pub commit: String,
+}
+
+impl ClaimMerged {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::Claim, &self.claim_id, "claimId")?;
+        require_positive(self.generation, "generation")?;
+        require_commit(&self.commit, "commit")
+    }
+}
+
 /// `claim.expired`: a claim's lease ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -10,6 +10,7 @@ import {
   inbox,
   intend,
   moveMain,
+  merge,
   push,
   ready,
   sizeDecision,
@@ -58,6 +59,7 @@ export const decisionReversal = syntheticLog("Synthetic decision reversal, rejec
     "chk_synth01",
   ),
   moveMain("int_synth01", "updated", synthCommit(3)),
+  merge(UPLOAD.atlasClaim, synthCommit(3)),
   adapt(UPLOAD.atlasClaim, "int_synth01", sizeDecision(1)),
   decide(2, "chunk"),
   ...inbox(
@@ -137,5 +139,6 @@ export const decisionReversal = syntheticLog("Synthetic decision reversal, rejec
     "chk_synth02",
   ),
   moveMain("int_synth02", "updated", synthCommit(5)),
+  merge(UPLOAD.atlasClaim, synthCommit(5)),
   adapt(UPLOAD.atlasClaim, "int_synth02", sizeDecision(2)),
 ]);

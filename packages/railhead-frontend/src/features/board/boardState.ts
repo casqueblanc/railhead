@@ -756,6 +756,13 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         }),
       };
     }
+    case "claim.merged": {
+      const { claimId, generation } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      currentGeneration(claim, generation);
+      check(claim.phase === "ready", `claim ${claimId} merged while ${claim.phase}`);
+      return { ...state, claims: draft.put(state.claims, claimId, { ...claim, phase: "merged" }) };
+    }
     case "claim.expired": {
       const { claimId, generation } = event.data;
       const claim = known(state.claims, claimId, "claim");
@@ -954,10 +961,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       if (landing.kind === "landed") {
         for (const claimId of intent.claims) {
           const claim = known(claims, claimId, "claim");
+          // The phase changes only on `claim.merged`: a pin readied again while this landing was
+          // published is sent back to the train, and its claim stays ready.
           claims = draft.put(claims, claimId, {
             ...claim,
-            // A claim that moved on since its ready, such as a reassigned one, keeps its phase.
-            phase: claim.phase === "ready" ? "merged" : claim.phase,
             landings: draft.append(claim.landings, intentId),
           });
         }

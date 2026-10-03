@@ -81,6 +81,8 @@ interface Setup {
   holdNextPin(): { reached: Promise<void>; release(): void };
   /** Makes reads of main wait until the returned function releases them. */
   holdMain(): { reached: Promise<void>; release: () => void };
+  /** Makes the next update of main wait, once applied, until the returned function releases it. */
+  holdUpdate(): { reached: Promise<void>; release: () => void };
   /** The Artifacts fake behind the adapter. */
   fake: FakeArtifacts;
   /** The commit main is at. */
@@ -162,6 +164,7 @@ function withHandoff<T>(
     const started: CheckAttempt[] = [];
     const published: string[] = [];
     let held: { reach(): void; released: Promise<void> } | null = null;
+    let updateGate: { reach(): void; released: Promise<void> } | null = null;
     const base = composeRepo(context);
     // Main moves only by a conditional update, as the main writer's ref allows.
     let mainAt: CommitSha = MAIN;
@@ -170,6 +173,12 @@ function withHandoff<T>(
       update: async (expected, next) => {
         if (mainAt !== expected) return ok({ kind: "rejected", actual: mainAt });
         mainAt = next;
+        const gate = updateGate;
+        updateGate = null;
+        if (gate !== null) {
+          gate.reach();
+          await gate.released;
+        }
         return ok({ kind: "updated" });
       },
     };
@@ -350,6 +359,12 @@ function withHandoff<T>(
             released.resolve();
           },
         };
+      },
+      holdUpdate() {
+        const reached = signal();
+        const released = signal();
+        updateGate = { reach: reached.resolve, released: released.promise };
+        return { reached: reached.promise, release: released.resolve };
       },
       main: () => mainAt,
       mainUp: true,
@@ -1269,6 +1284,54 @@ describe("a landed claim", () => {
       expect(second.issueId).not.toBe(claim.issueId);
       expect(second.state).toBe("working");
       expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+    });
+  });
+
+  it("appends claim.merged in the landing, after main moved", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const events = setup.log.replay(0, 256).events;
+      const moved = events.findIndex((event) => event.type === "train.main");
+      const merged = events.findIndex((event) => event.type === "claim.merged");
+      expect(moved).toBeGreaterThan(-1);
+      expect(merged).toBeGreaterThan(moved);
+      expect(events[merged]).toMatchObject({
+        actor: { kind: "system" },
+        data: { claimId: claim.claimId, generation: 1, commit: setup.main() },
+      });
+    });
+  });
+
+  it("stays ready, with no claim.merged, when it is readied again while its batch publishes", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const update = setup.holdUpdate();
+      const landing = landNext(setup);
+      await update.reached;
+
+      // Main has moved. A superseding version reopens the claim and the holder readies the same
+      // commit under it, so the batch's result belongs to the old episode.
+      await setup.decide(claim.claimId, first.decisionId);
+      await setup.ackAll();
+      const again = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(again).toMatchObject({ ok: true, value: { repeated: false } });
+      update.release();
+      await landing;
+
+      const published = setup.main();
+      expect(published).not.toBe(MAIN);
+      const types = eventTypes(setup);
+      expect(types).toContain("train.main");
+      expect(types).not.toContain("claim.merged");
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(null));
+      // The renewed pin went back to the train, to be checked under the new version.
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      expect(setup.started.length).toBeGreaterThan(1);
     });
   });
 

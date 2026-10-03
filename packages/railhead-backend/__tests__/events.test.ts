@@ -85,6 +85,10 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
       decisions: [{ decisionId: "dec_upload1", version: 2 }],
     },
   },
+  "claim.merged": {
+    actor: SYSTEM,
+    data: { claimId: "clm_42abcd", generation: 1, commit: SHA_B },
+  },
   "claim.expired": {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", generation: 1 },

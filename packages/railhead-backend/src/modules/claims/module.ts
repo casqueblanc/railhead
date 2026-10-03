@@ -954,6 +954,10 @@ export function createClaims(
         const row = mergeClaim(tx.sql, pin.claimId, pin.generation, episode, pin.commit);
         if (row === null) continue;
         recordClosed(tx.sql, row.agentId, row, { kind: "merged", commit: main }, now);
+        tx.append(CLAIMS_ACTOR, {
+          type: "claim.merged",
+          data: { claimId: row.claimId, generation: row.generation, commit: main },
+        });
         // A version recorded after the batch was checked may already supersede what landed.
         reviveMerged(tx, row);
         reopenWaiting(tx, row.agentId);
