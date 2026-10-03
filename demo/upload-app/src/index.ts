@@ -13,6 +13,16 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     return new Response(PAGE_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
   }
+  if (pathname === "/api/revision") {
+    if (request.method !== "GET") {
+      return errorResponse(405, "Method not allowed.", { allow: "GET" });
+    }
+    // Any origin may read it: the board shows it beside main to mark a stale deployment.
+    return Response.json(
+      { revision: env.APP_REVISION },
+      { headers: { "access-control-allow-origin": "*", "cache-control": "no-store" } },
+    );
+  }
   if (pathname === "/api/uploads") {
     if (request.method !== "POST") {
       return errorResponse(405, "Method not allowed.", { allow: "POST" });
