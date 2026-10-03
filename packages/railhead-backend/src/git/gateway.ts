@@ -73,7 +73,11 @@ export interface GitGatewayLimits {
    * for a push from the first read of its body.
    */
   readonly maxDurationMs: number;
-  /** The lifetime of the Artifacts token asked for. */
+  /**
+   * The lifetime of the Artifacts token asked for. The gateway asks for at least twice
+   * `maxDurationMs`: the adapter hands back a cached token while half the lifetime asked for
+   * remains, so any token it returns outlives the request.
+   */
   readonly tokenTtlMs: number;
 }
 
@@ -86,7 +90,7 @@ export const GIT_GATEWAY_LIMITS: GitGatewayLimits = {
   headTimeoutMs: 30_000,
   headersTimeoutMs: 30_000,
   maxDurationMs: 10 * 60_000,
-  tokenTtlMs: 10 * 60_000,
+  tokenTtlMs: 20 * 60_000,
 };
 
 /** Resolves the HTTPS remote of an Artifacts repository. */
@@ -221,8 +225,13 @@ class GitGateway implements GitPort {
     }
     const { head } = parsed;
     const reasons = new Map<RefUpdate, string>();
+    // A ref named twice could be reported both updated and refused, so its outcome is unknowable.
+    const named = new Set<string>();
     for (const update of head.updates) {
-      const reason = refRefusal(update);
+      const reason = named.has(update.ref)
+        ? "the branch is named more than once in this push"
+        : refRefusal(update);
+      named.add(update.ref);
       if (reason !== null) reasons.set(update, reason);
     }
     if (reasons.size > 0) {
@@ -373,7 +382,9 @@ class GitGateway implements GitPort {
     const before = await push?.admit();
     if (before !== undefined && before !== null) return release(before);
     const ports = this.#context.ports();
-    const token = await ports.artifacts.token(grant.repo, grant.scope, this.#limits.tokenTtlMs);
+    const { tokenTtlMs, maxDurationMs } = this.#limits;
+    const ttlMs = Math.max(tokenTtlMs, 2 * maxDurationMs);
+    const token = await ports.artifacts.token(grant.repo, grant.scope, ttlMs);
     if (!token.ok) return release(refusal(route, token));
     const remote = await this.#context.remote(grant.repo);
     if (!remote.ok) return release(refusal(route, remote));

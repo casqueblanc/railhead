@@ -115,12 +115,19 @@ export class PushReportReader {
     // report-status-v2 follows an `ok` line with `option` lines when the server changed what the
     // client asked for; such a ref's outcome is not the one requested, so it counts as unknown.
     const rewritten = new Set<string>();
+    // Each ref has exactly one status line; a second one, even `ng` after `ok`, is a protocol error.
+    const reported = new Set<string>();
     let last: string | null = null;
     for (const line of rest) {
       if (line.startsWith("ok ")) {
         last = line.slice("ok ".length);
+        if (reported.has(last)) return UNKNOWN;
+        reported.add(last);
         updated.add(last);
       } else if (line.startsWith("ng ")) {
+        const ref = line.slice("ng ".length).split(" ", 1)[0] ?? "";
+        if (reported.has(ref)) return UNKNOWN;
+        reported.add(ref);
         last = null;
       } else if (line.startsWith("option ")) {
         if (last !== null) rewritten.add(last);

@@ -574,6 +574,36 @@ describe("authority", () => {
     });
   });
 
+  it("hands out only a token that outlives the request, minting a fresh one when it would not", async () => {
+    // Real timers bound the request; the fake clock only ages the token, so these stay fast.
+    const limits: GitGatewayLimits = { ...FAST, maxDurationMs: 40_000, tokenTtlMs: 60_000 };
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "advertisement", "0000");
+      const remaining: number[] = [];
+      // At 25 s a 60 s token would have 35 s left, under the 40 s a request may take.
+      for (const elapsed of [0, 25_000, 20_000]) {
+        world.fake.advance(elapsed);
+        const response = await world.gateway.serve(
+          advertise("git-receive-pack"),
+          FORK,
+          "/info/refs",
+        );
+        expect(response.status).toBe(200);
+        await response.body?.cancel();
+        const bearer = world.seen
+          .at(-1)
+          ?.headers.get("authorization")
+          ?.replace(/^Bearer /, "");
+        const token = world.fake.repos
+          .get(world.forkName)
+          ?.tokens.find((candidate) => candidate.plaintext === bearer);
+        remaining.push((token?.expiresAtMs ?? 0) - world.fake.clock());
+      }
+      expect(remaining).toEqual([80_000, 55_000, 80_000]);
+      expect(world.minted()).toBe(2);
+    }, limits);
+  });
+
   it("refuses a whole push when one of its refs is not a branch", async () => {
     await withGateway(async (world) => {
       const body = pushBody([`${ZERO} ${HEAD} refs/heads/topic`, `${ZERO} ${HEAD} refs/tags/v1`]);
@@ -590,6 +620,46 @@ describe("authority", () => {
       expect(world.live()).toEqual([]);
       expect(pushedEvents(world)).toEqual([]);
     });
+  });
+
+  it("refuses a whole push that names the same branch twice, before minting a token", async () => {
+    const C = "3".repeat(40);
+    const cases: [string, string[]][] = [
+      ["two targets", [`${ROOT} ${HEAD} refs/heads/x`, `${ROOT} ${C} refs/heads/x`]],
+      [
+        "repeated apart",
+        [
+          `${ROOT} ${HEAD} refs/heads/x`,
+          `${ZERO} ${HEAD} refs/heads/y`,
+          `${HEAD} ${C} refs/heads/x`,
+        ],
+      ],
+      ["identical", [`${ROOT} ${HEAD} refs/heads/x`, `${ROOT} ${HEAD} refs/heads/x`]],
+    ];
+    for (const [label, commands] of cases) {
+      await withGateway(async (world) => {
+        world.respond = () =>
+          gitResponse(
+            "git-receive-pack",
+            "result",
+            sideBand(`${pkt("unpack ok\n")}${pkt("ok refs/heads/x\n")}0000`),
+          );
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody(commands)),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status, label).toBe(200);
+        const report = decoder.decode(await bytesOf(response));
+        expect(report, label).toContain(
+          "ng refs/heads/x the branch is named more than once in this push",
+        );
+        expect(report, label).not.toContain("ok refs/heads/");
+        expect(world.seen, label).toEqual([]);
+        expect(world.minted(), label).toBe(0);
+        expect(world.events(), label).toEqual([]);
+      });
+    }
   });
 
   it("refuses a bare refs/heads/, a branch name past the event limit and non-SHA-1 ids", async () => {
@@ -1622,6 +1692,33 @@ describe("push reports", () => {
     const reader = new PushReportReader("side-band");
     for (const byte of PUSH_RESULT) reader.push(Uint8Array.of(byte));
     expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/feature"]) });
+  });
+
+  it("knows nothing when a ref has more than one status line", () => {
+    const lines: [string, string][] = [
+      ["ng after ok", `${pkt("ok refs/heads/x\n")}${pkt("ng refs/heads/x failed to lock\n")}`],
+      ["ok after ng", `${pkt("ng refs/heads/x failed to lock\n")}${pkt("ok refs/heads/x\n")}`],
+      ["ok twice", `${pkt("ok refs/heads/x\n")}${pkt("ok refs/heads/x\n")}`],
+      ["ng twice", `${pkt("ng refs/heads/x a\n")}${pkt("ng refs/heads/x b\n")}`],
+    ];
+    for (const [label, statuses] of lines) {
+      const reader = new PushReportReader("plain");
+      reader.push(
+        encoder.encode(`${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${statuses}0000`),
+      );
+      expect(reader.end(), label).toEqual({ kind: "unknown" });
+    }
+    // One line each for refs that share a prefix is not a repeat.
+    const distinct = new PushReportReader("plain");
+    distinct.push(
+      encoder.encode(
+        `${pkt("unpack ok\n")}${pkt("ok refs/heads/x\n")}${pkt("ng refs/heads/x/y failed\n")}${pkt("ok refs/heads/xy\n")}0000`,
+      ),
+    );
+    expect(distinct.end()).toEqual({
+      kind: "reported",
+      updated: new Set(["refs/heads/x", "refs/heads/xy"]),
+    });
   });
 
   it("knows nothing without a report, or with bytes after it", () => {
