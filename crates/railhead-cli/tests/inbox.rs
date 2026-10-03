@@ -1045,6 +1045,66 @@ async fn an_ask_whose_answer_is_lost_names_the_key_to_reconcile_it() -> anyhow::
     Ok(())
 }
 
+#[tokio::test]
+async fn an_ask_answered_badly_or_refused_for_now_still_names_its_key() -> anyhow::Result<()> {
+    let world = world().await?;
+    let route = format!("{PREFIX}/claims/clm_42abcd/questions");
+    // Answered with an answered question that carries no decision.
+    let inconsistent = json!({"ok": true, "data": {"questionId": "qst_upload1",
+        "decisionId": "dec_upload1", "state": "answered", "decision": null},
+        "inbox": null, "next": null});
+    for response in [
+        ResponseTemplate::new(200).set_body_raw("<html>oops</html>", "application/json"),
+        json_response(200, &inconsistent),
+        json_response(
+            500,
+            &json!({"ok": false, "error": {"code": "internal", "message": "Try again.",
+                "retryable": true, "retryAfterMs": null, "next": null}}),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route.clone()))
+            .respond_with(response)
+            .up_to_n_times(1)
+            .mount(&world.server)
+            .await;
+    }
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(rh_in_clone(&world, &ask_args(QUESTION, "src/upload.ts"))?);
+    }
+    let keys: Vec<String> = received(&world, "/claims/clm_42abcd/questions")
+        .await
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.pointer("/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    anyhow::ensure!(keys.len() == 3, "{keys:?}");
+    for ((run, key), code) in
+        runs.iter()
+            .zip(&keys)
+            .zip(["malformed_response", "malformed_response", "internal"])
+    {
+        assert_eq!(run.code, Some(1), "{}", run.stdout);
+        assert_eq!(run.at("/error/code")?, json!(code));
+        assert_eq!(run.at("/error/retryable")?, json!(true));
+        let named = format!("--request-id {key}");
+        let message = run.at("/error/message")?;
+        assert!(
+            message.as_str().is_some_and(|text| text.contains(&named))
+                || run.stderr.contains(&named),
+            "{key} not named: {message} / {}",
+            run.stderr
+        );
+    }
+    assert!(!runs.iter().any(|run| run.stdout.contains("oops")));
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn an_interrupted_wait_leaves_the_question_to_resume() -> anyhow::Result<()> {

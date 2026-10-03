@@ -88,8 +88,8 @@ fn parse_question(value: &str) -> std::result::Result<String, String> {
 ///
 /// When the question breaks a protocol rule (checked before anything is sent), when it is asked
 /// outside a claim's clone, when the agent has no session, when the backend refuses or answers
-/// inconsistently, or when the ask's outcome is unknown, which names the request id to repeat it
-/// with.
+/// inconsistently. Any failure after the question may have reached the backend names the request
+/// id to repeat it with.
 pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
     let wait = args.wait.map(Duration::from_secs);
     let (response, request_id, timed_out) = match (&args.question, wait) {
@@ -99,7 +99,7 @@ pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
             (response, None, timed_out)
         }
         (None, wait) => {
-            let (asked, request_id) = ask(agent, args)?;
+            let (asked, request_id) = ask(agent, args, out)?;
             match wait {
                 Some(wait) if asked.data.state == QuestionState::Open => {
                     let question_id = asked.data.question_id.clone();
@@ -126,7 +126,11 @@ pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
 }
 
 /// Asks the question in the clone's claim, at the clone's generation.
-fn ask(agent: &Agent<'_>, args: &Args) -> Result<(AgentSuccess<QuestionResult>, String)> {
+fn ask(
+    agent: &Agent<'_>,
+    args: &Args,
+    out: &mut Output<'_>,
+) -> Result<(AgentSuccess<QuestionResult>, String)> {
     let binding = agent
         .invocation
         .context
@@ -157,23 +161,51 @@ fn ask(agent: &Agent<'_>, args: &Args) -> Result<(AgentSuccess<QuestionResult>, 
     let endpoint = Endpoint::Ask {
         claim_id: &binding.claim_id,
     };
-    let response = agent
+    // Once the request may have reached the backend, the question may have been recorded; only
+    // the same key finds it without asking twice, so every such failure names it.
+    let uncertain = |code| Error::Local {
+        code,
+        message: format!(
+            "the question may or may not have been recorded; repeat the same rh ask with --request-id {request_id} to find out without asking twice"
+        ),
+        retryable: true,
+        next: Some(NextCommand::Ask),
+    };
+    let response = match agent
         .invocation
         .runtime
         .block_on(client.send::<_, QuestionResult>(&endpoint, Some(&session), &request))
-        .map_err(|error| match error {
-            // The question may have been recorded; the same key finds it without asking twice.
-            http::Error::Timeout(_) | http::Error::Transport(_) => Error::Local {
-                code: LocalCode::Timeout,
-                message: format!(
-                    "the question may or may not have been recorded; repeat the same rh ask with --request-id {request_id} to find out without asking twice"
-                ),
-                retryable: true,
-                next: Some(NextCommand::Ask),
-            },
-            other => other.into(),
-        })?;
-    check(&response.data, None)?;
+    {
+        Ok(response) => response,
+        Err(http::Error::Timeout(_) | http::Error::Transport(_)) => {
+            return Err(uncertain(LocalCode::Timeout));
+        }
+        Err(http::Error::Malformed { .. } | http::Error::ResponseTooLarge(_)) => {
+            return Err(uncertain(LocalCode::MalformedResponse));
+        }
+        Err(http::Error::Rejected {
+            route,
+            status,
+            error,
+        }) => {
+            if error.retryable {
+                out.notice(&format!(
+                    "to retry this question without asking it twice, repeat the same rh ask with --request-id {request_id}"
+                ))
+                .map_err(Error::Output)?;
+            }
+            return Err(http::Error::Rejected {
+                route,
+                status,
+                error,
+            }
+            .into());
+        }
+        Err(other) => return Err(other.into()),
+    };
+    if check(&response.data, None).is_err() {
+        return Err(uncertain(LocalCode::MalformedResponse));
+    }
     Ok((response, request_id))
 }
 
