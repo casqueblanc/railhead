@@ -10,8 +10,10 @@ import {
   fileIssue,
   filedDuplicate,
   issueDraft,
+  sameDraft,
   titleProblem,
   type FileOutcome,
+  type IssueDraft,
 } from "./fileIssue";
 
 interface Problems {
@@ -30,39 +32,64 @@ interface IssueFormProps {
 /**
  * Files an issue for agents with one passkey assertion. What was typed stays in the form until the
  * backend reports the issue filed, so a refusal or a lost session never discards it.
+ *
+ * A draft sent without a confirmed result may still be filed. The form keeps it as unconfirmed and
+ * will not send it again until the log records it; only a refusal the backend states makes it
+ * fileable again. Changing the title or description makes a different issue, which can be filed.
  */
 export const IssueForm = ({ access, board }: IssueFormProps) => {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [problems, setProblems] = useState<Problems>(NO_PROBLEMS);
+  // Each entry took one passkey ceremony, and entries the log records are dropped on submit.
+  const [unconfirmed, setUnconfirmed] = useState<readonly IssueDraft[]>([]);
   const { state, start } = usePortAttempt<AvailableOwnerPort, FileOutcome>(
     access.kind === "ready" ? access.owner : null,
   );
   const pending = state.kind === "pending";
   const blocked = access.kind === "blocked";
+  const outstanding = unconfirmed.filter((sent) => filedDuplicate(board, sent) === null);
+  const lastSent = unconfirmed.at(-1);
+  const lastLanded = lastSent !== undefined && filedDuplicate(board, lastSent) !== null;
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (access.kind !== "ready") return;
     const draft = issueDraft(title, body);
-    const duplicate = filedDuplicate(board, draft);
     const found: Problems = {
-      title:
-        titleProblem(title) ??
-        (duplicate === null
-          ? null
-          : "An issue with this exact title and description is already on the board."),
+      title: titleProblem(title) ?? sentProblem(board, outstanding, draft),
       body: bodyProblem(body),
     };
     setProblems(found);
     if (found.title !== null || found.body !== null) return;
+    setUnconfirmed(outstanding);
     const { owner, authenticator } = access;
     const outcome = await start(owner, (control) =>
-      fileIssue(owner, authenticator, draft, control),
+      fileIssue(owner, authenticator, draft, {
+        signal: control.signal,
+        onSent: () => {
+          control.onSent();
+          setUnconfirmed((current) => [...current, draft]);
+        },
+      }),
     );
-    if (outcome?.kind === "filed") {
-      setTitle("");
-      setBody("");
+    // A withdrawn attempt resolves to `null`; if it was sent, its draft stays unconfirmed.
+    if (outcome === null) return;
+    switch (outcome.kind) {
+      case "filed":
+        setTitle("");
+        setBody("");
+        setUnconfirmed((current) => current.filter((sent) => !sameDraft(sent, draft)));
+        return;
+      case "failed":
+        setUnconfirmed((current) => current.filter((sent) => !sameDraft(sent, draft)));
+        return;
+      case "cancelled":
+      case "unconfirmed":
+      case "withdrawn":
+        return;
+      default:
+        unreachable(outcome);
     }
   };
 
@@ -103,14 +130,36 @@ export const IssueForm = ({ access, board }: IssueFormProps) => {
         </Button>
       </div>
       <div aria-live="polite">
-        <FileMessage state={state} board={board} />
+        <FileMessage state={state} board={board} landed={lastLanded} />
       </div>
     </form>
   );
 };
 
+/** Why `draft` cannot be sent now, or `null` when nothing on the board or in flight matches it. */
+const sentProblem = (
+  board: BoardState,
+  outstanding: readonly IssueDraft[],
+  draft: IssueDraft,
+): string | null => {
+  if (filedDuplicate(board, draft) !== null) {
+    return "An issue with this exact title and description is already on the board.";
+  }
+  if (outstanding.some((sent) => sameDraft(sent, draft))) {
+    return "This issue was already sent and may have been filed. It is not sent again until it shows in the list below.";
+  }
+  return null;
+};
+
+interface FileMessageProps {
+  state: AttemptState<FileOutcome>;
+  board: BoardState;
+  /** Whether the log records the last draft sent, so an unconfirmed filing turned out filed. */
+  landed: boolean;
+}
+
 /** The outcome of the last filing. */
-const FileMessage = ({ state, board }: { state: AttemptState<FileOutcome>; board: BoardState }) => {
+const FileMessage = ({ state, board, landed }: FileMessageProps) => {
   switch (state.kind) {
     case "idle":
     case "pending":
@@ -131,18 +180,41 @@ const FileMessage = ({ state, board }: { state: AttemptState<FileOutcome>; board
           {state.message}
         </Text>
       );
-    case "withdrawn":
-      return (
+    case "unconfirmed":
+      return landed ? (
+        <FiledAfterAll />
+      ) : (
         <Text variant="error" DANGEROUS_className="break-words">
-          {state.sent
-            ? "The board lost its current view after the issue was sent. Check the issues list before filing again."
-            : "Stopped: the board lost its current view before the issue was sent. Nothing was filed."}
+          The backend did not confirm the issue. If it was filed, it shows in the list below; until
+          then this board will not send the same issue again.
+        </Text>
+      );
+    case "withdrawn":
+      if (!state.sent) {
+        return (
+          <Text variant="error" DANGEROUS_className="break-words">
+            Stopped: the board lost its current view before the issue was sent. Nothing was filed.
+          </Text>
+        );
+      }
+      return landed ? (
+        <FiledAfterAll />
+      ) : (
+        <Text variant="error" DANGEROUS_className="break-words">
+          The board lost its current view after the issue was sent. If it was filed, it shows in the
+          list below; until then this board will not send the same issue again.
         </Text>
       );
     default:
       return unreachable(state);
   }
 };
+
+const FiledAfterAll = () => (
+  <Text variant="secondary">
+    Filed after all. The issue is in the list below, ready for an agent.
+  </Text>
+);
 
 const unreachable = (value: never): never => {
   throw new Error(`unhandled filing state: ${JSON.stringify(value)}`);

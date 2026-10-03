@@ -92,6 +92,12 @@ const recordingOwner = (
   return { owner, prepares, performs };
 };
 
+const UNCONFIRMED =
+  "The backend did not confirm the issue. If it was filed, it shows in the list below; until then this board will not send the same issue again.";
+
+const ALREADY_SENT =
+  "This issue was already sent and may have been filed. It is not sent again until it shows in the list below.";
+
 describe("IssuesPanel", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -239,11 +245,108 @@ describe("IssuesPanel", () => {
     await submit();
 
     expect(performs).toEqual(["chl_1"]);
-    expect(text()).toContain(
-      "The issue was not confirmed. Check the issues list before filing again.",
-    );
+    expect(text()).toContain(UNCONFIRMED);
     expect(text()).not.toContain("storage failed");
     expect(values()).toEqual({ title: "Show upload limits", body: "Beside the picker." });
+  });
+
+  it("does not send an unconfirmed filing again before its event arrives", async () => {
+    // The backend committed the issue, but its answer was lost and the event is still on its way.
+    const { owner, prepares, performs } = recordingOwner(() =>
+      Promise.reject(new Error("session lost")),
+    );
+    await render(live(board()), owner);
+    await draft("Show upload limits", "Beside the picker.");
+    await submit();
+    expect(text()).toContain(UNCONFIRMED);
+
+    await submit();
+
+    expect(prepares).toHaveLength(1);
+    expect(performs).toEqual(["chl_1"]);
+    expect(text()).toContain(ALREADY_SENT);
+    expect(values()).toEqual({ title: "Show upload limits", body: "Beside the picker." });
+
+    await render(
+      live(board([filed("iss_synthnew", "Show upload limits", "Beside the picker.")])),
+      owner,
+    );
+    expect(text()).toContain(
+      "Filed after all. The issue is in the list below, ready for an agent.",
+    );
+
+    await submit();
+
+    expect(prepares).toHaveLength(1);
+    expect(text()).toContain(
+      "An issue with this exact title and description is already on the board.",
+    );
+  });
+
+  it("files a changed draft while an earlier one is unconfirmed", async () => {
+    let lost = true;
+    const { owner, prepares } = recordingOwner(() =>
+      lost ? Promise.reject(new Error("session lost")) : Promise.resolve(FILED),
+    );
+    await render(live(board()), owner);
+    await draft("Show upload limits", "Beside the picker.");
+    await submit();
+    lost = false;
+
+    await type("Description", "Beside the picker, in MB.");
+    await submit();
+
+    expect(prepares.map((action) => action.kind === "issue.file" && action.body)).toEqual([
+      "Beside the picker.",
+      "Beside the picker, in MB.",
+    ]);
+    expect(values()).toEqual({ title: "", body: "" });
+
+    // The first draft is still unconfirmed, so typing it again does not send it.
+    await draft("Show upload limits", "Beside the picker.");
+    await submit();
+
+    expect(prepares).toHaveLength(2);
+    expect(text()).toContain(ALREADY_SENT);
+  });
+
+  it("lets the owner file again once the backend refuses the sent filing", async () => {
+    let answer: BoardResult<OwnerActionResult> = {
+      ok: false,
+      code: "quota_exceeded",
+      message: "too many issues",
+    };
+    const { owner, performs } = recordingOwner(async () => answer);
+    await render(live(board()), owner);
+    await draft("Show upload limits", "");
+    await submit();
+    expect(text()).toContain("The issue limit was reached. Nothing was filed.");
+    answer = FILED;
+
+    await submit();
+
+    expect(performs).toEqual(["chl_1", "chl_1"]);
+    expect(values()).toEqual({ title: "", body: "" });
+  });
+
+  it("lets the owner retry when the challenge could not be prepared", async () => {
+    let fail = true;
+    const { owner, prepares, performs } = recordingOwner(undefined, () =>
+      fail
+        ? Promise.reject(new Error("session lost"))
+        : Promise.resolve({ ok: true, value: challenge() }),
+    );
+    await render(live(board()), owner);
+    await draft("Show upload limits", "");
+    await submit();
+    expect(performs).toEqual([]);
+    expect(text()).toContain("The issue could not be sent. Nothing was filed. Try again.");
+    fail = false;
+
+    await submit();
+
+    expect(prepares).toHaveLength(2);
+    expect(performs).toEqual(["chl_1"]);
   });
 
   it("keeps what was typed when the backend cannot file issues", async () => {
@@ -332,6 +435,35 @@ describe("IssuesPanel", () => {
     expect(text()).toContain("Blocked while the board is offline. Reconnect to act.");
     expect(fileButton().disabled).toBe(true);
     expect(values()).toEqual({ title: "Show upload limits", body: "" });
+  });
+
+  it("does not send a filing withdrawn after sending again when access returns", async () => {
+    const held = deferred<BoardResult<OwnerActionResult>>();
+    const { owner, prepares, performs } = recordingOwner(() => held.promise);
+    const feed = live(board());
+    await render(feed, owner);
+    await draft("Show upload limits", "");
+
+    await act(async () => fileButton().click());
+    expect(performs).toEqual(["chl_1"]);
+    await render(feed, { kind: "unavailable", reason: "offline" });
+    await act(async () => held.resolve(FILED));
+    expect(text()).toContain(
+      "The board lost its current view after the issue was sent. If it was filed, it shows in the list below; until then this board will not send the same issue again.",
+    );
+
+    const { owner: back, prepares: again } = recordingOwner();
+    await render(feed, back);
+    await submit();
+
+    expect(prepares).toHaveLength(1);
+    expect(again).toEqual([]);
+    expect(text()).toContain(ALREADY_SENT);
+
+    await render(live(board([filed("iss_synthnew", "Show upload limits", "")])), back);
+    expect(text()).toContain(
+      "Filed after all. The issue is in the list below, ready for an agent.",
+    );
   });
 
   it("offers no way to file without a passkey on this page", async () => {
