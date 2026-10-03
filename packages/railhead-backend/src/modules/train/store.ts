@@ -24,9 +24,11 @@
 //
 // `train_conflicts` holds one row per conflicting pair the train parked, keyed by the batch whose
 // merge found it. While its state is `asking`, the train owes the owner a question about the pair,
-// so the row is work it owes a drive; once asked, it waits for the answer. The pair returns to the
-// queue when the question is answered, when a new ready of either claim arrives, or when either
-// claim is no longer held before the question is asked.
+// so the row is work it owes a drive; once asked, it waits for the answer, found by its
+// `decision_id`. The pair returns to the queue in the transaction that records the answer, when a
+// new ready of either claim arrives, when either claim is no longer held before the question is
+// asked, or when both are no longer held after it. `checked_at` orders asked pairs for that last
+// check, which reads a bounded batch on each wake, those checked longest ago first.
 //
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
@@ -130,6 +132,9 @@ const MIGRATIONS: readonly string[] = [
     CHECK (state NOT IN ('asked', 'answered') OR decision_id IS NOT NULL)
   ) STRICT`,
   "CREATE INDEX train_conflicts_by_state ON train_conflicts (state)",
+  "CREATE INDEX train_conflicts_by_decision ON train_conflicts (decision_id)",
+  "ALTER TABLE train_conflicts ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0",
+  "CREATE INDEX train_conflicts_by_check ON train_conflicts (state, checked_at, batch_id)",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -859,6 +864,36 @@ export function conflictsIn(
     )
     .toArray()
     .map(toConflict);
+}
+
+/** The asked pair whose question opened `decisionId`, or `null`. */
+export function askedConflictOf(sql: SqlStorage, decisionId: DecisionId): ConflictRecord | null {
+  const row = sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE decision_id = ? AND state = 'asked'`,
+      decisionId,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConflict(row);
+}
+
+/**
+ * Up to `limit` asked pairs, those checked longest ago first, each stamped as checked at `now`. A
+ * caller reading a bounded batch on each call so reaches every asked pair in turn.
+ */
+export function nextAskedToCheck(sql: SqlStorage, limit: number, now: number): ConflictRecord[] {
+  const conflicts = sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE state = 'asked'
+       ORDER BY checked_at, batch_id LIMIT ?`,
+      limit,
+    )
+    .toArray()
+    .map(toConflict);
+  for (const conflict of conflicts) {
+    sql.exec("UPDATE train_conflicts SET checked_at = ? WHERE batch_id = ?", now, conflict.batchId);
+  }
+  return conflicts;
 }
 
 /** The still-parked pair holding the claim's entry at `generation`, or `null`. */

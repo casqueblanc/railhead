@@ -90,7 +90,8 @@ export interface DecisionsPort {
    * that raised it, and appends `question.asked` with the asker as actor. Each claim becomes a
    * dependency of the question's decision, held by the agent holding the claim at its generation, so
    * the answer reaches each holder's inbox and supersedes each claim's ready pin. Recording a version
-   * of a system question also asks for the Repo's alarm, so the asker's `resume` sees the answer. A
+   * of a system question also calls `TrainPort.answered` in the same transaction and awaits the
+   * train's wake once it commits, answering `unavailable` when that alarm write fails. A
    * repeat of the asker's `key` returns the question it asked and records nothing. Refuses without
    * writing anything: `invalid_request` for an invalid question or a key used for another question,
    * `claim_closed` for a claim not held at its generation, `quota_exceeded` for a claim that already

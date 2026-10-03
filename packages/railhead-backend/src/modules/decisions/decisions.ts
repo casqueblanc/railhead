@@ -18,7 +18,8 @@
 //   when two claims conflict, inside the caller's transaction. Its asker is stored in place of an
 //   agent, so no agent can read it with `question`, and every claim it names is a dependency of its
 //   decision, so the answer reaches each holder and supersedes each ready pin. Recording a version
-//   of a system question asks for the Repo's alarm, which resumes the asker to read the answer.
+//   of a system question calls the train's `answered` in the same transaction, then awaits the
+//   train's wake once it commits.
 //
 // A decision's dependencies name the claim, and the agent and ownership generation an inbox item
 // goes to. An obligation is queued as an item only when the claims module reports that generation
@@ -691,8 +692,9 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                 target.relied !== null && target.relied < version ? "rework" : "decision";
               owe(tx, target, { decisionId, version }, kind);
             }
-            // The system module that asked reads the answer when the Repo's alarm resumes it.
-            if (SYSTEM_ID.test(question.agent_id)) context.wake(decidedAt);
+            // The train returns the pair its question parked to the queue in this transaction, so
+            // the answer and the drive the train owes for it commit together.
+            if (SYSTEM_ID.test(question.agent_id)) ports().train.answered(tx, decisionId);
             return ok({ decisionId, version });
           },
         );
@@ -701,6 +703,14 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         throw error;
       }
       if (committed.value.ok && committed.events.length > 0) wake(decisionId);
+      // The answer is committed, so the train's wake is asked for. Its alarm write in the
+      // transaction may have failed, and an answer reported as recorded must leave the drive it
+      // owes scheduled, so a failed write refuses it, as `ready` does. A repeat of the same grant
+      // finds the version it recorded and asks again; until then the stored wake is asked for by
+      // the train's startup and by the next call that queues work.
+      if (committed.value.ok && SYSTEM_ID.test(questionOfDecision(decisionId)?.agent_id ?? "")) {
+        if (!(await ports().train.armWake())) return unavailable("train");
+      }
       return committed.value;
     },
 

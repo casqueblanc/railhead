@@ -12,6 +12,7 @@ import {
 import type { OwnerAction } from "@railhead/shared/board-api";
 import { MAX_LIST_LENGTH, type QuestionOption, type RailheadEvent } from "@railhead/shared/events";
 import type { InboxPort } from "../src/contracts/inbox";
+import type { TrainPort } from "../src/contracts/train";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../src/contracts/result";
 import type { SystemQuestion } from "../src/contracts/decisions";
@@ -19,6 +20,7 @@ import {
   unavailableClaims,
   unavailableDecisions,
   unavailableInbox,
+  unavailableTrain,
 } from "../src/contracts/unavailable";
 import {
   createDecisions,
@@ -89,6 +91,8 @@ interface Harness {
   whileReading(step: (() => void) | null): void;
   /** Replaces the inbox the decisions module queues through. */
   useInbox(inbox: InboxPort): void;
+  /** Replaces the train the decisions module hands a system question's answer to. */
+  useTrain(train: TrainPort): void;
   /** Asks `ASK` (with `fields`) as `AGENT` and returns the question's decision id. */
   ask(fields?: Partial<AskRequest>): Promise<{ questionId: string; decisionId: string }>;
   /** Every event in the log. */
@@ -136,6 +140,7 @@ async function withDecisions<R>(
     let fence: ((claimId: string) => number | null) | null = null;
     let whileReading: (() => void) | null = null;
     let inbox: InboxPort = realInbox;
+    let train: TrainPort = composed.train;
     const currentGeneration = (claimId: string): number | null => {
       if (fence !== null) return fence(claimId);
       return active.ok && active.value?.claimId === claimId ? active.value.generation : null;
@@ -157,6 +162,7 @@ async function withDecisions<R>(
         },
       },
       inbox,
+      train,
     });
     const decisions = createDecisions(context, ports);
     const agent = (id = AGENT): AgentPrincipal => ({
@@ -190,6 +196,9 @@ async function withDecisions<R>(
       useInbox: (replacement) => {
         inbox = replacement;
       },
+      useTrain: (replacement) => {
+        train = replacement;
+      },
       ask: async (fields = {}) => {
         const asked = await decisions.ask(agent(), CLAIM, { ...ASK, ...fields });
         if (!asked.ok) throw new Error(`ask failed: ${asked.code}`);
@@ -203,6 +212,26 @@ async function withDecisions<R>(
     };
     return body(harness);
   });
+}
+
+/**
+ * Installs a train that records the decisions handed to `answered` and, for each `armWake`,
+ * how many versions were committed when it was asked; `arm` answers each `armWake`.
+ */
+function watchTrain(h: Harness, arm: () => boolean = () => true) {
+  const seen = { answered: [] as string[], armedAfter: [] as number[] };
+  h.useTrain({
+    ...unavailableTrain,
+    answered: (_tx, decisionId) => {
+      seen.answered.push(decisionId);
+      return true;
+    },
+    armWake: async () => {
+      seen.armedAfter.push(h.count("decision_versions"));
+      return arm();
+    },
+  });
+  return seen;
 }
 
 function types(events: RailheadEvent[]): string[] {
@@ -758,19 +787,22 @@ describe("askSystem", () => {
     });
   });
 
-  it("delivers the answer to both holders, supersedes both claims and asks for the alarm", async () => {
+  it("delivers the answer to both holders, supersedes both claims and hands it to the train", async () => {
     await withDecisions(async (h) => {
       holdBoth(h);
       const asked = askSystem(h);
       if (!asked.ok) throw new Error(asked.code);
       const { decisionId } = asked.value;
-      expect(h.wakes).toEqual([]);
+      const train = watchTrain(h);
 
       const recorded = await h.decisions.record(
         h.grant({ decisionId, option: "keep_second", expectedVersion: null }),
       );
 
       expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      expect(train.answered).toEqual([decisionId]);
+      // The train's wake is asked for once the version is committed.
+      expect(train.armedAfter).toEqual([1]);
       expect(h.events().slice(1)).toMatchObject([
         { type: "decision.recorded", actor: { kind: "human", id: OWNER } },
         { type: "inbox.queued", data: { agentId: AGENT, claimId: CLAIM } },
@@ -778,17 +810,63 @@ describe("askSystem", () => {
       ]);
       expect(h.decisions.currentVersions(CLAIM)).toEqual([{ decisionId, version: 1 }]);
       expect(h.decisions.currentVersions(OTHER_CLAIM)).toEqual([{ decisionId, version: 1 }]);
-      expect(h.wakes).toEqual([NOW]);
+      expect(h.wakes).toEqual([]);
     });
   });
 
-  it("asks for no alarm when an agent's question is answered", async () => {
+  it("keeps the answer but refuses it while the train's wake cannot be asked for", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { decisionId } = asked.value;
+      let armed = false;
+      const train = watchTrain(h, () => armed);
+      const grant = h.grant({ decisionId, option: "keep_first", expectedVersion: null });
+
+      expect(await h.decisions.record(grant)).toEqual(unavailable("train"));
+      // The version and the train's pair committed together; only the alarm is missing.
+      expect(h.count("decision_versions")).toBe(1);
+      expect(h.decisions.currentVersions(CLAIM)).toEqual([{ decisionId, version: 1 }]);
+      expect(train.answered).toEqual([decisionId]);
+
+      // A repeat of the same grant finds its version and asks for the wake again.
+      armed = true;
+      expect(await h.decisions.record(grant)).toEqual(ok({ decisionId, version: 1 }));
+      expect(train.answered).toEqual([decisionId]);
+      expect(train.armedAfter).toEqual([1, 1]);
+      expect(h.count("decision_versions")).toBe(1);
+    });
+  });
+
+  it("records no answer to a system question while the train is missing", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { decisionId } = asked.value;
+      h.useTrain(unavailableTrain);
+
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "keep_first", expectedVersion: null }),
+      );
+
+      expect(recorded).toEqual(unavailable("train"));
+      expect(h.count("decision_versions")).toBe(0);
+      expect(types(h.events())).toEqual(["question.asked"]);
+      expect(h.decisions.currentVersions(CLAIM)).toEqual([]);
+    });
+  });
+
+  it("hands an agent's answered question to no train", async () => {
     await withDecisions(async (h) => {
       const { decisionId } = await h.ask();
+      const train = watchTrain(h);
       const recorded = await h.decisions.record(
         h.grant({ decisionId, option: "chunk", expectedVersion: null }),
       );
       expect(recorded.ok).toBe(true);
+      expect(train).toEqual({ answered: [], armedAfter: [] });
       expect(h.wakes).toEqual([]);
     });
   });

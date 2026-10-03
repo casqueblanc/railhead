@@ -76,16 +76,20 @@
 // `MAX_DISCARDS_PER_WAKE`, outside any drive, so cleanup never holds up a batch.
 //
 // A conflict parks its pair and owes the owner a question, the conservative route while no
-// classifier tells overlap from disagreement. The park commits first; each drive then asks the
-// owed question through the decisions port inside its own transaction, before it forms or advances
-// a batch. While the decisions module cannot ask, the pair stays parked, the question stays owed
-// and the drive stops blocked, so the alarm retries it. The question's decision depends on both
-// claims, so the answer reaches both holders and supersedes both pins. The answer asks for the
-// Repo's alarm, and `resume` returns the pair to the queue, where reading the superseded pins
-// reopens both claims for their holders to adapt. A new ready of either claim also returns the
-// pair to the queue, so a redone change is merged with its partner again rather than waiting for
-// the answer. A pair whose claim is no longer held when the question would be asked returns to
-// the queue unasked.
+// classifier tells overlap from disagreement. Only a pair whose entries both still hold the ready
+// episode the merge composed is parked; when either was readied again during the merge, both go
+// back to the queue to be composed again, and nothing is asked about the older work. The park
+// commits first; each drive then asks the owed question through the decisions port inside its own
+// transaction, before it forms or advances a batch. While the decisions module cannot ask, the
+// pair stays parked, the question stays owed and the drive stops blocked, so the alarm retries it.
+// The question's decision depends on both claims, so the answer reaches both holders and
+// supersedes both pins. The transaction that records the answer calls `answered`, which returns
+// the pair to the queue and records the drive it is owed, so the answer and the train's wake
+// commit together; reading the superseded pins then reopens both claims for their holders to
+// adapt. A new ready of either claim also returns the pair to the queue, so a redone change is
+// merged with its partner again rather than waiting for the answer. A pair whose claim is no
+// longer held when the question would be asked returns to the queue unasked, and each `resume`
+// checks a bounded batch of asked pairs, in turn, for one whose claims are both no longer held.
 
 import {
   isCommitSha,
@@ -96,6 +100,7 @@ import {
   type ClaimId,
   type CommitSha,
   type CheckRunId,
+  type DecisionId,
   type DecisionRef,
   type IntentId,
 } from "@railhead/shared/events";
@@ -123,6 +128,7 @@ import { checkFence, type FenceReaders } from "../../train/authorize";
 import { sameVersions } from "../claims/module";
 import {
   activeBatch,
+  askedConflictOf,
   batchByAttempt,
   batchedEntries,
   clearWake,
@@ -139,6 +145,7 @@ import {
   markCheckHeld,
   markCheckStarted,
   migrateTrain,
+  nextAskedToCheck,
   nextDiscardAt,
   openConflictOf,
   owesWork,
@@ -243,11 +250,10 @@ export const STARTUP_WAKE_BASE_MS = 200;
 export const MAX_STEPS = 5 * MAX_QUEUE * (MAX_RETRIES + 3);
 
 /**
- * Most asked pairs one `resume` checks for an answer, oldest first. Each such pair holds two parked
- * entries that no other open pair holds, so this covers every pair while fewer than `2 * MAX_QUEUE`
- * entries wait for an answer.
+ * Most asked pairs one `resume` checks for claims no longer held, those checked longest ago first,
+ * so successive wakes reach every asked pair in turn.
  */
-export const MAX_ANSWER_READS = MAX_QUEUE;
+export const MAX_RELEASE_READS = MAX_QUEUE;
 
 /** The first delay after a discard fails. Each failure in a row doubles it. */
 export const DISCARD_BASE_MS = 60_000;
@@ -619,6 +625,15 @@ export function createTrain(
     const result = log.transaction((tx): PortResult<null> | null => {
       if (!holds(generation)) throw new DriveSuperseded();
       if (readConflict(sql, conflict.batchId)?.state !== "asking") return null;
+      // A newer ready episode returns the pair to the queue, so a pin no longer parked would make
+      // this a question about work its holder has since replaced.
+      const parked = conflict.pins.every(
+        (pin) => readEntry(sql, pin.claimId, pin.generation)?.state === "parked",
+      );
+      if (!parked) {
+        unparkPair(conflict, "redone", now);
+        return null;
+      }
       const held = conflict.pins.every(
         (pin) => ports().claims.currentGeneration(pin.claimId) === pin.generation,
       );
@@ -665,29 +680,27 @@ export function createTrain(
   }
 
   /**
-   * Returns to the queue every pair whose question the owner answered, or whose claims are both no
-   * longer held at their parked generations, so their question can never reach a holder.
+   * Returns to the queue each asked pair, of the `MAX_RELEASE_READS` checked longest ago, whose
+   * claims are both no longer held at their parked generations, so their answer can reach no
+   * holder of the parked work.
    */
-  function unparkAnswered(): void {
+  function unparkReleased(): void {
     const now = clock();
     context.storage.transactionSync(() => {
-      for (const conflict of conflictsIn(sql, "asked", MAX_ANSWER_READS)) {
-        const { decisionId } = conflict;
-        const answered = conflict.pins.some((pin) =>
-          ports()
-            .decisions.currentVersions(pin.claimId)
-            ?.some((ref) => ref.decisionId === decisionId),
-        );
-        if (answered) {
-          unparkPair(conflict, "answered", now);
-          continue;
-        }
+      for (const conflict of nextAskedToCheck(sql, MAX_RELEASE_READS, now)) {
         const released = conflict.pins.every(
           (pin) => ports().claims.currentGeneration(pin.claimId) !== pin.generation,
         );
         if (released) unparkPair(conflict, "closed", now);
       }
     });
+  }
+
+  function answered(_tx: EventTransaction, decisionId: DecisionId): boolean {
+    const conflict = askedConflictOf(sql, decisionId);
+    if (conflict === null) return false;
+    unparkPair(conflict, "answered", clock());
+    return true;
   }
 
   async function form(generation: number): Promise<Step> {
@@ -1066,7 +1079,8 @@ export function createTrain(
    * Parks a conflicting pair, owes the owner a question about it and records `train.conflict`,
    * which the board shows with both claims and the path. With no classifier installed, every
    * conflict is treated as a disagreement and given `route: "question"`. The batch's other pins go
-   * back to the front unchanged.
+   * back to the front unchanged. When either of the pair was readied again during the merge,
+   * nothing is parked, asked or recorded: both go back to the front, the renewed one as fresh work.
    */
   function routeConflict(
     generation: number,
@@ -1090,8 +1104,13 @@ export function createTrain(
       if (!holds(generation)) throw new DriveSuperseded();
       const entries = orderAsBatch(batch, batchedEntries(sql));
       closeBatch(batch.batchId, { state: "failed", failure: "conflict" }, now);
-      const parked = (entry: QueueEntry) =>
-        !renewed(entry) && (samePin(entry.pin, first) || samePin(entry.pin, second));
+      const pair = entries.filter(
+        (entry) => samePin(entry.pin, first) || samePin(entry.pin, second),
+      );
+      // A pair readied again during the merge is newer work than the merge composed, so both
+      // entries are composed again rather than parked behind a question about the older episode.
+      const parks = pair.length === 2 && !pair.some(renewed);
+      const parked = (entry: QueueEntry) => parks && pair.includes(entry);
       for (const entry of entries.filter(parked)) {
         settleEntry(sql, entry.pin, "parked", "conflict", now);
       }
@@ -1103,6 +1122,7 @@ export function createTrain(
         now,
       );
       promoteDeferred(sql, now);
+      if (!parks) return;
       insertConflict(
         sql,
         batch.batchId,
@@ -1270,8 +1290,8 @@ export function createTrain(
 
   /** Drives the train if its wake is due. Returns the time it read, or `null` when it read none. */
   async function resumeDrive(): Promise<number | null> {
-    // An answer asks for the alarm without knowing the train's wake, so look for one first.
-    unparkAnswered();
+    // A released pair is owed a drive without any call telling the train, so look for one first.
+    unparkReleased();
     const owedNow = readWake(sql);
     if (owedNow === null) return null;
     // Exhausted work waits for a call, and an alarm another module asked for does not restart it,
@@ -1480,6 +1500,7 @@ export function createTrain(
     recordCheck,
     attemptOutcome,
     holdsLiveEntry,
+    answered,
     armWake,
     startup,
     resume,

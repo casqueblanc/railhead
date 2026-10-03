@@ -11,6 +11,7 @@ import type {
   CheckRunId,
   ClaimId,
   CommitSha,
+  DecisionId,
   DecisionRef,
   IntentId,
 } from "@railhead/shared/events";
@@ -237,6 +238,15 @@ export interface TrainPort {
    * longer holds.
    */
   holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
+  /**
+   * Returns the pair parked behind the train's question that opened `decisionId` to the queue,
+   * inside the caller's transaction, and records the drive it is owed: the pair and the train's wake
+   * commit or roll back with that transaction. Answers whether an asked pair waited on that
+   * decision; for any other decision it writes nothing. Only the decisions module calls it, in the
+   * transaction that records a version of a system question, and awaits `armWake` once that
+   * commits. A missing module throws, so the caller's transaction rolls back.
+   */
+  answered(tx: EventTransaction, decisionId: DecisionId): boolean;
   /**
    * Asks the Repo's alarm again for the wake the train owes, and resolves whether storage holds it:
    * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is

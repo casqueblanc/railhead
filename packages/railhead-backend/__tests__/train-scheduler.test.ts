@@ -27,6 +27,7 @@ import {
   EXHAUSTED_FAILURES,
   MAX_QUEUE,
   MAX_DISCARDS_PER_WAKE,
+  MAX_RELEASE_READS,
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
   PORT_TIMEOUT_MS,
@@ -37,11 +38,16 @@ import {
   type Train,
 } from "../src/modules/train/scheduler";
 import {
+  insertConflict,
   insertEntry,
   migrateTrain,
+  readConflict,
   readEntry,
   readWake,
+  settleConflict,
+  settleEntry,
   writeWake,
+  type ConflictState,
   type PendingWake,
 } from "../src/modules/train/store";
 import { unavailableChecks, unavailableClaims } from "../src/contracts/unavailable";
@@ -136,6 +142,8 @@ class Fakes {
   readonly holds = new Map<PortCall, Promise<void>>();
   /** How long the train waits on each port call. */
   portTimeoutMs = PORT_TIMEOUT_MS;
+  /** While true, every alarm write the train asks for fails, as `EarliestAlarm.request` reports. */
+  alarmDown = false;
   readonly intents = new Map<string, MergeIntentRecord>();
 
   ready(...pins: ClaimPin[]): void {
@@ -311,6 +319,8 @@ interface Harness {
   /** Builds another train over the same storage, as a restarted `Repo` does. */
   restart(): QueueingTrain;
   events(): RailheadEvent[];
+  /** The Repo's event log, for a transaction a test runs as another module would. */
+  log: EventLog;
   sql: SqlStorage;
   /** Every time the train asked the Repo's alarm for a drive, oldest first. */
   wakes: number[];
@@ -345,6 +355,7 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       clock: () => (now += 1),
       env,
       wake: async (at) => {
+        if (fakes.alarmDown) return false;
         (forDiscard(at) ? discardWakes : wakes).push(at);
         return true;
       },
@@ -360,6 +371,7 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       fakes,
       restart: build,
       events: () => log.replay(0, 256).events,
+      log,
       sql: state.storage.sql,
       wakes,
       discardWakes,
@@ -837,6 +849,45 @@ function conflicting(): Fakes {
   return fakes;
 }
 
+/** One asked pair seeded into storage. */
+interface SeededPair {
+  batchId: number;
+  decisionId: string;
+  pins: [ClaimPin, ClaimPin];
+}
+
+/**
+ * Stores `count` parked pairs whose questions are asked, oldest first, each of two held claims of
+ * its own, as successive conflicts leave them. None is counted against the queue.
+ */
+function seedAskedPairs(sql: SqlStorage, fakes: Fakes, count: number, now: number): SeededPair[] {
+  return Array.from({ length: count }, (_, n) => {
+    const batchId = 1_000 + n;
+    const decisionId = `dec_seeded${String(n).padStart(4, "0")}`;
+    const pins: [ClaimPin, ClaimPin] = [pin(10 + 2 * n, 1, sha("a")), pin(11 + 2 * n, 1, sha("b"))];
+    for (const p of pins) {
+      insertEntry(sql, p, 1, now);
+      settleEntry(sql, p, "parked", "conflict", now);
+      fakes.ready(p);
+    }
+    insertConflict(sql, batchId, pins, "src/upload.ts", now);
+    settleConflict(sql, batchId, "asked", decisionId, now);
+    return { batchId, decisionId, pins };
+  });
+}
+
+/** How many stored pairs are in each state. */
+function conflictStates(sql: SqlStorage): Partial<Record<ConflictState, number>> {
+  return Object.fromEntries(
+    sql
+      .exec<{ state: ConflictState; n: number }>(
+        "SELECT state, COUNT(*) AS n FROM train_conflicts GROUP BY state ORDER BY state",
+      )
+      .toArray()
+      .map((row) => [row.state, row.n]),
+  );
+}
+
 /** Queues pins 1 and 3 while main cannot be read, then drives them into one batch. */
 async function park(train: QueueingTrain, fakes: Fakes): Promise<DriveOutcome> {
   const head = fakes.head;
@@ -887,34 +938,200 @@ describe("train conflict questions", () => {
     }, fakes);
   });
 
-  it("returns the pair to the queue once the question is answered", async () => {
+  it("returns the pair to the queue in the transaction that records the answer", async () => {
     const fakes = conflicting();
-    await withTrain(async ({ train, sql }) => {
+    await withTrain(async ({ train, sql, log, wakes }) => {
       await park(train, fakes);
       const [conflict] = train.conflicts(1);
       if (conflict?.decisionId == null) throw new Error("no question was asked");
+      const { decisionId } = conflict;
       // An alarm before the answer changes nothing.
       await train.resume();
       expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
+      expect(readWake(sql)).toBeNull();
 
-      // The answer reaches both claims' requirements; main cannot be read, so the drive the
-      // unpark owes stops after the pins are read again.
-      const answer = [{ decisionId: conflict.decisionId, version: 1 }];
-      fakes.requirements.set(pin(1).claimId, answer);
-      fakes.requirements.set(pin(3).claimId, answer);
-      fakes.head = () => fail("unavailable", "Main is down.");
-      fakes.reached.length = 0;
-      await train.resume();
+      const unparked = log.transaction((tx) => train.answered(tx, decisionId)).value;
 
-      expect(train.conflicts(1)).toMatchObject([{ state: "answered" }]);
+      expect(unparked).toBe(true);
+      expect(train.conflicts(1)).toMatchObject([{ state: "answered", decisionId }]);
       expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim003@1": "queued" });
       expect(train.entries(64)).toMatchObject([
         { state: "queued", isolate: false, retries: 0, reason: null },
         { state: "queued", isolate: false, retries: 0, reason: null },
       ]);
+      // The drive it owes is stored and asked for with the answer.
+      const wake = owed(sql);
+      expect(wake.failures).toBe(0);
+      expect(wakes.at(-1)).toBe(wake.dueAt);
+      // A later version of the same decision finds no parked pair and writes nothing.
+      expect(log.transaction((tx) => train.answered(tx, decisionId)).value).toBe(false);
+      expect(train.conflicts(1)).toMatchObject([{ state: "answered" }]);
+
+      // The drive reads the pins again; main cannot be read, so it stops there.
+      fakes.head = () => fail("unavailable", "Main is down.");
+      fakes.reached.length = 0;
+      await train.resume();
       expect(fakes.reached).toContain("claims.pin");
-      expect(owed(sql)).toMatchObject({ failures: 1 });
       expect(fakes.asked).toHaveLength(1);
+    }, fakes);
+  });
+
+  it("keeps the pair parked when the answer's transaction rolls back", async () => {
+    const fakes = conflicting();
+    await withTrain(async ({ train, sql, log }) => {
+      await park(train, fakes);
+      const [conflict] = train.conflicts(1);
+      if (conflict?.decisionId == null) throw new Error("no question was asked");
+      const { decisionId } = conflict;
+
+      expect(() =>
+        log.transaction((tx) => {
+          train.answered(tx, decisionId);
+          throw new Error("the answer was refused");
+        }),
+      ).toThrow("the answer was refused");
+
+      expect(train.conflicts(1)).toMatchObject([{ state: "asked" }]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
+      expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+
+  it("writes nothing for a decision no parked pair waits on", async () => {
+    const fakes = conflicting();
+    fakes.answerAsk = () => fail("unavailable", "Not yet.");
+    await withTrain(async ({ train, sql, log }) => {
+      await park(train, fakes);
+      const before = readWake(sql);
+
+      // An agent's decision, and a pair whose question is still owed, are not the train's answer.
+      expect(log.transaction((tx) => train.answered(tx, "dec_unrelated1")).value).toBe(false);
+      expect(train.conflicts(1)).toMatchObject([{ state: "asking", decisionId: null }]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
+      expect(readWake(sql)).toEqual(before);
+    }, fakes);
+  });
+
+  it("returns an answered pair behind more than MAX_RELEASE_READS older unanswered pairs", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Main is down.");
+    await withTrain(async ({ train, sql, log, now }) => {
+      const pairs = seedAskedPairs(sql, fakes, MAX_RELEASE_READS + 2, now());
+      const last = pairs.at(-1);
+      if (last === undefined) throw new Error("no pair was seeded");
+      // Alarms before the answer reach no answer and leave every pair parked.
+      await train.resume();
+      await train.resume();
+
+      const unparked = log.transaction((tx) => train.answered(tx, last.decisionId)).value;
+
+      expect(unparked).toBe(true);
+      expect(conflictStates(sql)).toEqual({ asked: MAX_RELEASE_READS + 1, answered: 1 });
+      for (const p of last.pins) {
+        expect(readEntry(sql, p.claimId, p.generation)?.state).toBe("queued");
+      }
+      const first = pairs[0];
+      if (first === undefined) throw new Error("no pair was seeded");
+      for (const p of first.pins) {
+        expect(readEntry(sql, p.claimId, p.generation)?.state).toBe("parked");
+      }
+    }, fakes);
+  });
+
+  it("asks again for the answer's wake after its alarm write failed", async () => {
+    const fakes = conflicting();
+    await withTrain(async ({ train, sql, log, wakes, restart }) => {
+      await park(train, fakes);
+      const [conflict] = train.conflicts(1);
+      if (conflict?.decisionId == null) throw new Error("no question was asked");
+      const { decisionId } = conflict;
+      fakes.head = () => fail("unavailable", "Main is down.");
+      fakes.alarmDown = true;
+      const asked = wakes.length;
+
+      log.transaction((tx) => train.answered(tx, decisionId));
+
+      // The answer and the train's wake row committed; only the alarm is missing.
+      const wake = owed(sql);
+      expect(wakes).toHaveLength(asked);
+      expect(await train.armWake()).toBe(false);
+      expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim003@1": "queued" });
+
+      // The next request asks again once the alarm can be written, and so does a restart.
+      fakes.alarmDown = false;
+      expect(await train.armWake()).toBe(true);
+      expect(wakes.at(-1)).toBe(wake.dueAt);
+      wakes.length = 0;
+      const again = restart();
+      expect(await again.startup).toBe(true);
+      expect(wakes).toEqual([wake.dueAt]);
+    }, fakes);
+  });
+
+  it("checks asked pairs for released claims in turn, a bounded batch per wake", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Main is down.");
+    await withTrain(async ({ train, sql, now }) => {
+      const pairs = seedAskedPairs(sql, fakes, MAX_RELEASE_READS + 2, now());
+      const last = pairs.at(-1);
+      if (last === undefined) throw new Error("no pair was seeded");
+      // Both claims of the newest pair are no longer held.
+      for (const p of last.pins) fakes.pins.delete(p.claimId);
+
+      // The first wake checks the oldest MAX_RELEASE_READS pairs, which are all still held.
+      await train.resume();
+      expect(conflictStates(sql)).toEqual({ asked: MAX_RELEASE_READS + 2 });
+
+      // The next one reaches the rest, then the oldest again.
+      await train.resume();
+      expect(conflictStates(sql)).toEqual({ asked: MAX_RELEASE_READS + 1, closed: 1 });
+      expect(readConflict(sql, last.batchId)?.state).toBe("closed");
+      for (const p of last.pins) {
+        expect(readEntry(sql, p.claimId, p.generation)?.state).not.toBe("parked");
+      }
+    }, fakes);
+  });
+
+  it("asks nothing about a pair whose claim was readied again while its question was owed", async () => {
+    const fakes = conflicting();
+    const answer = fakes.answerAsk;
+    fakes.answerAsk = () => fail("unavailable", "Not yet.");
+    await withTrain(async ({ train }) => {
+      await park(train, fakes);
+      expect(train.conflicts(1)).toMatchObject([{ state: "asking" }]);
+      const attempts = fakes.asked.length;
+
+      // Claim 1 is readied again with the same commit before the question could be asked.
+      fakes.head = () => fail("unavailable", "Main is down.");
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      fakes.answerAsk = answer;
+      await train.drive();
+
+      expect(fakes.asked).toHaveLength(attempts);
+      expect(train.conflicts(1)).toMatchObject([{ state: "redone", decisionId: null }]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim003@1": "queued" });
+    }, fakes);
+  });
+
+  it("asks nothing about a pair an entry of which is no longer parked", async () => {
+    const fakes = conflicting();
+    const answer = fakes.answerAsk;
+    fakes.answerAsk = () => fail("unavailable", "Not yet.");
+    await withTrain(async ({ train, sql }) => {
+      await park(train, fakes);
+      const attempts = fakes.asked.length;
+      // A newer episode holds claim 3's entry, which is waiting rather than parked.
+      sql.exec(
+        "UPDATE train_queue SET state = 'queued', episode = episode + 1 WHERE claim_id = ?",
+        pin(3).claimId,
+      );
+      fakes.head = () => fail("unavailable", "Main is down.");
+      fakes.answerAsk = answer;
+      await train.drive();
+
+      expect(fakes.asked).toHaveLength(attempts);
+      expect(train.conflicts(1)).toMatchObject([{ state: "redone", decisionId: null }]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim003@1": "queued" });
     }, fakes);
   });
 
@@ -2041,11 +2258,12 @@ describe("train ready episodes", () => {
     }, fakes);
   });
 
-  it("returns a same-commit re-ready to the queue instead of parking it with a conflict", async () => {
+  it("composes a pair again, unparked and unasked, when one was readied again during its merge", async () => {
     const fakes = new Fakes();
     fakes.head = () => fail("unavailable", "Not yet.");
+    // Only the merge of the older episode conflicts; the newer one composes cleanly.
     fakes.compose = (main, pins) =>
-      pins.length === 2
+      fakes.composeCalls.length === 1
         ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
         : ok({ kind: "clean", candidate: candidateOf(main, pins) });
     await withTrain(async ({ train, events }) => {
@@ -2062,9 +2280,48 @@ describe("train ready episodes", () => {
       expect(await queued).toEqual(ok({ queued: false }));
       await driving;
 
-      expect(events()).toMatchObject([{ type: "train.conflict" }]);
-      expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "parked" });
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      // Nothing is parked, asked or recorded about the older episode's conflict.
+      expect(fakes.asked).toEqual([]);
+      expect(train.conflicts(8)).toEqual([]);
+      expect(events().map((event) => event.type)).not.toContain("train.conflict");
+      expect(train.batches(2)).toMatchObject([
+        { state: "checking" },
+        { state: "failed", failure: "conflict" },
+      ]);
+      expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "batched" });
+      expect(lastStarted(fakes).pins).toEqual([pin(1), pin(2)]);
+    }, fakes);
+  });
+
+  it("parks and asks about a pair whose re-readied entry conflicts again", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Not yet.");
+    fakes.compose = (main, pins) =>
+      pins.length === 2
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        : ok({ kind: "clean", candidate: candidateOf(main, pins) });
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1), pin(2));
+      for (const p of [pin(1), pin(2)]) await train.enqueue(p);
+      fakes.head = () => ok(fakes.main);
+      const release = fakes.hold("merge.compose");
+      const driving = train.drive();
+      await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(1));
+      const queued = train.enqueue(pin(1));
+      release();
+      await queued;
+      await driving;
+
+      // The newer episode's own merge conflicts, so only that one is asked about.
+      expect(train.batches(2)).toMatchObject([
+        { state: "failed", failure: "conflict" },
+        { state: "failed", failure: "conflict" },
+      ]);
+      const [newer, older] = train.batches(2);
+      expect(train.conflicts(8)).toMatchObject([{ batchId: newer?.batchId, state: "asked" }]);
+      expect(fakes.asked.map((question) => question.key)).toEqual([`conflict_${newer?.batchId}`]);
+      expect(older?.batchId).not.toBe(newer?.batchId);
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim002@1": "parked" });
     }, fakes);
   });
 });
