@@ -398,6 +398,28 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("drops the fork's other cached tokens when a racing mint's cleanup sweeps the fork", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const paused = fake.pauseNext("createToken");
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      // Minted and cached after that revocation returned, while the write mint still runs.
+      const reader = await tokenValue(port, repo, "read");
+      fake.failRevocations(1);
+      paused.release();
+
+      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.accepts(reader)).toBe(false);
+      const renewed = await tokenValue(port, repo, "read");
+      expect(renewed).not.toBe(reader);
+      expect(fake.accepts(renewed)).toBe(true);
+    });
+  });
+
   it("mints nothing while a revocation runs, and the next token is accepted", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();

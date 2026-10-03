@@ -218,12 +218,8 @@ class ArtifactsAdapter implements ArtifactsPort {
       if (target.kind === "main") return invalid("main's tokens are not revoked through a claim");
       this.#revoking.set(repo, (this.#revoking.get(repo) ?? 0) + 1);
       try {
-        // Forget cached tokens and invalidate running mints before revoking, so none is handed out
-        // even if revocation fails.
-        this.#epochs.set(repo, this.#epoch(repo) + 1);
-        for (const [key, entry] of this.#cache) {
-          if (entry.token.repo === repo) this.#cache.delete(key);
-        }
+        // Before revoking, so no token is handed out even if revocation fails.
+        this.#forgetTokens(repo);
         // A mint that has not answered could create a token after the sweep lists, so sweep only
         // once none is running. New mints are refused until this revocation returns.
         if (this.#mintsRunning(repo)) {
@@ -277,6 +273,8 @@ class ArtifactsAdapter implements ArtifactsPort {
           if (target.kind === "main") {
             return fail("internal", "A minted token could not be revoked.");
           }
+          // The sweep may revoke the fork's other cached tokens, so none of them is handed out.
+          this.#forgetTokens(repo);
           const swept = await this.#revokeActive(handle);
           if (!swept.ok) return swept;
         }
@@ -516,6 +514,14 @@ class ArtifactsAdapter implements ArtifactsPort {
         );
       },
     });
+  }
+
+  /** Forgets `repo`'s cached tokens and invalidates its running mints. */
+  #forgetTokens(repo: ArtifactsRepoName): void {
+    this.#epochs.set(repo, this.#epoch(repo) + 1);
+    for (const [key, entry] of this.#cache) {
+      if (entry.token.repo === repo) this.#cache.delete(key);
+    }
   }
 
   #epoch(repo: ArtifactsRepoName): number {
