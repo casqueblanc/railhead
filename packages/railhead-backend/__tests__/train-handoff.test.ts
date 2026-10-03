@@ -81,6 +81,8 @@ interface Setup {
   holdNextPin(): { reached: Promise<void>; release(): void };
   /** Makes reads of main wait until the returned function releases them. */
   holdMain(): { reached: Promise<void>; release: () => void };
+  /** The commit main is at. */
+  main(): CommitSha;
   /** Whether main can be read; while false, every read refuses with `unavailable`. */
   mainUp: boolean;
   /** Moves the Repo's clock forward. */
@@ -164,6 +166,7 @@ function withHandoff<T>(
         currentGeneration: (claimId) => claims.currentGeneration(claimId),
         currentVersions: (claimId) => decisions.currentVersions(claimId),
         readyPin: (claimId) => claims.readyPin(claimId),
+        readyGateNow: (claimId, generation) => inbox.readyGateNow(claimId, generation),
       }),
       mainRef,
     );
@@ -176,6 +179,7 @@ function withHandoff<T>(
       currentGeneration: (claimId) => claims.currentGeneration(claimId),
       currentVersions: (claimId) => decisions.currentVersions(claimId),
       readyPin: (claimId) => claims.readyPin(claimId),
+      readyGateNow: (claimId, generation) => inbox.readyGateNow(claimId, generation),
     });
     const ports: RepoPorts = {
       ...base,
@@ -331,6 +335,7 @@ function withHandoff<T>(
           },
         };
       },
+      main: () => mainAt,
       mainUp: true,
       advance: (ms) => fake.advance(ms),
       now: () => fake.clock(),
@@ -903,6 +908,83 @@ describe("a decision recorded while the train forms a batch", () => {
       // The retried pin was superseded, so the train's read reopened the claim and dropped it.
       expect(claimState(setup.sql, claim.claimId)).toBe("working");
       expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
+    });
+  });
+});
+
+describe("an obligation queued after the batch formed", () => {
+  it("authorizes and writes nothing until the agent acknowledges, then lands the pin", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const first = await setup.decide(claim.claimId);
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      await setup.ackAll();
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      await setup.train.resume();
+      const old = setup.started[0];
+      if (old === undefined) throw new Error("no check was started for the pin");
+      expect(old.decisions).toEqual([second]);
+
+      // Work that relied on the replaced version lands while the batch is checking: rework is
+      // owed under the version the check runs under, so neither the pin nor its versions move.
+      setup.log.transaction((tx) =>
+        setup.decisions.relied(tx, claim.claimId, 1, [
+          { decisionId: first.decisionId, version: 1 },
+        ]),
+      );
+      expect(setup.decisions.currentVersions(claim.claimId)).toEqual([second]);
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+
+      const recorded = await setup.train.recordCheck({
+        attemptId: old.attemptId,
+        candidate: old.candidate,
+        result: "pass",
+        logDigest: null,
+        finishedAt: old.createdAt,
+      });
+      expect(recorded.ok).toBe(true);
+
+      const events = () => setup.log.replay(0, 128).events.map((event) => event.type);
+      expect(setup.train.batches(8).map((batch) => batch.failure)).toEqual([
+        "authorization_refused",
+      ]);
+      expect(events()).not.toContain("train.intent");
+      expect(events()).not.toContain("train.main");
+      expect(setup.published).toEqual([]);
+      expect(setup.main()).toBe(MAIN);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+
+      // The agent acknowledges and repeats its ready; the pin is checked again and lands.
+      await setup.ackAll();
+      expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+        ok: true,
+        value: { repeated: true },
+      });
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      const again = setup.started[1];
+      if (again === undefined) throw new Error("the pin was not checked again");
+      expect(again).toMatchObject({ pins: [pin], decisions: [second] });
+      expect(again.attemptId).not.toBe(old.attemptId);
+      expect(
+        (
+          await setup.train.recordCheck({
+            attemptId: again.attemptId,
+            candidate: again.candidate,
+            result: "pass",
+            logDigest: null,
+            finishedAt: again.createdAt,
+          })
+        ).ok,
+      ).toBe(true);
+      await setup.train.resume();
+
+      expect(setup.published).toHaveLength(1);
+      expect(setup.main()).toBe(again.candidate);
+      expect(events().filter((type) => type === "train.intent")).toHaveLength(1);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
     });
   });
 });

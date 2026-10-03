@@ -194,6 +194,8 @@ function withRepo<R>(
       currentGeneration,
       currentVersions,
       readyPin,
+      readyGateNow: (claimId: string, generation: number) =>
+        real.inbox.readyGateNow(claimId, generation),
     };
     const authorization = createAuthorization(context, readers);
     const mainWriter: MainWriterPort = createMainWriter(
