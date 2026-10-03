@@ -1265,13 +1265,158 @@ describe("an upstream that fails before reading the upload", () => {
           cancelled = true;
         },
       });
+      const started = Date.now();
       const response = await world.gateway.serve(
         rpc("git-receive-pack", body),
         FORK,
         "/git-receive-pack",
       );
       expect(response.status).toBe(504);
+      // The stalled upload is bounded by the whole exchange's limit, not by the headers wait.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(FAST.maxDurationMs);
       await until(() => cancelled);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
+describe("a slow upload", () => {
+  it("carries a steady push that takes longer than the headers wait, and records it", async () => {
+    const steady: GitGatewayLimits = { ...FAST, maxDurationMs: 5_000 };
+    const pieces = 8;
+    const gapMs = 40;
+    await withGateway(async (world) => {
+      world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      const size = Math.ceil(PUSH_REQUEST.length / pieces);
+      const body = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          for (let offset = 0; offset < PUSH_REQUEST.length; offset += size) {
+            controller.enqueue(PUSH_REQUEST.slice(offset, offset + size));
+            await new Promise((resolve) => setTimeout(resolve, gapMs));
+          }
+          controller.close();
+        },
+      });
+      const started = Date.now();
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", body),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(Date.now() - started).toBeGreaterThan(steady.headersTimeoutMs * 2);
+      expect(world.seen[0]?.body).toEqual(PUSH_REQUEST);
+      expect(pushedEvents(world)).toHaveLength(1);
+    }, steady);
+  });
+
+  it("still waits only the headers time once the whole upload has been sent", async () => {
+    const steady: GitGatewayLimits = { ...FAST, maxDurationMs: 5_000 };
+    await withGateway(async (world) => {
+      world.respond = () => new Promise<Response>(() => undefined);
+      const started = Date.now();
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(504);
+      expect(Date.now() - started).toBeLessThan(steady.maxDurationMs);
+      expect(pushedEvents(world)).toEqual([]);
+    }, steady);
+  });
+});
+
+describe("a client that stops reading a push's response", () => {
+  it("still has the push recorded when it never reads the response", async () => {
+    await withGateway(async (world) => {
+      // Progress ahead of the report, in more chunks than a pipe reads ahead on its own.
+      const progress = Array.from({ length: 256 }, (_, index) =>
+        encoder.encode(pkt(`\u0002Resolving deltas: ${index}\r`)),
+      );
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const chunk of progress) controller.enqueue(chunk);
+              controller.enqueue(PUSH_RESULT);
+              controller.close();
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await until(() => pushedEvents(world).length === 1);
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { claimId: CLAIM, generation: 3, ref: "refs/heads/feature", to: PUSHED } },
+      ]);
+      expect(await bytesOf(response)).toEqual(concatAll([...progress, PUSH_RESULT]));
+    });
+  });
+
+  it("still has the push recorded when it goes away before the report arrives", async () => {
+    await withGateway(async (world) => {
+      let finish: (() => void) | undefined;
+      let upstreamCancelled = false;
+      const [first, rest] = [PUSH_RESULT.slice(0, 8), PUSH_RESULT.slice(8)];
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(first);
+              finish = () => {
+                controller.enqueue(rest);
+                controller.close();
+              };
+            },
+            cancel() {
+              upstreamCancelled = true;
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await until(() => finish !== undefined);
+      // The upstream has sent part of its answer when the client goes away.
+      await response.body?.cancel();
+      finish?.();
+      await until(() => pushedEvents(world).length === 1);
+      expect(upstreamCancelled).toBe(false);
+    });
+  });
+
+  it("records nothing when the upstream is cut off after the client went away", async () => {
+    await withGateway(async (world) => {
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(PUSH_RESULT.slice(0, 8));
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      await response.body?.cancel();
+      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
       expect(pushedEvents(world)).toEqual([]);
     });
   });

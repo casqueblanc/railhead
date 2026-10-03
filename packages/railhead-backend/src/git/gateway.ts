@@ -17,8 +17,10 @@
 // own time limit; a client that stalls inside it is cut off and its body released.
 //
 // A push is recorded as `claim.pushed` only for the refs the upstream itself reported updated, once
-// its response has ended, and only if the claim is still working at the push's generation then. A
-// refused, failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
+// its response has ended, and only if the claim is still working at the push's generation then. The
+// gateway reads a push's response to its end whether or not the client keeps reading it, so a client
+// that stops reading or goes away after its push was applied does not lose the record. A refused,
+// failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -57,7 +59,10 @@ export interface GitGatewayLimits {
   readonly maxResponseBytes: number;
   /** How long a push's client may take to send the head of its body, its command list. */
   readonly headTimeoutMs: number;
-  /** How long the upstream may take to answer with headers. */
+  /**
+   * How long the upstream may take to answer with headers once the whole request body has been sent
+   * to it. An upload is bounded by `maxDurationMs` instead, so a slow but steady push is not cut off.
+   */
   readonly headersTimeoutMs: number;
   /**
    * How long one request may take to the end of its response, counted from the upstream call, or
@@ -111,6 +116,11 @@ const MAX_AUTHORIZATION_LENGTH = 8 * 1024;
 const BRANCH_PREFIX = "refs/heads/";
 const FORWARDED_REQUEST_HEADERS = ["accept", "content-encoding", "content-type", "git-protocol"];
 const textEncoder = new TextEncoder();
+/**
+ * How much of a push's response the gateway holds for a client that is not reading it, in bytes. A
+ * receive-pack response is progress and a report capped at 64 KiB, so this holds a whole one.
+ */
+const PUSH_RESPONSE_BUFFER_BYTES = 1024 * 1024;
 
 /** Builds the Git gateway of one repository. */
 export function createGitGateway(
@@ -361,7 +371,18 @@ class GitGateway implements GitPort {
     const after = await push?.admit();
     if (after !== undefined && after !== null) return release(after);
 
-    const sent = body === null ? null : limited(body, maxBody, deadline);
+    // The upstream may answer only once it has read the whole body, so its headers are waited for
+    // from then on; until then the upload is bounded by the deadline alone.
+    let answered = false;
+    let headersTimer: ReturnType<typeof setTimeout> | undefined;
+    const awaitHeaders = (): void => {
+      if (answered) return;
+      headersTimer = setTimeout(() => {
+        deadline.expire();
+      }, this.#limits.headersTimeoutMs);
+    };
+    const sent = body === null ? null : limited(body, maxBody, deadline, awaitHeaders);
+    if (sent === null) awaitHeaders();
     const headers = new Headers();
     for (const name of FORWARDED_REQUEST_HEADERS) {
       const value = request.headers.get(name);
@@ -377,9 +398,6 @@ class GitGateway implements GitPort {
     });
 
     let response: Response;
-    const headersTimer = setTimeout(() => {
-      deadline.expire();
-    }, this.#limits.headersTimeoutMs);
     try {
       response = await untilAborted(this.#context.upstream(upstreamRequest), deadline.signal);
     } catch {
@@ -394,6 +412,7 @@ class GitGateway implements GitPort {
         ? text(504, "railhead: the repository store did not answer in time")
         : text(502, "railhead: the repository store could not be reached");
     } finally {
+      answered = true;
       clearTimeout(headersTimer);
     }
 
@@ -415,16 +434,19 @@ class GitGateway implements GitPort {
 
     const report =
       push === null ? null : new PushReportReader(reportFraming(push.head.capabilities));
-    const passed = response.body
-      .pipeThrough(
-        inspected(this.#limits.maxResponseBytes, deadline, report, () => {
-          if (push !== null && report !== null) {
-            const outcome = report.end();
-            if (outcome.kind === "reported") push.record(outcome.updated);
-          }
-        }),
-      )
-      .pipeThrough(masked(textEncoder.encode(token.value.value)));
+    const read = response.body.pipeThrough(
+      inspected(this.#limits.maxResponseBytes, deadline, report, () => {
+        if (push !== null && report !== null) {
+          const outcome = report.end();
+          if (outcome.kind === "reported") push.record(outcome.updated);
+        }
+      }),
+    );
+    // A push's response is read to its end by the gateway, not by the client's reads, so its report
+    // is recorded even when the client stops reading.
+    const passed = (push === null ? read : drained(read, PUSH_RESPONSE_BUFFER_BYTES)).pipeThrough(
+      masked(textEncoder.encode(token.value.value)),
+    );
     return new Response(passed, {
       status: 200,
       headers: { "content-type": expectedType, "cache-control": "no-cache" },
@@ -435,7 +457,8 @@ class GitGateway implements GitPort {
    * Records each ref the upstream reported updated; a deleted ref names no commit and is skipped.
    * Nothing is recorded unless the claim is still working at the push's generation when the record
    * is written: a claim that expired, changed hands or went ready while the push was in flight
-   * keeps its own history, and the push's fact is left for reconciliation from the fork.
+   * keeps its own history. The refs the push moved stay in the fork without a `claim.pushed`
+   * event, and only the `git_push_unrecorded` warning says so.
    */
   #recordPush(
     principal: AgentPrincipal,
@@ -827,11 +850,15 @@ function cancelledOnAbort(
   );
 }
 
-/** A request body that errors once more than `max` bytes pass or the deadline expires. */
+/**
+ * A request body that errors once more than `max` bytes pass or the deadline expires, and calls
+ * `ended` once the whole body has passed.
+ */
 function limited(
   body: ReadableStream<Uint8Array>,
   max: number,
   deadline: Deadline,
+  ended: () => void,
 ): { readonly stream: ReadableStream<Uint8Array>; readonly exceeded: boolean } {
   let seen = 0;
   let exceeded = false;
@@ -848,6 +875,9 @@ function limited(
           return;
         }
         controller.enqueue(chunk);
+      },
+      flush() {
+        ended();
       },
     }),
   );
@@ -892,6 +922,55 @@ function inspected(
       deadline.clear();
     },
   });
+}
+
+/**
+ * Reads `source` to its end whatever its own reader does, holding at most `buffer` unread bytes for
+ * it. Past that, it waits for the reader to catch up, so a reader that stalls is still bounded by
+ * whatever bounds `source`. Once the reader cancels, the rest of `source` is read and dropped.
+ */
+function drained(source: ReadableStream<Uint8Array>, buffer: number): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let gone = false;
+  let wake: (() => void) | null = null;
+  const resume = (): void => {
+    wake?.();
+    wake = null;
+  };
+  return new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        // `cancel` sets `gone` while the pump waits.
+        const full = (): boolean => !gone && (controller.desiredSize ?? 0) <= 0;
+        const pump = async (): Promise<void> => {
+          for (;;) {
+            while (full()) {
+              await new Promise<void>((resolve) => {
+                wake = resolve;
+              });
+            }
+            const { done, value } = await reader.read();
+            if (done) {
+              if (!gone) controller.close();
+              return;
+            }
+            if (!gone) controller.enqueue(value);
+          }
+        };
+        // `source` errors only when the exchange is cut off, which records nothing; the reader, if
+        // still there, sees the same error.
+        pump().catch((error: unknown) => {
+          if (!gone) controller.error(error);
+        });
+      },
+      pull: resume,
+      cancel() {
+        gone = true;
+        resume();
+      },
+    },
+    new ByteLengthQueuingStrategy({ highWaterMark: buffer }),
+  );
 }
 
 /**
