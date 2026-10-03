@@ -29,11 +29,18 @@
 // expired claim's requirements cannot be read again later. Settlement therefore reads a landed
 // claim's dependencies only from the snapshot `owe` took, never from the decisions module.
 //
-// No event is appended: the board derives the same verdict from `train.intent`, `train.check` and
-// `train.main`. Nothing here reads repository content.
+// Each adaptation recorded is announced to the board as a `claim.adapted` event, because the board
+// cannot derive per-claim dependencies from the intent's combined decisions. The landing runs inside
+// the train's transaction, which appends no events, so a recorded adaptation is only marked
+// unannounced there and the Repo's alarm is asked to run at once; `resume` appends the events in its
+// own log transaction, at most `MAX_ANNOUNCE_PER_CALL` per call, and marks them announced in the same
+// transaction. The event states a fact about one decision version, so a later supersession does not
+// retract it: the board, like `adapted`, compares it with the decision's current version. Nothing
+// here reads repository content.
 
 import {
   isId,
+  type Actor,
   type ClaimId,
   type CommitSha,
   type DecisionId,
@@ -42,10 +49,17 @@ import {
 } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
 import type { AttemptOutcome, MergeIntentRecord } from "../../contracts/train";
+import type { EventLog } from "../../repo/eventLog";
 import { atomically, migrate, type RepoStorage } from "../../repo/storage";
 
 /** The migration owner name of the adaptation tables. */
 export const ADAPTATION_OWNER = "adaptation";
+
+/** Who records `claim.adapted`. */
+export const ADAPTATION_ACTOR: Actor = { kind: "system", id: "sys_adaptation" };
+
+/** Most `claim.adapted` events one `resume` call appends. */
+export const MAX_ANNOUNCE_PER_CALL = 32;
 
 /** Most pending landings one `recordLanding` call settles, its own included. */
 export const MAX_SETTLE_PER_CALL = 8;
@@ -84,6 +98,10 @@ const MIGRATIONS: readonly string[] = [
     recorded_at INTEGER NOT NULL,
     PRIMARY KEY (claim_id, decision_id, version)
   ) STRICT`,
+  // Whether the adaptation's `claim.adapted` event is in the log. Rows recorded before this step
+  // are announced by the next `resume`.
+  "ALTER TABLE adaptations ADD COLUMN announced INTEGER NOT NULL DEFAULT 0",
+  "CREATE INDEX adaptations_unannounced ON adaptations (recorded_at) WHERE announced = 0",
 ];
 
 /** How a landing settled. */
@@ -202,6 +220,8 @@ export interface AdaptationReaders {
 export interface AdaptationDeps {
   /** The Repo's storage; only the adaptation tables are written. */
   storage: RepoStorage;
+  /** The event log `claim.adapted` is appended to, never inside another transaction. */
+  log: EventLog;
   /** The other modules' readers. Called only while a request is handled. */
   readers: () => AdaptationReaders;
   /** The current time. */
@@ -215,6 +235,13 @@ interface LandingRow extends Record<string, SqlStorageValue> {
   claims: string;
   outcome: string | null;
   tries: number;
+}
+
+interface UnannouncedRow extends Record<string, SqlStorageValue> {
+  claim_id: string;
+  decision_id: string;
+  version: number;
+  intent_id: string;
 }
 
 interface AdaptationRow extends Record<string, SqlStorageValue> {
@@ -235,7 +262,7 @@ export class AdaptationWriteError extends Error {
 
 /** Builds the adaptation module, creating or migrating its tables first. */
 export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
-  const { storage, readers, clock, wake } = deps;
+  const { storage, log, readers, clock, wake } = deps;
   migrate(storage, ADAPTATION_OWNER, MIGRATIONS);
   const sql = storage.sql;
 
@@ -367,8 +394,16 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
       .map((row) => row.intent_id);
   }
 
-  // Asks the alarm for the earliest pending landing, if any. Call it as a transaction's last write.
+  // Asks the alarm to run now while an adaptation is unannounced, else for the earliest pending
+  // landing, if any. Call it as a transaction's last write.
   function requestWake(): void {
+    const unannounced = sql
+      .exec("SELECT 1 FROM adaptations WHERE announced = 0 LIMIT 1")
+      .toArray().length;
+    if (unannounced > 0) {
+      wake(clock());
+      return;
+    }
     const row = sql
       .exec<{ next: number | null }>(
         "SELECT MIN(next_at) AS next FROM adaptation_landings WHERE outcome IS NULL",
@@ -448,6 +483,33 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
     async resume() {
       atomically(storage, () => {
         for (const intentId of due(MAX_SETTLE_PER_CALL, null)) settle(intentId);
+      });
+      log.transaction((tx) => {
+        const rows = sql
+          .exec<UnannouncedRow>(
+            `SELECT claim_id, decision_id, version, intent_id FROM adaptations
+             WHERE announced = 0
+             ORDER BY recorded_at, intent_id, claim_id, decision_id, version LIMIT ?`,
+            MAX_ANNOUNCE_PER_CALL,
+          )
+          .toArray();
+        for (const row of rows) {
+          tx.append(ADAPTATION_ACTOR, {
+            type: "claim.adapted",
+            data: {
+              claimId: row.claim_id,
+              intentId: row.intent_id,
+              decision: { decisionId: row.decision_id, version: row.version },
+            },
+          });
+          sql.exec(
+            `UPDATE adaptations SET announced = 1
+             WHERE claim_id = ? AND decision_id = ? AND version = ?`,
+            row.claim_id,
+            row.decision_id,
+            row.version,
+          );
+        }
         requestWake();
       });
     },

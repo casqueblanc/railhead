@@ -386,6 +386,25 @@
           }
         ]
       }
+    },
+    {
+      "v": 1,
+      "seq": 22,
+      "at": 1790000000022,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.adapted",
+      "data": {
+        "claimId": "clm_42abcd",
+        "intentId": "int_merge01",
+        "decision": {
+          "decisionId": "dec_upload1",
+          "version": 1
+        }
+      }
     }
   ],
   "largestSafeSeq": {

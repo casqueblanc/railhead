@@ -93,6 +93,14 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", from: "agt_atlas01", to: "agt_ember01", generation: 2 },
   },
+  "claim.adapted": {
+    actor: SYSTEM,
+    data: {
+      claimId: "clm_42abcd",
+      intentId: "int_merge01",
+      decision: { decisionId: "dec_upload1", version: 1 },
+    },
+  },
   "question.asked": {
     actor: AGENT,
     data: {
@@ -250,6 +258,7 @@ describe("validateEvent", () => {
       "train.main",
       "claim.reassigned",
       "claim.reopened",
+      "claim.adapted",
       "inbox.queued",
     ] as const)("refuses %s asserted by an agent", (type) => {
       expect(() => validateEvent(event(type, AGENT))).toThrow(/must be recorded by the system/);
@@ -257,6 +266,12 @@ describe("validateEvent", () => {
 
     it("refuses a reopened claim asserted by a person", () => {
       expect(() => validateEvent(event("claim.reopened", HUMAN))).toThrow(
+        /must be recorded by the system/,
+      );
+    });
+
+    it("refuses an adaptation asserted by a person", () => {
+      expect(() => validateEvent(event("claim.adapted", HUMAN))).toThrow(
         /must be recorded by the system/,
       );
     });
@@ -359,6 +374,16 @@ describe("validateEvent", () => {
     it("rejects a reassignment to the agent that already holds the claim", () => {
       const bad = withData("claim.reassigned", (d) => ({ ...d, to: d.from }));
       expect(() => validateEvent(bad)).toThrow(/reassigned to the agent that holds it/);
+    });
+
+    it("rejects an adaptation that names a claim as its intent or a version of zero", () => {
+      const intent = withData("claim.adapted", (d) => ({ ...d, intentId: d.claimId }));
+      expect(() => validateEvent(intent)).toThrow(/intentId/);
+      const version = withData("claim.adapted", (d) => ({
+        ...d,
+        decision: { ...d.decision, version: 0 },
+      }));
+      expect(() => validateEvent(version)).toThrow(/version/);
     });
 
     it("rejects a merge intent with no claims", () => {

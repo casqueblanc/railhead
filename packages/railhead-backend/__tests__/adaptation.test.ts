@@ -2,7 +2,7 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { ClaimView } from "@railhead/shared/agent-api";
-import type { CommitSha, DecisionRef } from "@railhead/shared/events";
+import type { CommitSha, DecisionRef, RailheadEvent } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import { fail, ok } from "../src/contracts/result";
 import type {
@@ -23,9 +23,11 @@ import {
   type RepoContext,
   type RepoPorts,
 } from "../src/repo/composeRepo";
-import { EventLog } from "../src/repo/eventLog";
+import { EventLog, MAX_REPLAY_EVENTS } from "../src/repo/eventLog";
 import {
+  ADAPTATION_ACTOR,
   createAdaptation,
+  MAX_ANNOUNCE_PER_CALL,
   MAX_SETTLE_PER_CALL,
   RETRY_BASE_MS,
   RETRY_MAX_MS,
@@ -170,6 +172,10 @@ interface Harness {
   counts(): { landings: number; adaptations: number };
   /** Every time the module asked the Repo's alarm for, oldest first. */
   wakes: number[];
+  /** The Repo's event log. */
+  log: EventLog;
+  /** Every event in the Repo's log, oldest first. */
+  events(): RailheadEvent[];
   /** The clock's current time. */
   now(): number;
   /** Moves the clock forward. */
@@ -184,8 +190,10 @@ async function withAdaptation<R>(
   return runInDurableObject(stub, async (_instance, state) => {
     let now = 1_000;
     const wakes: number[] = [];
+    const log = EventLog.open(state.storage, REPO_ID, () => now);
     const port = createAdaptation({
       storage: state.storage,
+      log,
       readers: () => world.readers(),
       clock: () => (now += 1),
       wake: (at) => wakes.push(at),
@@ -200,6 +208,8 @@ async function withAdaptation<R>(
         adaptations: count("adaptations"),
       }),
       wakes,
+      log,
+      events: () => log.replay(0, MAX_REPLAY_EVENTS).events,
       now: () => now,
       advance: (ms) => {
         now += ms;
@@ -338,6 +348,108 @@ describe("recordLanding", () => {
       }
       expect(counts()).toEqual({ landings: 0, adaptations: 0 });
     });
+  });
+});
+
+/** The `claim.adapted` events in `events`, as claim, intent and decision version. */
+function announced(
+  events: RailheadEvent[],
+): { claimId: string; intentId: string; version: number }[] {
+  return events.flatMap((event) => {
+    if (event.type !== "claim.adapted") return [];
+    expect(event.actor).toEqual(ADAPTATION_ACTOR);
+    expect(event.data.decision.decisionId).toBe(DECISION);
+    const { claimId, intentId, decision } = event.data;
+    return [{ claimId, intentId, version: decision.version }];
+  });
+}
+
+describe("claim.adapted", () => {
+  it("announces only the claim that depended on the decision in a two-claim batch", async () => {
+    await withAdaptation(async ({ adaptation, world, wakes, events, now }) => {
+      world.intents.set(INTENT, intentOf({ pins: [pinOf(ATLAS), pinOf(BIRCH)] }));
+      world.versions.set(BIRCH, []);
+      expect(adaptation.recordLanding(INTENT)?.outcome).toBe("adapted");
+      // The landing runs inside the train's transaction, so it appends nothing and asks the alarm
+      // to run at once.
+      expect(events()).toEqual([]);
+      expect(wakes.at(-1)).toBeLessThanOrEqual(now());
+
+      await adaptation.resume();
+      expect(announced(events())).toEqual([{ claimId: ATLAS, intentId: INTENT, version: 1 }]);
+      expect(adaptation.adapted(BIRCH, DECISION)).toBe(false);
+
+      // A later alarm announces nothing twice and asks for no wake.
+      const asked = wakes.length;
+      await adaptation.resume();
+      expect(events()).toHaveLength(1);
+      expect(wakes).toHaveLength(asked);
+
+      // A supersession leaves the fact in the log; readers compare it with the current version.
+      world.supersede("reject");
+      await adaptation.resume();
+      expect(events()).toHaveLength(1);
+      expect(adaptation.adapted(ATLAS, DECISION)).toBe(false);
+    });
+  });
+
+  it("announces nothing for a landing that adapted no claim", async () => {
+    await withAdaptation(async ({ adaptation, world, events }) => {
+      world.versions.set(ATLAS, []);
+      expect(adaptation.recordLanding(INTENT)?.outcome).toBe("no_dependent_claim");
+      await adaptation.resume();
+      expect(events()).toEqual([]);
+    });
+  });
+
+  it("announces at most a bounded number per alarm and asks to run again for the rest", async () => {
+    await withAdaptation(async ({ adaptation, world, wakes, events, now }) => {
+      const claims = Array.from(
+        { length: MAX_ANNOUNCE_PER_CALL + 1 },
+        (_, n) => `clm_many${String(n).padStart(3, "0")}`,
+      );
+      for (const claimId of claims) world.versions.set(claimId, [ref(1)]);
+      world.intents.set(INTENT, intentOf({ pins: claims.map((claimId) => pinOf(claimId)) }));
+      expect(adaptation.recordLanding(INTENT)?.outcome).toBe("adapted");
+
+      await adaptation.resume();
+      expect(announced(events())).toHaveLength(MAX_ANNOUNCE_PER_CALL);
+      expect(wakes.at(-1)).toBeLessThanOrEqual(now());
+
+      await adaptation.resume();
+      expect(announced(events()).map((event) => event.claimId)).toEqual(claims);
+    });
+  });
+
+  it("keeps an adaptation unannounced when the log transaction fails, then announces it", async () => {
+    await withAdaptation(async ({ adaptation, log, events }) => {
+      adaptation.recordLanding(INTENT);
+      const failing = vi.spyOn(log, "transaction").mockImplementationOnce(() => {
+        throw new TypeError("storage busy");
+      });
+      await expect(adaptation.resume()).rejects.toThrow("storage busy");
+      failing.mockRestore();
+      expect(events()).toEqual([]);
+      expect(adaptation.adapted(ATLAS, DECISION)).toBe(true);
+
+      await adaptation.resume();
+      expect(announced(events())).toEqual([{ claimId: ATLAS, intentId: INTENT, version: 1 }]);
+    });
+  });
+
+  it("announces an adaptation recorded before the Repo restarted", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const world = new World();
+    await withAdaptation(({ adaptation }) => adaptation.recordLanding(INTENT), stub, world);
+    await evictDurableObject(stub);
+    await withAdaptation(
+      async ({ adaptation, events }) => {
+        await adaptation.resume();
+        expect(announced(events())).toEqual([{ claimId: ATLAS, intentId: INTENT, version: 1 }]);
+      },
+      stub,
+      world,
+    );
   });
 });
 
