@@ -811,6 +811,63 @@ describe("publish holds a moved fence while the intent's own write may still lan
   });
 });
 
+describe("publish holds a newly blocked inbox gate while the intent's own write may still land", () => {
+  it("records the earlier update when it lands after the gate blocked", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+
+        expect(await h.writer.publish(INTENT)).toEqual(
+          fail("unavailable", "An earlier write of this intent may still land; try again."),
+        );
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        expect(h.log.head()).toBe(1);
+
+        // The first update reaches Git after all.
+        ref.main = CANDIDATE;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, CANDIDATE),
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", CANDIDATE)]);
+      },
+      world,
+    );
+  });
+
+  it("settles the intent as not landed only once the earlier update can no longer land", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS - 1;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, MAIN), updatedAt: world.now },
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(ref.main).toBe(MAIN);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", MAIN, INTENT, world.now)]);
+      },
+      world,
+    );
+  });
+});
+
 describe("publish ends the wait for an unsettled write after the update lifetime", () => {
   it("settles the intent as not landed once its last attempt is that old", async () => {
     const world = new World();
