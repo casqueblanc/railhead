@@ -131,7 +131,7 @@ export const CLAIM_LEASE_MS = 30 * 60_000;
 export const REVOKE_RETRY_MS = 60_000;
 
 /** Most lapsed leases one call or alarm expires, so each stays bounded. */
-const RELEASE_BATCH = 16;
+export const RELEASE_BATCH = 16;
 
 /**
  * Most due revocations a `work` or `claim` call awaits before it chooses, so an agent waits on at
@@ -179,7 +179,7 @@ export function createClaims(
    * its former holder included, off a newer issue. Runs in a transaction.
    */
   const intend = (sql: SqlStorage, agent: AgentPrincipal, issueId: IssueId): Chosen => {
-    if (releasePendingBefore(sql, issueId)) {
+    if (releasePendingBefore(sql, issueId, clock())) {
       return fail("busy", "An older expired claim is still being released; repeat later.");
     }
     if (activeClaimsOfOwner(sql, agent.ownerId, clock()) >= limits.maxActiveClaimsPerOwner) {
@@ -449,10 +449,18 @@ export function createClaims(
         const held = active === null ? null : hold(tx, active);
         if (held !== null && lapsedAllocation(held, clock())) return lapsedHold();
         if (held !== null && held.state !== "expired") return ok({ row: held, resumed: true });
-        const takeover = nextTakeover(sql, agent.agentId, clock());
+        const now = clock();
+        const takeover = nextTakeover(sql, agent.agentId, now);
         if (takeover !== null) {
+          // A lapsed claim that `release` left for a later batch enters revocation before any
+          // newer one is handed over.
+          if (takeover.state === "working") {
+            expire(tx, takeover, now);
+            wakeForDeadline(sql);
+            return fail("busy", "An expired claim is still being released; repeat the request.");
+          }
           // An expired claim still being released stays ahead of every newer claim and issue.
-          if (takeover.revokeDue !== null || releasePendingBefore(sql, takeover.issueId)) {
+          if (takeover.revokeDue !== null || releasePendingBefore(sql, takeover.issueId, now)) {
             return fail("busy", "An expired claim is still being released; repeat the request.");
           }
           return takeOver(tx, agent, takeover);
@@ -489,7 +497,7 @@ export function createClaims(
         if (existing.agentId !== agent.agentId) {
           if (takeable(existing, clock())) {
             // An older expired claim still being released is handed over first.
-            if (releasePendingBefore(sql, issueId)) {
+            if (releasePendingBefore(sql, issueId, clock())) {
               return fail("busy", "An older expired claim is still being released; repeat later.");
             }
             return takeOver(tx, agent, existing);

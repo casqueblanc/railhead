@@ -21,6 +21,7 @@ import { createGitGateway } from "../src/git/gateway";
 import {
   CLAIM_LEASE_MS,
   CLAIMS_LIMITS,
+  RELEASE_BATCH,
   REVOKE_RETRY_MS,
   createClaims,
   type ClaimsLimits,
@@ -359,6 +360,40 @@ async function ackAll(setup: Setup, principal: AgentPrincipal): Promise<void> {
 
 const push = (principal: AgentPrincipal, claimId: string) =>
   ({ principal, target: { kind: "fork", claimId }, operation: "push" }) as const;
+
+/**
+ * Files `count` issues and has agents 1 to `count` claim them in filing order, all leased until the
+ * same time. Claim ids are minted in descending order, so the earliest filed issue's claim sorts
+ * last by claim id, the order in which lapsed claims are expired.
+ */
+async function claimInFilingOrder(
+  setup: Setup,
+  count: number,
+): Promise<{ issues: string[]; claims: { claimId: string; fork: string }[] }> {
+  const issues: string[] = [];
+  for (let n = 1; n <= count; n += 1) issues.push(await setup.file(`Issue ${n}`));
+  let minted = 0;
+  const uuid = vi.spyOn(crypto, "randomUUID").mockImplementation(() => {
+    minted += 1;
+    const tail = (0xffffffffffff - minted).toString(16).padStart(12, "0");
+    return `ffffffff-ffff-4fff-8fff-${tail}`;
+  });
+  const claims: { claimId: string; fork: string }[] = [];
+  try {
+    for (let n = 1; n <= count; n += 1) {
+      const claimed = await setup.port.work(agent(n));
+      if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
+      expect(claimed.value.claim.issueId).toBe(issues[n - 1]);
+      const { claimId } = claimed.value.claim;
+      claims.push({ claimId, fork: await forkRepoName(REPO, claimId) });
+    }
+  } finally {
+    uuid.mockRestore();
+  }
+  const ids = claims.map(({ claimId }) => claimId);
+  expect(ids.toSorted().at(-1)).toBe(ids[0]);
+  return { issues, claims };
+}
 
 describe("leases", () => {
   it("renews the lease on every holder call, so a live holder keeps its claim", async () => {
@@ -1242,6 +1277,101 @@ describe("takeover", () => {
         value: { claim: { claimId: newerId, generation: 2 } },
       });
     });
+  });
+
+  it("hands over the earliest filed lapsed claim first when more lapse than one call expires", async () => {
+    await withTakeover(
+      async (setup) => {
+        const count = RELEASE_BATCH + 1;
+        const { issues, claims } = await claimInFilingOrder(setup, count);
+        const earliest = claims[0] ?? { claimId: "", fork: "" };
+        const second = claims[1] ?? { claimId: "", fork: "" };
+        const former = setup.fake.mintFor(earliest.fork, "write", 3600);
+        setup.fake.advance(CLAIM_LEASE_MS);
+
+        // The call's batch expires every claim but the earliest filed one and settles the second
+        // issue's revocation. Selection still finds the earliest, expires it and hands nothing over.
+        const successor = agent(count + 1);
+        expectFailure(await setup.port.work(successor), "busy");
+        expect(stored(setup.sql, earliest.claimId)).toMatchObject({
+          agent_id: "agt_agent0001",
+          generation: 1,
+          state: "expired",
+          revoke_due: setup.fake.clock(),
+        });
+        expect(stored(setup.sql, second.claimId)).toMatchObject({
+          agent_id: "agt_agent0002",
+          generation: 1,
+          state: "expired",
+          revoke_due: null,
+        });
+        expect(types(setup.events())).not.toContain("claim.reassigned");
+
+        // While the earliest revocation is owed, no newer claim or write grant goes to anyone.
+        setup.fake.failRevocations(Number.MAX_SAFE_INTEGER);
+        expectFailure(await setup.port.work(successor), "busy");
+        expectFailure(await setup.port.claim(successor, issues[1] ?? ""), "busy");
+        expectFailure(
+          await setup.port.authorizeGit(push(successor, second.claimId)),
+          "stale_generation",
+        );
+        expect(setup.minted).toEqual([]);
+        expect(setup.fake.accepts(former.plaintext)).toBe(true);
+        expect(types(setup.events())).not.toContain("claim.reassigned");
+
+        // Once its revocation settles at the retry, the earliest filed issue goes to the successor
+        // first.
+        setup.fake.failRevocations(0);
+        setup.fake.advance(REVOKE_RETRY_MS);
+        expect(await setup.port.work(successor)).toMatchObject({
+          ok: true,
+          value: { claim: { claimId: earliest.claimId, issueId: issues[0], generation: 2 } },
+        });
+        expect(setup.fake.accepts(former.plaintext)).toBe(false);
+        expect(await setup.port.authorizeGit(push(successor, earliest.claimId))).toMatchObject({
+          ok: true,
+          value: { scope: "write", fence: { generation: 2 } },
+        });
+        expect(await setup.port.work(agent(count + 2))).toMatchObject({
+          ok: true,
+          value: { claim: { claimId: second.claimId, generation: 2 } },
+        });
+      },
+      { maxActiveClaimsPerOwner: 64 },
+    );
+  });
+
+  it("refuses a named claim on a newer issue while an older lapsed claim waits for a later batch", async () => {
+    await withTakeover(
+      async (setup) => {
+        const count = RELEASE_BATCH + 1;
+        const { issues, claims } = await claimInFilingOrder(setup, count);
+        const earliest = claims[0] ?? { claimId: "", fork: "" };
+        const second = claims[1] ?? { claimId: "", fork: "" };
+        setup.fake.advance(CLAIM_LEASE_MS);
+
+        // The call's batch leaves the earliest filed claim working and settles the second issue's
+        // revocation, yet the second issue is not handed over ahead of the earliest.
+        const successor = agent(count + 1);
+        expectFailure(await setup.port.claim(successor, issues[1] ?? ""), "busy");
+        expect(stored(setup.sql, earliest.claimId)).toMatchObject({
+          generation: 1,
+          state: "working",
+        });
+        expect(stored(setup.sql, second.claimId)).toMatchObject({
+          agent_id: "agt_agent0002",
+          generation: 1,
+          state: "expired",
+          revoke_due: null,
+        });
+        expectFailure(
+          await setup.port.authorizeGit(push(successor, second.claimId)),
+          "stale_generation",
+        );
+        expect(types(setup.events())).not.toContain("claim.reassigned");
+      },
+      { maxActiveClaimsPerOwner: 64 },
+    );
   });
 
   it("passes a lapsed allocation to the successor, which finishes the same fork intent", async () => {

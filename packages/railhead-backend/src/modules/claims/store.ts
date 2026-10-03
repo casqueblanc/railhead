@@ -360,20 +360,24 @@ export function nextClaimsDeadline(sql: SqlStorage): number | null {
 }
 
 /**
- * The claim first in line for the agent: the expired claim of the oldest issue, whether or not its
- * revocation is settled, then the oldest-leased allocation whose lease lapsed at or before `now`.
- * The caller takes it over only once its revocation, and every older one, is settled. A claim the agent itself held last
- * is never offered back to it.
+ * The claim first in line for the agent: the claim of the oldest issue that is expired, whether or
+ * not its revocation is settled, or working with a lease that lapsed at or before `now` and no
+ * expiry recorded yet; then the oldest-leased allocation whose lease lapsed at or before `now`. The
+ * caller expires a lapsed working claim before anything else, and takes a claim over only once its
+ * revocation, and every older one, is settled. A claim the agent itself held last is never offered
+ * back to it.
  */
 export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): ClaimRow | null {
-  const expired = first(
+  const lapsed = first(
     sql.exec<RawClaim>(
-      `${SELECT_CLAIM} WHERE c.state = 'expired' AND c.agent_id != ?
+      `${SELECT_CLAIM} WHERE c.agent_id != ?
+         AND (c.state = 'expired' OR (c.state = 'working' AND c.lease_until <= ?))
        ORDER BY i.filed_seq LIMIT 1`,
       agentId,
+      now,
     ),
   );
-  if (expired !== null) return expired;
+  if (lapsed !== null) return lapsed;
   return first(
     sql.exec<RawClaim>(
       `${SELECT_CLAIM} WHERE c.state = 'allocating' AND c.lease_until <= ? AND c.agent_id != ?
@@ -385,15 +389,18 @@ export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): Cl
 }
 
 /**
- * Whether an expired claim on an issue filed before `issueId` still owes the revocation of its
- * fork's tokens.
+ * Whether a claim on an issue filed before `issueId` still owes the revocation of its fork's
+ * tokens: an expired claim whose revocation is not settled, or a working claim whose lease lapsed
+ * at or before `now` and whose expiry is not recorded yet.
  */
-export function releasePendingBefore(sql: SqlStorage, issueId: IssueId): boolean {
+export function releasePendingBefore(sql: SqlStorage, issueId: IssueId, now: number): boolean {
   const [row] = sql
     .exec<{ pending: number }>(
       `SELECT EXISTS (SELECT 1 FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id
-         WHERE c.state = 'expired' AND c.revoke_due IS NOT NULL
+         WHERE ((c.state = 'expired' AND c.revoke_due IS NOT NULL)
+             OR (c.state = 'working' AND c.lease_until <= ?))
            AND i.filed_seq < (SELECT filed_seq FROM claims_issues WHERE issue_id = ?)) AS pending`,
+      now,
       issueId,
     )
     .toArray();
