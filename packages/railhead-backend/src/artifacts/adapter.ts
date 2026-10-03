@@ -13,9 +13,9 @@
 // passed, so a late token created within that window is revoked by a later sweep. A token Artifacts
 // creates after the final sweep escapes; how late a mint can take effect is not yet measured.
 //
-// A sweep whose token listing cannot cover every token still lets a claim's revocation finish, so
-// release and takeover never wait on it. The fork then owes a sweep: it takes no new token until a
-// later sweep sees every token or every token it may hold has expired.
+// A sweep whose token listing cannot cover every token does not count as a revocation: the fork
+// owes a sweep, `revokeTokens` reports `pending_debt` rather than `revoked`, and the fork takes no
+// new token until a later sweep sees every token or every token it may hold has expired.
 //
 // Tokens never leave this module except through `token`, whose caller streams them to Artifacts.
 // Nothing here logs a token, a repository name or a binding error's message.
@@ -27,7 +27,12 @@ import {
   type CommitSha,
   type RepoId,
 } from "@railhead/shared/events";
-import type { ArtifactsPort, ArtifactsRepoName, ArtifactsToken } from "../contracts/artifacts";
+import type {
+  ArtifactsPort,
+  ArtifactsRepoName,
+  ArtifactsToken,
+  TokenRevocation,
+} from "../contracts/artifacts";
 import { fail, ok, type PortFailure, type PortResult } from "../contracts/result";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
 
@@ -254,7 +259,7 @@ class ArtifactsAdapter implements ArtifactsPort {
     });
   }
 
-  async revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<void>> {
+  async revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<TokenRevocation>> {
     return guarded(async () => {
       const target = await this.#resolve(repo);
       if (target === null) return unknownRepo();
@@ -265,15 +270,16 @@ class ArtifactsAdapter implements ArtifactsPort {
         const unsettled = this.#unanswered.has(repo) || this.#previousMints(repo) > 0;
         using handle = await this.#open(repo);
         const swept = await sweepTokens(handle, this.#limits);
-        // A listing that cannot cover every token must not hold up release or takeover for good
-        // (#161 qualifies the binding's paging): the fork owes a sweep, takes no new token, and is
-        // swept again by a later request until it is clean or every token it may hold has expired.
+        // A listing that cannot cover every token (#161 qualifies the binding's paging) may hide a
+        // live token, so it is no revocation: the fork owes a sweep and takes no new token until a
+        // later sweep is clean or every token it may hold has expired.
         if (swept === "partial") this.#oweSweep(repo);
         else if (swept !== "clean") return swept;
         if (unsettled)
           return fail("busy", "A token for the repository may still be minted; try again.");
-        if (swept === "clean") this.#clearDebt(repo);
-        return ok(undefined);
+        if (swept === "partial" && !this.#debtExpired(repo)) return ok("pending_debt");
+        this.#clearDebt(repo);
+        return ok("revoked");
       });
     });
   }
@@ -469,6 +475,17 @@ class ArtifactsAdapter implements ArtifactsPort {
         now + TOKEN_DEBT_RETRY_MS,
       );
     });
+  }
+
+  /** Whether every token `repo` may hold from before its debt began has expired. */
+  #debtExpired(repo: ArtifactsRepoName): boolean {
+    const [debt] = this.#context.storage.sql
+      .exec<{ owed_until: number }>(
+        "SELECT owed_until FROM artifacts_token_debts WHERE repo = ?",
+        repo,
+      )
+      .toArray();
+    return debt !== undefined && debt.owed_until <= this.#context.clock();
   }
 
   #clearDebt(repo: ArtifactsRepoName): void {
@@ -744,7 +761,7 @@ export const PARTIAL_TOKEN_LISTING: PortFailure = fail(
  * than `total` fails with `PARTIAL_TOKEN_LISTING` instead of busy: `total` likely counts revoked
  * and expired tokens too, so if the page keeps those, no repeat would ever see further. Whether the
  * binding's page keeps or drops revoked tokens is not verified; #161 qualifies it against live
- * Artifacts. A claim's revocation does not fail on a partial listing: the fork owes a sweep instead.
+ * Artifacts. A claim's revocation does not fail on a partial listing: it reports `pending_debt`.
  */
 export async function revokeActiveTokens(
   handle: Pick<ArtifactsRepo, "listTokens" | "revokeToken">,
