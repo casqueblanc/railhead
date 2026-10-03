@@ -34,14 +34,18 @@ export interface GitGrant {
   repo: ArtifactsRepoName;
   /** The token scope the gateway mints internally for this request. */
   scope: "read" | "write";
-  /** For a push, the claim and generation the push is fenced to; `null` for a fetch. */
-  fence: { claimId: ClaimId; generation: number } | null;
+  /**
+   * For a push, the claim, generation and working episode the push is fenced to; `null` for a
+   * fetch. The episode tells a push granted before the claim went ready from one granted after it
+   * was reopened at the same generation.
+   */
+  fence: { claimId: ClaimId; generation: number; episode: number } | null;
 }
 
 /**
  * Issues and claims.
  *
- * `currentGeneration` and `workingGeneration` are fence readers: each is synchronous and reads only
+ * `currentGeneration`, `workingGeneration` and `workingEpisode` are fence readers: each is synchronous and reads only
  * the Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body,
  * and what it returns holds until that transaction commits. Read outside a transaction, the result may already be stale.
  */
@@ -79,6 +83,12 @@ export interface ClaimsPort {
    * caller's transaction. A push is recorded only while this equals the push's fence generation.
    */
   workingGeneration(claimId: ClaimId): number | null;
+  /**
+   * The claim's episode while it is working, or `null` once it is anything else. The episode rises
+   * each time the claim is pinned or reopened, so a push is recorded only while this also equals
+   * the push's fence episode. A fence reader like `workingGeneration`.
+   */
+  workingEpisode(claimId: ClaimId): number | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */

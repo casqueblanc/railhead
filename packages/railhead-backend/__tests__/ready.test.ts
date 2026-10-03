@@ -774,7 +774,11 @@ describe("a decision superseded after ready", () => {
 
       // The holder may push again, and the new version still gates ready until acknowledged.
       expect(await setup.port.authorizeGit(access)).toEqual(
-        ok({ repo: fork, scope: "write", fence: { claimId: claim.claimId, generation: 1 } }),
+        ok({
+          repo: fork,
+          scope: "write",
+          fence: { claimId: claim.claimId, generation: 1, episode: 3 },
+        }),
       );
       setup.push(fork, LATER);
       expectFailure(
@@ -831,7 +835,11 @@ describe("a decision superseded after ready", () => {
       expect(setup.log.head()).toBe(head);
 
       expect(await setup.port.authorizeGit(access)).toEqual(
-        ok({ repo: fork, scope: "write", fence: { claimId: claim.claimId, generation: 1 } }),
+        ok({
+          repo: fork,
+          scope: "write",
+          fence: { claimId: claim.claimId, generation: 1, episode: 3 },
+        }),
       );
       expect(claimState(setup.sql, claim.claimId)).toEqual({
         state: "working",
@@ -841,7 +849,7 @@ describe("a decision superseded after ready", () => {
     });
   });
 
-  it("refuses a push after ready, keeps the pin when a granted push lands, and reopens once", async () => {
+  it("fences a push granted before ready to its episode, which ready and the reopening each end", async () => {
     await withReady(async (setup) => {
       const { claim, fork } = await setup.open();
       setup.push(fork, WORK);
@@ -855,10 +863,13 @@ describe("a decision superseded after ready", () => {
       const granted = await setup.port.authorizeGit(access);
       expect(granted).toMatchObject({
         ok: true,
-        value: { fence: { claimId: claim.claimId, generation: 1 } },
+        value: { fence: { claimId: claim.claimId, generation: 1, episode: 1 } },
       });
+      expect(setup.port.workingEpisode(claim.claimId)).toBe(1);
 
       expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      expect(setup.port.workingGeneration(claim.claimId)).toBeNull();
+      expect(setup.port.workingEpisode(claim.claimId)).toBeNull();
       // The push granted before the pin lands now. It moves the fork's branch but not the pin,
       // and no new push is granted.
       setup.push(fork, LATER);
@@ -876,9 +887,13 @@ describe("a decision superseded after ready", () => {
       // A claim that is already working is not reopened again.
       expect((await setup.port.activeClaim(agent(1))).ok).toBe(true);
       expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+      // Working again at the same generation, but in a later episode: the fence of the push granted
+      // before ready no longer matches, so the gateway neither releases nor records that push.
+      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
+      expect(setup.port.workingEpisode(claim.claimId)).toBe(3);
       expect(await setup.port.authorizeGit(access)).toMatchObject({
         ok: true,
-        value: { fence: { claimId: claim.claimId, generation: 1 } },
+        value: { fence: { claimId: claim.claimId, generation: 1, episode: 3 } },
       });
       expect(types(setup.events()).filter((type) => type.startsWith("claim."))).toEqual([
         "claim.opened",
@@ -1008,7 +1023,11 @@ describe("authorizeGit", () => {
         }),
       ).toEqual({
         ok: true,
-        value: { repo: fork, scope: "write", fence: { claimId: claim.claimId, generation: 1 } },
+        value: {
+          repo: fork,
+          scope: "write",
+          fence: { claimId: claim.claimId, generation: 1, episode: 1 },
+        },
       });
     });
   });

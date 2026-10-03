@@ -50,6 +50,7 @@ export const unavailableClaims: ClaimsPort = {
   pin: refuse("claims"),
   currentGeneration: () => null,
   workingGeneration: () => null,
+  workingEpisode: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
 };

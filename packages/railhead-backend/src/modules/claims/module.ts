@@ -17,7 +17,8 @@
 // the train's read, answers only while those versions are still the current ones and the inbox
 // gate is still clear. From the pin on, `authorizeGit` refuses every push to the fork; a push
 // already granted may still move the fork's branch, but never the pin, which names a commit rather
-// than a ref.
+// than a ref. Each pin and each reopening raises the claim's episode, and a push is fenced to the
+// episode it was granted in, so a push granted before ready is never recorded after a reopening.
 //
 // A decision version recorded after ready supersedes the pin: the train must not take it, and the
 // holder must adapt. The first claims call that reads such a claim, whether a `ready`, the holder's
@@ -300,6 +301,11 @@ export function createClaims(
       return row?.state === "working" ? row.generation : null;
     },
 
+    workingEpisode(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      return row?.state === "working" ? row.episode : null;
+    },
+
     async ready(agent, claimId, request) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
@@ -541,7 +547,7 @@ function pushGrant(row: ClaimRow, principal: AgentPrincipal, repo: string): Port
       return ok({
         repo,
         scope: "write",
-        fence: { claimId: row.claimId, generation: row.generation },
+        fence: { claimId: row.claimId, generation: row.generation, episode: row.episode },
       });
     case "ready":
       return fail("after_ready", "The claim is ready, so its fork takes no more pushes.");

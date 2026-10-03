@@ -17,7 +17,10 @@
 // own time limit; a client that stalls inside it is cut off and its body released. While the push
 // uploads, its last bytes are held back: the upstream cannot finish the pack, or apply any ref,
 // without them. They are passed on only if the claim is still working at the push's generation once
-// the client has sent everything; otherwise the exchange is ended and the push refused.
+// the client has sent everything; otherwise the exchange is ended and the push refused. Here and
+// below, the push's generation stands for its whole fence: the generation and the claim's working
+// episode, which a pin and a reopening each raise, so a push granted before ready never outlives a
+// reopening at the same generation.
 //
 // A push must ask for a report, since without one nothing it did could be recorded. It is recorded
 // as `claim.pushed` only for the refs the upstream itself reported updated, once its response has
@@ -191,6 +194,9 @@ const MIGRATIONS: readonly string[] = [
   "CREATE TABLE git_fork_release (repo TEXT PRIMARY KEY, released INTEGER NOT NULL) STRICT",
   "ALTER TABLE git_pending_push ADD COLUMN release INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE git_pending_push ADD COLUMN prior TEXT",
+  // The claim's working episode the push was granted in. A row saved before this step has none and
+  // is fenced to the first episode.
+  "ALTER TABLE git_pending_push ADD COLUMN episode INTEGER NOT NULL DEFAULT 1",
 ];
 /** How many pending pushes one alarm reconciles; the alarm is asked for again for the rest. */
 const RECONCILE_BATCH = 8;
@@ -441,10 +447,12 @@ class GitGateway implements GitPort {
       const row = sql
         .exec<{ id: number }>(
           `INSERT INTO git_pending_push
-             (claim_id, generation, agent_id, repo, updates, due_at, attempts, release, prior)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) RETURNING id`,
+             (claim_id, generation, episode, agent_id, repo, updates, due_at, attempts, release,
+              prior)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?) RETURNING id`,
           fence.claimId,
           fence.generation,
+          fence.episode,
           principal.agentId,
           repo,
           JSON.stringify(updates),
@@ -457,9 +465,13 @@ class GitGateway implements GitPort {
     });
   }
 
-  /** Whether the push's claim is still working at the push's generation. */
+  /** Whether the push's claim is still working at the push's generation and episode. */
   #working(fence: Fence): boolean {
-    return this.#context.ports().claims.workingGeneration(fence.claimId) === fence.generation;
+    const { claims } = this.#context.ports();
+    return (
+      claims.workingGeneration(fence.claimId) === fence.generation &&
+      claims.workingEpisode(fence.claimId) === fence.episode
+    );
   }
 
   /** Drops a pending push its complete report refused. If that fails, the alarm finds nothing moved. */
@@ -481,7 +493,8 @@ class GitGateway implements GitPort {
     try {
       const due = this.#context.storage.sql
         .exec<PendingRow>(
-          `SELECT id, claim_id, generation, agent_id, repo, updates, attempts, release, prior
+          `SELECT id, claim_id, generation, episode, agent_id, repo, updates, attempts, release,
+             prior
            FROM git_pending_push WHERE due_at <= ? ORDER BY due_at, id LIMIT ?`,
           this.#context.clock(),
           RECONCILE_BATCH,
@@ -510,7 +523,7 @@ class GitGateway implements GitPort {
    * push whose claim moved on is dropped.
    */
   async #reconcile(row: PendingRow): Promise<void> {
-    const fence: Fence = { claimId: row.claim_id, generation: row.generation };
+    const fence = pendingFence(row);
     const updates = parsePushedRefs(row.updates);
     const prior = row.prior === null ? null : parsePrior(row.prior);
     if (updates === null || prior === undefined) {
@@ -518,7 +531,7 @@ class GitGateway implements GitPort {
       logUnrecorded(fence, "unreadable_record");
       return;
     }
-    if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
+    if (!this.#working(fence)) {
       this.#drop(row.id, fence);
       logUnrecorded(fence, "claim_changed");
       return;
@@ -578,7 +591,7 @@ class GitGateway implements GitPort {
    * the push once `RECONCILE_ATTEMPTS` reads have failed.
    */
   #retryLater(row: PendingRow, error: unknown): void {
-    const fence: Fence = { claimId: row.claim_id, generation: row.generation };
+    const fence = pendingFence(row);
     if (error !== null) logPush("git_push_reconcile_failed", fence, { error: errorName(error) });
     const attempts = row.attempts + 1;
     if (attempts >= RECONCILE_ATTEMPTS) {
@@ -963,7 +976,7 @@ class GitGateway implements GitPort {
     return this.#context.log.transaction((tx) => {
       const deleted = sql.exec("DELETE FROM git_pending_push WHERE id = ?", pending).rowsWritten;
       if (deleted === 0) return "settled";
-      if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
+      if (!this.#working(fence)) {
         return "claim_changed";
       }
       if (last !== null && this.#released(last.repo) !== last.release) return "later_push";
@@ -989,6 +1002,11 @@ class GitGateway implements GitPort {
 
 type Fence = NonNullable<GitGrant["fence"]>;
 
+/** The fence a pending push was saved under. */
+function pendingFence(row: PendingRow): Fence {
+  return { claimId: row.claim_id, generation: row.generation, episode: row.episode };
+}
+
 /** One branch a push moves, as a pending push keeps it and `claim.pushed` records it. */
 interface PushedRef {
   readonly ref: string;
@@ -1001,6 +1019,7 @@ interface PendingRow extends Record<string, SqlStorageValue> {
   id: number;
   claim_id: string;
   generation: number;
+  episode: number;
   agent_id: string;
   repo: string;
   updates: string;
@@ -1152,13 +1171,17 @@ function grantFits(grant: GitGrant, access: GitAccess): boolean {
   }
 }
 
-/** Whether `current` is the grant `original` was: the same repository, scope, claim and generation. */
+/**
+ * Whether `current` is the grant `original` was: the same repository, scope, claim, generation and
+ * episode.
+ */
 function sameGrant(current: GitGrant, original: GitGrant): boolean {
   return (
     current.repo === original.repo &&
     current.scope === original.scope &&
     current.fence?.claimId === original.fence?.claimId &&
-    current.fence?.generation === original.fence?.generation
+    current.fence?.generation === original.fence?.generation &&
+    current.fence?.episode === original.fence?.episode
   );
 }
 
