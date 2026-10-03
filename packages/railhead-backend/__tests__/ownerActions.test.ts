@@ -9,7 +9,11 @@ import type {
   PasskeyAssertion,
   PasskeyRegistration,
 } from "@railhead/shared/board-api";
-import { relyingParty, type RelyingParty } from "../src/auth/passkeyVerifier";
+import {
+  MAX_CLIENT_DATA_BYTES,
+  relyingParty,
+  type RelyingParty,
+} from "../src/auth/passkeyVerifier";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { IdentityPort } from "../src/contracts/identity";
@@ -24,6 +28,7 @@ import {
 } from "../src/modules/owner/entry";
 import { InstanceOwner, MAX_OPEN_ENROLLMENTS } from "../src/modules/owner/instance";
 import { OWNER_OBJECT_NAME, type Owner } from "../src/modules/owner/OwnerObject";
+import { MAX_ATTESTATION_OBJECT_BYTES } from "../src/modules/owner/registration";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
@@ -91,6 +96,84 @@ interface RegisterOptions {
   reportedId?: string;
   /** Encode the COSE key with every CBOR head one size longer than needed, as CBOR permits. */
   longHeads?: boolean;
+  /** Replaces the COSE key bytes. */
+  cose?: number[];
+  /** Bytes appended to the authenticator data after the COSE key, such as an extensions map. */
+  trailer?: number[];
+  /** Replaces the authenticator data's RP ID hash. */
+  rpHash?: Uint8Array;
+  /** A `pad` member of this many characters added to `clientDataJSON`. */
+  clientDataPad?: number;
+  /** Builds the attestation object from the authenticator data instead of the `none` default. */
+  attestation?: (authData: Uint8Array) => number[];
+}
+
+/** The attestation object `{fmt, attStmt: {}, authData}` in its shortest encoding. */
+function noneAttestation(authData: Uint8Array, fmt = "none"): number[] {
+  return [
+    0xa3,
+    ...cborText("fmt"),
+    ...cborText(fmt),
+    ...cborText("attStmt"),
+    0xa0,
+    ...cborText("authData"),
+    ...cborBytes(authData),
+  ];
+}
+
+/** `levels` maps nested one inside the next through the key `"a"`; the innermost is empty. */
+function nestedMaps(levels: number): number[] {
+  return levels <= 1 ? [0xa0] : [0xa1, ...cborText("a"), ...nestedMaps(levels - 1)];
+}
+
+/** Authenticator data flagged as carrying `extensions` after the key. */
+function withExtensions(extensions: number[]): RegisterOptions {
+  return { flags: 0xc5, trailer: extensions };
+}
+
+/** A map from the integers below `entries` to 0. */
+function countedMap(entries: number): number[] {
+  const body = Array.from({ length: entries }, (_, n) => [...cborHead(0, n), 0x00]).flat();
+  return [...cborHead(5, entries), ...body];
+}
+
+/** Decoded byte length of a base64url field. */
+function decodedLength(text: string): number {
+  return atob(text.replaceAll("-", "+").replaceAll("_", "/")).length;
+}
+
+/** A registration whose attestation object is exactly `total` bytes, padded by an extension. */
+async function paddedAttestation(
+  auth: Authenticator,
+  challenge: string,
+  total: number,
+): Promise<PasskeyRegistration> {
+  let pad = 0;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const registration = await auth.register(challenge, {
+      flags: 0xc5,
+      trailer: [0xa1, ...cborText("p"), ...cborBytes(new Uint8Array(pad))],
+    });
+    const length = decodedLength(registration.attestationObject);
+    if (length === total) return registration;
+    pad += total - length;
+  }
+  throw new Error(`no padding reaches ${total} attestation bytes`);
+}
+
+/** A registration whose `clientDataJSON` is exactly `total` bytes. */
+async function paddedClientData(
+  auth: Authenticator,
+  challenge: string,
+  total: number,
+): Promise<PasskeyRegistration> {
+  const base = await auth.register(challenge, { clientDataPad: 0 });
+  const pad = total - decodedLength(base.clientDataJson);
+  const registration = await auth.register(challenge, { clientDataPad: pad });
+  if (decodedLength(registration.clientDataJson) !== total) {
+    throw new Error(`no padding reaches ${total} client data bytes`);
+  }
+  return registration;
 }
 
 interface AssertOptions {
@@ -135,56 +218,59 @@ class Authenticator {
         challenge: options.challenge ?? challenge,
         origin: options.origin ?? ORIGIN,
         crossOrigin: false,
+        ...(options.clientDataPad === undefined ? {} : { pad: "p".repeat(options.clientDataPad) }),
       }),
     );
-    const cose = options.longHeads
-      ? [
-          184,
-          5,
-          24,
-          1,
-          24,
-          2,
-          24,
-          3,
-          56,
-          6,
-          56,
-          0,
-          24,
-          1,
-          56,
-          1,
-          89,
-          0,
-          32,
-          ...this.x,
-          56,
-          2,
-          89,
-          0,
-          32,
-          ...this.y,
-        ]
-      : [
-          0xa5,
-          0x01,
-          0x02,
-          0x03,
-          options.alg ?? 0x26,
-          0x20,
-          0x01,
-          0x21,
-          0x58,
-          32,
-          ...this.x,
-          0x22,
-          0x58,
-          32,
-          ...this.y,
-        ];
+    const cose =
+      options.cose ??
+      (options.longHeads
+        ? [
+            184,
+            5,
+            24,
+            1,
+            24,
+            2,
+            24,
+            3,
+            56,
+            6,
+            56,
+            0,
+            24,
+            1,
+            56,
+            1,
+            89,
+            0,
+            32,
+            ...this.x,
+            56,
+            2,
+            89,
+            0,
+            32,
+            ...this.y,
+          ]
+        : [
+            0xa5,
+            0x01,
+            0x02,
+            0x03,
+            options.alg ?? 0x26,
+            0x20,
+            0x01,
+            0x21,
+            0x58,
+            32,
+            ...this.x,
+            0x22,
+            0x58,
+            32,
+            ...this.y,
+          ]);
     const authData = Uint8Array.from([
-      ...(await sha256(enc.encode(HOST))),
+      ...(options.rpHash ?? (await sha256(enc.encode(HOST)))),
       options.flags ?? 0x45,
       0,
       0,
@@ -195,16 +281,11 @@ class Authenticator {
       this.idBytes.length,
       ...this.idBytes,
       ...cose,
+      ...(options.trailer ?? []),
     ]);
-    const attestation = Uint8Array.from([
-      0xa3,
-      ...cborText("fmt"),
-      ...cborText(options.fmt ?? "none"),
-      ...cborText("attStmt"),
-      0xa0,
-      ...cborText("authData"),
-      ...cborBytes(authData),
-    ]);
+    const attestation = Uint8Array.from(
+      options.attestation?.(authData) ?? noneAttestation(authData, options.fmt),
+    );
     return {
       credentialId: options.reportedId ?? this.credentialId,
       clientDataJson: b64url(clientData),
@@ -423,6 +504,9 @@ describe("owner enrollment", () => {
       { flags: 0x41 },
       { alg: 0x27 },
       { reportedId: other.credentialId },
+      { rpHash: new Uint8Array(32) },
+      // User verified but not present.
+      { flags: 0x44 },
     ];
     await withInstance(async (owner, state) => {
       const challenge = value(await owner.prepareEnrollment(TOKEN));
@@ -449,6 +533,267 @@ describe("owner enrollment", () => {
         ),
       );
     });
+  });
+
+  it("refuses malformed CBOR in the attestation and key, keeping the ceremony open", async () => {
+    const auth = await Authenticator.create();
+    const key = (x: Uint8Array = auth.x): number[] => [
+      0xa5,
+      0x01,
+      0x02,
+      0x03,
+      0x26,
+      0x20,
+      0x01,
+      0x21,
+      ...cborBytes(x),
+      0x22,
+      ...cborBytes(auth.y),
+    ];
+    const cases: [string, RegisterOptions][] = [
+      ["truncated payload", { attestation: (a) => noneAttestation(a).slice(0, -1) }],
+      ["truncated head", { attestation: () => [0xa3, 0x79, 0x00] }],
+      ["empty attestation", { attestation: () => [] }],
+      ["trailing byte", { attestation: (a) => [...noneAttestation(a), 0x00] }],
+      [
+        "array instead of map",
+        { attestation: (a) => [0x83, ...cborText("none"), 0xa0, ...cborBytes(a)] },
+      ],
+      [
+        "text authData",
+        {
+          attestation: () => [
+            0xa3,
+            ...cborText("fmt"),
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            ...cborText("authData"),
+          ],
+        },
+      ],
+      [
+        // Four entries, three distinct keys: only the duplicate check refuses it.
+        "duplicate map key",
+        {
+          attestation: (a) => [
+            0xa4,
+            ...cborText("fmt"),
+            ...cborText("packed"),
+            ...noneAttestation(a).slice(1),
+          ],
+        },
+      ],
+      [
+        "byte-string map key",
+        {
+          attestation: (a) => [
+            0xa3,
+            ...cborBytes(enc.encode("fmt")),
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            ...cborBytes(a),
+          ],
+        },
+      ],
+      [
+        "float map key",
+        {
+          attestation: (a) => [
+            0xa3,
+            0xf9,
+            0x00,
+            0x00,
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            ...cborBytes(a),
+          ],
+        },
+      ],
+      [
+        "indefinite-length map",
+        { attestation: (a) => [0xbf, ...noneAttestation(a).slice(1), 0xff] },
+      ],
+      [
+        "tagged authData",
+        {
+          attestation: (a) => [
+            0xa3,
+            ...cborText("fmt"),
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            0xd8,
+            0x18,
+            ...cborBytes(a),
+          ],
+        },
+      ],
+      [
+        "eight-byte length head",
+        {
+          attestation: (a) => [
+            0xa3,
+            ...cborText("fmt"),
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            0x5b,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            a.length >> 8,
+            a.length & 0xff,
+            ...a,
+          ],
+        },
+      ],
+      [
+        "length beyond the input",
+        {
+          attestation: (a) => [
+            0xa3,
+            ...cborText("fmt"),
+            ...cborText("none"),
+            ...cborText("attStmt"),
+            0xa0,
+            ...cborText("authData"),
+            0x5a,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            ...a,
+          ],
+        },
+      ],
+      ["truncated key", { cose: key().slice(0, -1) }],
+      // Six entries, five distinct labels; the second algorithm label repeats the first.
+      ["duplicate key label", { cose: [0xa6, 0x01, 0x02, 0x03, 0x27, ...key().slice(3)] }],
+      [
+        "text coordinate",
+        { cose: [...key().slice(0, 8), ...cborText("x".repeat(32)), ...key().slice(42)] },
+      ],
+      ["oversized coordinate", { cose: key(Uint8Array.from([0, ...auth.x])) }],
+      ["byte after key", { trailer: [0x00] }],
+      ["flagged extensions missing", withExtensions([])],
+      ["extensions not a map", withExtensions([0x80])],
+      ["extensions nested too deep", withExtensions(nestedMaps(5))],
+      ["extensions with too many entries", withExtensions(countedMap(65))],
+    ];
+    await withInstance(async (owner, state) => {
+      const challenge = value(await owner.prepareEnrollment(TOKEN));
+      for (const [label, options] of cases) {
+        const registration = await auth.register(challenge.challenge, options);
+        expect(
+          await owner.completeEnrollment(challenge.challengeId, registration),
+          label,
+        ).toMatchObject({ ok: false, code: "proof_invalid" });
+      }
+      expect(credentialRows(state)).toBe(0);
+      expect(enrollmentRows(state)).toBe(1);
+      value(
+        await owner.completeEnrollment(
+          challenge.challengeId,
+          await auth.register(challenge.challenge),
+        ),
+      );
+      expect(credentialRows(state)).toBe(1);
+    });
+  });
+
+  it("accepts CBOR at the parser's limits and in non-shortest encodings", async () => {
+    const auth = await Authenticator.create();
+    const cases: [string, RegisterOptions][] = [
+      ["extensions nested at the depth limit", { flags: 0xc5, trailer: nestedMaps(4) }],
+      ["extensions with the most entries", { flags: 0xc5, trailer: countedMap(64) }],
+      [
+        "non-shortest attestation heads",
+        {
+          attestation: (a) => [
+            0xb8,
+            3,
+            0x78,
+            3,
+            ...enc.encode("fmt"),
+            0x79,
+            0,
+            4,
+            ...enc.encode("none"),
+            0x78,
+            7,
+            ...enc.encode("attStmt"),
+            0xb9,
+            0,
+            0,
+            0x78,
+            8,
+            ...enc.encode("authData"),
+            0x5a,
+            0,
+            0,
+            a.length >> 8,
+            a.length & 0xff,
+            ...a,
+          ],
+        },
+      ],
+    ];
+    for (const [label, options] of cases) {
+      await withInstance(async (owner, state) => {
+        const challenge = value(await owner.prepareEnrollment(TOKEN));
+        const result = await owner.completeEnrollment(
+          challenge.challengeId,
+          await auth.register(challenge.challenge, options),
+        );
+        expect(result.ok, label).toBe(true);
+        expect(owner.credential()?.credential.credentialId).toBe(auth.credentialId);
+        expect(credentialRows(state)).toBe(1);
+      });
+    }
+  });
+
+  it("accepts registration fields at their byte limits and refuses one byte more", async () => {
+    const auth = await Authenticator.create();
+    const sizes: [string, (challenge: string, extra: number) => Promise<PasskeyRegistration>][] = [
+      [
+        "attestation object",
+        (challenge, extra) =>
+          paddedAttestation(auth, challenge, MAX_ATTESTATION_OBJECT_BYTES + extra),
+      ],
+      [
+        "client data",
+        (challenge, extra) => paddedClientData(auth, challenge, MAX_CLIENT_DATA_BYTES + extra),
+      ],
+    ];
+    for (const [label, build] of sizes) {
+      await withInstance(async (owner, state) => {
+        const challenge = value(await owner.prepareEnrollment(TOKEN));
+        const over = await build(challenge.challenge, 1);
+        expect(
+          await owner.completeEnrollment(challenge.challengeId, over),
+          `${label} over the limit`,
+        ).toMatchObject({ ok: false, code: "proof_invalid" });
+        expect(credentialRows(state)).toBe(0);
+        expect(enrollmentRows(state)).toBe(1);
+        const atLimit = await build(challenge.challenge, 0);
+        expect(
+          (await owner.completeEnrollment(challenge.challengeId, atLimit)).ok,
+          `${label} at the limit`,
+        ).toBe(true);
+        expect(credentialRows(state)).toBe(1);
+      });
+    }
   });
 
   it("expires ceremonies and bounds how many are open", async () => {
