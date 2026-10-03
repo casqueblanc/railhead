@@ -14,7 +14,8 @@ import type { HumanGrant } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import {
   createOwner,
-  MAX_OPEN_ACTION_CHALLENGES,
+  MAX_ACTION_BYTES,
+  MAX_SEALED_CHALLENGE_LENGTH,
   type OwnerDependencies,
   type OwnerPort,
 } from "../src/modules/owner/entry";
@@ -134,7 +135,34 @@ class Authenticator {
       }),
     );
     const cose = options.longHeads
-      ? [184, 5, 24, 1, 24, 2, 24, 3, 56, 6, 56, 0, 24, 1, 56, 1, 89, 0, 32, ...this.x, 56, 2, 89, 0, 32, ...this.y]
+      ? [
+          184,
+          5,
+          24,
+          1,
+          24,
+          2,
+          24,
+          3,
+          56,
+          6,
+          56,
+          0,
+          24,
+          1,
+          56,
+          1,
+          89,
+          0,
+          32,
+          ...this.x,
+          56,
+          2,
+          89,
+          0,
+          32,
+          ...this.y,
+        ]
       : [
           0xa5,
           0x01,
@@ -310,7 +338,23 @@ describe("owner enrollment", () => {
 
   it("stores the COSE key in its shortest encoding, however the authenticator encoded it", async () => {
     const auth = await Authenticator.create();
-    const shortest = Uint8Array.from([165, 1, 2, 3, 38, 32, 1, 33, 88, 32, ...auth.x, 34, 88, 32, ...auth.y]);
+    const shortest = Uint8Array.from([
+      165,
+      1,
+      2,
+      3,
+      38,
+      32,
+      1,
+      33,
+      88,
+      32,
+      ...auth.x,
+      34,
+      88,
+      32,
+      ...auth.y,
+    ]);
     for (const longHeads of [false, true]) {
       await withInstance(async (owner) => {
         const challenge = value(await owner.prepareEnrollment(TOKEN));
@@ -526,13 +570,29 @@ async function withRepoOwner(
   });
 }
 
-function consumedAt(state: DurableObjectState, challengeId: string): number | null | undefined {
-  return state.storage.sql
-    .exec<{ consumed_at: number | null }>(
-      "SELECT consumed_at FROM owner_action_challenge WHERE challenge_id = ?",
-      challengeId,
-    )
-    .toArray()[0]?.consumed_at;
+/** The grant id a sealed challenge id names: its first field. */
+function grantId(challengeId: string): string {
+  return challengeId.split(".")[0] ?? "";
+}
+
+/** Whether the challenge `challengeId` seals is recorded as spent. */
+function isSpent(state: DurableObjectState, challengeId: string): boolean {
+  return (
+    state.storage.sql
+      .exec("SELECT 1 FROM owner_spent_challenge WHERE challenge_id = ?", grantId(challengeId))
+      .toArray().length > 0
+  );
+}
+
+function rows(state: DurableObjectState, table: string): number {
+  return state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
+}
+
+/** `challengeId` with its field at `index` replaced by `field`. */
+function withField(challengeId: string, index: number, field: string): string {
+  const parts = challengeId.split(".");
+  parts[index] = field;
+  return parts.join(".");
 }
 
 describe("owner actions", () => {
@@ -540,13 +600,22 @@ describe("owner actions", () => {
     await withRepoOwner(async ({ owner, auth, userId, userHandle, repoId, grants }) => {
       const challenge = value(await owner.prepare(CONFIRM));
       expect(challenge).toMatchObject({ rpId: HOST, allowCredentials: [auth.credentialId] });
+      expect(challenge.challengeId).toMatch(
+        /^pkc_[0-9a-f]{32}\.[0-9]+\.[\w-]{43}\.[\w-]+\.[\w-]{43}$/,
+      );
       const assertion = await auth.assert(challenge.challenge, userHandle);
       expect(await owner.perform(challenge.challengeId, assertion)).toEqual({
         ok: true,
         value: { kind: "agent.confirm", agentId: "agt_atlas01" },
       });
       expect(grants).toEqual([
-        { kind: "human", userId, repoId, grantId: challenge.challengeId, action: CONFIRM },
+        {
+          kind: "human",
+          userId,
+          repoId,
+          grantId: grantId(challenge.challengeId),
+          action: CONFIRM,
+        },
       ]);
     });
   });
@@ -595,15 +664,27 @@ describe("owner actions", () => {
         code: "proof_invalid",
       });
       expect(grants).toEqual([]);
-      expect(consumedAt(state, confirm.challengeId)).toBeNull();
-      expect(consumedAt(state, revoke.challengeId)).toBeNull();
+      expect(isSpent(state, confirm.challengeId)).toBe(false);
+      expect(isSpent(state, revoke.challengeId)).toBe(false);
       // A tampered signature is refused without consuming the challenge.
       const tampered = { ...forRevoke, signature: forRevoke.signature.slice(0, -4) + "AAAA" };
       expect(await owner.perform(revoke.challengeId, tampered)).toMatchObject({
         ok: false,
         code: "proof_invalid",
       });
-      expect(consumedAt(state, revoke.challengeId)).toBeNull();
+      expect(isSpent(state, revoke.challengeId)).toBe(false);
+      // The other challenge's action sealed into this one's id breaks the seal.
+      const swapped = withField(confirm.challengeId, 3, revoke.challengeId.split(".")[3] ?? "");
+      expect(await owner.perform(swapped, forRevoke)).toMatchObject({
+        ok: false,
+        code: "proof_invalid",
+      });
+      expect(grants).toEqual([]);
+      // Both challenges still work for their own action.
+      value(await owner.perform(revoke.challengeId, forRevoke));
+      value(
+        await owner.perform(confirm.challengeId, await auth.assert(confirm.challenge, userHandle)),
+      );
     });
   });
 
@@ -643,7 +724,7 @@ describe("owner actions", () => {
         );
         // The action's own writes rolled back; the consumption did not.
         expect(EventLog.open(state.storage, repoId).head()).toBe(0);
-        expect(consumedAt(state, throwing.challengeId)).toEqual(expect.any(Number));
+        expect(isSpent(state, throwing.challengeId)).toBe(true);
         expect(await restart().perform(throwing.challengeId, throwingProof)).toMatchObject({
           code: "proof_expired",
         });
@@ -667,23 +748,58 @@ describe("owner actions", () => {
     expect(calls).toBe(2);
   });
 
-  it("refuses expired, unknown and malformed challenges without acting", async () => {
-    await withRepoOwner(async ({ owner, auth, userHandle, grants, clock }) => {
+  it("refuses expired, forged and malformed challenges without acting", async () => {
+    await withRepoOwner(async ({ owner, auth, userHandle, grants, clock, state }) => {
       const challenge = value(await owner.prepare(CONFIRM));
       const assertion = await auth.assert(challenge.challenge, userHandle);
+      const { challengeId } = challenge;
+      // A seal that is not this repository's, or fields the seal does not cover.
+      const forged = [
+        withField(challengeId, 4, b64url(new Uint8Array(32))),
+        withField(challengeId, 0, `pkc_${"0".repeat(32)}`),
+        withField(challengeId, 1, String(challenge.expiresAt + 60_000)),
+        withField(challengeId, 2, b64url(new Uint8Array(32))),
+        withField(challengeId, 3, b64url(enc.encode(JSON.stringify(REVOKE)))),
+      ];
+      for (const id of forged) {
+        expect(await owner.perform(id, assertion)).toMatchObject({
+          ok: false,
+          code: "proof_invalid",
+        });
+      }
+      const malformed = [
+        "chl_x",
+        `pkc_${"0".repeat(32)}`,
+        `${challengeId}.x`,
+        withField(challengeId, 1, "0"),
+        withField(challengeId, 3, "not base64url!"),
+        withField(challengeId, 3, b64url(enc.encode("{"))),
+        `${challengeId}${"A".repeat(MAX_SEALED_CHALLENGE_LENGTH)}`,
+      ];
+      for (const id of malformed) {
+        expect(await owner.perform(id, assertion)).toMatchObject({
+          ok: false,
+          code: "invalid_request",
+        });
+      }
       clock.now = challenge.expiresAt;
-      expect(await owner.perform(challenge.challengeId, assertion)).toMatchObject({
+      expect(await owner.perform(challengeId, assertion)).toMatchObject({
         ok: false,
         code: "proof_expired",
       });
-      expect(await owner.perform(`pkc_${"0".repeat(32)}`, assertion)).toMatchObject({
-        ok: false,
-        code: "proof_expired",
-      });
-      expect(await owner.perform("chl_x", assertion)).toMatchObject({
-        ok: false,
-        code: "invalid_request",
-      });
+      expect(rows(state, "owner_spent_challenge")).toBe(0);
+      // The largest action still yields an id within the stated bound, read back intact.
+      const empty = JSON.stringify({ kind: "issue.file", title: "t", body: "" }).length;
+      const largest = value(
+        await owner.prepare({
+          kind: "issue.file",
+          title: "t",
+          body: "b".repeat(MAX_ACTION_BYTES - empty),
+        }),
+      );
+      expect(largest.challengeId.length).toBeLessThanOrEqual(MAX_SEALED_CHALLENGE_LENGTH);
+      await owner.perform(largest.challengeId, await auth.assert(largest.challenge, userHandle));
+      expect(isSpent(state, largest.challengeId)).toBe(true);
       expect(
         await owner.prepare({ kind: "issue.file", title: "t", body: "b".repeat(70_000) }),
       ).toMatchObject({ ok: false, code: "invalid_request" });
@@ -691,12 +807,46 @@ describe("owner actions", () => {
     });
   });
 
-  it("bounds open challenges and frees the slots of expired ones", async () => {
-    await withRepoOwner(async ({ owner, clock }) => {
-      for (let n = 0; n < MAX_OPEN_ACTION_CHALLENGES; n += 1) value(await owner.prepare(REVOKE));
-      expect(await owner.prepare(REVOKE)).toMatchObject({ ok: false, code: "quota_exceeded" });
-      clock.now += 2 * 60_000;
-      value(await owner.prepare(REVOKE));
+  it("issues challenges to any caller without storing them, and still serves the owner", async () => {
+    await withRepoOwner(async ({ owner, auth, userHandle, grants, state }) => {
+      // Far more than any open-challenge quota would have allowed.
+      for (let n = 0; n < 200; n += 1) value(await owner.prepare(REVOKE));
+      expect(rows(state, "owner_spent_challenge")).toBe(0);
+      expect(rows(state, "owner_seal_key")).toBe(1);
+      const challenge = value(await owner.prepare(REVOKE));
+      const proof = await auth.assert(challenge.challenge, userHandle);
+      expect(await owner.perform(challenge.challengeId, proof)).toEqual({
+        ok: true,
+        value: { kind: "agent.revoke", agentId: "agt_atlas01" },
+      });
+      expect(grants).toHaveLength(1);
+    });
+  });
+
+  it("keeps a spent challenge only until it expires", async () => {
+    await withRepoOwner(async ({ owner, auth, userHandle, state, clock, restart }) => {
+      const first = value(await owner.prepare(CONFIRM));
+      const firstProof = await auth.assert(first.challenge, userHandle);
+      value(await owner.perform(first.challengeId, firstProof));
+      expect(rows(state, "owner_spent_challenge")).toBe(1);
+      // A restarted module reads the same seal key and the same spent record.
+      expect(await restart().perform(first.challengeId, firstProof)).toMatchObject({
+        code: "proof_expired",
+      });
+      clock.now = first.expiresAt;
+      const second = value(await owner.prepare(REVOKE));
+      value(
+        await restart().perform(
+          second.challengeId,
+          await auth.assert(second.challenge, userHandle),
+        ),
+      );
+      // Spending the second pruned the first, whose expiry already made it unusable.
+      expect(isSpent(state, first.challengeId)).toBe(false);
+      expect(isSpent(state, second.challengeId)).toBe(true);
+      expect(await owner.perform(first.challengeId, firstProof)).toMatchObject({
+        code: "proof_expired",
+      });
     });
   });
 
@@ -743,11 +893,7 @@ describe("owner actions", () => {
         relyingParty: party(),
       });
       expect(await owner.prepare(CONFIRM)).toMatchObject({ ok: false, code: "unavailable" });
-      expect(
-        state.storage.sql
-          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM owner_action_challenge")
-          .one().n,
-      ).toBe(0);
+      expect(rows(state, "owner_spent_challenge")).toBe(0);
     });
   });
 });
@@ -799,6 +945,21 @@ describe("human-only actions through the Worker", () => {
     if (!opened.ok) throw new Error(opened.code);
     using board = opened.value;
     using owner = await board.owner();
+
+    // An anonymous session asks for more challenges than any open-challenge quota would allow.
+    const other = await SELF.fetch(`${ORIGIN}${API_PATH}`, { headers: { Upgrade: "websocket" } });
+    const otherSocket = other.webSocket;
+    if (otherSocket === null) throw new Error("no WebSocket");
+    otherSocket.accept();
+    using anonymous = newWebSocketRpcSession<RailheadApi>(otherSocket);
+    const anonymousBoard = await anonymous.openBoard("acme", name);
+    if (!anonymousBoard.ok) throw new Error(anonymousBoard.code);
+    using anonymousOwner = await anonymousBoard.value.owner();
+    const flood = await Promise.all(
+      Array.from({ length: 40 }, () => anonymousOwner.prepare(REVOKE)),
+    );
+    expect(flood.every((r) => r.ok)).toBe(true);
+    anonymousBoard.value[Symbol.dispose]();
 
     const challenge = await owner.prepare(REVOKE);
     if (!challenge.ok) throw new Error(challenge.code);

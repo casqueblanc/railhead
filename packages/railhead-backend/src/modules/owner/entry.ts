@@ -1,13 +1,17 @@
 // Owner: the human-only actions on one repository, each performed once for one passkey assertion
 // bound to it, and the enrollment of the instance owner's passkey.
 //
-// `prepare` stores a challenge naming the exact action; the WebAuthn challenge the browser signs is
-// a digest of that action, the repository, the challenge id, a nonce and the expiry. `perform`
-// verifies the assertion against the instance owner's passkey and then consumes the challenge in
-// its own committed transaction before it builds the `HumanGrant` and hands it to the one port that
-// performs that action kind. A consumed challenge stays consumed whatever the action does next: an
-// action that fails or rolls back cannot be retried with the same proof, so a proof authorizes at
-// most one attempt, and of concurrent replays at most one gets that far.
+// `prepare` stores nothing. It seals the exact action, a challenge id, a nonce and the expiry into
+// the challenge id it returns, under an HMAC key that never leaves the repository's storage; the
+// WebAuthn challenge the browser signs is a digest of the same fields. So anyone may ask for a
+// challenge, but asking costs the repository no storage and cannot crowd out the owner's.
+// `perform` checks the seal, verifies the assertion against the instance owner's passkey and only
+// then records the challenge as spent, in its own committed transaction, before it builds the
+// `HumanGrant` and hands it to the one port that performs that action kind. Only assertions the
+// owner signed are recorded, each until its challenge expires. A spent challenge stays spent
+// whatever the action does next: an action that fails or rolls back cannot be retried with the
+// same proof, so a proof authorizes at most one attempt, and of concurrent replays at most one
+// gets that far.
 
 import {
   ACTION_CHALLENGE_TTL_MS,
@@ -31,7 +35,7 @@ import type { HumanGrant } from "../../contracts/principals";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import type { ModuleFactory, RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { atomically, migrate } from "../../repo/storage";
-import { randomBase64Url, randomHex } from "./encoding";
+import { decodeBase64Url, encodeBase64Url, randomBase64Url, randomHex } from "./encoding";
 import type { OwnerCredential } from "./instance";
 import { OWNER_OBJECT_NAME } from "./OwnerObject";
 
@@ -62,25 +66,31 @@ export interface InstanceOwnerPort {
   recordSignCount(credentialId: string, signCount: number): Promise<boolean>;
 }
 
-/** The most unconsumed, unexpired action challenges one repository holds. */
-export const MAX_OPEN_ACTION_CHALLENGES = 32;
-
 /** The largest action, in bytes of its JSON, a challenge may be bound to. */
 export const MAX_ACTION_BYTES = 64 * 1024;
 
-const CHALLENGE_ID = /^pkc_[0-9a-f]{32}$/;
+/** The longest sealed challenge id `prepare` issues, for the largest action. */
+export const MAX_SEALED_CHALLENGE_LENGTH = 4 * Math.ceil(MAX_ACTION_BYTES / 3) + 256;
+
+/** Domain separator for the seal; the version names the layout of the sealed fields. */
+const SEAL_DOMAIN = "railhead-owner-challenge-v1";
+
+/** The id part of a sealed challenge: what the WebAuthn challenge and the grant name. */
+const GRANT_ID = /^pkc_[0-9a-f]{32}$/;
+const EXPIRY = /^[1-9][0-9]{0,15}$/;
 
 /** The migration owner name of the owner module's table in each repository. */
 const OWNER_REPO = "owner";
 
 /** Released schema steps. Append a step to change it; never edit one. */
 const MIGRATIONS: readonly string[] = [
-  `CREATE TABLE owner_action_challenge (
+  `CREATE TABLE owner_seal_key (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    key BLOB NOT NULL
+  ) STRICT`,
+  `CREATE TABLE owner_spent_challenge (
     challenge_id TEXT PRIMARY KEY,
-    action TEXT NOT NULL,
-    nonce TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    consumed_at INTEGER
+    expires_at INTEGER NOT NULL
   ) STRICT`,
 ];
 
@@ -124,8 +134,8 @@ export function createOwner(
 
   return {
     async prepare(action) {
-      const encoded = JSON.stringify(action);
-      if (new TextEncoder().encode(encoded).length > MAX_ACTION_BYTES) {
+      const encoded = new TextEncoder().encode(JSON.stringify(action));
+      if (encoded.length > MAX_ACTION_BYTES) {
         return fail("invalid_request", "The action is too large.");
       }
       if (party === undefined) return misconfigured();
@@ -140,44 +150,40 @@ export function createOwner(
       };
       const digest = await actionChallenge(party, binding);
       if (!digest.ok) return misconfigured();
-      const now = clock();
-      return atomically(storage, () => {
-        sql.exec("DELETE FROM owner_action_challenge WHERE expires_at <= ?", now);
-        const open = sql
-          .exec<{ n: number }>(
-            "SELECT COUNT(*) AS n FROM owner_action_challenge WHERE consumed_at IS NULL",
-          )
-          .one().n;
-        if (open >= MAX_OPEN_ACTION_CHALLENGES) {
-          return fail("quota_exceeded", "Too many owner actions are waiting for a passkey.");
-        }
-        sql.exec(
-          "INSERT INTO owner_action_challenge (challenge_id, action, nonce, expires_at) VALUES (?, ?, ?, ?)",
-          binding.challengeId,
-          encoded,
-          binding.nonce,
-          binding.expiresAt,
-        );
-        return ok({
-          challengeId: binding.challengeId,
-          challenge: digest.challenge,
-          rpId: party.rpId,
-          allowCredentials: [enrolled.credential.credentialId],
-          expiresAt: binding.expiresAt,
-        });
+      const fields = [
+        binding.challengeId,
+        String(binding.expiresAt),
+        binding.nonce,
+        encodeBase64Url(encoded),
+      ].join(".");
+      const seal = await crypto.subtle.sign("HMAC", await sealKey(), sealed(fields));
+      return ok({
+        challengeId: `${fields}.${encodeBase64Url(new Uint8Array(seal))}`,
+        challenge: digest.challenge,
+        rpId: party.rpId,
+        allowCredentials: [enrolled.credential.credentialId],
+        expiresAt: binding.expiresAt,
       });
     },
 
-    async perform(challengeId, assertion) {
-      if (!CHALLENGE_ID.test(challengeId)) {
+    async perform(sealedId, assertion) {
+      const opened = parseSealed(sealedId);
+      if (opened === undefined) {
         return fail("invalid_request", "That is not an action challenge id.");
       }
       if (party === undefined) return misconfigured();
-      const stored = readChallenge(challengeId);
-      if (stored === null) return spent();
+      const intact = await crypto.subtle.verify(
+        "HMAC",
+        await sealKey(),
+        opened.seal,
+        sealed(opened.fields),
+      );
+      if (!intact) return fail("proof_invalid", "That action challenge was not issued here.");
+      const { binding } = opened;
+      const { challengeId } = binding;
+      if (binding.expiresAt <= clock() || isSpent(challengeId)) return spent();
       const enrolled = await instance.credential();
       if (enrolled === null) return fail("proof_invalid", "No owner passkey is enrolled.");
-      const binding: ActionBinding = { repoId, challengeId, ...stored };
       const verdict = await verifyActionAssertion({
         relyingParty: party,
         binding,
@@ -192,20 +198,22 @@ export function createOwner(
           : fail(code, "The passkey assertion did not verify for this action.");
       }
 
-      // Consume before acting, in a transaction of its own, so neither a concurrent replay nor an
+      // Spend before acting, in a transaction of its own, so neither a concurrent replay nor an
       // action that fails afterwards can use this proof again.
       const now = clock();
-      const consumed = atomically(
-        storage,
-        () =>
-          sql.exec(
-            `UPDATE owner_action_challenge SET consumed_at = ?
-              WHERE challenge_id = ? AND consumed_at IS NULL AND expires_at > ?`,
-            now,
+      const consumed = atomically(storage, () => {
+        if (binding.expiresAt <= now) return 0;
+        sql.exec("DELETE FROM owner_spent_challenge WHERE expires_at <= ?", now);
+        // `RETURNING` counts the inserted row alone; `rowsWritten` would count index writes too.
+        return sql
+          .exec(
+            `INSERT INTO owner_spent_challenge (challenge_id, expires_at) VALUES (?, ?)
+              ON CONFLICT DO NOTHING RETURNING challenge_id`,
             challengeId,
-            now,
-          ).rowsWritten,
-      );
+            binding.expiresAt,
+          )
+          .toArray().length;
+      });
       if (consumed !== 1) return spent();
       const counted = await instance.recordSignCount(
         enrolled.credential.credentialId,
@@ -224,21 +232,72 @@ export function createOwner(
     },
   };
 
-  function readChallenge(
-    challengeId: string,
-  ): Pick<ActionBinding, "nonce" | "expiresAt" | "action"> | null {
-    const row = sql
-      .exec<{ action: string; nonce: string; expires_at: number }>(
-        `SELECT action, nonce, expires_at FROM owner_action_challenge
-          WHERE challenge_id = ? AND consumed_at IS NULL AND expires_at > ?`,
-        challengeId,
-        clock(),
-      )
-      .toArray()[0];
-    if (row === undefined) return null;
-    // Written by `prepare` from an action the RPC boundary validated; read back as stored.
-    const action: OwnerAction = JSON.parse(row.action);
-    return { nonce: row.nonce, expiresAt: row.expires_at, action };
+  /** This repository's seal key, made on first use. */
+  async function sealKey(): Promise<CryptoKey> {
+    sql.exec(
+      "INSERT INTO owner_seal_key (id, key) VALUES (1, ?) ON CONFLICT DO NOTHING",
+      crypto.getRandomValues(new Uint8Array(32)),
+    );
+    const { key } = sql.exec<{ key: ArrayBuffer }>("SELECT key FROM owner_seal_key").one();
+    return crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, [
+      "sign",
+      "verify",
+    ]);
+  }
+
+  /** What the seal covers: the domain, this repository and the sealed fields. */
+  function sealed(fields: string): Uint8Array {
+    return new TextEncoder().encode(`${SEAL_DOMAIN}\n${repoId}\n${fields}`);
+  }
+
+  function isSpent(challengeId: string): boolean {
+    return (
+      sql.exec("SELECT 1 FROM owner_spent_challenge WHERE challenge_id = ?", challengeId).toArray()
+        .length > 0
+    );
+  }
+
+  /**
+   * Splits a sealed challenge id into its fields, its seal and the binding the fields name, or
+   * returns `undefined` when it is not shaped like one. The seal is not checked here.
+   */
+  function parseSealed(
+    text: string,
+  ): { fields: string; seal: Uint8Array<ArrayBuffer>; binding: ActionBinding } | undefined {
+    if (text.length > MAX_SEALED_CHALLENGE_LENGTH) return undefined;
+    const parts = text.split(".");
+    if (parts.length !== 5) return undefined;
+    const [challengeId, expiry, nonce, action, seal] = parts;
+    if (
+      challengeId === undefined ||
+      !GRANT_ID.test(challengeId) ||
+      expiry === undefined ||
+      !EXPIRY.test(expiry) ||
+      nonce === undefined ||
+      decodeBase64Url(nonce, 32) === undefined ||
+      action === undefined ||
+      seal === undefined
+    ) {
+      return undefined;
+    }
+    const actionBytes = decodeBase64Url(action, MAX_ACTION_BYTES);
+    const sealBytes = decodeBase64Url(seal, 32);
+    if (actionBytes === undefined || sealBytes === undefined) return undefined;
+    let parsed: OwnerAction;
+    try {
+      // Sealed by `prepare` from an action the RPC boundary validated; trusted once the seal checks.
+      parsed = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(actionBytes),
+      );
+    } catch (error) {
+      if (error instanceof SyntaxError || error instanceof TypeError) return undefined;
+      throw error;
+    }
+    return {
+      fields: [challengeId, expiry, nonce, action].join("."),
+      seal: sealBytes,
+      binding: { repoId, challengeId, nonce, expiresAt: Number(expiry), action: parsed },
+    };
   }
 }
 
