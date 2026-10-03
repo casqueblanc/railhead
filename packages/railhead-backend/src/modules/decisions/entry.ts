@@ -1,8 +1,9 @@
-// Decisions: questions and versioned decisions. Until its task installs the module, every asynchronous call refuses with `unavailable`, the synchronous fence reader `currentVersions` returns `null` (unknown, so callers refuse), and no call has an effect.
+// Decisions: questions, versioned decisions and the claims that depend on them.
 
 import type { DecisionsPort } from "../../contracts/decisions";
-import { unavailableDecisions } from "../../contracts/unavailable";
 import type { ModuleFactory } from "../../repo/composeRepo";
+import { createDecisions } from "./decisions";
 
 /** Builds the decisions module of one repository. */
-export const decisions: ModuleFactory<DecisionsPort> = () => unavailableDecisions;
+export const decisions: ModuleFactory<DecisionsPort> = (context, ports) =>
+  createDecisions(context, ports);

@@ -454,6 +454,7 @@ describe("unavailable ports", () => {
           requestId: "req_upload0000000001",
           text: "q",
           options: [],
+          scope: [],
         }),
     ],
     ["decisions.question", () => unavailableDecisions.question(agent, "qst_upload1", 0)],
