@@ -25,8 +25,13 @@
 // row stays but is marked exhausted, and no alarm is asked for it; the next drive any call starts
 // restores it with a fresh count. Neither a backoff nor exhaustion outlasts a requested attempt's
 // deadline: the wake stays due by then, so the attempt expires even when no port answers again.
+// Nor does exhaustion stop the train while the active batch's merge intent is authorized with a
+// write attempt counted: that write may have moved main unheard, and no call may come to read main
+// back. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
+// exhausted, so the intent settles once Git answers or the write's outcome window has passed.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
-// A restarted train asks again for the wake it owes.
+// A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
+// exhausted one only while such an intent is unsettled.
 //
 // The claims module queues a pin inside the transaction that records `ready`, so a pin and its
 // queue entry commit together and a repeated `ready` queues nothing. Each such call is a new ready
@@ -155,11 +160,21 @@ export const CHECK_DEADLINE_MS = 60 * 60_000;
  * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
  * all. After that the train stops asking and logs `train.wake_exhausted`; its work stays in storage
  * with a wake row marked `EXHAUSTED_FAILURES`, and the next `queue` or `recordCheck` drives it
- * again. A requested check attempt keeps one wake at its deadline, which expires it without a port.
+ * again. A requested check attempt keeps one wake at its deadline, which expires it without a port,
+ * and an unsettled merge intent keeps one every `SETTLE_WAKE_MS`, which reads main back.
  */
 export const MAX_WAKE_FAILURES = 24;
 
-/** The failure count of a wake row whose retries ran out: it is kept, but no alarm is asked for. */
+/**
+ * How long an exhausted wake waits between drives while the active batch's merge intent may have
+ * moved main unheard.
+ */
+export const SETTLE_WAKE_MS = 60 * 60_000;
+
+/**
+ * The failure count of a wake row whose retries ran out: it is kept, and no alarm is asked for it
+ * unless the active batch's merge intent is unsettled.
+ */
 export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
 
 /**
@@ -228,9 +243,9 @@ type Step = { kind: "continue" } | { kind: "stop"; outcome: DriveOutcome };
 type Debt =
   /**
    * A call accepted work or a drive starts: stored work is due now, and the alarm at `alarmAt`
-   * resumes it if the drive never settles.
+   * resumes it if the drive never settles. `settling` marks a drive of the slow settle wake.
    */
-  | { kind: "start"; alarmAt: number }
+  | { kind: "start"; alarmAt: number; settling?: boolean }
   /** A drive ran clean. */
   | { kind: "clean" }
   /** A drive stopped on a port, threw or was superseded. */
@@ -275,16 +290,18 @@ export function createTrain(
   const sql = context.storage.sql;
   let running: Running | null = null;
 
-  // A restarted train asks again for the wake it owes: the alarm may never have been set.
+  // A restarted train asks again for the wake it owes: the alarm may never have been set. Whether
+  // an exhausted wake is still owed needs the authorization port, which `resume` reads.
   const owed = readWake(sql);
-  if (owed !== null && !isExhausted(owed)) context.wake(owed.dueAt);
+  if (owed !== null) context.wake(owed.dueAt);
 
-  function drive(): Promise<DriveOutcome> {
+  /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
+  function drive(settling = false): Promise<DriveOutcome> {
     if (running !== null) {
       running.drive.again = true;
       return running.promise;
     }
-    return startDrive();
+    return startDrive(settling);
   }
 
   /**
@@ -292,13 +309,13 @@ export function createTrain(
    * the stored work commit together before any port is called, so a drive that restarts exhausted
    * work is resumed by the alarm even when the object stops before the drive settles.
    */
-  function startDrive(): Promise<DriveOutcome> {
+  function startDrive(settling: boolean): Promise<DriveOutcome> {
     const now = clock();
     const generation = context.storage.transactionSync((): number => {
       const next = (readDrive(sql)?.generation ?? 0) + 1;
       const leaseUntil = now + DRIVE_LEASE_MS;
       writeDrive(sql, { generation: next, leaseUntil });
-      recordDebt(now, { kind: "start", alarmAt: leaseUntil });
+      recordDebt(now, { kind: "start", alarmAt: leaseUntil, settling });
       return next;
     });
     const current: Drive = { generation, again: false };
@@ -409,8 +426,10 @@ export function createTrain(
     switch (debt.kind) {
       case "start": {
         if (!owesWork(sql)) return false;
-        // Restarting exhausted work grants a fresh count; any other start keeps the count so far.
-        const failures = wake === null || isExhausted(wake) ? 0 : wake.failures;
+        // Restarting exhausted work grants a fresh count, unless the slow settle wake restarts it;
+        // any other start keeps the count so far.
+        const fresh = wake === null || (isExhausted(wake) && debt.settling !== true);
+        const failures = fresh ? 0 : wake.failures;
         writeWake(sql, { dueAt: now, failures });
         context.wake(debt.alarmAt);
         return false;
@@ -429,9 +448,12 @@ export function createTrain(
         const deadline = pendingDeadline();
         if (failures > MAX_WAKE_FAILURES) {
           if (deadline !== null) writeWakeIn({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
-          else if (owesWork(sql)) writeWake(sql, { dueAt: now, failures: EXHAUSTED_FAILURES });
+          else if (owesSettlement()) {
+            writeWakeIn({ dueAt: now + SETTLE_WAKE_MS, failures: EXHAUSTED_FAILURES });
+          } else if (owesWork(sql)) writeWake(sql, { dueAt: now, failures: EXHAUSTED_FAILURES });
           else clearWake(sql);
-          return true;
+          // A settle drive that fails again was already exhausted, so it is not reported again.
+          return wake === null || !isExhausted(wake);
         }
         const retryAt = now + wakeDelay(failures);
         writeWakeIn({ dueAt: deadline === null ? retryAt : Math.min(retryAt, deadline), failures });
@@ -446,6 +468,17 @@ export function createTrain(
   function writeWakeIn(wake: PendingWake): void {
     writeWake(sql, wake);
     context.wake(wake.dueAt);
+  }
+
+  /**
+   * Whether the active batch's merge intent is authorized with a write attempt counted, so main may
+   * have moved without the train hearing it. Reads only the Repo's storage.
+   */
+  function owesSettlement(): boolean {
+    const batch = activeBatch(sql);
+    if (batch?.state !== "passed" || batch.intentId === null) return false;
+    const intent = ports().authorization.record(batch.intentId);
+    return intent?.status === "authorized" && intent.attempts > 0;
   }
 
   /** The deadline of the active batch's started attempt, or `null`. */
@@ -856,9 +889,9 @@ export function createTrain(
    * result into a thrown error; the drive has already asked for its retry. The error is logged by
    * name only, never with its message, which may carry a port's text.
    */
-  async function driveLogged(): Promise<void> {
+  async function driveLogged(settling = false): Promise<void> {
     try {
-      await drive();
+      await drive(settling);
     } catch (error) {
       const name = error instanceof Error ? error.name : "unknown";
       console.error(
@@ -869,8 +902,11 @@ export function createTrain(
 
   async function resume(): Promise<void> {
     const owedNow = readWake(sql);
-    // Exhausted work waits for a call; an alarm another module asked for does not restart it.
-    if (owedNow === null || isExhausted(owedNow)) return;
+    if (owedNow === null) return;
+    // Exhausted work waits for a call, and an alarm another module asked for does not restart it,
+    // unless a write to main may have landed unheard.
+    const settling = isExhausted(owedNow);
+    if (settling && !owesSettlement()) return;
     const now = clock();
     // Another module's alarm may fire first; ask again for this train's own time.
     if (owedNow.dueAt > now) {
@@ -898,7 +934,7 @@ export function createTrain(
         }),
       );
     }
-    await driveLogged();
+    await driveLogged(settling);
   }
 
   function attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null {

@@ -25,6 +25,7 @@ import {
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
   PORT_TIMEOUT_MS,
+  SETTLE_WAKE_MS,
   WAKE_BASE_MS,
   WAKE_MAX_MS,
   type Train,
@@ -1675,6 +1676,35 @@ describe("train batch fence", () => {
       await train.resume();
       expect(lastStarted(fakes)).toMatchObject({ pins: [pin(1)], decisions: [] });
       expect(train.entries(1)[0]).toMatchObject({ state: "batched" });
+    }, fakes);
+  });
+});
+
+describe("train settle wake", () => {
+  it("drives exhausted work with no unsettled intent only on a call, even after a restart", async () => {
+    const fakes = new Fakes();
+    fakes.authorize = () => fail("unavailable", "Authorization offline.");
+    await withTrain(async ({ train, sql, wakes, restart, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      while (owed(sql).failures <= MAX_WAKE_FAILURES) {
+        advance(owed(sql).dueAt - now());
+        await train.resume();
+      }
+      expect(owed(sql)).toEqual({ dueAt: now(), failures: EXHAUSTED_FAILURES });
+      const authorizations = fakes.authorized.length;
+
+      // The restarted train asks for the wake it holds, but its alarm drives nothing, since no
+      // intent was authorized, and asks for nothing more.
+      const again = restart();
+      expect(wakes.at(-1)).toBe(now());
+      const asked = wakes.length;
+      advance(SETTLE_WAKE_MS);
+      await again.resume();
+      expect(fakes.authorized).toHaveLength(authorizations);
+      expect(wakes).toHaveLength(asked);
+      expect(owed(sql).failures).toBe(EXHAUSTED_FAILURES);
     }, fakes);
   });
 });
