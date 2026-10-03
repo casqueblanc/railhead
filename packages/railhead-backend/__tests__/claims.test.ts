@@ -404,6 +404,22 @@ describe("allocation failures", () => {
     });
   });
 
+  it("records no base from a malformed main head, so a later retry still opens the claim", async () => {
+    await withClaims(async ({ port, sql }, world) => {
+      await fileIssues(port, 1);
+      world.mainHead = ok("not-a-commit");
+
+      expect(await port.work(agent(1))).toMatchObject({ ok: false, code: "internal" });
+      expect(world.fake.forkCalls).toBe(0);
+      expect(sql.exec("SELECT fork_base FROM claims_claims").toArray()).toEqual([
+        { fork_base: null },
+      ]);
+
+      world.mainHead = null;
+      expect(claimed(await port.work(agent(1))).claim.base).toBe(HEAD);
+    });
+  });
+
   it("refuses allocation in the installed composition, which has no main reader", async () => {
     await runInDurableObject(freshStub(), async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO);

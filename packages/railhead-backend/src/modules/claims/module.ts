@@ -12,7 +12,13 @@
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
 import type { ClaimResult, ClaimView } from "@railhead/shared/agent-api";
-import { isId, type ClaimId, type CommitSha, type IssueId } from "@railhead/shared/events";
+import {
+  isCommitSha,
+  isId,
+  type ClaimId,
+  type CommitSha,
+  type IssueId,
+} from "@railhead/shared/events";
 import type { ClaimsPort } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../../contracts/result";
@@ -92,6 +98,8 @@ export function createClaims(
     if (forkBase === null) {
       const head = await mainHead();
       if (!head.ok) return head;
+      // The base is written once, so a malformed answer must not become a claim's permanent base.
+      if (!isCommitSha(head.value)) return fail("internal", "Main's head is not a commit id.");
       log.transaction((tx) => recordForkBase(tx.sql, row.claimId, head.value));
       forkBase = current(row)?.forkBase ?? null;
       if (forkBase === null) return lost();
