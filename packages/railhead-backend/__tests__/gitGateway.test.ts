@@ -1657,44 +1657,59 @@ describe("invalid requests", () => {
 
 describe("bounds", () => {
   it("cuts off a client that stalls inside the push head, whether or not the claim admits it", async () => {
+    // A head limit no other timer shares, so arming it is unambiguous.
+    const limits: GitGatewayLimits = { ...FAST, headTimeoutMs: 150 };
     const cases: [ClaimState, number, string][] = [
       ["working", 408, "did not arrive in time"],
       ["ready", 403, "The claim is ready"],
     ];
     for (const [state, status, message] of cases) {
       await withGateway(async (world) => {
-        world.claim.state = state;
-        let cancelled = false;
-        let pulled = false;
-        // A length and half a command, then nothing: the head never completes and the body never ends.
-        const body = new ReadableStream<Uint8Array>({
-          pull(controller) {
-            if (pulled) return new Promise<void>(() => undefined);
-            pulled = true;
-            controller.enqueue(encoder.encode(`00b9${ZERO} ${HEAD} refs/he`));
-            return undefined;
-          },
-          cancel() {
-            cancelled = true;
-          },
-        });
-        const serving = tracked(
-          world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
-        );
-        await until(() => pulled);
-        await elapse(FAST.headTimeoutMs - 1);
-        expect(serving.settled, state).toBe(false);
-        // Cut off at the head's limit, well before the whole exchange's.
-        await elapse(1);
-        await until(() => serving.settled);
-        const response = await serving.promise;
-        expect(response.status, state).toBe(status);
-        expect(await response.text(), state).toContain(message);
-        expect(cancelled, state).toBe(true);
-        expect(world.minted(), state).toBe(0);
-        expect(world.seen, state).toEqual([]);
-        expect(pushedEvents(world), state).toEqual([]);
-      });
+        // The fake clock moves only once the head timer exists: the gateway authorizes the push
+        // before arming it, and under load that can lag the stream's first pull. Wrapped by hand,
+        // as in the next test, so the fake timers are the ones wrapped and restored.
+        const setTimer = globalThis.setTimeout;
+        let armed = false;
+        globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+          if (ms === limits.headTimeoutMs) armed = true;
+          return setTimer(handler, ms);
+        }) as typeof setTimeout;
+        try {
+          world.claim.state = state;
+          let cancelled = false;
+          let pulled = false;
+          // A length and half a command, then nothing: the head never completes and the body never ends.
+          const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (pulled) return new Promise<void>(() => undefined);
+              pulled = true;
+              controller.enqueue(encoder.encode(`00b9${ZERO} ${HEAD} refs/he`));
+              return undefined;
+            },
+            cancel() {
+              cancelled = true;
+            },
+          });
+          const serving = tracked(
+            world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
+          );
+          await until(() => armed);
+          await elapse(limits.headTimeoutMs - 1);
+          expect(serving.settled, state).toBe(false);
+          // Cut off at the head's limit, well before the whole exchange's.
+          await elapse(1);
+          await until(() => serving.settled);
+          const response = await serving.promise;
+          expect(response.status, state).toBe(status);
+          expect(await response.text(), state).toContain(message);
+          expect(cancelled, state).toBe(true);
+          expect(world.minted(), state).toBe(0);
+          expect(world.seen, state).toEqual([]);
+          expect(pushedEvents(world), state).toEqual([]);
+        } finally {
+          globalThis.setTimeout = setTimer;
+        }
+      }, limits);
     }
   });
 
