@@ -234,7 +234,6 @@ describe("unavailable modules", () => {
           target: { kind: "main" },
           operation: "fetch",
         }),
-        ports.sessions.authenticate(TOKEN),
       ]);
     });
 
@@ -490,8 +489,9 @@ describe("agent HTTP routes", () => {
       body,
       headers: { ...JSON_HEADERS, Authorization: `Bearer ${TOKEN}` },
     });
-    expect(withToken.status).toBe(503);
-    expect(await agentError(withToken, "claim")).toBe("unavailable");
+    // The token is not one this repository signed, whatever the body claims.
+    expect(withToken.status).toBe(401);
+    expect(await agentError(withToken, "claim")).toBe("unauthenticated");
     expect(await logHead(stub, repoId)).toBe(0);
   });
 
@@ -593,8 +593,9 @@ describe("agent HTTP routes", () => {
     const work = await agentRequest(name, "/work", {
       headers: { Authorization: `Bearer ${TOKEN}` },
     });
-    expect(work.status).toBe(503);
-    expect(await agentError(work, "work")).toBe("unavailable");
+    // A bodyless call reaches the Repo, whose sessions module refuses the unsigned token.
+    expect(work.status).toBe(401);
+    expect(await agentError(work, "work")).toBe("unauthenticated");
   });
 
   it("answer a repository nobody initialized with not_found", async () => {

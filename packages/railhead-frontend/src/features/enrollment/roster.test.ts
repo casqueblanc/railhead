@@ -4,14 +4,31 @@ import {
   SYNTH_GATEWAY,
   SYNTH_OWNER,
   SYNTH_REPO,
+  SYNTH_START_MS,
   syntheticLog,
 } from "../../../../../fixtures/board/syntheticLog";
 import { enrol } from "../../../../../fixtures/board/uploadSteps";
 import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
-import { codeProblem, inviteNameProblem, roster } from "./roster";
+import { codeProblem, inviteNameProblem, nextExpiry, roster } from "./roster";
 
 const fold = (events: readonly RailheadEvent[]): BoardState =>
   foldEvents(emptyBoardState(SYNTH_REPO), events);
+
+const FIFTEEN_MINUTES = 15 * 60_000;
+
+/** A log where cedar is invited and nobody joins, and when the log recorded the invite. */
+const cedarInvited = () => {
+  const { events } = syntheticLog("Synthetic invite", [
+    {
+      type: "agent.invited",
+      actor: SYNTH_OWNER,
+      data: { inviteId: "inv_synthcedar", name: "cedar" },
+    },
+  ]);
+  const invited = events.find((event) => event.type === "agent.invited");
+  if (invited === undefined) throw new Error("no invite in the log");
+  return { board: fold(events), invitedAt: invited.at };
+};
 
 describe("roster", () => {
   it("splits invites and agents by where each stands, ordered by name", () => {
@@ -44,16 +61,65 @@ describe("roster", () => {
     );
     expect(board.stream.kind).toBe("consistent");
 
-    const rows = roster(board);
+    // Long after every invite expired: dune's invite was used, so only cedar's shows as expired.
+    const rows = roster(board, SYNTH_START_MS + 4 * FIFTEEN_MINUTES);
 
-    expect(rows.invites.map((invite) => invite.name)).toEqual(["cedar"]);
+    expect(rows.invites).toEqual([]);
+    expect(rows.expired.map((invite) => invite.name)).toEqual(["cedar"]);
     expect(rows.awaiting.map((agent) => agent.name)).toEqual(["dune"]);
     expect(rows.confirmed.map((agent) => agent.name)).toEqual(["atlas"]);
     expect(rows.revoked.map((agent) => agent.name)).toEqual(["birch"]);
   });
 
+  it("lists an unused invite as open until the moment it expires, then as expired", () => {
+    const { board, invitedAt } = cedarInvited();
+    const cedar = {
+      inviteId: "inv_synthcedar",
+      name: "cedar",
+      expiresAt: invitedAt + FIFTEEN_MINUTES,
+    };
+
+    const before = roster(board, invitedAt + FIFTEEN_MINUTES - 1);
+    expect(before.invites).toEqual([cedar]);
+    expect(before.expired).toEqual([]);
+
+    const at = roster(board, invitedAt + FIFTEEN_MINUTES);
+    expect(at.invites).toEqual([]);
+    expect(at.expired).toEqual([cedar]);
+  });
+
+  it("keeps an invite open when the clock reads earlier than the log", () => {
+    const { board, invitedAt } = cedarInvited();
+
+    expect(roster(board, invitedAt - FIFTEEN_MINUTES).invites.map((i) => i.name)).toEqual([
+      "cedar",
+    ]);
+  });
+
   it("is empty for a log with no agents", () => {
-    expect(roster(fold([]))).toEqual({ invites: [], awaiting: [], confirmed: [], revoked: [] });
+    expect(roster(fold([]), SYNTH_START_MS)).toEqual({
+      invites: [],
+      expired: [],
+      awaiting: [],
+      confirmed: [],
+      revoked: [],
+    });
+  });
+});
+
+const invite = (name: string, expiresAt: number) => ({
+  inviteId: `inv_synth${name}` as const,
+  name,
+  expiresAt,
+});
+
+describe("nextExpiry", () => {
+  it("is the earliest expiry among the invites", () => {
+    expect(nextExpiry([invite("cedar", 300), invite("atlas", 100), invite("dune", 200)])).toBe(100);
+  });
+
+  it("is null when no invite is left to expire", () => {
+    expect(nextExpiry([])).toBeNull();
   });
 });
 
