@@ -24,7 +24,8 @@
 //
 // `train_conflicts` holds one row per conflicting pair the train parked, keyed by the batch whose
 // merge found it. While its state is `asking`, the train owes the owner a question about the pair,
-// so the row is work it owes a drive; once asked, it waits for the answer, found by its
+// so the row is work it owes a drive, due at `retry_at`; a refusal counts in `failures` and moves
+// `retry_at` later, and the question stays owed. Once asked, it waits for the answer, found by its
 // `decision_id`. The pair returns to the queue in the transaction that records the answer, when a
 // new ready of either claim arrives, when either claim is no longer held before the question is
 // asked, or when both are no longer held after it. `checked_at` orders asked pairs for that last
@@ -135,6 +136,10 @@ const MIGRATIONS: readonly string[] = [
   "CREATE INDEX train_conflicts_by_decision ON train_conflicts (decision_id)",
   "ALTER TABLE train_conflicts ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0",
   "CREATE INDEX train_conflicts_by_check ON train_conflicts (state, checked_at, batch_id)",
+  "ALTER TABLE train_conflicts ADD COLUMN failures INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE train_conflicts ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0",
+  // A refused question was once final; it is now owed again, with the backoff every refusal gets.
+  "UPDATE train_conflicts SET state = 'asking' WHERE state = 'refused'",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -781,8 +786,6 @@ export type ConflictState =
   | "asking"
   /** The question is asked; the pair waits for its answer. */
   | "asked"
-  /** The decisions module refused the question; the pair waits for a new ready of either claim. */
-  | "refused"
   /** The owner answered, and the pair returned to the queue. */
   | "answered"
   /** A new ready of one claim arrived, and the pair returned to the queue. */
@@ -806,6 +809,10 @@ export interface ConflictRecord {
   createdAt: number;
   /** When it last changed. */
   updatedAt: number;
+  /** The refusals of its question in a row. */
+  failures: number;
+  /** While asking, when the question is next due, in milliseconds since the Unix epoch. */
+  retryAt: number;
 }
 
 /** The queue entry a parked pair holds: a claim at one generation. */
@@ -817,7 +824,7 @@ export interface ConflictPin {
 }
 
 /** States in which a pair is still parked. */
-const OPEN_CONFLICT = "('asking', 'asked', 'refused')";
+const OPEN_CONFLICT = "('asking', 'asked')";
 
 type ConflictRow = {
   batch_id: number;
@@ -830,10 +837,12 @@ type ConflictRow = {
   decision_id: string | null;
   created_at: number;
   updated_at: number;
+  failures: number;
+  retry_at: number;
 };
 
 const CONFLICT_COLUMNS =
-  "batch_id, first_claim, first_generation, second_claim, second_generation, path, state, decision_id, created_at, updated_at";
+  "batch_id, first_claim, first_generation, second_claim, second_generation, path, state, decision_id, created_at, updated_at, failures, retry_at";
 
 /** Records a pair the batch's merge found conflicting, owing the owner a question about it. */
 export function insertConflict(
@@ -870,20 +879,44 @@ export function readConflict(sql: SqlStorage, batchId: number): ConflictRecord |
   return row === undefined ? null : toConflict(row);
 }
 
-/** Up to `limit` pairs in `state`, oldest first. */
-export function conflictsIn(
-  sql: SqlStorage,
-  state: ConflictState,
-  limit: number,
-): ConflictRecord[] {
-  return sql
+/** The oldest pair whose question is due at `now`, or `null`. */
+export function dueQuestion(sql: SqlStorage, now: number): ConflictRecord | null {
+  const row = sql
     .exec<ConflictRow>(
-      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE state = ? ORDER BY batch_id LIMIT ?`,
-      state,
-      limit,
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE state = 'asking' AND retry_at <= ?
+       ORDER BY batch_id LIMIT 1`,
+      now,
     )
-    .toArray()
-    .map(toConflict);
+    .toArray()[0];
+  return row === undefined ? null : toConflict(row);
+}
+
+/** When the earliest owed question is due, or `null` when none is owed. */
+export function nextQuestionAt(sql: SqlStorage): number | null {
+  const row = sql
+    .exec<{ due: number | null }>(
+      "SELECT MIN(retry_at) AS due FROM train_conflicts WHERE state = 'asking'",
+    )
+    .toArray()[0];
+  return row?.due ?? null;
+}
+
+/** Records a refusal of the pair's question, which stays owed and is next due at `retryAt`. */
+export function deferQuestion(
+  sql: SqlStorage,
+  batchId: number,
+  failures: number,
+  retryAt: number,
+  now: number,
+): void {
+  sql.exec(
+    `UPDATE train_conflicts SET failures = ?, retry_at = ?, updated_at = ?
+     WHERE batch_id = ? AND state = 'asking'`,
+    failures,
+    retryAt,
+    now,
+    batchId,
+  );
 }
 
 /** The asked pair whose question opened `decisionId`, or `null`. */
@@ -1054,20 +1087,23 @@ export function owesWork(sql: SqlStorage): boolean {
 }
 
 /**
- * Whether storage holds work a drive could move now: a question owed about a parked pair, an active
- * batch that is not waiting for a runner's report, or a waiting pin with no batch active.
+ * Whether storage holds work a drive could move at `now`: a question about a parked pair due by
+ * then, an active batch that is not waiting for a runner's report, or a waiting pin with no batch
+ * active.
  */
-export function hasMovableWork(sql: SqlStorage): boolean {
+export function hasMovableWork(sql: SqlStorage, now: number): boolean {
   const row = sql
     .exec<{ movable: number }>(
       `SELECT CASE
-         WHEN EXISTS (SELECT 1 FROM train_conflicts WHERE state = 'asking') THEN 1
+         WHEN EXISTS (SELECT 1 FROM train_conflicts WHERE state = 'asking' AND retry_at <= ?)
+           THEN 1
          WHEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
            THEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1
              AND (state IN ('composing', 'passed')
                OR (state = 'checking' AND check_started = 0 AND check_held = 0)))
          ELSE EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued')
        END AS movable`,
+      now,
     )
     .toArray()[0];
   return row?.movable === 1;
@@ -1128,10 +1164,12 @@ function toConflict(row: ConflictRow): ConflictRecord {
     decisionId: row.decision_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    failures: row.failures,
+    retryAt: row.retry_at,
   };
 }
 
-const CONFLICT_STATES = ["asking", "asked", "refused", "answered", "redone", "closed"] as const;
+const CONFLICT_STATES = ["asking", "asked", "answered", "redone", "closed"] as const;
 const ENTRY_STATES = ["queued", "batched", "landed", "dropped", "parked"] as const;
 const DROP_REASONS = [
   "pin_changed",

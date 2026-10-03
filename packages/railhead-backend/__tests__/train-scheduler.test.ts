@@ -31,6 +31,8 @@ import {
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
   PORT_TIMEOUT_MS,
+  QUESTION_BASE_MS,
+  QUESTION_MAX_MS,
   SETTLE_WAKE_MS,
   WAKE_BASE_MS,
   WAKE_MAX_MS,
@@ -47,6 +49,7 @@ import {
   settleConflict,
   settleEntry,
   writeWake,
+  type ConflictRecord,
   type ConflictState,
   type PendingWake,
 } from "../src/modules/train/store";
@@ -888,6 +891,13 @@ function conflictStates(sql: SqlStorage): Partial<Record<ConflictState, number>>
   );
 }
 
+/** The newest pair, which must still owe its question. */
+function owedQuestion(train: Train): ConflictRecord {
+  const [conflict] = train.conflicts(1);
+  if (conflict?.state !== "asking") throw new Error("the train owes no question");
+  return conflict;
+}
+
 /** Queues pins 1 and 3 while main cannot be read, then drives them into one batch. */
 async function park(train: QueueingTrain, fakes: Fakes): Promise<DriveOutcome> {
   const head = fakes.head;
@@ -1117,7 +1127,7 @@ describe("train conflict questions", () => {
     const fakes = conflicting();
     const answer = fakes.answerAsk;
     fakes.answerAsk = () => fail("unavailable", "Not yet.");
-    await withTrain(async ({ train, sql }) => {
+    await withTrain(async ({ train, sql, now, advance }) => {
       await park(train, fakes);
       const attempts = fakes.asked.length;
       // A newer episode holds claim 3's entry, which is waiting rather than parked.
@@ -1127,6 +1137,7 @@ describe("train conflict questions", () => {
       );
       fakes.head = () => fail("unavailable", "Main is down.");
       fakes.answerAsk = answer;
+      advance(owedQuestion(train).retryAt - now());
       await train.drive();
 
       expect(fakes.asked).toHaveLength(attempts);
@@ -1135,30 +1146,26 @@ describe("train conflict questions", () => {
     }, fakes);
   });
 
-  it("keeps the pair parked and the wake armed while the decisions module cannot ask", async () => {
+  it("keeps the pair parked and its question owed, with the wake armed, while the decisions module cannot ask", async () => {
     const fakes = conflicting();
     const answer = fakes.answerAsk;
     fakes.answerAsk = () => fail("unavailable", "The decisions module is missing.");
     await withTrain(async ({ train, sql, wakes, now, advance }) => {
       const outcome = await park(train, fakes);
 
-      expect(outcome).toEqual({
-        kind: "blocked",
-        batchId: null,
-        reason: "question_unavailable",
-        code: "unavailable",
-      });
+      // The refusal does not stop the drive; the question is due again after the first delay.
+      expect(outcome).toEqual({ kind: "idle" });
       expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
-      expect(train.conflicts(1)).toMatchObject([{ state: "asking", decisionId: null }]);
-      const wake = owed(sql);
-      expect(wake.failures).toBeGreaterThan(0);
-      expect(wake.dueAt).toBeGreaterThan(now());
-      expect(wakes.at(-1)).toBe(wake.dueAt);
+      const owing = owedQuestion(train);
+      expect(owing).toMatchObject({ state: "asking", decisionId: null, failures: 1 });
+      expect(owing.retryAt - owing.updatedAt).toBe(QUESTION_BASE_MS);
+      expect(owed(sql)).toEqual({ dueAt: owing.retryAt, failures: 0 });
+      expect(wakes.at(-1)).toBe(owing.retryAt);
 
       // Once the module answers, the alarm asks the owed question, once.
       fakes.answerAsk = answer;
       const attempts = fakes.asked.length;
-      advance(wake.dueAt - now());
+      advance(owing.retryAt - now());
       await train.resume();
       expect(fakes.asked).toHaveLength(attempts + 1);
       expect(train.conflicts(1)).toMatchObject([{ state: "asked" }]);
@@ -1167,31 +1174,89 @@ describe("train conflict questions", () => {
     }, fakes);
   });
 
-  it("leaves the pair parked when the decisions module refuses the question", async () => {
+  it("asks again after a quota refusal, backing off, until the question is asked", async () => {
+    const fakes = conflicting();
+    const answer = fakes.answerAsk;
+    fakes.answerAsk = () => fail("quota_exceeded", "Too many decisions.");
+    await withTrain(async ({ train, sql, wakes, now, advance }) => {
+      await park(train, fakes);
+      expect(fakes.asked).toHaveLength(1);
+      const first = owedQuestion(train);
+      expect(first).toMatchObject({ state: "asking", failures: 1 });
+      expect(owed(sql).dueAt).toBe(first.retryAt);
+
+      // An alarm before the question is due asks nothing. Each clock read moves the test clock by
+      // one, so the alarm comes a few reads early.
+      advance(first.retryAt - now() - 10);
+      await train.resume();
+      expect(fakes.asked).toHaveLength(1);
+
+      // The next refusal doubles the delay, and the wake follows it.
+      advance(first.retryAt - now());
+      await train.resume();
+      expect(fakes.asked).toHaveLength(2);
+      const second = owedQuestion(train);
+      expect(second).toMatchObject({ state: "asking", failures: 2 });
+      expect(second.retryAt - second.updatedAt).toBe(2 * QUESTION_BASE_MS);
+      expect(owed(sql)).toEqual({ dueAt: second.retryAt, failures: 0 });
+      expect(wakes.at(-1)).toBe(second.retryAt);
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
+
+      // Once the decisions module takes it, the question is asked and the wake cleared.
+      fakes.answerAsk = answer;
+      advance(second.retryAt - now());
+      await train.resume();
+      expect(fakes.asked).toHaveLength(3);
+      expect(train.conflicts(1)).toMatchObject([{ state: "asked", failures: 2 }]);
+      expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+
+  it("waits at most QUESTION_MAX_MS between refused questions", async () => {
     const fakes = conflicting();
     fakes.answerAsk = () => fail("quota_exceeded", "Too many decisions.");
-    await withTrain(async ({ train, sql }) => {
+    await withTrain(async ({ train, sql, now, advance }) => {
       await park(train, fakes);
+      sql.exec("UPDATE train_conflicts SET failures = 40");
+      advance(owedQuestion(train).retryAt - now());
+      await train.resume();
 
-      expect(fakes.asked).toHaveLength(1);
-      expect(train.conflicts(1)).toMatchObject([{ state: "refused", decisionId: null }]);
-      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
-      expect(readWake(sql)).toBeNull();
-      await train.drive();
+      const owing = owedQuestion(train);
+      expect(owing).toMatchObject({ state: "asking", failures: 41 });
+      expect(owing.retryAt - owing.updatedAt).toBe(QUESTION_MAX_MS);
+      expect(owed(sql).dueAt).toBe(owing.retryAt);
+    }, fakes);
+  });
+
+  it("lands other work while a parked pair's question is refused", async () => {
+    const fakes = conflicting();
+    fakes.answerAsk = () => fail("quota_exceeded", "Too many decisions.");
+    await withTrain(async ({ train }) => {
+      await park(train, fakes);
+      fakes.ready(pin(2));
+      expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
+
+      expect(fakes.composeCalls.at(-1)?.pins).toEqual([pin(2)]);
+      expect(states(train)).toMatchObject({
+        "clm_claim001@1": "parked",
+        "clm_claim002@1": "batched",
+        "clm_claim003@1": "parked",
+      });
       expect(fakes.asked).toHaveLength(1);
     }, fakes);
   });
 
-  it("returns the pair unasked when a claim is no longer held", async () => {
+  it("returns a pair whose question was refused unasked once a claim is no longer held", async () => {
     const fakes = conflicting();
     const answer = fakes.answerAsk;
-    fakes.answerAsk = () => fail("unavailable", "Not yet.");
-    await withTrain(async ({ train }) => {
+    fakes.answerAsk = () => fail("quota_exceeded", "Too many decisions.");
+    await withTrain(async ({ train, now, advance }) => {
       await park(train, fakes);
       const attempts = fakes.asked.length;
       fakes.pins.delete(pin(3).claimId);
       fakes.answerAsk = answer;
-      await train.drive();
+      advance(owedQuestion(train).retryAt - now());
+      await train.resume();
 
       expect(fakes.asked).toHaveLength(attempts);
       expect(train.conflicts(1)).toMatchObject([{ state: "closed" }]);

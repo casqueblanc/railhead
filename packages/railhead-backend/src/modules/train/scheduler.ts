@@ -80,8 +80,12 @@
 // episode the merge composed is parked; when either was readied again during the merge, both go
 // back to the queue to be composed again, and nothing is asked about the older work. The park
 // commits first; each drive then asks the owed question through the decisions port inside its own
-// transaction, before it forms or advances a batch. While the decisions module cannot ask, the
-// pair stays parked, the question stays owed and the drive stops blocked, so the alarm retries it.
+// transaction, before it forms or advances a batch. A refused question, whether the decisions
+// module is missing or the claims' decision quota is spent, is never final: the pair stays parked,
+// the question stays owed and is due again after a delay that doubles from `QUESTION_BASE_MS` up to
+// `QUESTION_MAX_MS`, and the wake is kept for it, while the drive goes on with the rest of the
+// queue. Each retry first checks that both claims are still held, so releasing either returns the
+// pair to the queue unasked.
 // The question's decision depends on both claims, so the answer reaches both holders and
 // supersedes both pins. The transaction that records the answer calls `answered`, which returns
 // the pair to the queue and records the drive it is owed, so the answer and the train's wake
@@ -133,10 +137,11 @@ import {
   batchedEntries,
   clearWake,
   completeDiscard,
-  conflictsIn,
   countPending,
   deferCommit,
+  deferQuestion,
   dueDiscards,
+  dueQuestion,
   hasMovableWork,
   highestGeneration,
   insertBatch,
@@ -147,6 +152,7 @@ import {
   migrateTrain,
   nextAskedToCheck,
   nextDiscardAt,
+  nextQuestionAt,
   openConflictOf,
   owesWork,
   promoteDeferred,
@@ -256,6 +262,12 @@ export const MAX_STEPS = 5 * MAX_QUEUE * (MAX_RETRIES + 3);
  */
 export const MAX_RELEASE_READS = MAX_QUEUE;
 
+/** The first delay after a conflict question is refused. Each refusal in a row doubles it. */
+export const QUESTION_BASE_MS = 60_000;
+
+/** The longest delay between refused conflict questions. */
+export const QUESTION_MAX_MS = 60 * 60_000;
+
 /** The first delay after a discard fails. Each failure in a row doubles it. */
 export const DISCARD_BASE_MS = 60_000;
 
@@ -296,9 +308,7 @@ export type BlockReason =
   /** The authorization port did not answer. */
   | "authorization_unavailable"
   /** The main writer did not answer, or left the intent unsettled. */
-  | "publish_pending"
-  /** The decisions module could not ask the owner about a parked pair. */
-  | "question_unavailable";
+  | "publish_pending";
 
 /** Where the train stands after a drive. */
 export type DriveOutcome =
@@ -547,8 +557,10 @@ export function createTrain(
       }
       case "clean": {
         const deadline = pendingDeadline();
-        if (hasMovableWork(sql)) writeWakeIn({ dueAt: now, failures: 0 });
-        else if (deadline !== null) writeWakeIn({ dueAt: deadline, failures: 0 });
+        // A refused question is owed again later, so its wake stays.
+        const later = earliest(deadline, nextQuestionAt(sql));
+        if (hasMovableWork(sql, now)) writeWakeIn({ dueAt: now, failures: 0 });
+        else if (later !== null) writeWakeIn({ dueAt: later, failures: 0 });
         else clearWake(sql);
         return false;
       }
@@ -602,10 +614,12 @@ export function createTrain(
 
   async function pass(generation: number): Promise<DriveOutcome> {
     for (let step = 0; step < MAX_STEPS; step += 1) {
-      const question = conflictsIn(sql, "asking", 1)[0];
+      // The clock is read only while a question is owed.
+      const due = nextQuestionAt(sql);
+      const question = due !== null && due <= clock() ? dueQuestion(sql, due) : null;
       const batch = activeBatch(sql);
       const next =
-        question !== undefined
+        question !== null
           ? ask(generation, question)
           : batch === null
             ? await form(generation)
@@ -618,8 +632,8 @@ export function createTrain(
   /**
    * Asks the owner about a parked pair, inside a transaction that records the question as asked.
    * A pair whose claim is no longer held at its parked generation goes back to the queue unasked.
-   * While the decisions module cannot ask, nothing is written and the drive stops blocked; any
-   * other refusal leaves the pair parked until a new ready of either claim.
+   * A refusal leaves the pair parked and its question owed, due again after a growing delay, and
+   * the drive goes on.
    */
   function ask(generation: number, conflict: ConflictRecord): Step {
     const now = clock();
@@ -644,22 +658,23 @@ export function createTrain(
       }
       const asked = ports().decisions.askSystem(tx, conflictQuestion(conflict));
       if (!asked.ok) {
-        if (!retriesQuestion(asked.code)) {
-          settleConflict(sql, conflict.batchId, "refused", null, now);
-        }
+        // A claim's spent decision quota does not clear while it stays held at this generation, so
+        // such a pair is asked again at most hourly until a claim is released (#260).
+        const failures = conflict.failures + 1;
+        deferQuestion(sql, conflict.batchId, failures, now + questionDelay(failures), now);
         return asked;
       }
       settleConflict(sql, conflict.batchId, "asked", asked.value.decisionId, now);
       return null;
     }).value;
     if (result === null || result.ok) return CONTINUE;
-    if (retriesQuestion(result.code)) return blocked(null, "question_unavailable", result.code);
     console.error(
       JSON.stringify({
         event: "train.question_refused",
         repo: context.repoId,
         batch: conflict.batchId,
         code: result.code,
+        failures: conflict.failures + 1,
       }),
     );
     return CONTINUE;
@@ -672,7 +687,7 @@ export function createTrain(
    */
   function unparkPair(
     conflict: ConflictRecord,
-    state: Exclude<ConflictState, "asking" | "asked" | "refused">,
+    state: Exclude<ConflictState, "asking" | "asked">,
     now: number,
   ): void {
     for (const pin of conflict.pins) unparkEntry(sql, pin, now);
@@ -1617,12 +1632,16 @@ function isTransient(code: PortErrorCode): boolean {
   );
 }
 
-/**
- * Whether a refused question is asked again. A claim's decision quota is not a passing limit: it
- * clears only when the claim changes, which a new ready reports.
- */
-function retriesQuestion(code: PortErrorCode): boolean {
-  return isTransient(code) && code !== "quota_exceeded";
+/** `QUESTION_BASE_MS` doubled for each refusal after the first, at most `QUESTION_MAX_MS`. */
+function questionDelay(failures: number): number {
+  return Math.min(QUESTION_BASE_MS * 2 ** Math.min(failures - 1, 20), QUESTION_MAX_MS);
+}
+
+/** The earlier of two times, either of which may be missing. */
+function earliest(left: number | null, right: number | null): number | null {
+  if (left === null) return right;
+  if (right === null) return left;
+  return Math.min(left, right);
 }
 
 function samePin(left: ClaimPin, right: ClaimPin): boolean {

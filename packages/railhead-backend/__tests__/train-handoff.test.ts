@@ -18,7 +18,7 @@ import { fail, ok } from "../src/contracts/result";
 import type { CheckAttempt, MainRefPort, TrainPort } from "../src/contracts/train";
 import { unavailableTrain } from "../src/contracts/unavailable";
 import { createClaims } from "../src/modules/claims/module";
-import { createDecisions } from "../src/modules/decisions/decisions";
+import { createDecisions, MAX_QUESTIONS_PER_CLAIM } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { createMainWriter } from "../src/modules/mainWriter/mainWriter";
 import {
@@ -26,6 +26,7 @@ import {
   EXHAUSTED_FAILURES,
   MAX_QUEUE,
   MAX_WAKE_FAILURES,
+  QUESTION_BASE_MS,
   type Train,
 } from "../src/modules/train/scheduler";
 import { insertEntry, readWake, settleEntry } from "../src/modules/train/store";
@@ -897,6 +898,56 @@ describe("a conflicting pair", () => {
         { claimId: second.claimId, generation: 1, commit: REDONE },
       ]);
       expect(setup.started.at(-1)).toMatchObject({ decisions: [answer] });
+    });
+  });
+
+  it("keeps the question owed with the wake armed when a claim's decision quota is spent", async () => {
+    await withHandoff(async (setup) => {
+      const first = await setup.openFor(1, WORK);
+      const second = await setup.openFor(2, OTHER);
+      setup.conflicting = true;
+      for (const [n, claim, commit] of [
+        [1, first, WORK],
+        [2, second, OTHER],
+      ] as const) {
+        const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+        expect(ready.ok).toBe(true);
+      }
+      // Unanswered dependencies stand in for the decisions that spent the first claim's quota.
+      for (let n = 0; n < MAX_QUESTIONS_PER_CLAIM; n += 1) {
+        setup.sql.exec(
+          `INSERT INTO decision_claims (decision_id, claim_id, agent_id, generation)
+           VALUES (?, ?, ?, 1)`,
+          `dec_spent${String(n).padStart(6, "0")}`,
+          first.claimId,
+          agent(1).agentId,
+        );
+      }
+      const before = setup.log.head();
+
+      await setup.train.resume();
+
+      // The pair is parked without a question, and the question stays owed with its wake armed.
+      const types = setup.log.replay(before, 64).events.map((event) => event.type);
+      expect(types).toEqual(["train.conflict"]);
+      const [owing] = setup.train.conflicts(1);
+      expect(owing).toMatchObject({ state: "asking", decisionId: null, failures: 1 });
+      if (owing === undefined) throw new Error("no pair was parked");
+      expect(owing.retryAt - owing.updatedAt).toBe(QUESTION_BASE_MS);
+      expect(readWake(setup.sql)).toEqual({ dueAt: owing.retryAt, failures: 0 });
+      expect(setup.wakes).toContain(owing.retryAt);
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["parked", "parked"]);
+
+      // Once the claim can take another decision, the alarm at the retry time asks the question.
+      setup.sql.exec("DELETE FROM decision_claims WHERE decision_id LIKE 'dec_spent%'");
+      setup.advance(owing.retryAt - setup.now());
+      await setup.train.resume();
+
+      const asked = setup.log.replay(before + 1, 64).events;
+      expect(asked.map((event) => event.type)).toEqual(["question.asked"]);
+      expect(asked[0]).toMatchObject({ actor: { kind: "system", id: "sys_train" } });
+      expect(setup.train.conflicts(1)).toMatchObject([{ state: "asked", failures: 1 }]);
+      expect(readWake(setup.sql)).toBeNull();
     });
   });
 });
