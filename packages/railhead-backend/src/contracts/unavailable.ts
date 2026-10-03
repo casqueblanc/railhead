@@ -50,6 +50,8 @@ export const unavailableClaims: ClaimsPort = {
   pin: refuse("claims"),
   currentGeneration: () => null,
   workingGeneration: () => null,
+  workingEpisode: () => null,
+  readyPin: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
 };
@@ -76,6 +78,7 @@ export const unavailableDecisions: DecisionsPort = {
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  currentDecision: () => null,
   transfer: () => {
     throw new UnavailableError("decisions");
   },
@@ -108,13 +111,17 @@ export const unavailableChecks: CheckPort = {
 };
 
 /**
- * The train while its module is missing: no report is recorded, no attempt is known and nothing is
- * owed, so `resume` does nothing.
+ * The train while its module is missing: no pin is queued, so no ready is recorded, no report is
+ * recorded, no attempt is known and nothing is owed, so `resume` does nothing.
  */
 export const unavailableTrain: TrainPort = {
-  enqueue: refuse("train"),
+  queue: () => {
+    throw new UnavailableError("train");
+  },
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  holdsLiveEntry: () => null,
+  armWake: async () => false,
   resume: async () => {},
 };
 

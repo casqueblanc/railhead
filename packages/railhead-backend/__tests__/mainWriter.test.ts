@@ -8,6 +8,8 @@ import {
   type DecisionRef,
   type MainOutcome,
 } from "@railhead/shared/events";
+import type { ReadyPin } from "../src/contracts/claims";
+import type { ReadyGate } from "../src/contracts/inbox";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -50,6 +52,7 @@ const CANDIDATE_B = "b".repeat(40);
 const TIMEOUT_MS = 50;
 const CLAIM_A: ClaimId = "clm_claim001";
 const CLAIM_B: ClaimId = "clm_claim002";
+const CLAIM_C: ClaimId = "clm_claim003";
 const DEC_FORMAT: DecisionRef = { decisionId: "dec_format01", version: 1 };
 
 /** How the fake ref answers one conditional update. */
@@ -131,20 +134,47 @@ class World {
   generations = new Map<ClaimId, number>([
     [CLAIM_A, 1],
     [CLAIM_B, 3],
+    [CLAIM_C, 1],
   ]);
   versions = new Map<ClaimId, DecisionRef[] | null>([
     [CLAIM_A, [DEC_FORMAT]],
     [CLAIM_B, []],
+    [CLAIM_C, []],
   ]);
+  /** Each ready claim's pinned commit; a claim missing here is not ready. */
+  ready = new Map<ClaimId, CommitSha>([
+    [CLAIM_A, "1".repeat(40)],
+    [CLAIM_B, "2".repeat(40)],
+    [CLAIM_C, "3".repeat(40)],
+  ]);
+
+  /** Each claim's ready gate; a claim missing here is clear. */
+  gates = new Map<ClaimId, ReadyGate | null>();
+
+  /** The claim's ready gate at `generation`, or `null` for another generation. */
+  readyGateNow(claimId: ClaimId, generation: number): ReadyGate | null {
+    if (this.generations.get(claimId) !== generation) return null;
+    const gate = this.gates.get(claimId);
+    return gate === undefined ? { kind: "clear" } : gate;
+  }
+
+  /** The claim's ready pin, recorded under the versions current now. */
+  readyPin(claimId: ClaimId): ReadyPin | null {
+    const commit = this.ready.get(claimId);
+    const generation = this.generations.get(claimId);
+    const decisions = this.versions.get(claimId) ?? null;
+    if (commit === undefined || generation === undefined || decisions === null) return null;
+    return { pin: { claimId, generation, commit }, episode: 1, decisions };
+  }
 }
 
-/** The second intent's attempt: claim B alone, composed on `expectedMain`. */
+/** The second intent's attempt: claim C alone, composed on `expectedMain`. */
 function attemptB(expectedMain: CommitSha): CheckAttempt {
   return {
     attemptId: ATTEMPT_B,
     expectedMain,
     candidate: CANDIDATE_B,
-    pins: [{ claimId: CLAIM_B, generation: 3, commit: "3".repeat(40) }],
+    pins: [{ claimId: CLAIM_C, generation: 1, commit: "3".repeat(40) }],
     definition: { name: "upload", source: expectedMain, digest: "d".repeat(64), acceptance: null },
     decisions: [],
     createdAt: NOW - 60_000,
@@ -216,6 +246,8 @@ function harness(
     },
     currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
     currentVersions: (claimId) => world.versions.get(claimId) ?? null,
+    readyPin: (claimId) => world.readyPin(claimId),
+    readyGateNow: (claimId, generation) => world.readyGateNow(claimId, generation),
   };
   const authorization: AuthorizationPort = createAuthorization(
     { storage, log, clock },
@@ -381,6 +413,8 @@ describe("publish refuses invalid input", () => {
           attemptOutcome: () => null,
           currentGeneration: () => null,
           currentVersions: () => null,
+          readyPin: () => null,
+          readyGateNow: () => null,
         }),
         ref,
       );
@@ -572,6 +606,56 @@ describe("publish fences claims and decisions", () => {
     );
   });
 
+  it("refuses when a claim is no longer ready with its pinned commit", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        world.ready.set(CLAIM_B, "9".repeat(40));
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        world.ready.delete(CLAIM_B);
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+      },
+      world,
+    );
+  });
+
+  it("writes nothing while an item affecting a claim is unacknowledged, then publishes", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "unacked_decision",
+        });
+        world.gates.set(CLAIM_B, null);
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
+
+        world.gates.delete(CLAIM_B);
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("updated", 1, CANDIDATE),
+        });
+        expect(ref.main).toBe(CANDIDATE);
+      },
+      world,
+    );
+  });
+
   it("refuses when a decision has a new version or a new one became required", async () => {
     const world = new World();
     const ref = new FakeMain();
@@ -721,6 +805,63 @@ describe("publish holds a moved fence while the intent's own write may still lan
         expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
         expect(ref.updates).toHaveLength(1);
         expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+      },
+      world,
+    );
+  });
+});
+
+describe("publish holds a newly blocked inbox gate while the intent's own write may still land", () => {
+  it("records the earlier update when it lands after the gate blocked", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+
+        expect(await h.writer.publish(INTENT)).toEqual(
+          fail("unavailable", "An earlier write of this intent may still land; try again."),
+        );
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        expect(h.log.head()).toBe(1);
+
+        // The first update reaches Git after all.
+        ref.main = CANDIDATE;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, CANDIDATE),
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", CANDIDATE)]);
+      },
+      world,
+    );
+  });
+
+  it("settles the intent as not landed only once the earlier update can no longer land", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.gates.set(CLAIM_B, { kind: "blocked", items: [3] });
+
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS - 1;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, MAIN), updatedAt: world.now },
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(ref.main).toBe(MAIN);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", MAIN, INTENT, world.now)]);
       },
       world,
     );

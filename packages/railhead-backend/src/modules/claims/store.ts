@@ -11,6 +11,10 @@
 // A ready claim keeps the decision versions its pin was recorded under, as JSON, so the train's
 // read of the pin can compare them with the current versions. A claim also keeps the last refusal
 // it recorded, so a repeated refusal is not recorded again.
+//
+// `episode` counts the claim's moves between working and ready: pinning and reopening each raise
+// it, and nothing lowers it. A push is fenced to the episode it was granted in as well as the
+// generation, so a push begun before ready cannot be recorded after the claim was reopened.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -52,6 +56,7 @@ const MIGRATIONS: readonly string[] = [
     WHERE state IN ('allocating', 'working', 'ready')`,
   "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
   "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN episode INTEGER NOT NULL DEFAULT 1 CHECK (episode > 0)",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -67,6 +72,8 @@ export interface ClaimRow {
   agentId: AgentId;
   ownerId: UserId;
   generation: number;
+  /** Raised each time the claim is pinned or reopened. */
+  episode: number;
   state: StoredState;
   /** The main commit requested for the fork, written once before the fork call. */
   forkBase: CommitSha | null;
@@ -88,6 +95,7 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   agent_id: string;
   owner_id: string;
   generation: number;
+  episode: number;
   state: string;
   fork_base: string | null;
   base: string | null;
@@ -97,8 +105,8 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   body: string;
 }
 
-const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.state,
-    c.fork_base, c.base, c.ready_commit, c.ready_decisions, i.title, i.body
+const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.episode,
+    c.state, c.fork_base, c.base, c.ready_commit, c.ready_decisions, i.title, i.body
   FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id`;
 
 /** Creates or migrates the claims tables. */
@@ -204,8 +212,8 @@ export function openClaim(
 
 /**
  * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
- * makes the claim ready, and forgets its last refusal. Returns `false`, and writes nothing, when the
- * claim is no longer working at that generation.
+ * makes the claim ready, raises its episode and forgets its last refusal. Returns `false`, and
+ * writes nothing, when the claim is no longer working at that generation.
  */
 export function pinReady(
   sql: SqlStorage,
@@ -217,7 +225,7 @@ export function pinReady(
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
-         last_refusal = NULL
+         episode = episode + 1, last_refusal = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,
@@ -230,14 +238,15 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working, clears its pin and forgets its last refusal.
+ * Returns a ready claim at `generation` to working, clears its pin, raises its episode and forgets
+ * its last refusal.
  * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
  */
 export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         last_refusal = NULL
+         episode = episode + 1, last_refusal = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
       claimId,
@@ -298,6 +307,7 @@ function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
     agentId: raw.agent_id,
     ownerId: raw.owner_id,
     generation: raw.generation,
+    episode: raw.episode,
     state: storedState(raw.state),
     forkBase: raw.fork_base,
     base: raw.base,

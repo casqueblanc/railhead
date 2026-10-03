@@ -10,10 +10,12 @@ import {
   SkipForwardIcon,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
+import type { CheckDetailPort } from "../board/boardPorts";
 import type { BoardFeed } from "../claims/boardFeed";
 import { ClaimLanes } from "../claims/ClaimLanes";
 import type { DecisionActions } from "../decisions/decisionActions";
 import { DecisionsPanel } from "../decisions/DecisionsPanel";
+import { TotalsPanel } from "../metrics/TotalsPanel";
 import { TrainOutcomes } from "../train/TrainOutcomes";
 import type { CaptureSource } from "./captureFile";
 import { firstFrame, frameAt, lastFrame, type Replay, type ReplayFrame } from "./replayLog";
@@ -23,6 +25,9 @@ export const PLAYBACK_STEP_MS = 400;
 
 /** A replay never records anything: the questions queue shows every answer as blocked. */
 const NO_ANSWERS: DecisionActions = { kind: "unavailable", reason: "offline" };
+
+/** A replay has no backend to read a check run's command and output from. */
+const NO_CHECK_DETAIL: CheckDetailPort = { kind: "unavailable", reason: "replay" };
 
 /** The frames of a replay are complete folds, so a section never offers to reconnect. */
 const noRetry = () => {};
@@ -154,7 +159,8 @@ export const ReplayBoard = ({ replay, onClose }: ReplayBoardProps) => {
           <ClaimLanes feed={feed} onRetry={noRetry} />
         </div>
         <div className="grid min-w-0 gap-6">
-          <TrainOutcomes feed={feed} onRetry={noRetry} />
+          <TrainOutcomes feed={feed} checks={NO_CHECK_DETAIL} onRetry={noRetry} />
+          <TotalsPanel feed={feed} />
         </div>
       </div>
     </div>

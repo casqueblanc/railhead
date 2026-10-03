@@ -957,7 +957,7 @@ async function withRepoOwner(
       log,
       clock: () => clock.now,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const grants: Dispatch[] = [];
     const ports = recordingPorts(
@@ -1550,7 +1550,7 @@ describe("owner actions", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
-        wake: () => {},
+        wake: async () => true,
       };
       const owner = createOwner(context, () => composeRepo(context), {
         instance: env.OWNER.getByName(unique("owner-")),
