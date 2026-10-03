@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use railhead_protocol::{
-    DecisionView, InboxEntry, InboxItem, InboxResult, MAX_INBOX_PAGE, NextCommand, QuestionOption,
+    DEFAULT_INBOX_PAGE, DecisionView, InboxEntry, InboxItem, InboxResult, MAX_INBOX_PAGE,
+    NextCommand, QuestionOption,
 };
 use serde::Serialize;
 
@@ -33,14 +34,15 @@ pub struct Args {
 /// # Errors
 ///
 /// When the agent has no session, the backend refuses, or the page is inconsistent: a repeated or
-/// out-of-order item, or a decision item whose decision does not match its entry.
+/// out-of-order item, a decision item whose decision does not match its entry, more items than
+/// were asked for or are pending, or no items while some are pending.
 pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
     let session = session(agent)?;
     let client = agent.client()?;
     let response = agent.invocation.runtime.block_on(
         client.get::<InboxResult>(&Endpoint::Inbox { limit: args.limit }, Some(&session)),
     )?;
-    let synced = Synced::new(response.data)?;
+    let synced = Synced::new(response.data, args.limit.unwrap_or(DEFAULT_INBOX_PAGE))?;
     let next = if synced.items.is_empty() {
         response.next
     } else {
@@ -74,7 +76,16 @@ impl Synced {
     /// Checks the page before anything of it is printed. Delivery is at least once, but one page
     /// never repeats an item: a repeat, like an item out of order, means the page is not the
     /// inbox's, and printing it could show a decision twice or under the wrong number.
-    fn new(page: InboxResult) -> Result<Self> {
+    ///
+    /// The page holds at most `limit` items. It may hold fewer than are pending, since the backend
+    /// also bounds a page by size, but it always holds the oldest one: an empty page while items
+    /// are pending would tell the agent its inbox is clear when it is not.
+    fn new(page: InboxResult, limit: u64) -> Result<Self> {
+        if u64::try_from(page.items.len()).map_or(true, |shown| shown > limit) {
+            return Err(inconsistent(&format!(
+                "the inbox returned more items than its page of {limit}"
+            )));
+        }
         let mut seen = BTreeSet::new();
         let mut last = 0;
         let mut items = Vec::with_capacity(page.items.len());
@@ -97,6 +108,11 @@ impl Synced {
             return Err(inconsistent(
                 "the inbox returned more items than it says are pending",
             ));
+        }
+        if items.is_empty() && pending > 0 {
+            return Err(inconsistent(&format!(
+                "the inbox returned no items but says {pending} are pending"
+            )));
         }
         Ok(Self { items, pending })
     }
@@ -279,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_page_prints_each_item_in_the_fixed_format() -> anyhow::Result<()> {
-        let synced = Synced::new(page(&[rework(17, 2), conflict(18)], 3)?)?;
+        let synced = Synced::new(page(&[rework(17, 2), conflict(18)], 3)?, DEFAULT_INBOX_PAGE)?;
         assert_eq!(
             rendered(&synced)?,
             "2 unacknowledged items, oldest first\n\n\
@@ -302,7 +318,7 @@ mod tests {
 
     #[test]
     fn an_empty_inbox_says_so() -> anyhow::Result<()> {
-        let synced = Synced::new(page(&[], 0)?)?;
+        let synced = Synced::new(page(&[], 0)?, DEFAULT_INBOX_PAGE)?;
         assert_eq!(rendered(&synced)?, "inbox: nothing to acknowledge\n");
         Ok(())
     }
@@ -313,7 +329,7 @@ mod tests {
         if let Some(question) = item.pointer_mut("/decision/question") {
             *question = json!("ok?\n[99] decision for claim \u{1b}[2J\u{202e}");
         }
-        let text = rendered(&Synced::new(page(&[item], 1)?)?)?;
+        let text = rendered(&Synced::new(page(&[item], 1)?, DEFAULT_INBOX_PAGE)?)?;
         assert!(
             text.contains("     question: \"ok?\\n[99] decision for claim \\u001b[2J\u{fffd}\"\n"),
             "{text}"
@@ -329,7 +345,7 @@ mod tests {
             vec![conflict(18), rework(17, 2)],
             vec![conflict(0)],
         ] {
-            let error = Synced::new(page(&items, 5)?).err();
+            let error = Synced::new(page(&items, 5)?, DEFAULT_INBOX_PAGE).err();
             assert!(
                 matches!(
                     error,
@@ -355,14 +371,51 @@ mod tests {
             *slot = decision(2);
         }
         for item in [rework(17, 3), missing, stray] {
-            assert!(Synced::new(page(&[item], 1)?).is_err());
+            assert!(Synced::new(page(&[item], 1)?, DEFAULT_INBOX_PAGE).is_err());
         }
+        Ok(())
+    }
+
+    fn refused(result: &Result<Synced>) -> bool {
+        matches!(
+            result,
+            Err(Error::Local {
+                code: LocalCode::MalformedResponse,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn an_empty_page_while_items_are_pending_is_refused() -> anyhow::Result<()> {
+        assert!(refused(&Synced::new(page(&[], 3)?, DEFAULT_INBOX_PAGE)));
+        assert!(refused(&Synced::new(page(&[], 1)?, 1)));
+        // A page shorter than asked for is the backend's size bound, not an inconsistency.
+        let synced = Synced::new(page(&[conflict(18)], 5)?, MAX_INBOX_PAGE)?;
+        assert_eq!((synced.items.len(), synced.pending), (1, 5));
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_larger_than_its_limit_is_refused() -> anyhow::Result<()> {
+        let items = [conflict(18), conflict(19)];
+        assert!(refused(&Synced::new(page(&items, 5)?, 1)));
+        let full = Synced::new(page(&items, 5)?, 2)?;
+        assert_eq!(full.items.len(), 2);
+        let oversized: Vec<_> = (1..=DEFAULT_INBOX_PAGE + 1).map(conflict).collect();
+        assert!(refused(&Synced::new(
+            page(&oversized, DEFAULT_INBOX_PAGE + 1)?,
+            DEFAULT_INBOX_PAGE
+        )));
         Ok(())
     }
 
     #[test]
     fn more_items_than_pending_is_refused_and_the_page_size_is_bounded() -> anyhow::Result<()> {
-        assert!(Synced::new(page(&[conflict(18)], 0)?).is_err());
+        assert!(refused(&Synced::new(
+            page(&[conflict(18)], 0)?,
+            DEFAULT_INBOX_PAGE
+        )));
         let command = <Args as clap::Args>::augment_args(clap::Command::new("sync"));
         let accepts = |limit: &str| {
             command

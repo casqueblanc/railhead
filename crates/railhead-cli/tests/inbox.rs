@@ -368,6 +368,63 @@ async fn sync_refuses_a_page_that_repeats_an_item_and_prints_none_of_it() -> any
 }
 
 #[tokio::test]
+async fn sync_refuses_an_empty_page_while_items_are_pending() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(&world, "GET", "/inbox", page(&[], 3)).await;
+    let run = rh(&world, &["--json", "sync"])?;
+    assert_eq!(
+        (run.code, run.at("/error/code")?),
+        (Some(1), json!("malformed_response"))
+    );
+
+    let text = rh(&world, &["sync"])?;
+    assert_eq!(text.code, Some(1));
+    assert_eq!(text.stdout, "");
+    assert!(
+        text.stderr
+            .starts_with("rh: the inbox returned no items but says 3 are pending"),
+        "{}",
+        text.stderr
+    );
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_refuses_a_page_larger_than_it_asked_for() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "GET",
+        "/inbox",
+        page(&[inbox_item(17), inbox_item(18)], 5),
+    )
+    .await;
+    let text = rh(&world, &["sync", "--limit", "1"])?;
+    assert_eq!(text.code, Some(1));
+    assert_eq!(text.stdout, "");
+    assert!(
+        text.stderr
+            .starts_with("rh: the inbox returned more items than its page of 1"),
+        "{}",
+        text.stderr
+    );
+
+    // Without --limit, the backend's default page of 16 is the bound.
+    world.server.reset().await;
+    let items: Vec<_> = (1..=17).map(inbox_item).collect();
+    answer(&world, "GET", "/inbox", page(&items, 17)).await;
+    let run = rh(&world, &["--json", "sync"])?;
+    assert_eq!(
+        (run.code, run.at("/error/code")?),
+        (Some(1), json!("malformed_response"))
+    );
+    assert!(!run.stdout.contains("clm_43abcd"), "{}", run.stdout);
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn sync_shows_how_many_items_wait_beyond_the_page() -> anyhow::Result<()> {
     let world = world().await?;
     answer(&world, "GET", "/inbox", page(&[inbox_item(18)], 5)).await;
