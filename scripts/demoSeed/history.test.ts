@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { DEMO_AUTHOR, planHistory, writeHistoryBundle } from "./history.ts";
+import {
+  DEMO_AUTHOR,
+  planHistory,
+  readFileAt,
+  resolveCommit,
+  writeHistoryBundle,
+  type ImportRequest,
+  type OverlayEntry,
+} from "./history.ts";
 import { SeedRefusal } from "./manifest.ts";
 
 const scratch = mkdtempSync(join(tmpdir(), "railhead-demo-seed-test-"));
@@ -17,9 +25,36 @@ function git(cwd: string, args: string[], env: Record<string, string> = {}): str
   }).trim();
 }
 
+/** The history of `apps/demo` at `revision`, with no overlay unless one is given. */
+function request(
+  source: string,
+  revision: string,
+  overlay: readonly OverlayEntry[] = [],
+  directory = "apps/demo",
+): ImportRequest {
+  return {
+    sourceRoot: source,
+    commit: resolveCommit(source, revision),
+    directory,
+    overlay,
+    overlaySubject: "chore: stand alone",
+  };
+}
+
+function cloneOf(bundle: string, name: string): string {
+  const clone = join(scratch, name);
+  execFileSync("git", ["clone", "--quiet", bundle, clone]);
+  return clone;
+}
+
 let commitCount = 0;
-function commit(repo: string, files: Record<string, string>, message: string): string {
+/** Commits `files`; a `null` content deletes that path, file or directory. */
+function commit(repo: string, files: Record<string, string | null>, message: string): string {
   for (const [path, content] of Object.entries(files)) {
+    if (content === null) {
+      rmSync(join(repo, path), { recursive: true });
+      continue;
+    }
     mkdirSync(join(repo, path, ".."), { recursive: true });
     writeFileSync(join(repo, path), content);
   }
@@ -55,7 +90,7 @@ test("the import keeps every commit that changed the directory, rooted at it", (
   const bundle = join(scratch, "normal.bundle");
   const refsBefore = git(source, ["for-each-ref"]);
 
-  const history = writeHistoryBundle(source, "HEAD", "apps/demo", bundle);
+  const history = writeHistoryBundle(request(source, "HEAD"), bundle);
 
   assert.equal(history.commits, 3);
   // Every Git version checks out a bundle that records HEAD; some check out nothing without it.
@@ -83,15 +118,15 @@ test("the import keeps every commit that changed the directory, rooted at it", (
 
 test("the same revision always yields the same head, and an earlier one a prefix of it", () => {
   const source = sourceRepo("repeat");
-  const first = planHistory(source, "HEAD", "apps/demo");
-  const second = planHistory(source, "HEAD", "apps/demo");
-  const earlier = planHistory(source, "HEAD~1", "apps/demo");
+  const first = planHistory(request(source, "HEAD"));
+  const second = planHistory(request(source, "HEAD"));
+  const earlier = planHistory(request(source, "HEAD~1"));
 
   assert.deepEqual(first, second);
   assert.equal(earlier.commits, 2);
   assert.notEqual(earlier.head, first.head);
   const bundle = join(scratch, "repeat.bundle");
-  writeHistoryBundle(source, "HEAD", "apps/demo", bundle);
+  writeHistoryBundle(request(source, "HEAD"), bundle);
   const clone = join(scratch, "repeat-clone");
   execFileSync("git", ["clone", "--quiet", bundle, clone]);
   assert.equal(git(clone, ["rev-parse", "HEAD~1"]), earlier.head);
@@ -100,9 +135,9 @@ test("the same revision always yields the same head, and an earlier one a prefix
 test("a revision before the directory existed, or a missing directory, is refused", () => {
   const source = sourceRepo("missing");
 
-  assert.throws(() => planHistory(source, "HEAD~4", "apps/demo"), /No commit up to HEAD~4 changes/);
-  assert.throws(() => planHistory(source, "HEAD", "apps/none"), SeedRefusal);
-  assert.throws(() => planHistory(source, "no-such-ref", "apps/demo"), /not a commit/);
+  assert.throws(() => planHistory(request(source, "HEAD~4")), /No commit up to [0-9a-f]+ changes/);
+  assert.throws(() => planHistory(request(source, "HEAD", [], "apps/none")), SeedRefusal);
+  assert.throws(() => resolveCommit(source, "no-such-ref"), /not a commit/);
 });
 
 test("a shallow clone is refused rather than imported as a truncated history", () => {
@@ -110,5 +145,156 @@ test("a shallow clone is refused rather than imported as a truncated history", (
   const shallow = join(scratch, "shallow");
   execFileSync("git", ["clone", "--quiet", "--depth", "1", `file://${source}`, shallow]);
 
-  assert.throws(() => planHistory(shallow, "HEAD", "apps/demo"), /shallow clone/);
+  assert.throws(() => planHistory(request(shallow, "HEAD")), /shallow clone/);
+});
+
+test("a deleted directory imports as an empty tree, and an identical re-addition is kept", () => {
+  const source = sourceRepo("readd");
+  const appTree = git(source, ["rev-parse", "HEAD:apps/demo"]);
+  commit(source, { "apps/demo": null }, "chore(demo): remove the app");
+  commit(source, { "apps/demo/index.ts": "export const v = 2;\n" }, "feat(demo): bring it back");
+  commit(source, { "apps/demo/README.md": "demo\n" }, "docs(demo): describe it again");
+  assert.equal(git(source, ["rev-parse", "HEAD:apps/demo"]), appTree);
+  const bundle = join(scratch, "readd.bundle");
+
+  const history = writeHistoryBundle(request(source, "HEAD"), bundle);
+
+  assert.equal(history.commits, 6);
+  const clone = cloneOf(bundle, "readd-clone");
+  assert.deepEqual(git(clone, ["log", "--format=%s"]).split("\n"), [
+    "docs(demo): describe it again",
+    "feat(demo): bring it back",
+    "chore(demo): remove the app",
+    "docs(demo): describe it",
+    "fix(demo): bump",
+    "feat(demo): add the app",
+  ]);
+  assert.equal(git(clone, ["ls-tree", "HEAD~2"]), "");
+  assert.equal(git(clone, ["rev-parse", "HEAD^{tree}"]), appTree);
+});
+
+test("a revision at which the directory was deleted is refused, not imported as its past", () => {
+  const source = sourceRepo("deleted");
+  commit(source, { "apps/demo": null }, "chore(demo): remove the app");
+  const bundle = join(scratch, "deleted.bundle");
+
+  assert.throws(
+    () => writeHistoryBundle(request(source, "HEAD"), bundle),
+    /apps\/demo does not exist at [0-9a-f]{40}/,
+  );
+  assert.equal(existsSync(bundle), false);
+  // The revision before the deletion still imports.
+  assert.equal(planHistory(request(source, "HEAD~1")).commits, 3);
+});
+
+test("an unreadable tree fails the import and writes no bundle", () => {
+  const source = sourceRepo("corrupt");
+  // The app's tree at "fix(demo): bump", stored loose because the repository was never packed.
+  const tree = git(source, ["rev-parse", "HEAD~1:apps/demo"]);
+  rmSync(join(source, ".git", "objects", tree.slice(0, 2), tree.slice(2)));
+  const bundle = join(scratch, "corrupt.bundle");
+
+  assert.throws(
+    () => writeHistoryBundle(request(source, "HEAD"), bundle),
+    (error) => error instanceof Error && !(error instanceof SeedRefusal),
+  );
+  assert.equal(existsSync(bundle), false);
+});
+
+test("the overlay adds, replaces and removes files from the tip commit in one last commit", () => {
+  const source = sourceRepo("overlay");
+  commit(
+    source,
+    { "tooling/package.json": "{}\n", "apps/demo/vite.config.ts": "monorepo\n" },
+    "chore: add tooling",
+  );
+  const overlay: OverlayEntry[] = [
+    { path: "package.json", from: "tooling/package.json" },
+    { path: "README.md", from: "README.md" },
+    { path: "vite.config.ts", from: null },
+  ];
+  const bundle = join(scratch, "overlay.bundle");
+
+  const history = writeHistoryBundle(request(source, "HEAD", overlay), bundle);
+
+  assert.equal(history.commits, 5);
+  const clone = cloneOf(bundle, "overlay-clone");
+  assert.deepEqual(git(clone, ["log", "-2", "--format=%s|%an|%ad", "--date=raw"]).split("\n"), [
+    `chore: stand alone|${DEMO_AUTHOR.name}|${git(source, ["log", "-1", "--format=%ad", "--date=raw"])}`,
+    `chore: add tooling|${DEMO_AUTHOR.name}|${git(source, ["log", "-1", "--format=%ad", "--date=raw"])}`,
+  ]);
+  assert.deepEqual(git(clone, ["ls-tree", "--name-only", "HEAD"]).split("\n"), [
+    "README.md",
+    "index.ts",
+    "package.json",
+  ]);
+  assert.equal(git(clone, ["show", "HEAD:README.md"]), "monorepo");
+  assert.equal(git(clone, ["show", "HEAD~1:vite.config.ts"]), "monorepo");
+  assert.deepEqual(planHistory(request(source, "HEAD", overlay)), history);
+});
+
+test("an overlay whose source or removed file is missing is refused", () => {
+  const source = sourceRepo("overlay-missing");
+
+  assert.throws(
+    () => planHistory(request(source, "HEAD", [{ path: "package.json", from: "tooling/none" }])),
+    /overlay needs tooling\/none/,
+  );
+  assert.throws(
+    () => planHistory(request(source, "HEAD", [{ path: "package.json", from: "other" }])),
+    /overlay needs other/,
+  );
+  assert.throws(
+    () => planHistory(request(source, "HEAD", [{ path: "vite.config.ts", from: null }])),
+    /removes vite.config.ts/,
+  );
+});
+
+test("a file is read from the commit, not from the working tree", () => {
+  const source = sourceRepo("read");
+  const head = resolveCommit(source, "HEAD");
+  writeFileSync(join(source, "apps", "demo", "index.ts"), "dirty\n");
+
+  assert.equal(readFileAt(source, head, "apps/demo/index.ts"), "export const v = 2;\n");
+  assert.equal(
+    readFileAt(source, resolveCommit(source, "HEAD~2"), "apps/demo/index.ts"),
+    "export const v = 1;\n",
+  );
+  assert.throws(() => readFileAt(source, head, "apps/demo/none.ts"), /has no file/);
+  assert.throws(() => readFileAt(source, head, "apps/demo"), /has no file/);
+});
+
+test("a failed directory lookup fails the import instead of skipping that commit", () => {
+  const source = sourceRepo("lookup");
+  const failing = git(source, ["rev-parse", "HEAD~1"]);
+  // A git that fails every path lookup in one commit, while the walk over history still works.
+  const bin = join(scratch, "lookup-bin");
+  mkdirSync(bin);
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    join(bin, "git"),
+    [
+      "#!/bin/sh",
+      'case " $* " in',
+      `  *" ls-tree "*" ${failing} "*|*" ${failing}:"*) echo "fatal: lookup failed" >&2; exit 128 ;;`,
+      "esac",
+      `exec ${realGit} "$@"`,
+      "",
+    ].join("\n"),
+  );
+  chmodSync(join(bin, "git"), 0o755);
+  const bundle = join(scratch, "lookup.bundle");
+  const lookup = request(source, "HEAD");
+  const path = process.env["PATH"];
+  process.env["PATH"] = `${bin}:${path ?? ""}`;
+  try {
+    assert.throws(
+      () => writeHistoryBundle(lookup, bundle),
+      (error) => error instanceof Error && /lookup failed/.test(String(error)),
+    );
+  } finally {
+    process.env["PATH"] = path;
+  }
+  assert.equal(existsSync(bundle), false);
+  assert.equal(planHistory(request(source, "HEAD")).commits, 3);
 });

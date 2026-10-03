@@ -1,47 +1,78 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, test } from "node:test";
+import { basename, dirname, join } from "node:path";
+import { after, test } from "node:test";
+import { stripVTControlCharacters } from "node:util";
 import { run } from "./cli.ts";
 import { SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
 const scratch = mkdtempSync(join(tmpdir(), "railhead-demo-cli-test-"));
-const source = join(scratch, "source");
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
-// A source repository holding the app's real acceptance tags, so the run does not depend on how
-// deep this checkout's history is.
-before(() => {
-  const acceptance = join(source, "demo", "upload-app", "acceptance");
-  mkdirSync(acceptance, { recursive: true });
-  copyFileSync(
-    join(root, "demo", "upload-app", "acceptance", "checks.json"),
-    join(acceptance, "checks.json"),
-  );
-  const env = {
-    ...process.env,
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_AUTHOR_NAME: "Someone",
-    GIT_AUTHOR_EMAIL: "someone@example.com",
-    GIT_COMMITTER_NAME: "Someone",
-    GIT_COMMITTER_EMAIL: "someone@example.com",
-  };
-  execFileSync("git", ["-C", source, "init", "--quiet"], { env });
-  execFileSync("git", ["-C", source, "add", "--all"], { env });
-  execFileSync(
-    "git",
-    ["-C", source, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "feat: add the app"],
-    { env },
-  );
-});
+const CHECKS = "demo/upload-app/acceptance/checks.json";
+const gitEnv = {
+  ...process.env,
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "Someone",
+  GIT_AUTHOR_EMAIL: "someone@example.com",
+  GIT_COMMITTER_NAME: "Someone",
+  GIT_COMMITTER_EMAIL: "someone@example.com",
+};
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", ["-C", cwd, "-c", "commit.gpgsign=false", ...args], {
+    encoding: "utf8",
+    env: gitEnv,
+  }).trim();
+}
+
+/**
+ * A source repository holding this checkout's demo app and every file the standalone overlay
+ * reads, committed once, so the run does not depend on how deep this checkout's history is.
+ */
+function sourceRepo(name: string): string {
+  const source = join(scratch, name);
+  for (const path of ["demo/upload-app", "fixtures/demo/standalone", "scripts/assert-workerd.ts"]) {
+    mkdirSync(dirname(join(source, path)), { recursive: true });
+    cpSync(join(root, path), join(source, path), {
+      recursive: true,
+      // Installed and generated files are not part of the app.
+      filter: (from) => !["node_modules", ".wrangler"].includes(basename(from)),
+    });
+  }
+  cpSync(join(root, ".node-version"), join(source, ".node-version"));
+  git(source, ["init", "--quiet"]);
+  git(source, ["add", "--all"]);
+  git(source, ["commit", "--quiet", "-m", "feat: add the app"]);
+  return source;
+}
+
+/** `checks.json` naming another decision than the manifest's. */
+function otherDecision(): string {
+  const checks: unknown = JSON.parse(readFileSync(join(root, CHECKS), "utf8"));
+  assert.ok(typeof checks === "object" && checks !== null);
+  return `${JSON.stringify({ ...checks, decision: "another-decision" })}\n`;
+}
+
+const source = sourceRepo("source");
 
 test("seed --dry-run names the repository, its main, every issue and the decision", async () => {
   const lines = await run(["seed", "--dry-run", "--source-root", source]);
 
-  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(1 commits, full history\)$/);
+  // The app's one commit, then the commit that makes it stand alone.
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
   assert.deepEqual(lines.slice(1, 2), ["todo create repository demo/upload-app"]);
   assert.match(lines[2] ?? "", /^todo import main demo\/upload-app@main = [0-9a-f]{40}$/);
   assert.equal(
@@ -77,18 +108,79 @@ test("seed and reset without --dry-run, and unknown commands, are refused", asyn
   await assert.rejects(run(["deploy", "--source-root", source]), /Usage/);
   await assert.rejects(run(["seed", "extra", "--dry-run", "--source-root", source]), SeedRefusal);
   await assert.rejects(run(["bundle", "--source-root", source]), /needs --out/);
-  await assert.rejects(run(["seed", "--dry-run", "--source-root", scratch]), /acceptance checks/);
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", scratch]), /not a commit/);
 });
 
-test("bundle writes a clonable main whose head the dry run predicted", async () => {
+test("the acceptance checks are read from the selected commit, never the working tree", async () => {
+  const repo = sourceRepo("checks");
+  const compatible = readFileSync(join(repo, CHECKS), "utf8");
+  // HEAD~1 holds compatible checks; HEAD commits checks for another decision.
+  writeFileSync(join(repo, CHECKS), otherDecision());
+  git(repo, ["commit", "--quiet", "--all", "-m", "chore: rename the decision"]);
+  const out = join(scratch, "checks.bundle");
+
+  // A working tree that matches the manifest does not make the incompatible commit pass.
+  writeFileSync(join(repo, CHECKS), compatible);
+  await assert.rejects(
+    run(["bundle", "--out", out, "--source-root", repo]),
+    /names a different decision/,
+  );
+  assert.equal(existsSync(out), false);
+
+  // A working tree that does not match does not make the compatible commit fail.
+  writeFileSync(join(repo, CHECKS), otherDecision());
+  const lines = await run(["bundle", "--out", out, "--revision", "HEAD~1", "--source-root", repo]);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
+  const clone = join(scratch, "checks-clone");
+  execFileSync("git", ["clone", "--quiet", out, clone]);
+  assert.equal(readFileSync(join(clone, "acceptance", "checks.json"), "utf8"), compatible);
+
+  // A commit whose checks are not JSON is refused, naming that commit.
+  writeFileSync(join(repo, CHECKS), "{");
+  git(repo, ["commit", "--quiet", "--all", "-m", "chore: break the checks"]);
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), /are not JSON/);
+});
+
+test("the bundle is a repository that installs and runs its checks on its own", async () => {
   const out = join(scratch, "main.bundle");
   const [planned] = await run(["seed", "--dry-run", "--source-root", source]);
 
   const lines = await run(["bundle", "--out", out, "--source-root", source]);
 
   assert.equal(lines[0], planned);
-  assert.ok(existsSync(out));
-  const clone = join(scratch, "clone");
+  // An empty directory outside any workspace: nothing above it can supply a package or config.
+  const clone = join(mkdtempSync(join(tmpdir(), "railhead-demo-standalone-")), "upload-app");
+  after(() => rmSync(dirname(clone), { recursive: true, force: true }));
   execFileSync("git", ["clone", "--quiet", out, clone]);
-  assert.deepEqual(readdirSync(clone).toSorted(), [".git", "acceptance"]);
+  assert.deepEqual(readdirSync(clone).toSorted(), [
+    ".git",
+    ".node-version",
+    "README.md",
+    "__tests__",
+    "acceptance",
+    "assert-workerd.ts",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "src",
+    "tsconfig.json",
+    "vitest.config.ts",
+    "worker-configuration.d.ts",
+    "wrangler.jsonc",
+  ]);
+  for (const file of ["package.json", "tsconfig.json", "vitest.config.ts"]) {
+    const text = readFileSync(join(clone, file), "utf8");
+    assert.doesNotMatch(text, /catalog:|workspace:|@railhead\/scripts|\.\.\//, file);
+  }
+
+  // From the bundle's own lockfile. The store the monorepo's install filled supplies most packages;
+  // pnpm fetches what it lacks, such as metadata for another platform's optional packages.
+  const pnpm = (args: string[]) =>
+    execFileSync("pnpm", args, { cwd: clone, encoding: "utf8", timeout: 180_000 });
+  pnpm(["install", "--frozen-lockfile", "--prefer-offline"]);
+  pnpm(["run", "typecheck"]);
+  // The fixture's own tests and the current option's suite, under workerd.
+  const tests = stripVTControlCharacters(pnpm(["run", "test:run"]));
+  assert.match(tests, /✓ acceptance\/option-a\.test\.ts/);
+  assert.match(tests, /Test Files {2}\d+ passed \(\d+\)\n/);
 });

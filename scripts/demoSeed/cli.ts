@@ -8,13 +8,20 @@
 // only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing
 // here creates a Cloudflare resource or reads a secret.
 
-import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { planHistory, writeHistoryBundle, type ImportedHistory } from "./history.ts";
+import {
+  planHistory,
+  readFileAt,
+  resolveCommit,
+  writeHistoryBundle,
+  type ImportedHistory,
+  type ImportRequest,
+} from "./history.ts";
 import { assertDemoTarget, assertMatchesChecks, loadManifest, SeedRefusal } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
 import { describePlan, planReset, planSeed } from "./reconcile.ts";
+import { STANDALONE_OVERLAY, STANDALONE_SUBJECT } from "./standalone.ts";
 
 /** The repository root, which holds the default manifest and the demo app's history. */
 const ROOT = resolve(import.meta.dirname, "..", "..");
@@ -40,13 +47,20 @@ export async function run(argv: readonly string[]): Promise<string[]> {
 
   const manifest = loadManifest(values.manifest);
   assertDemoTarget(values.org ?? manifest.org, values.repo ?? manifest.repo);
-  const sourceRoot = values["source-root"];
-  assertMatchesChecks(manifest, readChecks(join(sourceRoot, manifest.source)));
+  // Resolved once, so the checks validated below and the history exported are the same commit's.
+  const request: ImportRequest = {
+    sourceRoot: values["source-root"],
+    commit: resolveCommit(values["source-root"], values.revision),
+    directory: manifest.source,
+    overlay: STANDALONE_OVERLAY,
+    overlaySubject: STANDALONE_SUBJECT,
+  };
+  assertMatchesChecks(manifest, readChecks(request));
 
   switch (command) {
     case "seed": {
       requireDryRun(values["dry-run"], "seed");
-      const history = planHistory(sourceRoot, values.revision, manifest.source);
+      const history = planHistory(request);
       return [
         ...header(history),
         ...describePlan(await planSeed(manifest, history, new MemoryTarget())),
@@ -65,12 +79,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     }
     case "bundle": {
       if (values.out === undefined) throw new SeedRefusal("bundle needs --out FILE.");
-      const history = writeHistoryBundle(
-        sourceRoot,
-        values.revision,
-        manifest.source,
-        resolve(values.out),
-      );
+      const history = writeHistoryBundle(request, resolve(values.out));
       return [...header(history), `wrote ${resolve(values.out)}`];
     }
     default:
@@ -78,12 +87,17 @@ export async function run(argv: readonly string[]): Promise<string[]> {
   }
 }
 
-function readChecks(appRoot: string): unknown {
-  const path = join(appRoot, "acceptance", "checks.json");
+/** The app's acceptance checks as committed at the import's commit, never the working tree's. */
+function readChecks({ sourceRoot, commit, directory }: ImportRequest): unknown {
+  const path = `${directory}/acceptance/checks.json`;
+  // A missing file is already a refusal; a failure to read the repository is not one.
+  const text = readFileAt(sourceRoot, commit, path);
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    return JSON.parse(text);
   } catch (error) {
-    throw new SeedRefusal(`Cannot read the app's acceptance checks at ${path}.`, { cause: error });
+    throw new SeedRefusal(`The app's acceptance checks at ${commit}:${path} are not JSON.`, {
+      cause: error,
+    });
   }
 }
 

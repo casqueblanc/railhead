@@ -1,13 +1,16 @@
 // The demo repository's main: the full history of one directory of a source Git repository,
-// rewritten so that directory is the root, as `git subtree split` would.
+// rewritten so that directory is the root, as `git subtree split` would, followed by one commit
+// that applies an overlay of files the directory needs to stand alone.
 //
 // The rewrite is deterministic. Each source commit that changed the directory becomes one commit
 // with the directory's tree, the source commit's subject and dates, and a fixed demo author, so the
 // same source revision always yields the same head. That is what lets a repeated seed recognise a
-// main it already imported, and a reset followed by a seed land on the same base.
+// main it already imported, and a reset followed by a seed land on the same base. A commit that
+// deleted the directory becomes a commit with an empty tree, so a later re-addition is kept too.
 //
 // Nothing is written to the source repository. The commits are made in a scratch repository that
 // borrows the source's objects through `objects/info/alternates`, and leave it only as a bundle.
+// Every file is read from the source commit, never from a working tree.
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -22,6 +25,25 @@ export const MAIN_BRANCH = "main";
 /** The most commits an import may hold. The demo history is small; more means the wrong source. */
 export const MAX_IMPORT_COMMITS = 500;
 
+/** One file of the overlay applied on top of the imported directory. */
+export interface OverlayEntry {
+  /** The path in the imported repository. */
+  readonly path: string;
+  /** The source repository path whose content it takes at the same commit, or `null` to delete it. */
+  readonly from: string | null;
+}
+
+/** What to import: the history of `directory` up to `commit`, then `overlay` as one more commit. */
+export interface ImportRequest {
+  readonly sourceRoot: string;
+  /** A full commit SHA, from `resolveCommit`. */
+  readonly commit: string;
+  readonly directory: string;
+  readonly overlay: readonly OverlayEntry[];
+  /** The subject of the overlay commit. */
+  readonly overlaySubject: string;
+}
+
 /** What an import produced. */
 export interface ImportedHistory {
   /** The head of the imported main. */
@@ -31,33 +53,42 @@ export interface ImportedHistory {
 }
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
+// `ls-tree -z` prints `<mode> <type> <object>\t<path>\0`.
+const TREE_ENTRY = /^(\d{6}) (blob|tree|commit) ([0-9a-f]{40})\t/;
 // Commit and tree lookups are small; a source this slow is broken, not busy.
 const GIT_TIMEOUT_MS = 60_000;
 
-/**
- * Computes the rewritten history of `directory` at `revision` in the repository at `sourceRoot`
- * without writing a bundle, for a dry run.
- */
-export function planHistory(
-  sourceRoot: string,
-  revision: string,
-  directory: string,
-): ImportedHistory {
-  return withScratch(sourceRoot, (scratch) => rewrite(sourceRoot, scratch, revision, directory));
+/** Resolves `revision` in the repository at `sourceRoot` to a full commit SHA, once. */
+export function resolveCommit(sourceRoot: string, revision: string): string {
+  let commit: string;
+  try {
+    commit = git(sourceRoot, ["rev-parse", "--verify", "--quiet", `${revision}^{commit}`]).trim();
+  } catch (error) {
+    throw new SeedRefusal(`${revision} is not a commit.`, { cause: error });
+  }
+  if (!COMMIT_SHA.test(commit)) throw new SeedRefusal(`${revision} is not a commit.`);
+  return commit;
+}
+
+/** Reads the file at `path` as it is in `commit`, refusing when that commit has no such file. */
+export function readFileAt(sourceRoot: string, commit: string, path: string): string {
+  const entry = entryAt(sourceRoot, commit, path);
+  if (entry?.type !== "blob") throw new SeedRefusal(`${commit} has no file ${path}.`);
+  return git(sourceRoot, ["cat-file", "blob", entry.object]);
+}
+
+/** Computes the rewritten history without writing a bundle, for a dry run. */
+export function planHistory(request: ImportRequest): ImportedHistory {
+  return withScratch(request.sourceRoot, (scratch) => rewrite(request, scratch));
 }
 
 /**
- * Rewrites the history of `directory` at `revision` and writes it to `bundlePath` as a Git bundle
- * holding `main`. The owner pushes that bundle to the demo repository's main.
+ * Rewrites the history and writes it to `bundlePath` as a Git bundle holding `main`. The owner
+ * pushes that bundle to the demo repository's main.
  */
-export function writeHistoryBundle(
-  sourceRoot: string,
-  revision: string,
-  directory: string,
-  bundlePath: string,
-): ImportedHistory {
-  return withScratch(sourceRoot, (scratch) => {
-    const history = rewrite(sourceRoot, scratch, revision, directory);
+export function writeHistoryBundle(request: ImportRequest, bundlePath: string): ImportedHistory {
+  return withScratch(request.sourceRoot, (scratch) => {
+    const history = rewrite(request, scratch);
     git(scratch, ["update-ref", `refs/heads/${MAIN_BRANCH}`, history.head]);
     // `HEAD` too: without it some Git versions clone the bundle but check nothing out.
     git(scratch, ["bundle", "create", bundlePath, "HEAD", `refs/heads/${MAIN_BRANCH}`]);
@@ -65,83 +96,135 @@ export function writeHistoryBundle(
   });
 }
 
-function rewrite(
-  sourceRoot: string,
-  scratch: string,
-  revision: string,
-  directory: string,
-): ImportedHistory {
+function rewrite(request: ImportRequest, scratch: string): ImportedHistory {
+  const { sourceRoot, commit: tip, directory } = request;
   if (git(sourceRoot, ["rev-parse", "--is-shallow-repository"]).trim() !== "false") {
     throw new SeedRefusal(
       "The source repository is a shallow clone; the import needs its full history.",
     );
   }
-  const tip = resolve(sourceRoot, `${revision}^{commit}`, `${revision} is not a commit.`);
   const sources = git(sourceRoot, ["rev-list", "--reverse", "--topo-order", tip, "--", directory])
     .split("\n")
     .filter((line) => line !== "");
   if (sources.length === 0) {
-    throw new SeedRefusal(`No commit up to ${revision} changes ${directory}.`);
+    throw new SeedRefusal(`No commit up to ${tip} changes ${directory}.`);
   }
   if (sources.length > MAX_IMPORT_COMMITS) {
     throw new SeedRefusal(`${directory} has more than ${MAX_IMPORT_COMMITS} commits to import.`);
   }
 
+  const emptyTree = git(scratch, ["mktree"], {}, "").trim();
   let head: string | null = null;
   let previousTree: string | null = null;
   let commits = 0;
   for (const source of sources) {
-    const tree = treeOf(sourceRoot, source, directory);
-    // A commit that deleted the directory, or a merge that left it as it was, adds nothing.
+    // A commit that deleted the directory imports as an empty tree, once there is history to
+    // delete from. A merge that left the directory as it was adds nothing.
+    const tree = treeOf(sourceRoot, source, directory) ?? (head === null ? null : emptyTree);
     if (tree === null || tree === previousTree) continue;
-    const [subject = "", authorDate = "", committerDate = ""] = git(sourceRoot, [
-      "show",
-      "-s",
-      "--format=%s%x00%ad%x00%cd",
-      "--date=raw",
-      source,
-    ])
-      .trimEnd()
-      .split("\0");
-    const parents: string[] = head === null ? [] : ["-p", head];
-    const commit: string = git(
-      scratch,
-      ["commit-tree", "--no-gpg-sign", tree, ...parents, "-m", subject || "Update the demo app"],
-      {
-        GIT_AUTHOR_NAME: DEMO_AUTHOR.name,
-        GIT_AUTHOR_EMAIL: DEMO_AUTHOR.email,
-        GIT_AUTHOR_DATE: authorDate,
-        GIT_COMMITTER_NAME: DEMO_AUTHOR.name,
-        GIT_COMMITTER_EMAIL: DEMO_AUTHOR.email,
-        GIT_COMMITTER_DATE: committerDate,
-      },
-    ).trim();
-    head = commit;
+    head = commitTree(scratch, tree, head, metadataOf(sourceRoot, source));
     previousTree = tree;
     commits += 1;
   }
-  if (head === null || !COMMIT_SHA.test(head)) {
-    throw new SeedRefusal(`${directory} does not exist at any commit up to ${revision}.`);
+  if (head === null || previousTree === null || previousTree === emptyTree) {
+    throw new SeedRefusal(`${directory} does not exist at ${tip}.`);
   }
+  if (request.overlay.length > 0) {
+    const tree = overlayTree(request, scratch, previousTree);
+    const { authorDate, committerDate } = metadataOf(sourceRoot, tip);
+    head = commitTree(scratch, tree, head, {
+      subject: request.overlaySubject,
+      authorDate,
+      committerDate,
+    });
+    commits += 1;
+  }
+  if (!COMMIT_SHA.test(head)) throw new Error(`git commit-tree printed no commit for ${tip}.`);
   return { head, commits };
 }
 
-function treeOf(root: string, commit: string, directory: string): string | null {
-  try {
-    const tree = git(root, ["rev-parse", "--verify", "--quiet", `${commit}:${directory}`]).trim();
-    return git(root, ["cat-file", "-t", tree]).trim() === "tree" ? tree : null;
-  } catch {
-    // `--verify --quiet` exits 1 with no output when the path is absent at that commit.
-    return null;
-  }
+interface CommitMetadata {
+  readonly subject: string;
+  readonly authorDate: string;
+  readonly committerDate: string;
 }
 
-function resolve(root: string, spec: string, message: string): string {
-  try {
-    return git(root, ["rev-parse", "--verify", "--quiet", spec]).trim();
-  } catch (error) {
-    throw new SeedRefusal(message, { cause: error });
-  }
+function metadataOf(root: string, commit: string): CommitMetadata {
+  const [subject = "", authorDate = "", committerDate = ""] = git(root, [
+    "show",
+    "-s",
+    "--format=%s%x00%ad%x00%cd",
+    "--date=raw",
+    commit,
+  ])
+    .trimEnd()
+    .split("\0");
+  return { subject: subject || "Update the demo app", authorDate, committerDate };
+}
+
+function commitTree(
+  scratch: string,
+  tree: string,
+  parent: string | null,
+  metadata: CommitMetadata,
+): string {
+  const parents = parent === null ? [] : ["-p", parent];
+  return git(scratch, ["commit-tree", "--no-gpg-sign", tree, ...parents, "-m", metadata.subject], {
+    GIT_AUTHOR_NAME: DEMO_AUTHOR.name,
+    GIT_AUTHOR_EMAIL: DEMO_AUTHOR.email,
+    GIT_AUTHOR_DATE: metadata.authorDate,
+    GIT_COMMITTER_NAME: DEMO_AUTHOR.name,
+    GIT_COMMITTER_EMAIL: DEMO_AUTHOR.email,
+    GIT_COMMITTER_DATE: metadata.committerDate,
+  }).trim();
+}
+
+/** `tree` with the overlay applied, every added file taken from the source at the import's tip. */
+function overlayTree(request: ImportRequest, scratch: string, tree: string): string {
+  // A private index in the bare scratch repository; the source's index is never touched.
+  const env = { GIT_INDEX_FILE: join(scratch, "overlay-index") };
+  git(scratch, ["read-tree", tree], env);
+  const lines = request.overlay.map(({ path, from }) => {
+    if (from === null) {
+      if (git(scratch, ["ls-files", "--", path], env).trim() === "") {
+        throw new SeedRefusal(`The overlay removes ${path}, which ${request.directory} lacks.`);
+      }
+      // Mode 0 removes the entry.
+      return `0 ${"0".repeat(40)}\t${path}\n`;
+    }
+    const entry = entryAt(request.sourceRoot, request.commit, from);
+    if (entry?.type !== "blob") {
+      throw new SeedRefusal(`The overlay needs ${from}, which ${request.commit} lacks.`);
+    }
+    return `${entry.mode} ${entry.object}\t${path}\n`;
+  });
+  git(scratch, ["update-index", "--index-info"], env, lines.join(""));
+  return git(scratch, ["write-tree"], env).trim();
+}
+
+/** The tree of `directory` at `commit`, or `null` when that commit has no such directory. */
+function treeOf(root: string, commit: string, directory: string): string | null {
+  const entry = entryAt(root, commit, directory);
+  return entry?.type === "tree" ? entry.object : null;
+}
+
+interface TreeEntry {
+  readonly mode: string;
+  readonly type: string;
+  readonly object: string;
+}
+
+/**
+ * The entry at `path` in `commit`, or `null` when the path is absent. `ls-tree` prints nothing for
+ * an absent path, so any failure to read the commit or its trees throws instead.
+ */
+function entryAt(root: string, commit: string, path: string): TreeEntry | null {
+  const output = git(root, ["ls-tree", "-z", "--full-tree", commit, "--", path]);
+  if (output === "") return null;
+  const match = TREE_ENTRY.exec(output);
+  if (match === null) throw new Error(`Unexpected git ls-tree output for ${path}.`);
+  const [, mode = "", type = "", object = ""] = match;
+  return { mode, type, object };
 }
 
 function withScratch<T>(sourceRoot: string, work: (scratch: string) => T): T {
@@ -160,12 +243,18 @@ function withScratch<T>(sourceRoot: string, work: (scratch: string) => T): T {
   }
 }
 
-function git(cwd: string, args: readonly string[], env: Record<string, string> = {}): string {
+function git(
+  cwd: string,
+  args: readonly string[],
+  env: Record<string, string> = {},
+  input?: string,
+): string {
   return execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     timeout: GIT_TIMEOUT_MS,
     // A user's global hooks, templates or signing settings must not change what is written.
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", ...env },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    ...(input === undefined ? {} : { input }),
   });
 }
