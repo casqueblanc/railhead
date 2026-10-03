@@ -20,6 +20,13 @@
 // `revoke_attempt` counts the revocation sweeps started for a claim and each new obligation to
 // revoke. Only a `revoked` answer from the latest sweep clears `revoke_due`, so an earlier sweep
 // that answers late cannot settle a debt a later sweep or obligation still owes.
+//
+// Every sweep that has started holds a revocation barrier on its claim's fork, recorded with its
+// attempt in the transaction that starts it. Until that attempt records its outcome, no write to the
+// fork is granted: the sweep could still revoke a token minted meanwhile, and a Repo restarted
+// mid-sweep knows of the sweep only through this row. Overlapping sweeps each hold their own. A
+// barrier whose sweep outlived `expires_at` is presumed lost; it keeps refusing grants until a new
+// sweep replaces it and records its outcome.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -67,6 +74,13 @@ const MIGRATIONS: readonly string[] = [
     WHERE state IN ('allocating', 'working')`,
   "CREATE INDEX claims_by_revocation ON claims_claims (revoke_due) WHERE revoke_due IS NOT NULL",
   "ALTER TABLE claims_claims ADD COLUMN revoke_attempt INTEGER NOT NULL DEFAULT 0",
+  `CREATE TABLE claims_revocation_barriers (
+    claim_id TEXT NOT NULL REFERENCES claims_claims (claim_id),
+    attempt INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (claim_id, attempt)
+  ) STRICT`,
+  "CREATE INDEX claims_barriers_by_expiry ON claims_revocation_barriers (expires_at)",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -288,12 +302,14 @@ export function dueRevocations(sql: SqlStorage, now: number, limit: number): Cla
 /**
  * Starts a revocation sweep of the claim's fork tokens and returns its attempt, which
  * `recordRevocation` needs to settle it, only while the stored generation, state and due
- * revocation still equal `expected`. Returns `"stale"`, and writes nothing, when the claim changed
+ * revocation still equal `expected`. In the same step it raises the fork's revocation barrier for
+ * that attempt until `barrierUntil`. Returns `"stale"`, and writes nothing, when the claim changed
  * since the caller read it: a reopened claim owes nothing, and its holder's new tokens must live.
  */
 export function beginRevocation(
   sql: SqlStorage,
   expected: Pick<ClaimRow, "claimId" | "generation" | "state" | "revokeDue">,
+  barrierUntil: number,
 ): number | "stale" {
   if (expected.revokeDue === null) return "stale";
   const [row] = sql
@@ -308,28 +324,110 @@ export function beginRevocation(
       expected.revokeDue,
     )
     .toArray();
-  return row?.revoke_attempt ?? "stale";
+  if (row === undefined) return "stale";
+  raiseBarrier(sql, expected.claimId, row.revoke_attempt, barrierUntil);
+  return row.revoke_attempt;
+}
+
+/**
+ * Starts a new sweep in place of the one whose barrier at attempt `lost` expired at or before
+ * `now`, and returns the new attempt, whose barrier replaces it until `barrierUntil`. Returns
+ * `"stale"`, and writes nothing, when that barrier was lowered or replaced or has not expired.
+ */
+export function replaceLostBarrier(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  lost: number,
+  now: number,
+  barrierUntil: number,
+): number | "stale" {
+  const [row] = sql
+    .exec<{ revoke_attempt: number }>(
+      `UPDATE claims_claims SET revoke_attempt = revoke_attempt + 1
+       WHERE claim_id = ? AND EXISTS (SELECT 1 FROM claims_revocation_barriers b
+         WHERE b.claim_id = claims_claims.claim_id AND b.attempt = ? AND b.expires_at <= ?)
+       RETURNING revoke_attempt`,
+      claimId,
+      lost,
+      now,
+    )
+    .toArray();
+  if (row === undefined) return "stale";
+  sql.exec(
+    "DELETE FROM claims_revocation_barriers WHERE claim_id = ? AND attempt = ?",
+    claimId,
+    lost,
+  );
+  raiseBarrier(sql, claimId, row.revoke_attempt, barrierUntil);
+  return row.revoke_attempt;
+}
+
+function raiseBarrier(sql: SqlStorage, claimId: ClaimId, attempt: number, until: number): void {
+  sql.exec(
+    "INSERT INTO claims_revocation_barriers (claim_id, attempt, expires_at) VALUES (?, ?, ?)",
+    claimId,
+    attempt,
+    until,
+  );
+}
+
+/** Whether any revocation barrier stands on the claim's fork, expired or not. */
+export function barrierStands(sql: SqlStorage, claimId: ClaimId): boolean {
+  const [row] = sql
+    .exec<{ standing: number }>(
+      "SELECT EXISTS (SELECT 1 FROM claims_revocation_barriers WHERE claim_id = ?) AS standing",
+      claimId,
+    )
+    .toArray();
+  return row?.standing === 1;
+}
+
+/** One barrier whose sweep outlived it. */
+export interface LostBarrier {
+  claimId: ClaimId;
+  /** The attempt the barrier was raised for. */
+  attempt: number;
+}
+
+/** Barriers that expired at or before `now`, earliest first, at most `limit`. */
+export function lostBarriers(sql: SqlStorage, now: number, limit: number): LostBarrier[] {
+  return sql
+    .exec<{ claim_id: string; attempt: number }>(
+      `SELECT claim_id, attempt FROM claims_revocation_barriers WHERE expires_at <= ?
+       ORDER BY expires_at, claim_id LIMIT ?`,
+      now,
+      limit,
+    )
+    .toArray()
+    .map((row) => ({ claimId: row.claim_id, attempt: row.attempt }));
 }
 
 /** How a revocation sweep of a claim's fork tokens ended. */
 export type RevocationOutcome =
   /** Artifacts reported every token revoked. */
-  | { kind: "settled"; attempt: number }
+  | { kind: "settled" }
   /** The sweep failed, threw or reported a debt; the revocation is due again at `retryAt`. */
   | { kind: "owed"; retryAt: number };
 
 /**
- * Records the outcome of a revocation of an expired or ready claim at `generation`. A settled
- * sweep clears `revoke_due` only when it is the latest attempt and nothing newer is owed. An owed
- * one always keeps the revocation due, even after another sweep cleared it, so a late partial
- * listing is never lost.
+ * Records the outcome of the sweep `attempt` of a claim at `generation`, and lowers the barrier
+ * that attempt raised: the sweep has ended, so it can no longer revoke a token minted after this.
+ * A settled sweep clears `revoke_due` of an expired or ready claim only when it is the latest
+ * attempt and nothing newer is owed. An owed one always keeps the revocation of an expired or ready
+ * claim due, even after another sweep cleared it, so a late partial listing is never lost.
  */
 export function recordRevocation(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
+  attempt: number,
   outcome: RevocationOutcome,
 ): void {
+  sql.exec(
+    "DELETE FROM claims_revocation_barriers WHERE claim_id = ? AND attempt = ?",
+    claimId,
+    attempt,
+  );
   switch (outcome.kind) {
     case "settled":
       sql.exec(
@@ -338,7 +436,7 @@ export function recordRevocation(
            AND revoke_attempt = ?`,
         claimId,
         generation,
-        outcome.attempt,
+        attempt,
       );
       return;
     case "owed":
@@ -355,7 +453,10 @@ export function recordRevocation(
   }
 }
 
-/** The earliest time a lease lapses or a revocation is due, or `null` when nothing waits. */
+/**
+ * The earliest time a lease lapses, a revocation is due or a barrier expires, or `null` when
+ * nothing waits.
+ */
 export function nextClaimsDeadline(sql: SqlStorage): number | null {
   const [row] = sql
     .exec<{ at: number | null }>(
@@ -363,6 +464,8 @@ export function nextClaimsDeadline(sql: SqlStorage): number | null {
          SELECT MIN(lease_until) AS at FROM claims_claims WHERE state = 'working'
          UNION ALL
          SELECT MIN(revoke_due) AS at FROM claims_claims WHERE revoke_due IS NOT NULL
+         UNION ALL
+         SELECT MIN(expires_at) AS at FROM claims_revocation_barriers
        )`,
     )
     .toArray();
@@ -526,8 +629,9 @@ export function pinReady(
 
 /**
  * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
- * and the revocation the pin owed, since its holder may push again, and forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer
- * ready at that generation.
+ * and the revocation the pin owed, since its holder may push again, and forgets its last refusal.
+ * A sweep the pin started keeps its barrier, so the holder pushes only once that sweep has ended.
+ * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
  */
 export function reopenReady(
   sql: SqlStorage,

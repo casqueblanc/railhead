@@ -63,8 +63,12 @@
 // Every await here (main's head, a fork, a commit lookup, a fork's name, a revocation sweep) lets
 // other calls change the claim, so nothing read before one is acted on after it. A sweep starts
 // only if the claim still has the generation, state and due revocation its caller read, so a pin
-// reopened since then is never swept and its holder's new tokens stay valid; while a sweep runs,
-// the holder of the reopened claim gets no write grant. The alarm reads each claim of its batch
+// reopened since then is never swept and its holder's new tokens stay valid. A started sweep raises
+// a revocation barrier in storage in the same transaction, and until its attempt records an
+// outcome nobody gets a write grant on the fork, even from a Repo restarted mid-sweep whose memory
+// holds no running sweep. A barrier that outlives `REVOCATION_BARRIER_MS` keeps refusing grants;
+// the Repo's alarm treats its sweep as lost and sweeps again under a new barrier, and only that
+// sweep's outcome lowers it. The alarm reads each claim of its batch
 // again just before that claim's sweep. `ready` answers from the stored claim after its sweep:
 // a pin a newer decision superseded meanwhile is reopened and refused, never reported as pinned.
 //
@@ -82,7 +86,7 @@ import {
   type IssueId,
   type RefusalReason,
 } from "@railhead/shared/events";
-import { forkRepoName, mainRepoName } from "../../artifacts/adapter";
+import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName } from "../../artifacts/adapter";
 import type { TokenRevocation } from "../../contracts/artifacts";
 import type { ClaimPin, ClaimsPort, GitAccess, GitGrant } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
@@ -93,6 +97,7 @@ import {
   activeClaimOf,
   activeClaimsOfOwner,
   backfillLeases,
+  barrierStands,
   beginRevocation,
   claimById,
   claimOfIssue,
@@ -103,6 +108,7 @@ import {
   issueByGrant,
   issueStatus,
   lapsedClaims,
+  lostBarriers,
   migrateClaims,
   nextClaimsDeadline,
   nextOpenIssue,
@@ -116,6 +122,7 @@ import {
   releasePendingBefore,
   renewLease,
   reopenReady,
+  replaceLostBarrier,
   type ClaimRow,
   type RevocationOutcome,
 } from "./store";
@@ -137,6 +144,14 @@ export const CLAIM_LEASE_MS = 30 * 60_000;
 
 /** How long after a failed or pending revocation the Repo's alarm tries it again. */
 export const REVOKE_RETRY_MS = 60_000;
+
+/**
+ * How long a sweep's revocation barrier stands before its sweep is presumed lost: one Artifacts
+ * call to open the fork and the adapter's sweep deadline, plus a minute's margin. A design value,
+ * not a measured bound on how late Artifacts may apply a call.
+ */
+export const REVOCATION_BARRIER_MS =
+  ARTIFACTS_LIMITS.callTimeoutMs + ARTIFACTS_LIMITS.sweepDeadlineMs + 60_000;
 
 /** Most lapsed leases one call or alarm expires, so each stays bounded. */
 export const RELEASE_BATCH = 16;
@@ -256,51 +271,86 @@ export function createClaims(
   const revoking = new Map<ClaimId, Promise<Sweep>>();
 
   /**
-   * Revokes the fork tokens of `row`, an expired or ready claim as the caller read it, and records
-   * the outcome, joining the sweep already running for the claim rather than starting another. A
-   * revocation that fails, or that Artifacts reports as `pending_debt`, is not settled and is due
-   * again after `REVOKE_RETRY_MS`. Answers `stale`, having called nothing, when the claim no longer
-   * owes that revocation.
+   * Revokes the fork tokens of `claimId` under the attempt `begin` starts, and records the outcome,
+   * joining the sweep already running for the claim rather than starting another. A revocation
+   * that fails, or that Artifacts reports as `pending_debt`, is not settled and is due again after
+   * `REVOKE_RETRY_MS`. Answers `stale`, having called nothing, when `begin` starts no attempt.
    */
-  const revoke = (row: ClaimRow): Promise<Sweep> => {
-    const running = revoking.get(row.claimId);
+  const revoke = (claimId: ClaimId, begin: BeginSweep): Promise<Sweep> => {
+    const running = revoking.get(claimId);
     if (running !== undefined) return running;
-    const sweep = sweepTokens(row).finally(() => revoking.delete(row.claimId));
-    revoking.set(row.claimId, sweep);
+    const sweep = sweepTokens(claimId, begin).finally(() => revoking.delete(claimId));
+    revoking.set(claimId, sweep);
     return sweep;
   };
 
   /**
-   * One revocation sweep under a new attempt. The attempt starts only if the claim still stands as
-   * `row` after the fork's name is derived, the sweep's last await before Artifacts, so a claim
-   * reopened since the caller read it is never swept. The attempt is stored before Artifacts is
-   * called, so a sweep this one overlaps, after an eviction lost the running one, cannot settle the
-   * claim.
+   * Starts the revocation `row`, an expired or ready claim as the caller read it, owes, only while
+   * the claim still stands as `row`, so a claim reopened since the caller read it is never swept.
    */
-  const sweepTokens = async (row: ClaimRow): Promise<Sweep> => {
-    const { claimId, generation } = row;
+  const owedBy =
+    (row: ClaimRow): BeginSweep =>
+    (sql) => {
+      const attempt = beginRevocation(sql, row, clock() + REVOCATION_BARRIER_MS);
+      return attempt === "stale" ? attempt : { attempt, generation: row.generation };
+    };
+
+  /** Starts a sweep in place of the one whose barrier at attempt `lostAttempt` expired. */
+  const replacing =
+    (claimId: ClaimId, lostAttempt: number): BeginSweep =>
+    (sql) => {
+      const row = claimById(sql, claimId);
+      if (row === null) return "stale";
+      const now = clock();
+      const attempt = replaceLostBarrier(
+        sql,
+        claimId,
+        lostAttempt,
+        now,
+        now + REVOCATION_BARRIER_MS,
+      );
+      return attempt === "stale" ? attempt : { attempt, generation: row.generation };
+    };
+
+  /**
+   * One revocation sweep under a new attempt. The attempt starts after the fork's name is derived,
+   * the sweep's last await before Artifacts, and is stored with its barrier before Artifacts is
+   * called, so a sweep this one overlaps, after an eviction lost the running one, cannot settle the
+   * claim, and no write is granted on the fork until this sweep records its outcome.
+   */
+  const sweepTokens = async (claimId: ClaimId, begin: BeginSweep): Promise<Sweep> => {
     const repo = await forkRepoName(repoId, claimId);
-    const attempt = log.transaction((tx) => beginRevocation(tx.sql, row)).value;
-    if (attempt === "stale") return { kind: "stale" };
+    const started = log.transaction((tx) => begin(tx.sql)).value;
+    if (started === "stale") return { kind: "stale" };
+    const { attempt, generation } = started;
     let revoked: PortResult<TokenRevocation>;
     try {
       revoked = await ports().artifacts.revokeTokens(repo);
     } catch (error) {
       // A revocation that throws is retried like a failed one, rather than at once by every wake.
       log.transaction((tx) => {
-        recordRevocation(tx.sql, claimId, generation, owed());
+        recordRevocation(tx.sql, claimId, generation, attempt, owed());
         wakeForDeadline(tx.sql);
       });
       throw error;
     }
     log.transaction((tx) => {
-      const outcome: RevocationOutcome = revocationSettled(revoked)
-        ? { kind: "settled", attempt }
-        : owed();
-      recordRevocation(tx.sql, claimId, generation, outcome);
+      const outcome: RevocationOutcome = revocationSettled(revoked) ? { kind: "settled" } : owed();
+      recordRevocation(tx.sql, claimId, generation, attempt, outcome);
       wakeForDeadline(tx.sql);
     });
     return { kind: "swept", result: revoked };
+  };
+
+  /**
+   * Sweeps again, up to `limit`, the forks whose barrier outlived its sweep: that sweep is presumed
+   * lost, and whether it revoked everything is unknown, so its barrier stands until a new sweep
+   * records an outcome.
+   */
+  const resweepLost = async (limit: number): Promise<void> => {
+    for (const { claimId, attempt } of lostBarriers(context.storage.sql, clock(), limit)) {
+      await revoke(claimId, replacing(claimId, attempt));
+    }
   };
 
   /**
@@ -312,7 +362,7 @@ export function createClaims(
     for (const due of dueRevocations(context.storage.sql, clock(), limit)) {
       const row = claimById(context.storage.sql, due.claimId);
       if (row === null || row.revokeDue === null || row.revokeDue > clock()) continue;
-      await revoke(row);
+      await revoke(row.claimId, owedBy(row));
     }
   };
 
@@ -345,12 +395,14 @@ export function createClaims(
   };
 
   /**
-   * Expires lapsed claims and revokes up to `limit` due revocations, so a takeover sees them
-   * settled. Whatever throws, it asks for the next deadline, so a revocation still owed keeps a wake.
+   * Expires lapsed claims, sweeps up to `limit` forks whose barrier outlived its sweep and revokes
+   * up to `limit` due revocations, so a takeover sees them settled. Whatever throws, it asks for
+   * the next deadline, so a revocation still owed and a barrier still standing keep a wake.
    */
   const release = async (limit: number): Promise<void> => {
     try {
       expireLapsed();
+      await resweepLost(limit);
       await releaseDue(limit);
     } finally {
       wakeForDeadline(context.storage.sql);
@@ -687,7 +739,7 @@ export function createClaims(
       // this read sees the pin it recorded. A repeat while the revocation is owed revokes again.
       const pinned = claimById(context.storage.sql, claimId);
       if (pinned === null || pinned.revokeDue === null) return decided;
-      const revoked = await revoke(pinned);
+      const revoked = await revoke(claimId, owedBy(pinned));
       if (revoked.kind === "swept" && !revoked.result.ok) return revoked.result;
       // A decision, a reopen or another `ready` may have run during the sweep, so the answer comes
       // from the stored claim, not from `decided`.
@@ -735,7 +787,6 @@ export function createClaims(
             const leased = hold(tx, row);
             return reopen ? settle(tx, leased) : leased;
           }).value,
-        sweeping: (claimId) => revoking.has(claimId),
       });
     },
 
@@ -808,6 +859,12 @@ function revocationSettled(result: PortResult<TokenRevocation>): boolean {
       return result.value satisfies never;
   }
 }
+
+/**
+ * Starts a sweep's attempt and raises its barrier, in the caller's transaction, answering the
+ * attempt and the claim's generation, or `"stale"` when no sweep is owed any more.
+ */
+type BeginSweep = (sql: SqlStorage) => { attempt: number; generation: number } | "stale";
 
 /** How one call to revoke a claim's fork tokens ended. */
 type Sweep =
@@ -906,8 +963,6 @@ interface GitHolder {
    * returns it to working if a newer decision superseded its pin.
    */
   holderRead(claimId: ClaimId, agentId: AgentId, reopen: boolean): ClaimRow | null;
-  /** Whether a revocation sweep of the claim's fork tokens is running in this Repo. */
-  sweeping(claimId: ClaimId): boolean;
 }
 
 /**
@@ -949,8 +1004,8 @@ async function decideGit(
       return ok({ repo, scope: "read", fence: null });
     case "push":
       // A sweep that started before a newer decision reopened the claim may still reach a token
-      // minted now, so the holder waits for it to end.
-      if (row.state === "working" && holder.sweeping(claimId)) {
+      // minted now, so the holder waits until every started sweep has recorded its outcome.
+      if (row.state === "working" && barrierStands(sql, claimId)) {
         return fail("busy", "The fork's earlier tokens are still being revoked; repeat the push.");
       }
       return pushGrant(row, principal, repo);

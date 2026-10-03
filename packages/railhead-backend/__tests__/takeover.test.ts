@@ -22,6 +22,7 @@ import {
   CLAIM_LEASE_MS,
   CLAIMS_LIMITS,
   RELEASE_BATCH,
+  REVOCATION_BARRIER_MS,
   REVOKE_RETRY_MS,
   createClaims,
   type ClaimsLimits,
@@ -95,6 +96,16 @@ interface Setup {
    * would build. It knows nothing of the first module's running sweeps.
    */
   restarted: () => ClaimsPort;
+  /**
+   * A claims module and an Artifacts adapter both new, over the same storage, as a Repo recreated
+   * after an eviction would build: neither knows of the first Repo's running sweeps or mints. Its
+   * revocations and mints are recorded in `revoked` and `minted` too, and each revocation awaits
+   * `holdRevocation`, when given, before reaching Artifacts.
+   */
+  rebooted: (holdRevocation?: () => Promise<void>) => {
+    claims: ClaimsPort;
+    artifacts: ArtifactsPort;
+  };
 }
 
 /**
@@ -221,6 +232,32 @@ function withTakeover<T>(
       storedAlarm: () => storedAlarm,
       laterResumes,
       restarted: () => createClaims(context, () => ports, limits),
+      rebooted(holdRevocation) {
+        const fresh = createArtifactsAdapter(
+          { ...context, namespace: fake },
+          { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
+        );
+        const freshArtifacts: ArtifactsPort = {
+          forkForClaim: (claimId, forkBase) => fresh.forkForClaim(claimId, forkBase),
+          commitExists: (repo, commit) => fresh.commitExists(repo, commit),
+          token(repo, scope, ttlMs) {
+            setup.minted.push(repo);
+            return fresh.token(repo, scope, ttlMs);
+          },
+          async revokeTokens(repo) {
+            setup.revoked.push(repo);
+            await holdRevocation?.();
+            return fresh.revokeTokens(repo);
+          },
+        };
+        // The module reads its ports only when called, never while it is built.
+        const claims: ClaimsPort = createClaims(
+          context,
+          () => ({ ...ports, claims, artifacts: freshArtifacts }),
+          limits,
+        );
+        return { claims, artifacts: freshArtifacts };
+      },
     };
     const result = await body(setup);
     expect(fake.openHandles).toBe(0);
@@ -300,6 +337,16 @@ function stored(
     .toArray();
   if (row === undefined) throw new Error("no such claim");
   return row;
+}
+
+/** Every stored revocation barrier, by claim and attempt. */
+function barriers(sql: SqlStorage): { claim_id: string; attempt: number; expires_at: number }[] {
+  return sql
+    .exec<{ claim_id: string; attempt: number; expires_at: number }>(
+      `SELECT claim_id, attempt, expires_at FROM claims_revocation_barriers
+       ORDER BY claim_id, attempt`,
+    )
+    .toArray();
 }
 
 /** Asks a question on the claim for agent 1 and records two versions of its decision. */
@@ -1718,6 +1765,150 @@ describe("revocation at ready", () => {
     });
   });
 
+  it("refuses a restarted Repo's write grant until the sweep started before the restart ends, then keeps its token", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      const held = deferred();
+      setup.holdRevocation = () => held.promise;
+      const pending = setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+      const barrierUntil = setup.fake.clock() + REVOCATION_BARRIER_MS;
+      expect(barriers(setup.sql)).toMatchObject([
+        { claim_id: claim.claimId, expires_at: barrierUntil },
+      ]);
+
+      // The Repo is recreated while the first sweep still waits on Artifacts. The new Repo's
+      // memory holds no running sweep and its adapter no revocation, so only storage knows.
+      const rebooted = setup.rebooted();
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      const minted = setup.fake.tokensMinted;
+      // The push reopens the superseded pin, and the barrier refuses it.
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+      expect(setup.fake.tokensMinted).toBe(minted);
+      // The barrier's expiry is the earliest deadline left, so the alarm is asked for it.
+      expect(setup.wakes.at(-1)).toBe(barrierUntil);
+
+      // The first sweep ends and records its outcome, which lowers the barrier.
+      held.resolve();
+      expectFailure(await pending, "busy");
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+
+      const grant = await rebooted.claims.authorizeGit(push(agent(1), claim.claimId));
+      expect(grant).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+      const token = await rebooted.artifacts.token(fork, "write", 120_000);
+      if (!token.ok) throw new Error(`token refused: ${token.code}`);
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+
+      // Neither Repo's alarm revokes it later: nothing is owed and no barrier stands.
+      setup.fake.advance(REVOCATION_BARRIER_MS);
+      await rebooted.claims.resume();
+      await setup.port.resume();
+      expect(setup.revoked).toEqual([fork]);
+      expect(setup.fake.accepts(token.value.value)).toBe(true);
+    });
+  });
+
+  it("keeps refusing grants past a lost sweep's barrier until the alarm's new sweep records its outcome", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      const lost = deferred();
+      setup.holdRevocation = () => lost.promise;
+      const pending = setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+      const barrierUntil = setup.fake.clock() + REVOCATION_BARRIER_MS;
+      const resweep = deferred();
+      const rebooted = setup.rebooted(() => resweep.promise);
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+      const missed = setup.fake.mintFor(fork, "write", 3600);
+
+      // A millisecond before the barrier expires, the alarm leaves the first sweep to finish.
+      setup.fake.advance(REVOCATION_BARRIER_MS - 1);
+      await rebooted.claims.resume();
+      expect(setup.revoked).toEqual([fork]);
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+
+      // At expiry the alarm presumes that sweep lost and starts another under a new barrier.
+      setup.fake.advance(1);
+      expect(setup.fake.clock()).toBe(barrierUntil);
+      const alarm = rebooted.claims.resume();
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork, fork]), { timeout: 1000 });
+      const [replacement] = barriers(setup.sql);
+      expect(replacement).toMatchObject({
+        claim_id: claim.claimId,
+        expires_at: barrierUntil + REVOCATION_BARRIER_MS,
+      });
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+
+      // The lost sweep answers late; its outcome lowers only its own barrier.
+      lost.resolve();
+      await pending;
+      expect(barriers(setup.sql)).toEqual([replacement]);
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+
+      resweep.resolve();
+      await alarm;
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(setup.fake.accepts(missed.plaintext)).toBe(false);
+      expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { generation: 1 } },
+      });
+    });
+  });
+
+  it("lowers a lost sweep's barrier when the new sweep fails, leaving the adapter to refuse the mint", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const decisionId = await decideOnce(setup, agent(1), claim.claimId);
+      setup.push(fork, WORK);
+      setup.holdRevocation = () => deferred().promise;
+      void setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+      await vi.waitFor(() => expect(setup.revoked).toEqual([fork]), { timeout: 1000 });
+      const rebooted = setup.rebooted();
+      await record(setup, decisionId, "reject", 1);
+      await ackAll(setup, agent(1));
+      expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
+      setup.fake.mintFor(fork, "write", 3600);
+
+      // The new sweep's listing is partial, so Artifacts reports a debt, not a revocation.
+      setup.fake.pageTokens(1, "live-first");
+      setup.fake.advance(REVOCATION_BARRIER_MS);
+      await rebooted.claims.resume();
+      expect(setup.revoked).toEqual([fork, fork]);
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "working",
+        revoke_due: null,
+      });
+
+      // The claim grants the push, and the adapter refuses its token while the debt stands.
+      expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write" },
+      });
+      // A partial listing may hide a live token, so none is minted until a later sweep is clean.
+      const minted = setup.fake.tokensMinted;
+      expectFailure(await rebooted.artifacts.token(fork, "write", 120_000), "busy");
+      expect(setup.fake.tokensMinted).toBe(minted);
+    });
+  });
+
   it("answers busy, then pins under the new version, when the holder acknowledges it during the sweep", async () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
@@ -1775,6 +1966,7 @@ describe("revocation at ready", () => {
           )
           .one().n;
       const before = attempts();
+      const until = setup.fake.clock() + REVOCATION_BARRIER_MS;
 
       for (const changed of [
         { generation: 2 },
@@ -1782,13 +1974,17 @@ describe("revocation at ready", () => {
         { revokeDue: owedAt - 1 },
         { revokeDue: null },
       ] as const) {
-        expect(beginRevocation(setup.sql, { ...read, ...changed })).toBe("stale");
+        expect(beginRevocation(setup.sql, { ...read, ...changed }, until)).toBe("stale");
       }
-      expect(beginRevocation(setup.sql, { ...read, claimId: "clm_unknown00000000001" })).toBe(
-        "stale",
-      );
+      expect(
+        beginRevocation(setup.sql, { ...read, claimId: "clm_unknown00000000001" }, until),
+      ).toBe("stale");
       expect(attempts()).toBe(before);
-      expect(beginRevocation(setup.sql, read)).toBe(before + 1);
+      expect(barriers(setup.sql)).toEqual([]);
+      expect(beginRevocation(setup.sql, read, until)).toBe(before + 1);
+      expect(barriers(setup.sql)).toEqual([
+        { claim_id: claim.claimId, attempt: before + 1, expires_at: until },
+      ]);
     });
   });
 
