@@ -35,6 +35,7 @@ import {
   type AdaptationReaders,
   type LandedDependency,
 } from "../src/train/adaptation/adaptation";
+import { queueing } from "./trainQueue";
 
 const REPO_ID = "rep_adapt0001";
 const MAIN = sha("1");
@@ -196,7 +197,10 @@ async function withAdaptation<R>(
       log,
       readers: () => world.readers(),
       clock: () => (now += 1),
-      wake: (at) => wakes.push(at),
+      wake: async (at) => {
+        wakes.push(at);
+        return true;
+      },
     });
     const count = (table: string): number =>
       state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
@@ -740,7 +744,14 @@ describe("owe and resume", () => {
             },
           },
         ];
-        const context = { repoId: REPO_ID, clock: now, wake: (at: number) => wakes.push(at) };
+        const context = {
+          repoId: REPO_ID,
+          clock: now,
+          wake: async (at: number) => {
+            wakes.push(at);
+            return true;
+          },
+        };
 
         await resumeAll(context, modules);
         const retryAt = now() + RESUME_RETRY_MS;
@@ -798,7 +809,10 @@ function repoContext(
       log,
       clock: () => (now += 1),
       env,
-      wake: (at) => wakes.push(at),
+      wake: async (at) => {
+        wakes.push(at);
+        return true;
+      },
     },
     wakes,
   };
@@ -887,7 +901,10 @@ async function land(
       log,
       clock: () => (now += 1),
       env,
-      wake: (at) => wakes.push(at),
+      wake: async (at) => {
+        wakes.push(at);
+        return true;
+      },
     };
     const composed = composeRepo(context);
     let main = MAIN;
@@ -897,10 +914,19 @@ async function land(
     const ports = (): RepoPorts => current;
     current = {
       ...composed,
-      claims:
-        decisionId === null
-          ? { ...composed.claims, pin: async () => ok(pinOf(ATLAS)) }
-          : holding(composed.claims),
+      claims: {
+        ...holding(composed.claims),
+        // ATLAS's pin is ready, at the episode `enqueue` below queues it at, under the versions
+        // current now.
+        readyPin: (claimId) => {
+          const decisions = ports().decisions.currentVersions(claimId);
+          return claimId === ATLAS && decisions !== null
+            ? { pin: pinOf(ATLAS), episode: 1, decisions }
+            : null;
+        },
+      },
+      // ATLAS acknowledged the version it marked ready under, as `pin` above assumes.
+      inbox: { ...composed.inbox, readyGateNow: () => ({ kind: "clear" }) },
       decisions:
         decisionId === null
           ? {
@@ -958,7 +984,7 @@ async function land(
     const port = adaptationOf(context, ports);
     current = { ...current, train, adaptation: port };
 
-    expect(await train.enqueue(pinOf(ATLAS))).toEqual(ok({ queued: true }));
+    expect(await queueing(train, log).enqueue(pinOf(ATLAS), 1)).toEqual(ok({ queued: true }));
     const attempt = started.at(-1);
     if (attempt === undefined) throw new Error("no check was started");
     await train.recordCheck(reportOf({ attemptId: attempt.attemptId }));

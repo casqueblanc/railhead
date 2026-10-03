@@ -9,10 +9,12 @@ import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
   CheckRunId,
+  ClaimId,
   CommitSha,
   DecisionRef,
   IntentId,
 } from "@railhead/shared/events";
+import type { EventTransaction } from "../repo/eventLog";
 import type { ClaimPin } from "./claims";
 import type { PortResult } from "./result";
 
@@ -198,13 +200,27 @@ export interface AttemptOutcome {
 /**
  * The train's queue and its check bookkeeping.
  *
- * `attemptOutcome` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * `attemptOutcome` and `holdsLiveEntry` are fence readers: each is synchronous and reads only the Repo's storage, so a
  * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
  * until that transaction commits. Read outside a transaction, the result may already be stale.
  */
 export interface TrainPort {
-  /** Queues a ready pin. A repeat for the same claim and generation is a no-op. */
-  enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
+  /**
+   * Queues a ready pin inside the caller's transaction, without driving: the entry and the train's
+   * wake commit or roll back with that transaction, and the Repo's alarm drives once it commits.
+   * Each call is a new ready episode of the claim, numbered by the claim's `episode`, which the
+   * entry records: a pin already waiting is a no-op apart from that number, a waiting entry of the
+   * same claim and generation takes the new commit, a dropped or parked one is queued again, a
+   * landed one is queued again with another commit, answered as done for a repeat of the episode it
+   * landed for, and refused with `decision_superseded` for a later episode of the same commit, and a batched one takes the new commit and episode once its batch settles. A drive
+   * settles or drops a waiting entry only at the episode it read, so a newer episode is never lost
+   * to an older read. Every accepted pin asks for a drive, restarting a wake whose retries ran out.
+   * A pin of an older generation than one queued is `stale_generation`. A refusal writes nothing; a
+   * missing module throws, so the caller's transaction rolls back. Only the claims module calls it,
+   * in the transaction that records `ready`, or that answers a repeated `ready` when `holdsLiveEntry`
+   * finds no live entry.
+   */
+  queue(tx: EventTransaction, pin: ClaimPin, episode: number): PortResult<{ queued: boolean }>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
   recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>>;
   /**
@@ -213,6 +229,23 @@ export interface TrainPort {
    * between this read and the write that relies on it is not a fence.
    */
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
+  /**
+   * Whether the queue holds a live entry for the claim at `generation`: waiting, batched or parked.
+   * A landed or dropped entry settled an earlier attempt or episode and does not count. `null` when
+   * the module is missing; `null` is a refusal. Call it only inside the caller's transaction. The
+   * claims module reads it when a ready claim is marked ready again, to queue a pin the train no
+   * longer holds.
+   */
+  holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
+  /**
+   * Asks the Repo's alarm again for the wake the train owes, and resolves whether storage holds it:
+   * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is
+   * missing. A wake whose retries ran out owes no alarm unless the active batch's merge intent is
+   * unsettled. The claims module awaits it once `ready` commits, so a `ready` answered with success
+   * never leaves its pin without a scheduled drive, and a `ready` repeated after a failed write asks
+   * again. It writes nothing, so a repeat is harmless.
+   */
+  armWake(): Promise<boolean>;
   /**
    * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
    * for the next wake itself. It never throws for a port's failure.
