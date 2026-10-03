@@ -1070,6 +1070,97 @@ async fn ask_reports_a_refused_or_inconsistent_question() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Whether any request to `route` carried a `waitMs` query parameter.
+async fn any_wait(world: &World, route: &str) -> bool {
+    received(world, route)
+        .await
+        .iter()
+        .any(|request| request.url.query_pairs().any(|(key, _)| key == "waitMs"))
+}
+
+#[tokio::test]
+async fn ask_question_without_wait_reads_it_once_and_acknowledges_nothing() -> anyhow::Result<()> {
+    let world = world().await?;
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .respond_with(fixture(
+            "question.json",
+            "a long poll that times out is still open",
+        )?)
+        .up_to_n_times(1)
+        .mount(&world.server)
+        .await;
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        fixture("question.json", "an answered question carries the decision")?,
+    )
+    .await;
+
+    let open = rh(&world, &["--json", "ask", "--question", "qst_upload1"])?;
+    assert_eq!(open.code, Some(0), "{}", open.stderr);
+    assert_eq!(open.at("/data/question/questionId")?, json!("qst_upload1"));
+    assert_eq!(open.at("/data/question/state")?, json!("open"));
+    assert_eq!(open.at("/data/requestId")?, Value::Null);
+    assert_eq!(open.at("/data/waitedSeconds")?, Value::Null);
+    assert_eq!(open.at("/data/timedOut")?, json!(false));
+    assert_eq!(open.at("/next")?, Value::Null);
+
+    let answered = rh(&world, &["ask", "--question", "qst_upload1"])?;
+    assert_eq!(answered.code, Some(0), "{}", answered.stderr);
+    assert!(
+        answered.stdout.starts_with(
+            "question qst_upload1 is answered\n     decision: \"dec_upload1\" v1, recorded by \"usr_lemarier\" through Railhead\n"
+        ),
+        "{}",
+        answered.stdout
+    );
+    assert!(
+        answered.stdout.ends_with("next: rh sync\n"),
+        "{}",
+        answered.stdout
+    );
+
+    // One read each, never held, and nothing else sent.
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
+    assert!(!any_wait(&world, "/questions/qst_upload1").await);
+    assert_eq!(requests(&world).await, 2);
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ask_question_without_wait_refuses_another_questions_answer() -> anyhow::Result<()> {
+    let world = world().await?;
+    let mut other = exchange("question.json", "an answered question carries the decision")?
+        .pointer("/response/body")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for pointer in ["/data/questionId", "/data/decision/questionId"] {
+        if let Some(id) = other.pointer_mut(pointer) {
+            *id = json!("qst_other01");
+        }
+    }
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        json_response(200, &other),
+    )
+    .await;
+
+    let run = rh(&world, &["--json", "ask", "--question", "qst_upload1"])?;
+    assert_ne!(run.code, Some(0), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("malformed_response"));
+    assert_eq!(run.at("/data")?, Value::Null);
+    assert!(!run.stdout.contains("qst_other01"), "{}", run.stdout);
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 1);
+    assert!(!any_wait(&world, "/questions/qst_upload1").await);
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_ask_whose_answer_is_lost_names_the_key_to_reconcile_it() -> anyhow::Result<()> {
     // A backend that reads the request and closes the connection without answering: a dropped
