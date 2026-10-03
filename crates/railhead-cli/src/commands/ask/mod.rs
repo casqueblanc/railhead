@@ -107,8 +107,11 @@ pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
             match wait {
                 Some(wait) if asked.data.state == QuestionState::Open => {
                     let question_id = asked.data.question_id.clone();
+                    let seconds = wait.as_secs();
                     let (response, timed_out) =
-                        wait_for(agent, &question_id, wait, Some(asked), out)?;
+                        wait_for(agent, &question_id, wait, Some(asked), out).map_err(|error| {
+                            resumable(error, &question_id, &request_id, seconds)
+                        })?;
                     (response, Some(request_id), timed_out)
                 }
                 Some(_) | None => (asked, Some(request_id), false),
@@ -238,6 +241,68 @@ fn read(agent: &Agent<'_>, question_id: &str) -> Result<AgentSuccess<QuestionRes
         ))?;
     check(&response.data, Some(question_id))?;
     Ok(response)
+}
+
+/// A failure while waiting on a question just asked, naming the question and the command that
+/// resumes the wait: repeating the ask itself would ask again under a new key. The failure keeps
+/// its code and whether it may be retried.
+fn resumable(error: Error, question_id: &str, request_id: &str, seconds: u64) -> Error {
+    let hint = format!(
+        "question {question_id} was asked with --request-id {request_id}; resume with rh ask --question {question_id} --wait {seconds}"
+    );
+    let local = |code, retryable, error: &dyn std::fmt::Display| Error::Local {
+        code,
+        message: format!("{error}; {hint}"),
+        retryable,
+        next: retryable.then_some(NextCommand::Ask),
+    };
+    match error {
+        Error::Http(http::Error::Rejected {
+            route,
+            status,
+            mut error,
+        }) => {
+            error.message = format!("{} ({hint})", error.message);
+            if error.retryable {
+                error.next = Some(NextCommand::Ask);
+            }
+            Error::Http(http::Error::Rejected {
+                route,
+                status,
+                error,
+            })
+        }
+        Error::Http(error @ http::Error::Timeout(_)) => local(LocalCode::Timeout, true, &error),
+        Error::Http(error @ (http::Error::Unreachable(_) | http::Error::Transport(_))) => {
+            local(LocalCode::Unreachable, true, &error)
+        }
+        Error::Http(error @ (http::Error::Malformed { .. } | http::Error::ResponseTooLarge(_))) => {
+            local(LocalCode::MalformedResponse, false, &error)
+        }
+        Error::Http(
+            error @ (http::Error::InvalidRequest { .. }
+            | http::Error::InvalidTarget { .. }
+            | http::Error::RequestTooLarge(_)),
+        ) => local(LocalCode::InvalidInput, false, &error),
+        Error::Local {
+            code,
+            message,
+            retryable,
+            next,
+        } => Error::Local {
+            code,
+            message: format!("{message}; {hint}"),
+            retryable,
+            next: next.or_else(|| retryable.then_some(NextCommand::Ask)),
+        },
+        other @ (Error::Context(_)
+        | Error::Identity(_)
+        | Error::Credential(_)
+        | Error::Unavailable(_)
+        | Error::WorkingDirectory(_)
+        | Error::Runtime(_)
+        | Error::Output(_)) => other,
+    }
 }
 
 /// Polls until the question is answered or `wait` has passed, after telling a person on stderr how

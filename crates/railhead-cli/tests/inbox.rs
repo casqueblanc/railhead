@@ -1368,3 +1368,71 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
     assert_eq!(stored.pointer("/token"), Some(&json!(FRESH)));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_wait_that_fails_after_asking_names_the_question_to_resume() -> anyhow::Result<()> {
+    let world = world().await?;
+    let route = "/claims/clm_42abcd/questions";
+    answer(
+        &world,
+        "POST",
+        route,
+        fixture("ask.json", "asks the owner and returns at once")?,
+    )
+    .await;
+    for response in [
+        json_response(
+            500,
+            &json!({"ok": false, "error": {"code": "internal", "message": "Try again.",
+                "retryable": true, "retryAfterMs": null, "next": null}}),
+        ),
+        ResponseTemplate::new(200).set_body_raw("<html>oops</html>", "application/json"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("{PREFIX}/questions/qst_upload1")))
+            .respond_with(response)
+            .up_to_n_times(1)
+            .mount(&world.server)
+            .await;
+    }
+    let mut args = ask_args(QUESTION, "src/upload.ts");
+    args.extend(["--wait", "30"]);
+    let refused = rh_in_clone(&world, &args)?;
+    let malformed = rh_in_clone(&world, &args)?;
+
+    let keys: Vec<String> = received(&world, route)
+        .await
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| {
+            body.pointer("/requestId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    anyhow::ensure!(keys.len() == 2, "{keys:?}");
+    for ((run, key), (code, retryable, next)) in [&refused, &malformed].iter().zip(&keys).zip([
+        ("internal", true, json!("rh ask")),
+        ("malformed_response", false, Value::Null),
+    ]) {
+        assert_eq!(run.code, Some(1), "{}", run.stdout);
+        assert_eq!(run.at("/error/code")?, json!(code));
+        assert_eq!(run.at("/error/retryable")?, json!(retryable));
+        assert_eq!(run.at("/error/next")?, next);
+        let message = run.at("/error/message")?;
+        let expected = format!(
+            "question qst_upload1 was asked with --request-id {key}; resume with rh ask --question qst_upload1 --wait 30"
+        );
+        assert!(
+            message
+                .as_str()
+                .is_some_and(|text| text.contains(&expected)),
+            "{message}"
+        );
+    }
+    assert!(!malformed.stdout.contains("oops"));
+    // Each wait failed at its one poll; nothing was asked again.
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
