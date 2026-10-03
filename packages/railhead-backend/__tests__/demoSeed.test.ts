@@ -11,10 +11,11 @@ import {
   type PasskeyRegistration,
 } from "@railhead/shared/board-api";
 import { isRepoSegment } from "@railhead/shared/agent-api";
-import { createArtifactsAdapter, mainRepoName } from "../src/artifacts/adapter";
+import { createArtifactsAdapter, mainRepoName, MINT_CLOCK_SKEW_MS } from "../src/artifacts/adapter";
 import { FakeArtifacts, FakeArtifactsError } from "../src/artifacts/fake";
 import { actionChallenge, relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
-import { ok, type PortResult } from "../src/contracts/result";
+import { fail, ok, type PortResult } from "../src/contracts/result";
+import { toBoard } from "../src/gateway/rpc";
 import { readBundle } from "../src/modules/demoSeed/bundle";
 import {
   checkPerformInput,
@@ -119,6 +120,8 @@ class SeedFake implements SeedArtifacts {
   /** How the next push misbehaves. */
   pushFault: "none" | "lose-response" | "drop" | "reject" = "none";
   failNextDelete = false;
+  /** Makes every `get` fail as an Artifacts error, until cleared. */
+  failGets = false;
   /** A repository whose deletion fails every time, until cleared. */
   failDeleteOf: string | null = null;
   /** Runs once when the next push reaches the Git endpoint. */
@@ -178,6 +181,7 @@ class SeedFake implements SeedArtifacts {
 
   async get(name: string): Promise<SeedArtifactsRepo> {
     this.gets += 1;
+    if (this.failGets) throw new FakeArtifactsError("INTERNAL_ERROR");
     const handle = await this.fake.get(name);
     return {
       ...handle,
@@ -388,6 +392,30 @@ const UNCONFIRMED = {
     "An earlier change to Artifacts never answered and its effect cannot be confirmed yet; try again later.",
 };
 
+const ORPHAN_BUSY = {
+  ok: false,
+  code: "busy",
+  message:
+    "An earlier change to Artifacts never answered and has not settled yet; try again in a few minutes.",
+};
+
+/** A push token's lifetime plus the clock skew margin, after which a lost mint's token has expired. */
+const ORPHAN_MINT_EXPIRY_MS = 300_000 + MINT_CLOCK_SKEW_MS;
+
+/** The seed's effect records, oldest first. */
+function effectRows(storage: RepoStorage): { kind: string; answered: number }[] {
+  return storage.sql
+    .exec<{ kind: string; answered: number }>(
+      "SELECT kind, answered FROM demo_seed_effects ORDER BY id",
+    )
+    .toArray();
+}
+
+/** A retryable refusal for `eventually`. */
+function busyResult(): PortResult<never> {
+  return { ok: false, code: "busy", message: "not yet" };
+}
+
 const PUSH_UNCONFIRMED = {
   ok: false,
   code: "internal",
@@ -444,6 +472,22 @@ async function eventually<T>(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+describe("toBoard", () => {
+  it("passes busy to the board with its message, and hides an agent-only code", () => {
+    expect(toBoard(fail("busy", "Try again in a few minutes."))).toEqual({
+      ok: false,
+      code: "busy",
+      message: "Try again in a few minutes.",
+    });
+    expect(toBoard(fail("rate_limited", "slow down"))).toEqual({
+      ok: false,
+      code: "internal",
+      message: "The backend failed.",
+    });
+    expect(toBoard(ok(1))).toEqual(ok(1));
+  });
+});
 
 describe("seed target", () => {
   it("creates main, pushes the bundle, revokes every token and initializes the Repo", () =>
@@ -555,8 +599,8 @@ describe("seed target", () => {
       const paused = seed.fake.pauseNext("get");
       const first = target.seed(HEAD, fakePack());
       await paused.reached;
-      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
-      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "busy" });
+      expect(await target.reset()).toMatchObject({ ok: false, code: "busy" });
       paused.release();
       expect(await first).toMatchObject({ ok: true });
     }));
@@ -569,8 +613,8 @@ describe("seed target", () => {
         await create.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
         // The lock is free, but the create may still land: neither a seed nor a reset may run.
-        expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
-        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        expect(await target.reset()).toMatchObject({ ok: false, code: "busy" });
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "busy" });
         expect(host.wipes).toBe(0);
         expect(seed.deleted).toEqual([]);
 
@@ -592,7 +636,7 @@ describe("seed target", () => {
         const first = target.seed(HEAD, fakePack());
         await mint.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
-        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "busy" });
         expect(seed.pushes).toEqual([]);
 
         // The mint lands after its caller gave up; nothing may report success while it is live.
@@ -626,28 +670,82 @@ describe("seed target", () => {
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, refuses a create that has not taken effect however old, until it does", () =>
+  it("after a restart, forgets a create that never took effect, and a reset finishes", () =>
     withTarget(
-      async ({ seed, target, host, main, clock, restart }) => {
+      async ({ storage, seed, target, host, main, restart }) => {
         seed.hangAfterNextCreate = true;
         const create = seed.holdNextCreate();
         const first = target.seed(HEAD, fakePack());
         await create.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
-        // An hour later the create still has not landed: neither a reset nor a seed may run.
+        // Main is missing, so the create the old object lost has not taken effect: its record is
+        // settled at once, with no wait and nothing done by hand.
         const restarted = restart();
-        clock.now += 3_600_000;
-        expect(await restarted.reset()).toEqual(UNCONFIRMED);
-        expect(await restarted.seed(HEAD, fakePack())).toEqual(UNCONFIRMED);
-        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: false }));
+        expect(host.wipes).toBe(1);
+        expect(effectRows(storage)).toEqual([]);
+
+        // The lost create lands afterwards and leaves an empty main with a token nobody received.
+        // The next seed takes that main, pushes, and revokes the stray token before initializing.
+        create.release();
+        await eventually(async () => (seed.fake.repos.has(main) ? ok(true) : busyResult()));
+        expect(seed.fake.liveTokens(main)).toHaveLength(1);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(host.initialized).toBe(true);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, seeds over a create that never took effect, even if it lands late", () =>
+    withTarget(
+      async ({ seed, target, host, main, restart }) => {
+        seed.hangAfterNextCreate = true;
+        const create = seed.holdNextCreate();
+        const first = target.seed(HEAD, fakePack());
+        await create.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+
+        // The new object's own create answers; the held one has not reached Artifacts yet.
+        seed.hangAfterNextCreate = false;
+        const restarted = restart();
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(host.initialized).toBe(true);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+
+        // The lost create lands on the seeded main and is refused; main keeps its head.
+        create.release();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, keeps a create record while Artifacts cannot be read, and reports busy", () =>
+    withTarget(
+      async ({ storage, seed, target, host, main, restart }) => {
+        seed.hangAfterNextCreate = true;
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+
+        const restarted = restart();
+        seed.failGets = true;
+        expect(await restarted.reset()).toEqual(ORPHAN_BUSY);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(ORPHAN_BUSY);
+        expect(effectRows(storage)).toEqual([{ kind: "create", answered: 0 }]);
+        expect(seed.deleted).toEqual([]);
         expect(host.wipes).toBe(0);
 
-        // The create lands and never answers; main read back settles it, and the reset deletes it.
-        create.release();
-        expect(await eventually(() => restarted.reset())).toEqual(
-          ok({ kind: "demo.reset", deleted: true }),
-        );
+        // Once Artifacts answers, main read back shows the create took effect, and the reset
+        // deletes it.
+        seed.failGets = false;
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
         expect(seed.fake.repos.has(main)).toBe(false);
         expect(host.wipes).toBe(1);
       },
@@ -687,7 +785,43 @@ describe("seed target", () => {
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, refuses while a token mint the old object never saw answered stands", () =>
+  it("after a restart, reports busy for a lost token mint until its token has expired", () =>
+    withTarget(
+      async ({ storage, seed, target, host, main, clock, restart }) => {
+        seed.fake.seed(main, []);
+        const mint = seed.fake.pauseNext("createTokenBeforeMint");
+        const first = target.seed(HEAD, fakePack());
+        await mint.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+
+        // A minted token cannot be told apart from the others, but it expires: until its lifetime
+        // and the clock skew margin have passed, the mint may still leave a live token.
+        const restarted = restart();
+        clock.now += ORPHAN_MINT_EXPIRY_MS - 1;
+        expect(await restarted.reset()).toEqual(ORPHAN_BUSY);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(ORPHAN_BUSY);
+        expect(seed.pushes).toEqual([]);
+        expect(host.wipes).toBe(0);
+        expect(effectRows(storage)).toEqual([{ kind: "mint", answered: 0 }]);
+
+        // From then on any token it made has expired, so its record is cleared and the seed runs.
+        clock.now += 1;
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(effectRows(storage)).toEqual([]);
+        expect(host.initialized).toBe(true);
+
+        // Let the held call finish so its handle closes.
+        mint.release();
+        await eventually(async () => (seed.fake.openHandles === 0 ? ok(true) : busyResult()));
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, a reset clears a lost token mint once its token has expired", () =>
     withTarget(
       async ({ seed, target, host, main, clock, restart }) => {
         seed.fake.seed(main, []);
@@ -696,18 +830,15 @@ describe("seed target", () => {
         await mint.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
-        // A minted token cannot be told apart from the others, so age alone never settles it.
         const restarted = restart();
-        clock.now += 3_600_000;
-        expect(await restarted.reset()).toEqual(UNCONFIRMED);
-        expect(seed.pushes).toEqual([]);
-        expect(host.wipes).toBe(0);
+        expect(await restarted.reset()).toEqual(ORPHAN_BUSY);
+        clock.now += ORPHAN_MINT_EXPIRY_MS;
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(1);
 
         mint.release();
-        expect(await eventually(() => restarted.reset())).toEqual(
-          ok({ kind: "demo.reset", deleted: true }),
-        );
-        expect(seed.fake.repos.has(main)).toBe(false);
+        await eventually(async () => (seed.fake.openHandles === 0 ? ok(true) : busyResult()));
       },
       { limits: SHORT_CALLS },
     ));

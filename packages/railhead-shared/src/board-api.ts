@@ -73,6 +73,11 @@ export type BoardErrorCode =
   | "bootstrap_closed"
   /** A limit on invites, issues or questions was reached. */
   | "quota_exceeded"
+  /**
+   * Earlier work the call depends on has not settled yet, so the call was refused before it changed
+   * anything. Try again shortly.
+   */
+  | "busy"
   /** The backend module that serves this call is not installed. Nothing happened. */
   | "unavailable"
   /** The backend failed; the call may be repeated. */

@@ -82,6 +82,7 @@ const stopFor = (code: BoardErrorCode): StreamStop => {
     case "action_stale":
     case "bootstrap_closed":
     case "quota_exceeded":
+    case "busy":
     case "internal":
       return "failed";
     default:

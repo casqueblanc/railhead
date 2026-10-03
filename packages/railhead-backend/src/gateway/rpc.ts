@@ -353,6 +353,7 @@ const BOARD_ERROR_CODES = {
   action_stale: true,
   bootstrap_closed: true,
   quota_exceeded: true,
+  busy: true,
   unavailable: true,
   internal: true,
 } as const satisfies Record<BoardErrorCode, true>;

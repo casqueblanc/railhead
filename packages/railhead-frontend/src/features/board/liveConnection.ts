@@ -281,6 +281,7 @@ const openFailure = (code: BoardErrorCode): SessionView["board"] => {
     case "action_stale":
     case "bootstrap_closed":
     case "quota_exceeded":
+    case "busy":
     case "internal":
       return "failed";
     default:
@@ -387,6 +388,8 @@ const refusal = (code: BoardErrorCode): string => {
       return "The answer changed since this board read it. Nothing was recorded.";
     case "unavailable":
       return "This Railhead cannot record answers: its decisions module is not installed.";
+    case "busy":
+      return "The backend is busy. Nothing was recorded; try again shortly.";
     case "invalid_request":
     case "not_found":
     case "bootstrap_closed":
