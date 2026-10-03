@@ -6,7 +6,9 @@
 // from the identity module, verifies the SSHSIG over `loginMessage(...)`, and only then consumes the
 // challenge id in one transaction: of concurrent redemptions of one challenge, exactly one gets a
 // session. A challenge that expired before that transaction is refused there too. A consumed id is
-// kept until the challenge would have expired anyway, so the table holds at most
+// kept for `CHALLENGE_TTL_MS` from its redemption: it counts against the agent's login rate for that
+// window, however close to its own expiry the challenge was redeemed, and outlives the challenge,
+// so it is never deleted while the id could be redeemed again. The table holds at most
 // `MAX_AGENTS * MAX_LOGINS_PER_WINDOW` rows. After a lost response the challenge is spent and the
 // CLI asks for a new one, as the agent wire specifies.
 //
@@ -37,7 +39,10 @@ import type { ModuleFactory, RepoContext, RepoPorts } from "../../repo/composeRe
 import { atomically, migrate } from "../../repo/storage";
 import { equalBytes, randomHex } from "../owner/encoding";
 
-/** Most challenges one agent may redeem per `CHALLENGE_TTL_MS`. Past it logins are `rate_limited`. */
+/**
+ * Most challenges one agent may redeem in any `CHALLENGE_TTL_MS`, counted from each redemption.
+ * Past it logins are `rate_limited`.
+ */
 export const MAX_LOGINS_PER_WINDOW = 30;
 
 const SESSIONS_OWNER = "sessions";
@@ -53,9 +58,9 @@ const MIGRATIONS: readonly string[] = [
   `CREATE TABLE sessions_challenge (
     challenge_id TEXT PRIMARY KEY,
     agent_id TEXT NOT NULL,
-    expires_at INTEGER NOT NULL
+    retained_until INTEGER NOT NULL
   ) STRICT`,
-  "CREATE INDEX sessions_challenge_agent ON sessions_challenge (agent_id, expires_at)",
+  "CREATE INDEX sessions_challenge_agent ON sessions_challenge (agent_id, retained_until)",
 ];
 
 /** Where the sessions module finds the origin agents sign for and the secret its keys come from. */
@@ -233,7 +238,7 @@ export function createSessions(
         // before its record would be deleted as expired and the same id admitted again.
         const at = clock();
         if (expiresAt <= at) return "expired";
-        sql.exec("DELETE FROM sessions_challenge WHERE expires_at <= ?", at);
+        sql.exec("DELETE FROM sessions_challenge WHERE retained_until <= ?", at);
         const spent = sql
           .exec("SELECT 1 FROM sessions_challenge WHERE challenge_id = ?", challengeId)
           .toArray();
@@ -245,11 +250,12 @@ export function createSessions(
           )
           .one().n;
         if (used >= MAX_LOGINS_PER_WINDOW) return "limited";
+        // Retained a full window from now, past the challenge's own expiry.
         sql.exec(
-          "INSERT INTO sessions_challenge (challenge_id, agent_id, expires_at) VALUES (?, ?, ?)",
+          "INSERT INTO sessions_challenge (challenge_id, agent_id, retained_until) VALUES (?, ?, ?)",
           challengeId,
           agentId,
-          expiresAt,
+          at + CHALLENGE_TTL_MS,
         );
         return "consumed";
       });

@@ -560,7 +560,7 @@ describe("redeeming a challenge", () => {
     });
   });
 
-  it("bounds logins per agent and window, and frees them as challenges expire", async () => {
+  it("bounds logins per agent and window, and frees them a window after redemption", async () => {
     await withSessions(async ({ sessions, enroll, login, clock, consumed }) => {
       const agent = await enroll();
       for (let i = 0; i < MAX_LOGINS_PER_WINDOW; i += 1) {
@@ -576,6 +576,37 @@ describe("redeeming a challenge", () => {
 
       clock.now += CHALLENGE_TTL_MS;
       value(await sessions.redeem((await login(agent)).request));
+      expect(consumed()).toBe(1);
+    });
+  });
+
+  it("counts a login from its redemption, so redeeming challenges near expiry cannot pass the limit", async () => {
+    await withSessions(async ({ sessions, enroll, login, clock, consumed }) => {
+      const agent = await enroll();
+      const issuedAt = clock.now;
+      const early = [];
+      for (let i = 0; i < MAX_LOGINS_PER_WINDOW; i += 1) early.push(await login(agent));
+      // Every challenge was issued at `issuedAt`; all are redeemed one millisecond before expiry.
+      const redeemedAt = issuedAt + CHALLENGE_TTL_MS - 1;
+      clock.now = redeemedAt;
+      for (const { request } of early) value(await sessions.redeem(request));
+
+      // The early challenges have expired, but their logins still fill this window.
+      clock.now = issuedAt + CHALLENGE_TTL_MS;
+      const fresh = await login(agent);
+      expect(await sessions.redeem(fresh.request)).toMatchObject({
+        ok: false,
+        code: "rate_limited",
+      });
+      clock.now = redeemedAt + CHALLENGE_TTL_MS - 1;
+      expect(await sessions.redeem(fresh.request)).toMatchObject({
+        ok: false,
+        code: "rate_limited",
+      });
+      // The refusals consumed nothing, so the same challenge logs in once the window has passed.
+      expect(consumed()).toBe(MAX_LOGINS_PER_WINDOW);
+      clock.now = redeemedAt + CHALLENGE_TTL_MS;
+      value(await sessions.redeem(fresh.request));
       expect(consumed()).toBe(1);
     });
   });
