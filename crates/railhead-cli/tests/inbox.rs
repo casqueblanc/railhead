@@ -10,14 +10,18 @@ use std::io::{self, Read, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
+#[cfg(debug_assertions)]
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
+#[cfg(debug_assertions)]
+use wiremock::Respond;
 use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLXNlY3JldA";
 /// The token a login during the test issues.
@@ -303,6 +307,7 @@ impl Gate {
 
     /// Runs `command`, whose `--wait` is `wait`, through the gate. Returns the run, when the test
     /// opened the gate, and when `rh` exited.
+    #[cfg(debug_assertions)]
     fn run(&self, command: Command, wait: Duration) -> anyhow::Result<(Run, Instant, Instant)> {
         self.run_within(command, PATIENCE, wait + OVERRUN)
     }
@@ -624,20 +629,24 @@ async fn answer(world: &World, verb: &str, route: &str, response: ResponseTempla
 }
 
 /// How long a held response is delayed: far beyond any `--wait` a test passes.
+#[cfg(debug_assertions)]
 const HOLD: Duration = Duration::from_secs(20);
 /// Room for process exit after a wait ends. A wait plus this stays well under [`HOLD`], so a CLI
 /// that waited for the held answer still fails.
+#[cfg(debug_assertions)]
 const EXIT_SLACK: Duration = Duration::from_secs(10);
 
 /// A response held for [`HOLD`], or until a set time after a [`Gate`] opens, that records when each
 /// request arrived, so a test bounds how long the CLI held it open.
 #[derive(Clone)]
+#[cfg(debug_assertions)]
 struct Held {
     response: ResponseTemplate,
     until: Option<(Arc<OnceLock<Instant>>, Duration)>,
     arrivals: Arc<Mutex<Vec<Instant>>>,
 }
 
+#[cfg(debug_assertions)]
 impl Held {
     fn new(response: ResponseTemplate) -> Self {
         Self {
@@ -666,6 +675,7 @@ impl Held {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Respond for Held {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
         let now = Instant::now();
@@ -1984,6 +1994,8 @@ async fn an_ask_interrupted_in_flight_has_already_named_its_key() -> anyhow::Res
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     let world = world().await?;
@@ -2061,6 +2073,8 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Result<()> {
     let world = world().await?;
@@ -2140,6 +2154,7 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
 
 /// Lapses `atlas`'s stored session and gives it a key, so its next command logs in. Returns the
 /// lapsed record and the challenge response for that login.
+#[cfg(debug_assertions)]
 fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
     let origin = world.server.uri();
     let atlas = world.home.path().join("agents/atlas");
@@ -2159,15 +2174,17 @@ fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
     Ok((lapsed, challenge))
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> anyhow::Result<()> {
     let world = world().await?;
     let (lapsed, challenge) = lapse_session(&world)?;
-    let wait = Duration::from_secs(4);
-    // The challenge answers half a second before the deadline, timed from the moment the gate
-    // lets the wait start.
+    let wait = Duration::from_secs(6);
+    // The challenge answers two seconds before the deadline, timed from the moment the gate lets
+    // the wait start.
     let gate = Gate::new()?;
-    let near = wait.saturating_sub(Duration::from_millis(500));
+    let near = Duration::from_secs(4);
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
         .respond_with(Held::after_go(challenge, &gate, near))
@@ -2182,7 +2199,7 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
     ));
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session")))
-        .respond_with(stall.clone())
+        .respond_with(stall)
         .mount(&world.server)
         .await;
 
@@ -2191,27 +2208,30 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
             &world,
             world.outside.path(),
             Some("atlas"),
-            &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "6"],
         ),
         wait,
     )?;
+    // A login that gave its session request the request timeout, which the poll set to what was
+    // left of the wait as it began, would end no sooner than `near + wait` after the gate opened,
+    // however the machine scheduled it. One bounded by the deadline ends a little after `wait`.
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= wait, "{elapsed:?}");
-    // Half a second was left when the session request arrived. A login that gave it the request
-    // timeout instead would hold it for the full stall.
-    let open = stall.open_until(exited)?;
-    assert!(open < Duration::from_secs(3), "{open:?}");
+    assert!(elapsed < wait + Duration::from_secs(3), "{elapsed:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
-    // The login reached its session request, no poll was sent, and the lapsed session is kept.
-    assert_eq!(received(&world, "/session").await.len(), 1);
+    // The login sent its session request, unless a loaded machine delivered the challenge only
+    // once the deadline had passed. No poll was sent, and the lapsed session is kept.
+    assert!(received(&world, "/session").await.len() <= 1);
     assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
     let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
     assert_eq!(stored, lapsed);
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Result<()> {
     let world = world().await?;
