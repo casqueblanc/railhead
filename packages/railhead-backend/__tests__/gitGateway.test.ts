@@ -10,10 +10,10 @@ import {
 } from "../src/artifacts/adapter";
 import { FakeArtifacts, type FakeToken } from "../src/artifacts/fake";
 import type { ArtifactsPort } from "../src/contracts/artifacts";
-import type { ClaimsPort, GitAccess } from "../src/contracts/claims";
+import type { ClaimsPort, GitAccess, GitGrant } from "../src/contracts/claims";
 import type { SessionsPort } from "../src/contracts/identity";
 import type { AgentPrincipal } from "../src/contracts/principals";
-import { fail, ok } from "../src/contracts/result";
+import { fail, ok, type PortResult } from "../src/contracts/result";
 import { unavailableClaims, unavailableSessions } from "../src/contracts/unavailable";
 import {
   GIT_GATEWAY_LIMITS,
@@ -25,7 +25,7 @@ import {
 import { artifactsRemotes } from "../src/git/remotes";
 import { PushReportReader } from "../src/git/reportStatus";
 import type { GitPort, GitTarget } from "../src/modules/git/entry";
-import { EventLog } from "../src/repo/eventLog";
+import { EventLog, EventLogError } from "../src/repo/eventLog";
 
 // Request and response bodies recorded from stock Git 2.50.1 against `git http-backend`: a
 // protocol v2 `git clone --depth 1`, then a push of one new commit from that shallow clone to a new
@@ -126,6 +126,10 @@ interface World {
   authorizations: GitAccess[];
   /** Whether the claims module answers every decision as unavailable. */
   claimsDown: boolean;
+  /** When set, answers `authorizeGit` in place of the A21 contract. */
+  authorize: ((access: GitAccess) => PortResult<GitGrant>) | null;
+  /** When set, the next `times` reads of `workingGeneration` throw `error`. */
+  generationFault: { times: number; error: Error } | null;
   /** The requests the default upstream received, with their bodies. */
   seen: Seen[];
   /** What the default upstream answers once it has read a request carrying a live token. */
@@ -151,6 +155,7 @@ function claimsFor(world: World): ClaimsPort {
     async authorizeGit(access) {
       world.authorizations.push(access);
       if (world.claimsDown) return fail("unavailable", "The claims module is unavailable.");
+      if (world.authorize !== null) return world.authorize(access);
       const { principal, target, operation } = access;
       if (principal === null || principal.repoId !== REPO) {
         return fail("unauthenticated", "A Git request needs a session for this repository.");
@@ -181,6 +186,11 @@ function claimsFor(world: World): ClaimsPort {
       }
     },
     workingGeneration(claimId) {
+      const fault = world.generationFault;
+      if (fault !== null && fault.times > 0) {
+        fault.times -= 1;
+        throw fault.error;
+      }
       return claimId === CLAIM && world.claim.state === "working" ? world.claim.generation : null;
     },
   };
@@ -228,6 +238,8 @@ function withGateway(
       claim: { agentId: AGENT.agentId, generation: 3, state: "working" },
       authorizations: [],
       claimsDown: false,
+      authorize: null,
+      generationFault: null,
       seen: [],
       respond: () => new Response(null, { status: 500 }),
       upstream: async (request) => {
@@ -320,6 +332,11 @@ function pushedEvents(world: World): RailheadEvent[] {
 }
 
 let logged: string[] = [];
+
+/** The warning for a push that moved the claim's fork without a `claim.pushed` event. */
+function unrecorded(reason: "claim_changed" | "record_failed"): string {
+  return JSON.stringify({ event: "git_push_unrecorded", claimId: CLAIM, generation: 3, reason });
+}
 
 beforeEach(() => {
   logged = [];
@@ -553,6 +570,79 @@ describe("authority", () => {
       expect(world.seen).toEqual([]);
       expect(world.live()).toEqual([]);
       expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+
+  it("refuses with 500 a grant that does not fit the request, before minting a token", async () => {
+    const otherClaim = "clm_gitclaim0002";
+    const cases: [string, () => Request, string, GitGrant][] = [
+      [
+        "write grant for a fetch",
+        () => advertise("git-upload-pack"),
+        "/info/refs",
+        { repo: "", scope: "write", fence: null },
+      ],
+      [
+        "fenced read grant for a fetch",
+        () => rpc("git-upload-pack", SHALLOW_FETCH_REQUEST),
+        "/git-upload-pack",
+        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3 } },
+      ],
+      [
+        "read grant for a push",
+        () => advertise("git-receive-pack"),
+        "/info/refs",
+        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3 } },
+      ],
+      [
+        "unfenced write grant for a push",
+        () => rpc("git-receive-pack", PUSH_REQUEST),
+        "/git-receive-pack",
+        { repo: "", scope: "write", fence: null },
+      ],
+      [
+        "push fenced to another claim",
+        () => rpc("git-receive-pack", PUSH_REQUEST),
+        "/git-receive-pack",
+        { repo: "", scope: "write", fence: { claimId: otherClaim, generation: 3 } },
+      ],
+    ];
+    for (const [label, request, path, grant] of cases) {
+      await withGateway(async (world) => {
+        world.authorize = () => ok({ ...grant, repo: world.forkName });
+        world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
+        const response = await world.gateway.serve(request(), FORK, path);
+        expect(response.status, label).toBe(500);
+        expect(await response.text(), label).toContain("does not match the request");
+        expect(world.minted(), label).toBe(0);
+        expect(world.seen, label).toEqual([]);
+        expect(world.events(), label).toEqual([]);
+      });
+    }
+  });
+
+  it("answers a fetch refused at its POST with an ERR packet, or an HTTP error past 403", async () => {
+    await withGateway(async (world) => {
+      world.authorize = () => fail("claim_closed", "The claim is closed.");
+      const refused = await world.gateway.serve(
+        rpc("git-upload-pack", SHALLOW_FETCH_REQUEST),
+        FORK,
+        "/git-upload-pack",
+      );
+      expect(refused.status).toBe(200);
+      expect(refused.headers.get("content-type")).toBe("application/x-git-upload-pack-result");
+      expect(await refused.text()).toBe(pkt("ERR railhead: The claim is closed.\n"));
+
+      world.authorize = () => fail("not_found", "The claim has no fork.");
+      const missing = await world.gateway.serve(
+        rpc("git-upload-pack", SHALLOW_FETCH_REQUEST),
+        FORK,
+        "/git-upload-pack",
+      );
+      expect(missing.status).toBe(404);
+      expect(await missing.text()).toBe("railhead: The claim has no fork.\n");
+      expect(world.minted()).toBe(0);
+      expect(world.seen).toEqual([]);
     });
   });
 
@@ -953,9 +1043,7 @@ describe("a push decided again after it was admitted", () => {
         expect(world.authorizations, label).toHaveLength(3);
         expect(pushedEvents(world), label).toEqual([]);
         expect(world.events(), label).toEqual([]);
-        expect(logged, label).toContain(
-          JSON.stringify({ event: "git_push_unrecorded", outcome: "claim_changed" }),
-        );
+        expect(logged, label).toContain(unrecorded("claim_changed"));
       });
     }
   });
@@ -1673,6 +1761,106 @@ describe("a client that stops reading a push's response", () => {
       await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
       expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
+/** Arms `fault` once the upstream has the whole push, after the last pre-send check. */
+function failingRecord(world: World, fault: { times: number; error: Error }): void {
+  world.respond = () => {
+    world.generationFault = fault;
+    return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+  };
+}
+
+describe("a push whose record fails", () => {
+  it("retries a failed record within its bound, then logs it and still answers the client", async () => {
+    await withGateway(async (world) => {
+      const fault = { times: 10, error: new Error("storage failed") };
+      failingRecord(world, fault);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      // The upstream applied the push, so its report reaches the client whole.
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(fault.times).toBe(7);
+      expect(world.events()).toEqual([]);
+      expect(logged).toEqual([unrecorded("record_failed")]);
+      for (const line of logged) {
+        expect(line).not.toContain("refs/heads/feature");
+        expect(line).not.toContain(PUSHED);
+      }
+    });
+  });
+
+  it("records the push when a retry succeeds, and logs nothing", async () => {
+    await withGateway(async (world) => {
+      const fault = { times: 2, error: new Error("storage failed") };
+      failingRecord(world, fault);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(fault.times).toBe(0);
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { claimId: CLAIM, generation: 3, ref: "refs/heads/feature", to: PUSHED } },
+      ]);
+      expect(logged).toEqual([]);
+    });
+  });
+
+  it("does not retry a record the event log refused", async () => {
+    await withGateway(async (world) => {
+      const fault = { times: 10, error: new EventLogError("corrupt_log", "unreadable row") };
+      failingRecord(world, fault);
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(await bytesOf(response)).toEqual(PUSH_RESULT);
+      expect(fault.times).toBe(9);
+      expect(world.events()).toEqual([]);
+      expect(logged).toEqual([unrecorded("record_failed")]);
+    });
+  });
+
+  it("logs a failed record after the client went away", async () => {
+    await withGateway(async (world) => {
+      let finish: (() => void) | undefined;
+      const [first, rest] = [PUSH_RESULT.slice(0, 8), PUSH_RESULT.slice(8)];
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(first);
+              finish = () => {
+                controller.enqueue(rest);
+                controller.close();
+              };
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      await until(() => finish !== undefined);
+      await response.body?.cancel();
+      world.generationFault = { times: 10, error: new Error("storage failed") };
+      finish?.();
+      await until(() => logged.length > 0);
+      expect(logged).toEqual([unrecorded("record_failed")]);
+      expect(world.events()).toEqual([]);
     });
   });
 });

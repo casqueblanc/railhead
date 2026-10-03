@@ -24,7 +24,9 @@
 // ended, and only if the claim is still working at the push's generation then. The
 // gateway reads a push's response to its end whether or not the client keeps reading it, so a client
 // that stops reading or goes away after its push was applied does not lose the record. A refused,
-// failed, cut-off or unreadable push records nothing, nor does one that outlived its claim.
+// failed, cut-off or unreadable push records nothing, nor does one that outlived its claim. A push
+// the upstream applied but that was left unrecorded, because its claim changed or the record failed,
+// is logged as `git_push_unrecorded` with its claim and generation, for reconciliation.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -41,7 +43,7 @@ import {
 } from "../contracts/result";
 import type { GitPort, GitTarget } from "../modules/git/entry";
 import type { RepoPorts } from "../repo/composeRepo";
-import type { EventLog } from "../repo/eventLog";
+import { EventLogError, type EventLog } from "../repo/eventLog";
 import {
   readReceivePackHead,
   receivePackRefusal,
@@ -135,6 +137,8 @@ const PUSH_RESPONSE_BUFFER_BYTES = 1024 * 1024;
  */
 const HELD_PUSH_BYTES = 20;
 const CLAIM_CHANGED = "the claim changed while this push was being sent";
+/** How many times a confirmed push's record is tried before it is left to reconciliation. */
+const RECORD_ATTEMPTS = 3;
 
 /** Builds the Git gateway of one repository. */
 export function createGitGateway(
@@ -485,8 +489,11 @@ class GitGateway implements GitPort {
    * Records each ref the upstream reported updated; a deleted ref names no commit and is skipped.
    * Nothing is recorded unless the claim is still working at the push's generation when the record
    * is written: a claim that expired, changed hands or went ready while the push was in flight
-   * keeps its own history. The refs the push moved stay in the fork without a `claim.pushed`
-   * event, and only the `git_push_unrecorded` warning says so.
+   * keeps its own history. A record that fails is tried again up to `RECORD_ATTEMPTS` times in
+   * all, unless the event log refused it, which no retry changes. Whenever the refs the push moved
+   * stay in the fork without a `claim.pushed` event, the `git_push_unrecorded` warning names the
+   * claim and generation so the fork can be reconciled. The client's response is not cut short
+   * either way: the upstream has already applied the push.
    */
   #recordPush(
     principal: AgentPrincipal,
@@ -498,7 +505,27 @@ class GitGateway implements GitPort {
       (update) => update.kind !== "delete" && updated.has(update.ref),
     );
     if (pushed.length === 0) return;
-    const recorded = this.#context.log.transaction((tx) => {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const recorded = this.#appendPushed(principal, fence, pushed);
+        if (!recorded) logUnrecorded(fence, "claim_changed");
+        return;
+      } catch (error) {
+        if (error instanceof EventLogError || attempt >= RECORD_ATTEMPTS) {
+          logUnrecorded(fence, "record_failed");
+          return;
+        }
+      }
+    }
+  }
+
+  /** Appends `pushed` in one transaction if the claim is still working at the fence's generation. */
+  #appendPushed(
+    principal: AgentPrincipal,
+    fence: { claimId: string; generation: number },
+    pushed: readonly RefUpdate[],
+  ): boolean {
+    return this.#context.log.transaction((tx) => {
       if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
         return false;
       }
@@ -519,10 +546,6 @@ class GitGateway implements GitPort {
       }
       return true;
     }).value;
-    if (!recorded) {
-      // Codes only: never the claim, a ref or a commit.
-      console.warn(JSON.stringify({ event: "git_push_unrecorded", outcome: "claim_changed" }));
-    }
   }
 }
 
@@ -756,6 +779,24 @@ function methodNotAllowed(allow: string): Response {
 async function discarding(request: Request, response: Response): Promise<Response> {
   await request.body?.cancel().catch(() => undefined);
   return response;
+}
+
+/**
+ * Warns that a push moved refs in a claim's fork without a `claim.pushed` event. The claim id and
+ * generation are Railhead's own; no ref, commit or other text from the push is logged.
+ */
+function logUnrecorded(
+  fence: { claimId: string; generation: number },
+  reason: "claim_changed" | "record_failed",
+): void {
+  console.warn(
+    JSON.stringify({
+      event: "git_push_unrecorded",
+      claimId: fence.claimId,
+      generation: fence.generation,
+      reason,
+    }),
+  );
 }
 
 function logFailure(route: Route, outcome: string): void {
