@@ -487,21 +487,45 @@ describe("ready hands its pin to the train", () => {
     });
   });
 
-  it("answers a repeated ready while the train is missing without queuing", async () => {
+  it("refuses a repeated ready while the train is missing, and queues it once it returns", async () => {
     let missing = false;
     await withHandoff(
       async (setup) => {
         const claim = await setup.open(WORK);
         const request = { generation: 1, commit: WORK };
         expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+        // A ready claim with no queue entry, as a pin whose handoff was lost would leave it.
         setup.sql.exec("DELETE FROM train_queue");
+        setup.sql.exec("DELETE FROM train_wake");
+        const head = setup.log.head();
         missing = true;
 
+        expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+          ok: false,
+          code: "unavailable",
+        });
+        expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+        expect(setup.log.head()).toBe(head);
+        expect(setup.entries()).toEqual([]);
+        expect(readWake(setup.sql)).toBeNull();
+
+        missing = false;
         expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
           ok: true,
           value: { repeated: true },
         });
-        expect(setup.entries()).toEqual([]);
+        expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+          ok: true,
+          value: { repeated: true },
+        });
+        expect(setup.log.head()).toBe(head);
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+        expect(readWake(setup.sql)).not.toBeNull();
+
+        await setup.train.resume();
+        const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+        expect(setup.composed).toEqual([[pin]]);
+        expect(setup.started).toHaveLength(1);
       },
       (train) => ({
         ...train,
