@@ -585,3 +585,30 @@ test("a reset whose answer is lost exits 4, tells the owner to inspect, and is n
   await assert.rejects(run([...args, "--assertion", file], open, SHORT), /proof_expired/);
   assert.deepEqual(backend.performed, ["demo.reset"]);
 });
+
+test("a dry run whose repository is reset while it plans fails and reports nothing done", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "concurrent-seed.json");
+  await run([...args, "--assertion", file], open);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+
+  // Another operator's reset lands after the plan reads main and before it reads the board.
+  backend.onOpenBoard = () => {
+    backend.exists = false;
+    backend.main = null;
+  };
+  const changed = await run(["seed", "--dry-run", ...args.slice(1)], open).then(
+    () => assert.fail("the plan should fail"),
+    (thrown: unknown) => thrown,
+  );
+  assert.deepEqual(failureReport(changed), {
+    stdout: [],
+    stderr: [
+      "demo/upload-app changed during planning: it was read, then the board did not find it; run again.",
+    ],
+    exitCode: 2,
+  });
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+});

@@ -219,6 +219,8 @@ export class LiveTarget implements SeedTarget, BoardIssues {
   readonly #session: LiveSession;
   readonly #limits: LiveLimits;
   #approval: Approval | null;
+  /** Whether this target's last `read` found the repository initialized. */
+  #readFound = false;
 
   constructor(session: LiveSession, approval: Approval, limits: LiveLimits = LIVE_LIMITS) {
     this.#session = session;
@@ -231,6 +233,7 @@ export class LiveTarget implements SeedTarget, BoardIssues {
     const { readMs } = this.#limits;
     using demo = await within(this.#session.demoSeed(), readMs, "demoSeed");
     const state = valueOf(await within(demo.read(), readMs, "demoSeed.read"), "read");
+    this.#readFound = state !== null;
     return state === null ? null : { main: state.main };
   }
 
@@ -253,14 +256,21 @@ export class LiveTarget implements SeedTarget, BoardIssues {
 
   /**
    * The repository's filed issues titled one of `titles`, in log order, paging the log from its
-   * start. Other issues are dropped as each page arrives.
+   * start. Other issues are dropped as each page arrives. A repository the board does not find has
+   * none, unless this target's `read` found it: then it changed during planning, such as a
+   * concurrent reset, and an empty list would report a seed done that is not.
    */
   async issues(ref: RepoRef, titles: ReadonlySet<string>): Promise<readonly BoardIssue[]> {
     const { org, repo } = demoRef(ref);
     const { readMs, scanMs, now } = this.#limits;
     const deadline = now() + scanMs;
     const opened = await within(this.#session.openBoard(org, repo), readMs, "openBoard");
-    if (!opened.ok && opened.code === "not_found") return [];
+    if (!opened.ok && opened.code === "not_found") {
+      if (!this.#readFound) return [];
+      throw new SeedRefusal(
+        `${org}/${repo} changed during planning: it was read, then the board did not find it; run again.`,
+      );
+    }
     using board = valueOf(opened, "openBoard");
     const filed: BoardIssue[] = [];
     let cursor = 0;

@@ -271,6 +271,22 @@ test("issues are read from every page of the log, keeping only the titles asked 
   );
 });
 
+test("a repository reset between the read and the board read fails the plan", async () => {
+  const backend = withLog(0);
+  backend.onOpenBoard = () => {
+    backend.exists = false;
+    backend.main = null;
+  };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => seed(manifest, bundleAt(HEAD), t, t)),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        "demo/upload-app changed during planning: it was read, then the board did not find it; run again.",
+  );
+  assert.equal(backend.prepared.length, 0);
+});
+
 test("a board log longer than the page cap stops the plan as incomplete", async () => {
   const cap = MAX_EVENT_PAGES * MAX_EVENT_PAGE;
   // Exactly the cap is read whole.

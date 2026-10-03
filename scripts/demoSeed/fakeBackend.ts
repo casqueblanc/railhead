@@ -75,6 +75,8 @@ export class FakeBackend {
   failNextPerform: BoardErrorCode | null = null;
   /** Whether the next `perform` applies its action and then never answers, as a lost response. */
   withholdNextAnswer = false;
+  /** Runs as `openBoard` is called, before it looks up the repository. */
+  onOpenBoard: (() => void) | null = null;
   /** Whether `readEvents` stops advancing its cursor. */
   stall = false;
   readonly #challenges = new Map<string, DemoSeedAction>();
@@ -193,6 +195,7 @@ class FakeApi extends RpcTarget {
     return new FakeDemoSeed(this.#backend);
   }
   openBoard(org: string, repo: string): BoardResult<FakeBoard> {
+    this.#backend.onOpenBoard?.();
     if (!this.#backend.exists || `${org}/${repo}` !== "demo/upload-app") return fail("not_found");
     return { ok: true, value: new FakeBoard(this.#backend) };
   }
