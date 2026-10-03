@@ -22,9 +22,9 @@ use ssh_key::rand_core::{OsRng, RngCore};
 
 use crate::commands::claim::{session, workspace};
 use crate::commands::join;
-use crate::commands::sync::{quoted, render_decision};
+use crate::commands::sync::render_decision;
 use crate::http::{self, Endpoint};
-use crate::output::{LocalCode, Output, Render};
+use crate::output::{LocalCode, Output, Render, quoted};
 use crate::{Agent, Error, Result};
 
 /// Longest `--wait`, in seconds.
