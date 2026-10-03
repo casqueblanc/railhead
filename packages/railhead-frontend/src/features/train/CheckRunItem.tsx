@@ -34,6 +34,13 @@ export const CheckRunItem = ({ run, checks }: CheckRunItemProps) => {
         </Text>
         <CheckResultBadge result={run.overall} />
       </div>
+      {/* The full id from the log itself, readable and copyable even when no detail can be read. */}
+      <Text variant="secondary">
+        Candidate{" "}
+        <span className="font-mono break-all select-all" translate="no">
+          {run.candidate}
+        </span>
+      </Text>
       <ul className="grid gap-1 text-sm">
         {run.results.map((entry, index) => (
           // A run may record the same check more than once; the log order is the identity.

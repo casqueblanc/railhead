@@ -46,6 +46,16 @@ const detail = (patch: Partial<CheckDetail> = {}): CheckDetail => ({
   ...patch,
 });
 
+// The full candidate id is rendered text in the row itself, outside the detail panel.
+const expectFullCandidate = (item: Element | undefined) => {
+  const full = [...(item?.querySelectorAll("span") ?? [])].find(
+    (span) => span.textContent === CANDIDATE,
+  );
+  expect(full).toBeDefined();
+  expect(full?.hasAttribute("title")).toBe(false);
+  expect(item?.textContent).toContain(`Candidate ${CANDIDATE}`);
+};
+
 describe("check runs in the train section", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -97,7 +107,7 @@ describe("check runs in the train section", () => {
     expect(item?.textContent).toContain("Failed");
     expect(item?.textContent).toContain("test: Failed");
     expect(item?.querySelector(`[title="${CANDIDATE}"]`)?.textContent).toBe(CANDIDATE.slice(0, 7));
-    expect(text()).not.toContain(CANDIDATE);
+    expectFullCandidate(item);
     expect(text()).toContain("Nothing merged yet");
     expect(reads).toEqual([]);
   });
@@ -244,6 +254,29 @@ describe("check runs in the train section", () => {
     await render(feedOf(failingLog), { kind: "unavailable", reason: "replay" });
     expect(text()).toContain("A replay has no backend");
     expect(reads).toEqual([]);
+  });
+
+  it("shows the full candidate in a replay, where no detail can be read", async () => {
+    await render(feedOf(failingLog), { kind: "unavailable", reason: "replay" });
+    await openDetail();
+
+    expect(text()).toContain("A replay has no backend");
+    // No detail rendered, so the full id comes from the folded check event.
+    expect(container.querySelector("dl")).toBeNull();
+    expectFullCandidate(checkItems()[0]);
+  });
+
+  it("shows the full candidate when the detail is unavailable or its read fails", async () => {
+    await render(feedOf(failingLog), { kind: "unavailable", reason: "module_unavailable" });
+    await openDetail();
+    expect(container.querySelector("dl")).toBeNull();
+    expectFullCandidate(checkItems()[0]);
+
+    answers = [{ ok: false, code: "internal", message: "boom" }];
+    await render(feedOf(failingLog));
+    expect(text()).toContain("The run could not be read.");
+    expect(container.querySelector("dl")).toBeNull();
+    expectFullCandidate(checkItems()[0]);
   });
 
   it(`lists the newest ${MAX_LISTED_CHECK_RUNS} runs and says how many are left out`, async () => {
