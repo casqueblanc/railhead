@@ -274,10 +274,67 @@ async fn a_mismatched_agent_in_a_clone_sends_nothing() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result<()> {
+async fn the_clone_identity_reaches_sync_ack_and_ask() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let world = world(&server.uri())?;
-    // Outside the clone, the named agent is used: boreas has no session and no key to log in with.
+    // rh ask names the claim generation the clone was made for.
+    git(world.clone.path(), &["config", "railhead.generation", "1"])?;
+    let commands: [&[&str]; 3] = [
+        &["--json", "sync"],
+        &["--json", "ack", "17", "--plan", "p"],
+        &[
+            "--json",
+            "ask",
+            "Reject?",
+            "--option",
+            "reject=Reject",
+            "--option",
+            "chunk=Chunk",
+            "--scope",
+            "src",
+        ],
+    ];
+    for agent in [None, Some("atlas"), Some("agt_atlas01")] {
+        for argv in commands {
+            server.reset().await;
+            let run = rh(&world, world.clone.path(), agent, argv, "")?;
+            // Nothing is mounted, so each command fails on the backend's answer, after sending
+            // its request as atlas.
+            assert_eq!(run.code, Some(1), "{agent:?} {argv:?}: {}", run.stdout);
+            let received = server.received_requests().await.unwrap_or_default();
+            anyhow::ensure!(
+                !received.is_empty(),
+                "{agent:?} {argv:?} sent nothing: {}",
+                run.stdout
+            );
+            for request in &received {
+                assert!(
+                    request
+                        .url
+                        .path()
+                        .starts_with("/agent/v1/casqueblanc/demo/"),
+                    "{agent:?} {argv:?}: {}",
+                    request.url.path()
+                );
+                assert_eq!(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(format!("Bearer {TOKEN}").as_str()),
+                    "{agent:?} {argv:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn outside_a_clone_the_named_agent_is_used() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let world = world(&server.uri())?;
+    // boreas has no session and no key to log in with.
     let outside = rh(
         &world,
         world.outside.path(),
