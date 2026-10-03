@@ -6,9 +6,10 @@
 //! text and backend messages are untrusted and never written.
 //!
 //! The agent wire shows an agent its own claim and inbox, not the train, so batches and parked
-//! pairs are not events here. "Landed" is what the agent saw: its claim merged, or its ready
-//! claim closed with no conflict routed to it. "Auto-merged" is derived: two edits of the same
-//! path landed, the second on a base that did not have the first.
+//! pairs are not events here. "Landed" needs positive evidence: the agent read its claim as
+//! `merged`. A ready claim that leaves the agent's status without that evidence may have expired,
+//! so it is a failure (`closed_unknown`), never a landing. "Auto-merged" is derived: two edits of
+//! the same path landed, the second on a base that did not have the first.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,8 @@ pub enum TaskClass {
     SameFileHunks,
     /// [`EditClass::Overlapping`].
     Overlapping,
+    /// A ready claim an earlier run pinned, for which no progress record names the planned task.
+    Adopted,
 }
 
 impl From<EditClass> for TaskClass {
@@ -90,17 +93,8 @@ pub enum Step {
     Inbox,
     /// Fetching main for a redo.
     Redo,
-}
-
-/// How a landing was seen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum LandedVia {
-    /// The claim's state read `merged`.
-    Merged,
-    /// The ready claim left the agent's status with no conflict routed to it. The agent wire does
-    /// not say more once a claim closes.
-    Closed,
+    /// Saving the agent's progress record.
+    Progress,
 }
 
 /// One event.
@@ -164,7 +158,18 @@ pub enum Event {
         /// The pinned commit.
         commit: String,
     },
-    /// A pinned commit landed.
+    /// `rh work` returned a claim an earlier run had already pinned; the agent waits for its
+    /// outcome before planning new edits.
+    Adopted {
+        /// The agent.
+        agent: String,
+        /// The claim.
+        claim_id: String,
+        /// The planned round it carries, from the agent's progress record, or `None` when no
+        /// record names it.
+        round: Option<u32>,
+    },
+    /// A pinned commit landed: the agent read its claim as `merged`.
     Landed {
         /// The agent.
         agent: String,
@@ -172,10 +177,9 @@ pub enum Event {
         claim_id: String,
         /// What it delivered.
         class: TaskClass,
-        /// How the agent saw it.
-        via: LandedVia,
-        /// From the last `rh ready` to the poll that saw it land.
-        ready_to_landed_ms: u64,
+        /// From the last `rh ready` to the poll that saw it land; `None` for an adopted claim,
+        /// whose `rh ready` this run did not see.
+        ready_to_landed_ms: Option<u64>,
     },
     /// Two claims changed the same path and both landed: Git merged them.
     ConflictAutoMerged {
@@ -285,8 +289,22 @@ pub struct Summary {
     pub stalls: u64,
     /// Steps that failed for good.
     pub failures: u64,
+    /// Agents that landed every planned task.
+    pub agents_done: u64,
     /// Ready→landed latency.
     pub ready_to_landed: Latency,
+}
+
+impl Summary {
+    /// Whether the run did all it was asked: it completed, all `agents` landed every planned
+    /// task, and nothing failed or stalled.
+    #[must_use]
+    pub fn succeeded(&self, agents: u32) -> bool {
+        self.stopped_by == StopReason::Completed
+            && self.agents_done == u64::from(agents)
+            && self.failures == 0
+            && self.stalls == 0
+    }
 }
 
 /// The `p`th percentile of sorted `samples` by nearest rank.
@@ -306,6 +324,7 @@ pub struct Tally {
     redos: u64,
     stalls: u64,
     failures: u64,
+    agents_done: u64,
     latencies: Vec<u64>,
 }
 
@@ -317,7 +336,7 @@ impl Tally {
             Event::Landed {
                 ready_to_landed_ms, ..
             } => {
-                self.latencies.push(*ready_to_landed_ms);
+                self.latencies.extend(*ready_to_landed_ms);
                 &mut self.landings
             }
             Event::ConflictAutoMerged { .. } => &mut self.auto_merged,
@@ -325,9 +344,14 @@ impl Tally {
             Event::Redo { .. } => &mut self.redos,
             Event::Stalled { .. } => &mut self.stalls,
             Event::Failed { .. } => &mut self.failures,
+            Event::AgentState {
+                state: AgentState::Done,
+                ..
+            } => &mut self.agents_done,
             Event::RunStarted { .. }
             | Event::AgentState { .. }
             | Event::Claimed { .. }
+            | Event::Adopted { .. }
             | Event::Acknowledged { .. }
             | Event::Summary(_) => return,
         };
@@ -350,6 +374,7 @@ impl Tally {
             redos: self.redos,
             stalls: self.stalls,
             failures: self.failures,
+            agents_done: self.agents_done,
             ready_to_landed: Latency {
                 samples: self.latencies.len(),
                 p50_ms: percentile(&self.latencies, 50),
@@ -451,13 +476,19 @@ impl Emitter {
 mod tests {
     use super::*;
 
-    fn landed(ms: u64) -> Event {
+    fn landed(ms: Option<u64>) -> Event {
         Event::Landed {
             agent: "swarm-00".to_owned(),
             claim_id: "clm_abcdef".to_owned(),
             class: TaskClass::Disjoint,
-            via: LandedVia::Closed,
             ready_to_landed_ms: ms,
+        }
+    }
+
+    fn state(state: AgentState) -> Event {
+        Event::AgentState {
+            agent: "swarm-00".to_owned(),
+            state,
         }
     }
 
@@ -479,8 +510,8 @@ mod tests {
             agent: "swarm-00".to_owned(),
             state: AgentState::Claiming,
         })?;
-        writer.write(&landed(40))?;
-        writer.write(&landed(10))?;
+        writer.write(&landed(Some(40)))?;
+        writer.write(&landed(Some(10)))?;
         let summary = writer.finish(StopReason::Completed)?;
         assert_eq!(summary.landings, 2);
         assert_eq!(
@@ -510,7 +541,6 @@ mod tests {
         assert_eq!(at(0, "/type"), Some("agentState".into()));
         assert_eq!(at(0, "/state"), Some("claiming".into()));
         assert_eq!(at(1, "/readyToLandedMs"), Some(40.into()));
-        assert_eq!(at(1, "/via"), Some("closed".into()));
         assert_eq!(at(3, "/type"), Some("summary".into()));
         assert_eq!(at(3, "/label"), Some(SUMMARY_LABEL.into()));
         assert_eq!(at(3, "/stoppedBy"), Some("completed".into()));
@@ -548,6 +578,45 @@ mod tests {
     #[test]
     fn a_closed_stdout_is_an_error() {
         let mut writer = Writer::new(Closed, Instant::now());
-        assert!(writer.write(&landed(1)).is_err());
+        assert!(writer.write(&landed(Some(1))).is_err());
+    }
+
+    #[test]
+    fn an_adopted_landing_counts_without_a_latency_sample() {
+        let mut tally = Tally::default();
+        tally.count(&landed(None));
+        tally.count(&landed(Some(30)));
+        let summary = tally.summary(StopReason::Completed, Duration::ZERO);
+        assert_eq!(summary.landings, 2);
+        assert_eq!(summary.ready_to_landed.samples, 1);
+        assert_eq!(summary.ready_to_landed.p50_ms, Some(30));
+    }
+
+    #[test]
+    fn a_run_succeeds_only_when_every_agent_is_done_and_nothing_failed() {
+        let summary_of = |events: &[Event], stopped_by| {
+            let mut tally = Tally::default();
+            for event in events {
+                tally.count(event);
+            }
+            tally.summary(stopped_by, Duration::ZERO)
+        };
+        let done = [state(AgentState::Done), state(AgentState::Done)];
+        assert!(summary_of(&done, StopReason::Completed).succeeded(2));
+        // One agent short: it stopped, or never reported.
+        assert!(!summary_of(&done, StopReason::Completed).succeeded(3));
+        let stopped = [state(AgentState::Done), state(AgentState::Stopped)];
+        assert!(!summary_of(&stopped, StopReason::Completed).succeeded(2));
+        let stalled = [
+            state(AgentState::Done),
+            Event::Stalled {
+                agent: "swarm-00".to_owned(),
+                claim_id: "clm_abcdef".to_owned(),
+                waited_ms: 1,
+            },
+        ];
+        assert!(!summary_of(&stalled, StopReason::Completed).succeeded(1));
+        assert!(!summary_of(&done, StopReason::TimedOut).succeeded(2));
+        assert!(!summary_of(&done, StopReason::Interrupted).succeeded(2));
     }
 }

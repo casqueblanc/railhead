@@ -4,7 +4,8 @@
 //! Every child gets the agent's own `RAILHEAD_HOME`, `RAILHEAD_AGENT` and Git author, no stdin,
 //! and no stderr: what `rh` and Git write there can quote the backend or the repository, which
 //! are untrusted. `rh` runs with `--json` and its one envelope is decoded; nothing else of its
-//! output is kept.
+//! output is kept. Stdout is read through a byte limit, and a child that writes past it is killed
+//! at once.
 
 use std::ffi::OsStr;
 use std::io;
@@ -16,6 +17,7 @@ use std::time::Duration;
 use railhead_protocol::{AgentErrorCode, InboxDigest};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
@@ -130,6 +132,9 @@ pub enum Error {
     /// `rh` printed something other than one envelope.
     #[error("rh printed no envelope")]
     Malformed,
+    /// It wrote more than [`MAX_OUTPUT_BYTES`] to stdout and was killed.
+    #[error("{0} wrote more output than the limit")]
+    TooMuchOutput(&'static str),
     /// `rh` reported a refusal.
     #[error("rh reported {}", .0.code.wire())]
     Rejected(Rejection),
@@ -144,6 +149,7 @@ impl Error {
             Self::TimedOut(_) => "timeout".to_owned(),
             Self::Git(_) => "git".to_owned(),
             Self::Malformed => "malformed".to_owned(),
+            Self::TooMuchOutput(_) => "output_too_large".to_owned(),
             Self::Rejected(rejection) => rejection.code.wire(),
         }
     }
@@ -156,7 +162,9 @@ impl Error {
             Self::Rejected(rejection) if rejection.retryable => Some(Duration::from_millis(
                 rejection.retry_after_ms.unwrap_or_default(),
             )),
-            Self::Rejected(_) | Self::Spawn { .. } | Self::Malformed => None,
+            Self::Rejected(_) | Self::Spawn { .. } | Self::Malformed | Self::TooMuchOutput(_) => {
+                None
+            }
         }
     }
 
@@ -289,21 +297,39 @@ impl Runner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|source| Error::Spawn { program, source })?;
+        let stdout = child.stdout.take();
         // Dropping the child on timeout kills it.
-        let output = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| Error::TimedOut(program))?
-            .map_err(|source| Error::Spawn { program, source })?;
-        if output.stdout.len() > MAX_OUTPUT_BYTES {
-            return Err(Error::Malformed);
-        }
-        Ok(Output {
-            success: output.status.success(),
-            bytes: output.stdout,
+        tokio::time::timeout(self.timeout, async {
+            let mut bytes = Vec::new();
+            if let Some(stdout) = stdout {
+                // One byte past the limit is enough to know it was crossed.
+                let limit =
+                    u64::try_from(MAX_OUTPUT_BYTES).map_or(u64::MAX, |n| n.saturating_add(1));
+                stdout
+                    .take(limit)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(|source| Error::Spawn { program, source })?;
+            }
+            if bytes.len() > MAX_OUTPUT_BYTES {
+                // `kill` fails only when the child already exited; dropping it kills it otherwise.
+                let _ = child.kill().await;
+                return Err(Error::TooMuchOutput(program));
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|source| Error::Spawn { program, source })?;
+            Ok(Output {
+                success: status.success(),
+                bytes,
+            })
         })
+        .await
+        .map_err(|_| Error::TimedOut(program))?
     }
 }
 
@@ -400,6 +426,86 @@ mod tests {
         };
         let result = runner.rh::<Data>(&agent, dir.path(), &["status"]).await;
         assert!(matches!(result, Err(Error::Spawn { program: "rh", .. })));
+        Ok(())
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) -> anyhow::Result<PathBuf> {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    fn output_of(
+        runner: &Runner,
+        dir: &Path,
+        program: &Path,
+    ) -> impl Future<Output = Result<Output, Error>> {
+        let agent = AgentEnv {
+            name: "swarm-00".to_owned(),
+            home: dir.to_owned(),
+        };
+        let command = Command::new(program);
+        let runner = runner.clone();
+        let dir = dir.to_owned();
+        async move { runner.output("rh", &agent, &dir, command).await }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_printing_past_the_limit_is_killed_while_it_runs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pid_file = dir.path().join("pid");
+        let program = script(
+            dir.path(),
+            "chatty-rh",
+            &format!("echo $$ > '{}'\nexec yes swarm", pid_file.display()),
+        )?;
+        let runner = Runner::new(program.clone(), 1, Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let result = output_of(&runner, dir.path(), &program).await;
+        assert!(
+            matches!(result, Err(Error::TooMuchOutput("rh"))),
+            "{:?}",
+            result.err()
+        );
+        // Well within the command timeout: the limit, not the timeout, stopped it.
+        assert!(started.elapsed() < Duration::from_secs(20));
+        let pid = std::fs::read_to_string(&pid_file)?;
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()?;
+        assert!(!alive.success(), "the child is still running");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_up_to_the_limit_is_kept_and_one_byte_more_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let runner = Runner::new(PathBuf::from("rh"), 1, Duration::from_secs(60));
+        let exact = script(
+            dir.path(),
+            "exact",
+            &format!("head -c {MAX_OUTPUT_BYTES} /dev/zero"),
+        )?;
+        let output = output_of(&runner, dir.path(), &exact).await?;
+        assert!(output.success);
+        assert_eq!(output.bytes.len(), MAX_OUTPUT_BYTES);
+        let over = script(
+            dir.path(),
+            "over",
+            &format!("head -c {} /dev/zero", MAX_OUTPUT_BYTES + 1),
+        )?;
+        let result = output_of(&runner, dir.path(), &over).await;
+        assert!(
+            matches!(result, Err(Error::TooMuchOutput("rh"))),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(Error::TooMuchOutput("rh").code(), "output_too_large");
+        assert_eq!(Error::TooMuchOutput("rh").retry(), None);
         Ok(())
     }
 }

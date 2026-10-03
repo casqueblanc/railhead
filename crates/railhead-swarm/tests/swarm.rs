@@ -4,8 +4,9 @@
 //! The fake's train lands claims in waves: it hands out claims until a wave is full, then lands
 //! the wave once every claim in it is ready, in the order they were pinned, with `git merge-tree`.
 //! A clean merge moves main; a conflict reopens the claim at the next generation and routes a
-//! `conflict` inbox item to its agent. Like the real backend, a claim that landed leaves its
-//! agent's status. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
+//! `conflict` inbox item to its agent. By default the agent's status keeps showing its last claim
+//! once it merged, the positive evidence the driver needs to count a landing; the real backend
+//! does not show it yet (#237), and [`Status::HidesClosed`] reproduces that. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
 //! the origin's `/git/` URLs, so every remote keeps the address the backend named.
 //!
 //! The agents and the backend are both simulated; nothing here measures Railhead itself.
@@ -114,6 +115,18 @@ enum ClaimState {
     Working,
     Ready,
     Merged,
+    Expired,
+}
+
+/// What the fake's `status` shows once a claim closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    /// The agent's last claim, merged included.
+    ShowsMerged,
+    /// Only an active claim, as the real backend does today.
+    HidesClosed,
+    /// The last claim, but a ready claim expires on the poll after the first that saw it ready.
+    ExpiresReady,
 }
 
 #[derive(Debug)]
@@ -148,6 +161,12 @@ struct State {
     last_landed: Option<String>,
     seq: u64,
     readies: u64,
+    /// Whether the train holds every pinned claim.
+    paused: bool,
+    /// Status requests that pass before the train moves on one.
+    held_polls: u64,
+    /// Polls that saw a ready claim, for [`Status::ExpiresReady`].
+    ready_polls: u64,
 }
 
 /// The fake backend.
@@ -155,6 +174,7 @@ struct Fake {
     uri: String,
     root: PathBuf,
     wave_size: usize,
+    status: Status,
     state: Mutex<State>,
 }
 
@@ -173,6 +193,7 @@ impl Fake {
             ClaimState::Working => "working",
             ClaimState::Ready => "ready",
             ClaimState::Merged => "merged",
+            ClaimState::Expired => "expired",
         };
         json!({"claimId": claim.id, "issueId": claim.issue, "generation": claim.generation,
             "base": claim.base, "state": state, "readyCommit": claim.ready_commit,
@@ -198,10 +219,29 @@ impl Fake {
     }
 
     fn active(state: &State, agent: usize) -> Option<usize> {
-        state
-            .claims
-            .iter()
-            .position(|claim| claim.agent == agent && claim.state != ClaimState::Merged)
+        state.claims.iter().position(|claim| {
+            claim.agent == agent && matches!(claim.state, ClaimState::Working | ClaimState::Ready)
+        })
+    }
+
+    /// The claim `status` shows the agent.
+    fn shown(&self, state: &mut State, agent: usize) -> Option<usize> {
+        let last = state.claims.iter().rposition(|claim| claim.agent == agent);
+        match self.status {
+            Status::ShowsMerged => last,
+            Status::HidesClosed => Self::active(state, agent),
+            Status::ExpiresReady => {
+                let claim = last.and_then(|index| state.claims.get_mut(index))?;
+                if claim.state == ClaimState::Ready {
+                    state.ready_polls += 1;
+                    if state.ready_polls > 1 {
+                        claim.state = ClaimState::Expired;
+                    }
+                }
+                // Like the real backend, an expired claim leaves the status.
+                Self::active(state, agent)
+            }
+        }
     }
 
     fn agent_view(agent: usize) -> Value {
@@ -306,8 +346,11 @@ impl Fake {
         ))
     }
 
-    /// Lands the wave once it is full and every claim in it is ready.
+    /// Lands the wave once it is full and every claim in it is ready, unless the train is paused.
     fn land(&self, state: &mut State) -> anyhow::Result<()> {
+        if state.paused {
+            return Ok(());
+        }
         let waiting: Vec<usize> = state
             .wave
             .iter()
@@ -447,7 +490,14 @@ impl Fake {
         let method = request.method.as_str();
         match (method, segments.as_slice()) {
             ("GET", ["status"]) => {
-                let claim = Self::active(&state, agent)
+                // The train also moves between pins, as a real one does.
+                if state.held_polls > 0 {
+                    state.held_polls -= 1;
+                } else {
+                    self.land(&mut state)?;
+                }
+                let claim = self
+                    .shown(&mut state, agent)
                     .and_then(|index| state.claims.get(index))
                     .map(|claim| self.view(claim));
                 Ok(success(
@@ -524,6 +574,15 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
 /// A world with `agents` joined agents and a main holding a README, plus the scaffold when
 /// `scaffolded`.
 async fn world(agents: usize, wave_size: usize, scaffolded: bool) -> anyhow::Result<World> {
+    world_with(agents, wave_size, scaffolded, Status::ShowsMerged).await
+}
+
+async fn world_with(
+    agents: usize,
+    wave_size: usize,
+    scaffolded: bool,
+    status: Status,
+) -> anyhow::Result<World> {
     let server = MockServer::builder().start().await;
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("backend");
@@ -600,6 +659,7 @@ async fn world(agents: usize, wave_size: usize, scaffolded: bool) -> anyhow::Res
         uri,
         root,
         wave_size,
+        status,
         state: Mutex::new(State::default()),
     });
     wiremock::Mock::given(wiremock::matchers::any())
@@ -617,9 +677,20 @@ impl World {
         mix: &Value,
         bounds: &Value,
     ) -> anyhow::Result<PathBuf> {
+        self.scenario_of(agents, 1, repository, mix, bounds)
+    }
+
+    fn scenario_of(
+        &self,
+        agents: usize,
+        rounds: u32,
+        repository: &str,
+        mix: &Value,
+        bounds: &Value,
+    ) -> anyhow::Result<PathBuf> {
         let path = self.dir.path().join("scenario.json");
         let scenario = json!({"seed": 211, "origin": self.server.uri(), "repository": repository,
-            "agents": agents, "rounds": 1, "mix": mix, "bounds": bounds});
+            "agents": agents, "rounds": rounds, "mix": mix, "bounds": bounds});
         fs::write(&path, scenario.to_string())?;
         Ok(path)
     }
@@ -651,6 +722,20 @@ impl World {
 
     fn work_is_empty(&self) -> anyhow::Result<bool> {
         Ok(fs::read_dir(self.dir.path().join("work"))?.next().is_none())
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.fake
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn progress_file(&self, agent: &str) -> PathBuf {
+        self.dir
+            .path()
+            .join("homes/progress")
+            .join(format!("{agent}.json"))
     }
 }
 
@@ -765,7 +850,10 @@ async fn disjoint_edits_land_without_conflict() -> anyhow::Result<()> {
         (Some(2), Some(2), Some(0), Some(0))
     );
     assert_eq!(summary.pointer("/readyToLanded/samples"), Some(&json!(2)));
+    assert_eq!(run.total("agentsDone"), Some(2));
     assert!(world.work_is_empty()?, "the run left clones behind");
+    // A finished run leaves nothing to resume.
+    assert!(!world.progress_file("swarm-00").exists());
     Ok(())
 }
 
@@ -865,25 +953,84 @@ async fn overlapping_edits_are_routed_and_redone_until_they_land() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn a_claim_of_another_repository_is_never_touched() -> anyhow::Result<()> {
+async fn a_home_joined_to_another_repository_starts_nothing() -> anyhow::Result<()> {
     let world = world(1, 1, false).await?;
     // The agent is joined to casqueblanc/demo; the scenario names another repository.
     let scenario = world.scenario(1, "casqueblanc/other", &mix(1, 0, 0), &fast_bounds())?;
+    let output = world.driver(&scenario)?.output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("agent swarm-00 in ")
+            && stderr.contains("joined another origin or repository"),
+        "{stderr}"
+    );
+    // Not one request reached the backend the home is joined to: no claim, no fork.
+    assert!(
+        world
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(world.state().claims.is_empty());
+    let forks = world.fake.root.join("git/casqueblanc/demo/claims");
+    assert_eq!(fs::read_dir(forks)?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_that_closes_without_evidence_is_not_a_landing() -> anyhow::Result<()> {
+    // The fake lands the claim but, like today's backend, drops it from the status.
+    let world = world_with(1, 1, false, Status::HidesClosed).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     let run = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(run.code, Some(0));
+    assert_eq!(run.code, Some(1));
+    assert_eq!(
+        run.steps_of("swarm-00"),
+        ["claimed", "pushed", "ready", "failed"]
+    );
     let failed = run.of_type("failed");
-    assert_eq!(failed.len(), 1);
     assert_eq!(
         failed.first().and_then(|e| e.get("code")),
-        Some(&json!("foreign_claim"))
+        Some(&json!("closed_unknown"))
     );
-    assert_eq!(run.of_type("pushed").len(), 0);
-    let state = world
-        .fake
-        .state
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(state.readies, 0);
+    assert_eq!(
+        (run.total("landings"), run.total("agentsDone")),
+        (Some(0), Some(0))
+    );
+    assert_eq!(
+        run.summary()?.pointer("/readyToLanded/samples"),
+        Some(&json!(0))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ready_claim_that_expires_between_polls_is_not_a_landing() -> anyhow::Result<()> {
+    // A wave of 2 with one agent never lands; the ready claim expires on the second poll.
+    let world = world_with(1, 2, false, Status::ExpiresReady).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(
+        run.steps_of("swarm-00"),
+        ["claimed", "pushed", "ready", "failed"]
+    );
+    assert_eq!(
+        run.of_type("failed").first().and_then(|e| e.get("code")),
+        Some(&json!("closed_unknown"))
+    );
+    assert_eq!(run.total("landings"), Some(0));
+    assert_eq!(world.state().ready_polls, 2);
+    assert!(
+        world
+            .main_file("swarm/agents/swarm-00/round-000.txt")
+            .is_err(),
+        "main changed although nothing landed"
+    );
     Ok(())
 }
 
@@ -894,7 +1041,7 @@ async fn a_claim_that_never_lands_stalls_its_agent() -> anyhow::Result<()> {
     let bounds = json!({"landTimeoutSecs": 1, "runTimeoutSecs": 60, "pollMs": 50});
     let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &bounds)?;
     let run = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(run.code, Some(0));
+    assert_eq!(run.code, Some(1));
     assert_eq!(
         run.steps_of("swarm-00"),
         ["claimed", "pushed", "ready", "stalled"]
@@ -991,5 +1138,148 @@ async fn an_invalid_scenario_starts_nothing() -> anyhow::Result<()> {
             .unwrap_or_default()
             .is_empty()
     );
+    Ok(())
+}
+
+/// Runs a two-round scenario until its first claim is pinned, then interrupts it while the train
+/// holds that pin. Returns the scenario and the pinned claim.
+#[cfg(unix)]
+fn interrupt_after_the_first_pin(world: &World) -> anyhow::Result<(PathBuf, String)> {
+    let scenario = world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    world.state().paused = true;
+    let mut child = world.driver(&scenario)?.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let pinned = loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the run ended early"))??;
+        let event: Value = serde_json::from_str(&line)?;
+        if event.get("type") == Some(&json!("ready"))
+            && let Some(claim) = event.get("claimId").and_then(Value::as_str)
+        {
+            break claim.to_owned();
+        }
+    };
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()?;
+    assert!(interrupted.success());
+    for line in lines {
+        line?;
+    }
+    assert_eq!(child.wait()?.code(), Some(130));
+    let saved: Value = serde_json::from_str(&fs::read_to_string(world.progress_file("swarm-00"))?)?;
+    assert_eq!(
+        saved,
+        json!({"seed": 211, "round": 0, "scaffold": false, "claimId": pinned})
+    );
+    Ok((scenario, pinned))
+}
+
+/// Checks a rerun that recorded `pinned` as round 0's landing, then delivered round 1 only.
+fn assert_resumed(world: &World, rerun: &Run, pinned: &str) -> anyhow::Result<()> {
+    assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
+    let adopted = rerun.of_type("adopted");
+    assert_eq!(
+        adopted.first().map(|e| (e.get("claimId"), e.get("round"))),
+        Some((Some(&json!(pinned)), Some(&json!(0))))
+    );
+    let landed = rerun.of_type("landed");
+    assert_eq!(
+        landed
+            .first()
+            .map(|e| (e.get("claimId"), e.get("class"), e.get("readyToLandedMs"))),
+        Some((
+            Some(&json!(pinned)),
+            Some(&json!("disjoint")),
+            Some(&Value::Null)
+        ))
+    );
+    assert_eq!(
+        (
+            rerun.total("landings"),
+            rerun.total("pushes"),
+            rerun.total("agentsDone")
+        ),
+        (Some(2), Some(1), Some(1))
+    );
+    // Round 0 was not delivered twice: two claims in all, both merged.
+    let states: Vec<ClaimState> = world.state().claims.iter().map(|c| c.state).collect();
+    assert_eq!(states, [ClaimState::Merged, ClaimState::Merged]);
+    for round in ["round-000", "round-001"] {
+        assert!(
+            world
+                .main_file(&format!("swarm/agents/swarm-00/{round}.txt"))?
+                .starts_with("swarm-00 ")
+        );
+    }
+    assert!(!world.progress_file("swarm-00").exists());
+    assert!(world.work_is_empty()?, "the run left clones behind");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_interrupted_run_adopts_its_pinned_claim_when_run_again() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
+    // The train lands the pin only after the rerun's first status, so `rh work` returns it ready.
+    {
+        let mut state = world.state();
+        state.paused = false;
+        state.held_polls = 1;
+    }
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    // The pinned claim is adopted and its outcome recorded before any new edit.
+    assert_eq!(
+        rerun.steps_of("swarm-00"),
+        [
+            "claimed", "adopted", "landed", "claimed", "pushed", "ready", "landed"
+        ]
+    );
+    assert_eq!(
+        rerun
+            .of_type("claimed")
+            .first()
+            .and_then(|e| e.get("resumed")),
+        Some(&json!(true))
+    );
+    assert_resumed(&world, &rerun, &pinned)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_that_merged_between_runs_is_recorded_not_redone() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
+    world.state().paused = false;
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(
+        rerun.steps_of("swarm-00"),
+        ["adopted", "landed", "claimed", "pushed", "ready", "landed"]
+    );
+    assert_resumed(&world, &rerun, &pinned)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_that_closed_between_runs_without_evidence_stops_the_rerun() -> anyhow::Result<()> {
+    let world = world_with(1, 1, false, Status::HidesClosed).await?;
+    let (scenario, _) = interrupt_after_the_first_pin(&world)?;
+    world.state().paused = false;
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(rerun.code, Some(1));
+    assert_eq!(rerun.steps_of("swarm-00"), ["failed"]);
+    assert_eq!(
+        rerun.of_type("failed").first().and_then(|e| e.get("code")),
+        Some(&json!("closed_unknown"))
+    );
+    // Nothing was claimed or delivered again.
+    assert_eq!(world.state().claims.len(), 1);
+    assert_eq!(rerun.total("pushes"), Some(0));
     Ok(())
 }

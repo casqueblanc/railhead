@@ -8,9 +8,15 @@
 //! simulated run.
 //!
 //! Agent `i` is named `swarm-NN` and uses `<homes>/swarm-NN` as its `RAILHEAD_HOME`, which must
-//! already hold that agent, joined to the scenario's repository. Clones go in a temporary
+//! already hold that agent, joined to the scenario's origin and repository. The driver checks each
+//! identity before any agent runs and refuses to start on a mismatch. Clones go in a temporary
 //! directory that is removed when the run ends, on Ctrl-C included; every child process is killed
-//! first.
+//! first. Each agent's progress is kept in `<homes>/progress/swarm-NN.json`, so running a stopped
+//! scenario again resumes it.
+//!
+//! The exit code is 0 only when every agent landed every planned task; 1 when the run ended with
+//! a task not landed, an agent failed or stalled, or the run timed out; 130 on Ctrl-C; 2 when the
+//! run could not start.
 //!
 //! ```text
 //! railhead-swarm --scenario crates/railhead-swarm/scenarios/local.json \
@@ -21,6 +27,7 @@ mod agent;
 mod events;
 mod plan;
 mod process;
+mod progress;
 mod scenario;
 
 use std::io::{self, Read as _};
@@ -37,7 +44,11 @@ use crate::agent::{Agent, Landings, Shared};
 use crate::events::{Emitter, Event, StopReason, Writer};
 use crate::plan::Plan;
 use crate::process::{AgentEnv, Runner};
+use crate::progress::ProgressFile;
 use crate::scenario::{MAX_SCENARIO_BYTES, Scenario};
+
+/// Largest identity record read from an agent home, in bytes.
+const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
 
 /// Run simulated agents, each a real `rh` process, against one Railhead repository.
 #[derive(Debug, Parser)]
@@ -69,9 +80,16 @@ fn agent_name(index: u32) -> String {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli).await {
-        Ok(StopReason::Completed) => ExitCode::SUCCESS,
-        Ok(StopReason::TimedOut) => ExitCode::FAILURE,
-        Ok(StopReason::Interrupted) => ExitCode::from(130),
+        Ok(Ended {
+            stopped_by: StopReason::Interrupted,
+            ..
+        }) => ExitCode::from(130),
+        Ok(Ended {
+            succeeded: true, ..
+        }) => ExitCode::SUCCESS,
+        Ok(Ended {
+            succeeded: false, ..
+        }) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("railhead-swarm: {error:#}");
             ExitCode::from(2)
@@ -90,18 +108,50 @@ fn read_scenario(path: &Path) -> anyhow::Result<Scenario> {
     Ok(Scenario::parse(&text)?)
 }
 
-async fn run(cli: &Cli) -> anyhow::Result<StopReason> {
+/// The part of an `rh` identity record the driver checks.
+#[derive(serde::Deserialize)]
+struct Joined {
+    origin: String,
+    repo: String,
+}
+
+/// Checks that agent `name`'s home holds that agent, joined to the scenario's origin and
+/// repository, so no `rh` command can reach another one.
+fn check_home(scenario: &Scenario, home: &Path, name: &str) -> anyhow::Result<()> {
+    let path = home.join("agents").join(name).join("identity.json");
+    let file = std::fs::File::open(&path)
+        .with_context(|| format!("{} holds no agent {name}", home.display()))?;
+    let mut text = String::new();
+    file.take(MAX_IDENTITY_BYTES)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let joined: Joined = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not an agent identity", path.display()))?;
+    anyhow::ensure!(
+        scenario.admits(&joined.origin, &joined.repo),
+        "agent {name} in {} joined another origin or repository than the scenario names",
+        home.display()
+    );
+    Ok(())
+}
+
+/// How a run ended.
+struct Ended {
+    stopped_by: StopReason,
+    succeeded: bool,
+}
+
+async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     let scenario = read_scenario(&cli.scenario)?;
     let homes = (0..scenario.agents)
         .map(|index| {
-            let home = cli.homes.join(agent_name(index));
-            if home.is_dir() {
-                Ok(home)
-            } else {
-                anyhow::bail!("{} is not an agent home directory", home.display())
-            }
+            let name = agent_name(index);
+            let home = cli.homes.join(&name);
+            check_home(&scenario, &home, &name)?;
+            Ok(home)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let progress = cli.homes.join("progress");
     let mut builder = tempfile::Builder::new();
     builder.prefix("railhead-swarm-");
     let clones = match &cli.workdir {
@@ -144,9 +194,11 @@ async fn run(cli: &Cli) -> anyhow::Result<StopReason> {
         std::fs::create_dir(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
         let agent = Agent {
             slot,
+            progress: ProgressFile::new(&progress, &name),
             env: AgentEnv { name, home },
             workdir,
             edits: plan.agent(usize::try_from(slot)?).to_vec(),
+            seed: scenario.seed,
         };
         agents.spawn(agent.run(Arc::clone(&shared)));
     }
@@ -173,11 +225,14 @@ async fn run(cli: &Cli) -> anyhow::Result<StopReason> {
     while let Ok(event) = received.try_recv() {
         writer.write(&event)?;
     }
-    writer.finish(stopped_by)?;
+    let summary = writer.finish(stopped_by)?;
     clones
         .close()
         .context("removing the run's temporary directory")?;
-    Ok(stopped_by)
+    Ok(Ended {
+        stopped_by,
+        succeeded: summary.succeeded(scenario.agents),
+    })
 }
 
 #[cfg(test)]
@@ -210,6 +265,50 @@ mod tests {
             error.as_deref(),
             Some("the scenario is larger than 65536 bytes")
         );
+        Ok(())
+    }
+
+    fn scenario() -> anyhow::Result<Scenario> {
+        Ok(Scenario::parse(
+            r#"{"seed": 1, "origin": "http://127.0.0.1:8787", "repository": "casqueblanc/demo",
+                "rounds": 1, "mix": {"disjoint": 1, "sameFileHunks": 0, "overlapping": 0}}"#,
+        )?)
+    }
+
+    fn home_with(identity: &str) -> anyhow::Result<tempfile::TempDir> {
+        let home = tempfile::tempdir()?;
+        let dir = home.path().join("agents/swarm-00");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("identity.json"), identity)?;
+        Ok(home)
+    }
+
+    #[test]
+    fn a_home_joined_to_the_scenario_repository_is_accepted() -> anyhow::Result<()> {
+        let home = home_with(
+            r#"{"name":"swarm-00","agentId":"agt_swarm00","origin":"http://127.0.0.1:8787",
+                "repo":"casqueblanc/demo"}"#,
+        )?;
+        check_home(&scenario()?, home.path(), "swarm-00")
+    }
+
+    #[test]
+    fn a_home_joined_elsewhere_or_missing_is_refused() -> anyhow::Result<()> {
+        let scenario = scenario()?;
+        let other = home_with(
+            r#"{"name":"swarm-00","origin":"http://127.0.0.1:8787","repo":"casqueblanc/other"}"#,
+        )?;
+        let error = check_home(&scenario, other.path(), "swarm-00").err();
+        assert!(error.is_some_and(|e| {
+            e.to_string()
+                .contains("joined another origin or repository")
+        }),);
+        let origin = home_with(r#"{"origin":"http://127.0.0.1:9999","repo":"casqueblanc/demo"}"#)?;
+        assert!(check_home(&scenario, origin.path(), "swarm-00").is_err());
+        let damaged = home_with("not json")?;
+        assert!(check_home(&scenario, damaged.path(), "swarm-00").is_err());
+        // No identity of that name.
+        assert!(check_home(&scenario, origin.path(), "swarm-01").is_err());
         Ok(())
     }
 }

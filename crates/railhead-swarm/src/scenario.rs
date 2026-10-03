@@ -226,6 +226,14 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// Whether an agent joined to `origin` and `repo`, as its identity records them, belongs to
+    /// this scenario.
+    #[must_use]
+    pub fn admits(&self, origin: &str, repo: &str) -> bool {
+        Origin::new(origin).is_ok_and(|origin| origin == self.origin)
+            && Repository::new(repo).is_ok_and(|repo| repo == self.repository)
+    }
+
     /// Reads a scenario from its JSON text.
     ///
     /// # Errors
@@ -515,5 +523,19 @@ mod tests {
         ));
         let huge = format!("{MINIMAL}{}", " ".repeat(MAX_SCENARIO_BYTES));
         assert!(matches!(Scenario::parse(&huge), Err(Error::TooLarge)));
+    }
+
+    #[test]
+    fn an_agent_belongs_only_to_the_scenario_origin_and_repository() -> anyhow::Result<()> {
+        let scenario = Scenario::parse(MINIMAL)?;
+        assert!(scenario.admits("https://railhead.dev", "casqueblanc/demo"));
+        // The same origin written with its trailing slash.
+        assert!(scenario.admits("https://railhead.dev/", "casqueblanc/demo"));
+        assert!(!scenario.admits("https://railhead.dev", "casqueblanc/other"));
+        assert!(!scenario.admits("https://other.dev", "casqueblanc/demo"));
+        assert!(!scenario.admits("https://railhead.dev:8443", "casqueblanc/demo"));
+        assert!(!scenario.admits("not a url", "casqueblanc/demo"));
+        assert!(!scenario.admits("https://railhead.dev", ""));
+        Ok(())
     }
 }

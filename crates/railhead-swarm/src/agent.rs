@@ -7,6 +7,15 @@
 //! it redo the edit on the new main and push again. A ready claim that does not land within the
 //! land timeout stops the agent: it still holds the claim, so it cannot take other work.
 //!
+//! A task lands only when the agent reads its claim as `merged`. A claim that leaves the agent's
+//! status without that evidence may have expired, so the agent stops on it instead of counting a
+//! landing.
+//!
+//! A rerun picks up where a stopped run left off. The agent's progress record names the planned
+//! task it was on and that task's claim. When `rh work` hands back a claim an earlier run already
+//! pinned, the agent adopts it: it waits for the claim's outcome and records it before it plans
+//! any new edit.
+//!
 //! The agent writes only inside the clone `rh work` made under its own working directory, and
 //! only to a clone whose fork belongs to the scenario's repository.
 
@@ -20,9 +29,10 @@ use railhead_protocol::{
 };
 use serde::Deserialize;
 
-use crate::events::{AgentState, Emitter, Event, LandedVia, Step, TaskClass, millis};
+use crate::events::{AgentState, Emitter, Event, Step, TaskClass, millis};
 use crate::plan::{ApplyError, Edit, scaffold};
 use crate::process::{self, AgentEnv, Envelope, Runner};
+use crate::progress::{Progress, ProgressFile};
 use crate::scenario::Bounds;
 
 /// The plan an agent writes when it acknowledges an item.
@@ -59,6 +69,10 @@ pub struct Agent {
     pub workdir: PathBuf,
     /// Its planned edits.
     pub edits: Vec<Edit>,
+    /// The scenario seed its plan came from.
+    pub seed: u64,
+    /// Where its progress is kept between runs.
+    pub progress: ProgressFile,
 }
 
 /// The agent stopped; an event already says why.
@@ -101,6 +115,34 @@ struct Held {
 enum Waited {
     Landed,
     Redo,
+}
+
+/// What one `rh status` poll says about a ready claim.
+#[derive(Debug, PartialEq, Eq)]
+enum Polled {
+    /// It merged.
+    Landed,
+    /// It reopened for a redo.
+    Redo,
+    /// It is still ready.
+    Pending,
+    /// It closed without landing, or without evidence that it did.
+    Closed(&'static str),
+}
+
+/// Judges the held claim's state as `rh status` reported it, `None` when the status shows no
+/// claim of that id.
+fn judge(state: Option<ClaimState>) -> Polled {
+    match state {
+        Some(ClaimState::Merged) => Polled::Landed,
+        Some(ClaimState::Working) => Polled::Redo,
+        Some(ClaimState::Ready) => Polled::Pending,
+        Some(ClaimState::Expired) => Polled::Closed("claim_expired"),
+        // The status shows only an active claim, so one that left it may have merged or expired.
+        // The agent wire does not yet say which (#237 adds the closed reason); without positive
+        // evidence it is not a landing.
+        None => Polled::Closed("closed_unknown"),
+    }
 }
 
 /// A landing, for pairing same-path edits.
@@ -192,35 +234,152 @@ impl Run<'_> {
     async fn all(&self) -> Outcome<()> {
         // A first `rh status` proves the identity and its session before any claim.
         let workdir = &self.agent.workdir;
-        self.retrying(Step::Preflight, || {
-            self.shared
-                .runner
-                .rh::<serde_json::Value>(&self.agent.env, workdir, &["status"])
-        })
-        .await?;
-        for edit in &self.agent.edits {
-            self.task(*edit).await?;
+        let status: Envelope<Status> = self
+            .retrying(Step::Preflight, || {
+                self.shared.runner.rh(&self.agent.env, workdir, &["status"])
+            })
+            .await?;
+        let Ok(saved) = self.agent.progress.load(self.agent.seed) else {
+            return Err(self.fail(Step::Progress, "progress".to_owned()).await);
+        };
+        let mut next = saved.as_ref().map_or(0, |saved| saved.round);
+        // The claim an earlier run left may have closed while no run watched it.
+        if let Some(saved) = &saved
+            && let Some(claim_id) = &saved.claim_id
+        {
+            let state = status
+                .data
+                .claim
+                .filter(|claim| &claim.claim_id == claim_id)
+                .map(|claim| claim.state);
+            match judge(state) {
+                // Still held: `rh work` hands it back.
+                Polled::Pending | Polled::Redo => {}
+                Polled::Landed => next = self.landed_meanwhile(saved, claim_id).await?,
+                Polled::Closed(code) => {
+                    return Err(self.fail(Step::Claim, code.to_owned()).await);
+                }
+            }
+        }
+        let mut first = None;
+        if task_index(next) < self.agent.edits.len() {
+            let held = self.claim().await?;
+            if held.state == ClaimState::Ready {
+                next = self.adopt(held, saved.as_ref(), next).await?;
+            } else {
+                first = Some(held);
+            }
+        }
+        for (index, edit) in self.agent.edits.iter().enumerate().skip(task_index(next)) {
+            let round = u32::try_from(index).unwrap_or(u32::MAX);
+            self.task(round, *edit, first.take()).await?;
+        }
+        if self.agent.progress.clear().is_err() {
+            return Err(self.fail(Step::Progress, "progress".to_owned()).await);
         }
         Ok(())
     }
 
-    /// Lands one planned edit, landing the scaffold first when the clone lacks it.
-    async fn task(&self, edit: Edit) -> Outcome<()> {
+    /// Waits for the outcome of a claim an earlier run pinned, and returns the planned task to go
+    /// on with; `next` when no record names the claim.
+    async fn adopt(&self, held: Held, saved: Option<&Progress>, next: u32) -> Outcome<u32> {
+        let saved = saved.filter(|saved| saved.claim_id.as_deref() == Some(&held.claim_id));
+        self.emit(Event::Adopted {
+            agent: self.name(),
+            claim_id: held.claim_id.clone(),
+            round: saved.map(|saved| saved.round),
+        })
+        .await;
+        let Some(saved) = saved else {
+            // No record says which planned task it carries, so it cannot be redone.
+            return match self.wait(&held, None, TaskClass::Adopted, None).await? {
+                Waited::Landed => Ok(next),
+                Waited::Redo => Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await),
+            };
+        };
+        let Some(edit) = self.agent.edits.get(task_index(saved.round)).copied() else {
+            return Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await);
+        };
+        if saved.scaffold {
+            self.deliver(held, None, true).await?;
+            return Ok(saved.round);
+        }
+        self.deliver(held, Some(edit), true).await?;
+        let next = saved.round.saturating_add(1);
+        self.save(next, false, None).await?;
+        Ok(next)
+    }
+
+    /// Records the landing of an earlier run's claim that merged while no run watched it, and
+    /// returns the planned task to go on with.
+    async fn landed_meanwhile(&self, saved: &Progress, claim_id: &str) -> Outcome<u32> {
+        let Some(edit) = self.agent.edits.get(task_index(saved.round)).copied() else {
+            return Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await);
+        };
+        self.emit(Event::Adopted {
+            agent: self.name(),
+            claim_id: claim_id.to_owned(),
+            round: Some(saved.round),
+        })
+        .await;
+        self.emit(Event::Landed {
+            agent: self.name(),
+            claim_id: claim_id.to_owned(),
+            class: if saved.scaffold {
+                TaskClass::Scaffold
+            } else {
+                TaskClass::from(edit.class)
+            },
+            ready_to_landed_ms: None,
+        })
+        .await;
+        if saved.scaffold {
+            self.save(saved.round, false, None).await?;
+            return Ok(saved.round);
+        }
+        let next = saved.round.saturating_add(1);
+        self.save(next, false, None).await?;
+        Ok(next)
+    }
+
+    /// Lands planned task `round`, landing the scaffold first when the clone lacks it. `first` is
+    /// a claim `rh work` already returned for it.
+    async fn task(&self, round: u32, edit: Edit, mut first: Option<Held>) -> Outcome<()> {
         // Each pass claims once; a pass that lands the scaffold goes round again, which happens
         // at most once per task.
         for _ in 0..2 {
-            let held = self.claim().await?;
+            let held = match first.take() {
+                Some(held) => held,
+                None => self.claim().await?,
+            };
             if held.state != ClaimState::Working {
-                // An earlier run pinned it, and this run cannot tell what it holds.
+                // Only the first claim of a run may be an earlier run's pin.
                 return Err(self.fail(Step::Claim, "claim_not_working".to_owned()).await);
             }
-            if edit.needs_scaffold() && !has_scaffold(&held.dir) {
-                self.deliver(held, None).await?;
+            let scaffold = edit.needs_scaffold() && !has_scaffold(&held.dir);
+            self.save(round, scaffold, Some(&held.claim_id)).await?;
+            if scaffold {
+                self.deliver(held, None, false).await?;
                 continue;
             }
-            return self.deliver(held, Some(edit)).await;
+            self.deliver(held, Some(edit), false).await?;
+            return self.save(round.saturating_add(1), false, None).await;
         }
         Err(self.fail(Step::Claim, "unexpected_claim".to_owned()).await)
+    }
+
+    /// Records that the agent is on planned task `round`, holding `claim_id`.
+    async fn save(&self, round: u32, scaffold: bool, claim_id: Option<&str>) -> Outcome<()> {
+        let progress = Progress {
+            seed: self.agent.seed,
+            round,
+            scaffold,
+            claim_id: claim_id.map(str::to_owned),
+        };
+        match self.agent.progress.save(&progress) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self.fail(Step::Progress, "progress".to_owned()).await),
+        }
     }
 
     /// `rh work`, repeated while it is retryable, with the clone checked to be this run's.
@@ -269,8 +428,9 @@ impl Run<'_> {
     }
 
     /// Writes, pushes and pins the edit, or the scaffold for `None`, then waits for it to land,
-    /// redoing it on the new main as often as the retry bound allows.
-    async fn deliver(&self, mut held: Held, edit: Option<Edit>) -> Outcome<()> {
+    /// redoing it on the new main as often as the retry bound allows. A claim already `pinned` by
+    /// an earlier run is waited on first.
+    async fn deliver(&self, mut held: Held, edit: Option<Edit>, mut pinned: bool) -> Outcome<()> {
         let class = edit.map_or(TaskClass::Scaffold, |edit| TaskClass::from(edit.class));
         let path = edit.map_or_else(
             || crate::plan::SHARED_PATH.to_owned(),
@@ -278,27 +438,15 @@ impl Run<'_> {
         );
         let mut redos = 0;
         loop {
-            self.state(AgentState::Editing).await;
-            self.write(&held.dir, edit).await?;
-            let commit = self.commit(&held, edit, redos > 0).await?;
-            self.emit(Event::Pushed {
-                agent: self.name(),
-                claim_id: held.claim_id.clone(),
-                commit: commit.clone(),
-                class,
-                path: path.clone(),
-            })
-            .await;
-            self.ready(&held).await?;
-            self.emit(Event::Ready {
-                agent: self.name(),
-                claim_id: held.claim_id.clone(),
-                commit,
-            })
-            .await;
+            let ready_at = if pinned {
+                pinned = false;
+                None
+            } else {
+                Some(self.pin(&held, edit, redos > 0, class, &path).await?)
+            };
             // Only planned edits pair: every scaffold is the same bytes.
             let pairs = edit.map(|_| path.as_str());
-            match self.wait(&held, Instant::now(), class, pairs).await? {
+            match self.wait(&held, ready_at, class, pairs).await? {
                 Waited::Landed => return Ok(()),
                 Waited::Redo => {}
             }
@@ -308,6 +456,36 @@ impl Run<'_> {
             }
             held = self.redo(&held).await?;
         }
+    }
+
+    /// Writes, commits, pushes and pins the edit, and returns when it was pinned.
+    async fn pin(
+        &self,
+        held: &Held,
+        edit: Option<Edit>,
+        force: bool,
+        class: TaskClass,
+        path: &str,
+    ) -> Outcome<Instant> {
+        self.state(AgentState::Editing).await;
+        self.write(&held.dir, edit).await?;
+        let commit = self.commit(held, edit, force).await?;
+        self.emit(Event::Pushed {
+            agent: self.name(),
+            claim_id: held.claim_id.clone(),
+            commit: commit.clone(),
+            class,
+            path: path.to_owned(),
+        })
+        .await;
+        self.ready(held).await?;
+        self.emit(Event::Ready {
+            agent: self.name(),
+            claim_id: held.claim_id.clone(),
+            commit,
+        })
+        .await;
+        Ok(Instant::now())
     }
 
     /// Writes the edit, or every missing scaffold file, into the clone.
@@ -456,26 +634,26 @@ impl Run<'_> {
         Ok(redo)
     }
 
-    /// Polls `rh status` until the ready claim lands, is sent back for a redo, or the land
-    /// timeout passes.
+    /// Polls `rh status` until the ready claim lands, is sent back for a redo, closes, or the land
+    /// timeout passes. `ready_at` is when this run pinned it, `None` for an adopted claim.
     async fn wait(
         &self,
         held: &Held,
-        ready_at: Instant,
+        ready_at: Option<Instant>,
         class: TaskClass,
         path: Option<&str>,
     ) -> Outcome<Waited> {
         self.state(AgentState::Waiting).await;
         let bounds = &self.shared.bounds;
-        let mut redo = false;
+        let since = ready_at.unwrap_or_else(Instant::now);
         let mut failures = 0;
         loop {
             tokio::time::sleep(bounds.poll).await;
-            if ready_at.elapsed() > bounds.land_timeout {
+            if since.elapsed() > bounds.land_timeout {
                 self.emit(Event::Stalled {
                     agent: self.name(),
                     claim_id: held.claim_id.clone(),
-                    waited_ms: millis(ready_at.elapsed()),
+                    waited_ms: millis(since.elapsed()),
                 })
                 .await;
                 return Err(Stopped);
@@ -499,24 +677,23 @@ impl Run<'_> {
             if let Some(InboxDigest { items, .. }) = &status.inbox
                 && !items.is_empty()
             {
-                redo |= self.acknowledge(held, items).await?;
+                self.acknowledge(held, items).await?;
             }
-            let claim = status
+            let state = status
                 .data
                 .claim
-                .filter(|claim| claim.claim_id == held.claim_id);
-            let landed = match claim.map(|claim| claim.state) {
-                Some(ClaimState::Merged) => Some(LandedVia::Merged),
-                None if !redo => Some(LandedVia::Closed),
-                Some(ClaimState::Working) => return Ok(Waited::Redo),
-                Some(ClaimState::Ready) => None,
-                Some(ClaimState::Expired) | None => {
-                    return Err(self.fail(Step::Status, "claim_closed".to_owned()).await);
+                .filter(|claim| claim.claim_id == held.claim_id)
+                .map(|claim| claim.state);
+            match judge(state) {
+                Polled::Landed => {
+                    self.landed(held, ready_at, class, path).await;
+                    return Ok(Waited::Landed);
                 }
-            };
-            if let Some(via) = landed {
-                self.landed(held, ready_at, class, via, path).await;
-                return Ok(Waited::Landed);
+                Polled::Redo => return Ok(Waited::Redo),
+                Polled::Pending => {}
+                Polled::Closed(code) => {
+                    return Err(self.fail(Step::Status, code.to_owned()).await);
+                }
             }
         }
     }
@@ -524,9 +701,8 @@ impl Run<'_> {
     async fn landed(
         &self,
         held: &Held,
-        ready_at: Instant,
+        ready_at: Option<Instant>,
         class: TaskClass,
-        via: LandedVia,
         path: Option<&str>,
     ) {
         let now = Instant::now();
@@ -534,8 +710,7 @@ impl Run<'_> {
             agent: self.name(),
             claim_id: held.claim_id.clone(),
             class,
-            via,
-            ready_to_landed_ms: millis(now.duration_since(ready_at)),
+            ready_to_landed_ms: ready_at.map(|at| millis(now.duration_since(at))),
         })
         .await;
         let Some(path) = path else { return };
@@ -632,6 +807,11 @@ fn backoff(tries: u32, asked: Duration, poll: Duration) -> Duration {
     asked.max(doubled).min(MAX_BACKOFF)
 }
 
+/// A planned task's index into the agent's edits.
+fn task_index(round: u32) -> usize {
+    usize::try_from(round).unwrap_or(usize::MAX)
+}
+
 /// Whether the clone has both scaffold files.
 fn has_scaffold(dir: &Path) -> bool {
     scaffold().iter().all(|(path, _)| dir.join(path).is_file())
@@ -679,6 +859,19 @@ mod tests {
         assert_eq!(landings.record("clm_dddddd", "g", start, later(40)), None);
         // A redo landing of the same claim never pairs with itself.
         assert_eq!(landings.record("clm_dddddd", "g", start, later(50)), None);
+    }
+
+    #[test]
+    fn only_a_merged_claim_counts_as_landed() {
+        assert_eq!(judge(Some(ClaimState::Merged)), Polled::Landed);
+        assert_eq!(judge(Some(ClaimState::Ready)), Polled::Pending);
+        assert_eq!(judge(Some(ClaimState::Working)), Polled::Redo);
+        assert_eq!(
+            judge(Some(ClaimState::Expired)),
+            Polled::Closed("claim_expired")
+        );
+        // Gone from the status: merged or expired, the agent cannot tell.
+        assert_eq!(judge(None), Polled::Closed("closed_unknown"));
     }
 
     #[test]
