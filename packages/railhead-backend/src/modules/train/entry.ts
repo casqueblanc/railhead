@@ -1,8 +1,13 @@
-// Train: the queue of ready pins and check bookkeeping. Until its task installs the module, every asynchronous call refuses with `unavailable`, the synchronous fence reader `attemptOutcome` returns `null` (unknown, so callers refuse), and no call has an effect.
+// Train: the queue of ready pins, one batch at a time, and check bookkeeping. Main's commit comes
+// from the main writer and the trusted check definitions from the checks module; while either is
+// missing it refuses with `unavailable`, so pins queue but no batch starts.
 
 import type { TrainPort } from "../../contracts/train";
-import { unavailableTrain } from "../../contracts/unavailable";
 import type { ModuleFactory } from "../../repo/composeRepo";
+import { createTrain } from "./scheduler";
 
 /** Builds the train module of one repository. */
-export const train: ModuleFactory<TrainPort> = () => unavailableTrain;
+export const train: ModuleFactory<TrainPort> = (context, ports) => {
+  const { enqueue, recordCheck, attemptOutcome, resume } = createTrain(context, ports);
+  return { enqueue, recordCheck, attemptOutcome, resume };
+};

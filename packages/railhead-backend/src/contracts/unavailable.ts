@@ -92,11 +92,15 @@ export const unavailableChecks: CheckPort = {
   start: refuse("checks"),
 };
 
-/** The train while its module is missing: no report is recorded and no attempt is known. */
+/**
+ * The train while its module is missing: no report is recorded, no attempt is known and nothing is
+ * owed, so `resume` does nothing.
+ */
 export const unavailableTrain: TrainPort = {
   enqueue: refuse("train"),
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  resume: async () => {},
 };
 
 /** Authorization while its module is missing: no intent is authorized. */
