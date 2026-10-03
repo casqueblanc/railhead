@@ -136,7 +136,14 @@ interface Scripted {
   stdout?: string;
 }
 
-/** A Sandbox Durable Object stub that records every call and answers from a script. */
+/** Answers a check's command from the files in the workspace when it runs. */
+type ScriptedCommand = (command: string, workspace: ReadonlySet<string>) => Scripted;
+
+/**
+ * A Sandbox Durable Object stub that records every call and answers from a script. It models the
+ * workspace as a set of paths: a fresh checkout replaces it with the fetched commit's tree, an
+ * overlay adds that tree without deleting anything, and a backup restores the paths it captured.
+ */
 class ScriptedSandbox {
   readonly calls: string[] = [];
   readonly envs: Record<string, string>[] = [];
@@ -144,10 +151,14 @@ class ScriptedSandbox {
   readonly restored: unknown[] = [];
   readonly scripts: string[] = [];
   policy: unknown = null;
+  private workspace = new Set<string>();
+  private lastCommand: Scripted = { exitCode: 0 };
 
   constructor(
     private readonly checkout: (overlay: boolean) => Scripted,
-    private readonly command: Scripted,
+    private readonly command: ScriptedCommand,
+    private readonly trees: Readonly<Record<string, readonly string[]>>,
+    private readonly saved: Map<string, ReadonlySet<string>>,
   ) {}
 
   async setOutboundHandler(handler: string, params: unknown) {
@@ -158,13 +169,22 @@ class ScriptedSandbox {
   async execWithSessionToken(command: string, _session: string, options?: { env?: object }) {
     this.envs.push({ ...options?.env });
     if (command.startsWith("tail -c")) {
-      return { exitCode: 0, stdout: command.includes(".out") ? (this.command.stdout ?? "") : "" };
+      return {
+        exitCode: 0,
+        stdout: command.includes(".out") ? (this.lastCommand.stdout ?? "") : "",
+      };
     }
     if (command.includes("git init")) {
       const overlay = !command.startsWith("rm -rf");
       this.calls.push(overlay ? "checkout:overlay" : "checkout");
       this.scripts.push(command);
-      return { stdout: "", stderr: "", ...this.checkout(overlay) };
+      const result = this.checkout(overlay);
+      if (result.exitCode === 0) {
+        if (!overlay) this.workspace.clear();
+        const sha = /fetch --depth=1 origin '([0-9a-f]{40})'/.exec(command)?.[1] ?? "";
+        for (const path of this.trees[sha] ?? []) this.workspace.add(path);
+      }
+      return { stdout: "", stderr: "", ...result };
     }
     this.calls.push(`exec:${command}`);
     return { exitCode: 0, stdout: "", stderr: "" };
@@ -173,19 +193,23 @@ class ScriptedSandbox {
   async startProcess(command: string, options?: { env?: Record<string, string> }) {
     this.calls.push(`command:${command}`);
     this.envs.push({ ...options?.env });
-    const { exitCode } = this.command;
+    this.lastCommand = this.command(command, this.workspace);
+    const { exitCode } = this.lastCommand;
     return { waitForExit: async () => ({ exitCode }) };
   }
 
   async createBackup(options: { localBucket?: unknown }) {
     this.calls.push("backup");
     this.backups.push({ localBucket: options.localBucket });
-    return { id: BACKUP_ID, dir: "/workspace", localBucket: options.localBucket };
+    const id = crypto.randomUUID();
+    this.saved.set(id, new Set(this.workspace));
+    return { id, dir: "/workspace", localBucket: options.localBucket };
   }
 
-  async restoreBackup(backup: unknown) {
+  async restoreBackup(backup: { id: string }) {
     this.calls.push("restore");
     this.restored.push(backup);
+    this.workspace = new Set(this.saved.get(backup.id));
     return { success: true };
   }
 
@@ -220,15 +244,17 @@ class RecordingArtifacts {
   }
 }
 
-/** An R2 bucket holding one install cache pointer and its backup metadata. */
+/** An R2 bucket holding one install cache pointer, written by `producedBySha`, and its backup. */
 class CacheBucket {
+  constructor(private readonly producedBySha: string) {}
+
   async get(key: string) {
     if (key.startsWith("cache/")) {
       return {
         json: async () => ({
           backupId: BACKUP_ID,
           dir: "/workspace",
-          producedBySha: SHA,
+          producedBySha: this.producedBySha,
           createdAt: "2026-10-02T00:00:00.000Z",
         }),
       };
@@ -284,13 +310,23 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
 /** Runs the pipeline for `sha` against one scripted sandbox and reports what it saw. */
 async function run(options: {
   checkout?: (overlay: boolean) => Scripted;
-  command?: Scripted;
+  command?: Scripted | ScriptedCommand;
   sha?: string;
   cached?: boolean;
+  /** The commit that wrote the install cache pointer; defaults to the run's own. */
+  cachedBy?: string;
+  /** Each commit's tracked files, and those of the cached backup, for workspace assertions. */
+  trees?: Record<string, readonly string[]>;
 }) {
+  const sha = options.sha ?? SHA;
+  const command = options.command ?? { exitCode: 0 };
+  const cachedBy = options.cachedBy ?? sha;
+  const trees = options.trees ?? {};
   const sandbox = new ScriptedSandbox(
     options.checkout ?? (() => ({ exitCode: 0 })),
-    options.command ?? { exitCode: 0 },
+    typeof command === "function" ? command : () => command,
+    trees,
+    new Map([[BACKUP_ID, new Set(trees[cachedBy])]]),
   );
   const artifacts = new RecordingArtifacts();
   const bindings = {
@@ -298,7 +334,7 @@ async function run(options: {
     R2_ACCESS_KEY_ID: "r2-key-id",
     R2_SECRET_ACCESS_KEY: "r2-secret",
     ARTIFACTS: artifacts,
-    BACKUP_BUCKET: new CacheBucket(),
+    BACKUP_BUCKET: new CacheBucket(cachedBy),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
     SANDBOX: { idFromName: (name: string) => name, get: () => sandbox },
@@ -319,7 +355,7 @@ async function run(options: {
       event: { type: "push" },
       owner: NAMESPACE,
       repo: REPO,
-      sha: options.sha ?? SHA,
+      sha,
       trigger: "push",
       ref: "refs/heads/candidate/chk_1/head",
     },
@@ -429,7 +465,47 @@ describe("a check run through the patched SDK", () => {
     expect(outcome).toEqual({ kind: "pass" });
     // The cache hit skips the install; the test restores its workspace from the binding.
     expect(sandbox.restored).toEqual([{ id: BACKUP_ID, dir: "/workspace", localBucket: true }]);
+    expect(sandbox.calls).not.toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
     expect(artifacts.calls).toEqual(["get:demo"]);
+  });
+
+  it("never restores another commit's cached workspace, so a deleted file cannot linger", async () => {
+    const before = "c".repeat(40);
+    const after = "d".repeat(40);
+    // `after` deletes src/legacy.ts but keeps src/index.ts, which imports it, and package.json,
+    // the cache input, so both commits share one cache key.
+    const trees = {
+      [before]: ["package.json", "src/index.ts", "src/legacy.ts"],
+      [after]: ["package.json", "src/index.ts"],
+    };
+    const seen: string[][] = [];
+    // The test passes only while the deleted module is still on disk.
+    const command: ScriptedCommand = (line, workspace) => {
+      seen.push([...workspace].toSorted());
+      const stale = workspace.has("src/legacy.ts");
+      return { exitCode: line.includes("npm test") && !stale ? 1 : 0 };
+    };
+
+    const { outcome, sandbox } = await run({
+      sha: after,
+      cached: true,
+      cachedBy: before,
+      trees,
+      command,
+    });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "fail", runner: "test", exitCode: 1 },
+    });
+    // The install runs on a clean checkout; the test restores only that install's backup.
+    expect(sandbox.calls).toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
+    expect(sandbox.restored).toHaveLength(1);
+    expect(sandbox.restored).not.toContainEqual(expect.objectContaining({ id: BACKUP_ID }));
+    expect(seen).toEqual([
+      ["package.json", "src/index.ts"],
+      ["package.json", "src/index.ts"],
+    ]);
   });
 });
 

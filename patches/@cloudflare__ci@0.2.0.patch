@@ -21,10 +21,37 @@ index 481724b271c3cd141b71d5bee1928932fdfafa00..37c54d671816e8d788752046e2b4677d
  import type { CloudflareArtifacts } from '../pipeline';
  import type { SourceControlRepositoryFilter } from '../source-control-adapter';
 diff --git a/src/ci/cache.ts b/src/ci/cache.ts
-index 433f19c0e750f2957e1c08e9c41600f90b234296..05cc96f7b7dbb3cc017685fad0d450b17b16cc14 100644
+index 433f19c0e750f2957e1c08e9c41600f90b234296..6670ed4c08159872474c5a3edf36c1a2207d2706 100644
 --- a/src/ci/cache.ts
 +++ b/src/ci/cache.ts
-@@ -173,7 +173,8 @@ export async function lookupSnapshotCache(
+@@ -55,6 +55,11 @@ export type SnapshotCacheInput = {
+   label: string;
+ };
+ 
++// Railhead patch: the commit a lookup restores for. A restored workspace is
++// overlaid without deleting files, so a backup from another commit could keep a
++// file this commit removed; only the commit that produced a backup reuses it.
++export type SnapshotCacheLookupInput = SnapshotCacheInput & { sha: string };
++
+ export type PublishSnapshotCacheInput = SnapshotCacheInput & {
+   snapshot: DirectoryBackup;
+   producedBySha: string;
+@@ -143,7 +148,7 @@ async function writeCachePointer(
+  */
+ export async function lookupSnapshotCache(
+   env: Bindings,
+-  input: SnapshotCacheInput
++  input: SnapshotCacheLookupInput
+ ): Promise<SnapshotCacheLookup> {
+   const pointer = await readCachePointer(env, input.key);
+   console.log('[cache] pointer read', {
+@@ -168,12 +173,13 @@ export async function lookupSnapshotCache(
+     result: pointer && metadata ? 'HIT' : 'MISS',
+   });
+ 
+-  if (!pointer || !metadata) {
++  if (!pointer || !metadata || pointer.producedBySha !== input.sha) {
+     return { status: 'miss' };
    }
    return {
      status: 'hit',
@@ -35,7 +62,7 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..05cc96f7b7dbb3cc017685fad0d450b1
    };
  }
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..dbdd0a4249a6f8b3ab0583ea4edafe8ed5206da6 100644
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..81af991e8ed7611a175d72cc2b6332bf9f15f705 100644
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
 @@ -1,5 +1,6 @@
@@ -45,6 +72,14 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..dbdd0a4249a6f8b3ab0583ea4edafe8e
  
  import { z } from 'zod';
  import type {
+@@ -167,6 +168,7 @@ async function executeStep(
+     ? await lookupSnapshotCache(env, {
+         key: prepared.cacheKey,
+         label: input.label,
++        sha: input.source.sha,
+       })
+     : { status: 'miss' as const };
+   if (cache.status === 'hit') {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..ddf822fa77730cf8a00a517e55c35af444a52c1a 100644
 --- a/src/ci/runners/sandbox.ts

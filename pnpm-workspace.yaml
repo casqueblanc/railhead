@@ -57,7 +57,8 @@ allowBuilds:
 
 # The smallest changes Railhead needs in @cloudflare/ci 0.2.0 (#9, #10): the runner selects the
 # sandbox's Git gateway before checkout so no token enters the sandbox, a nonzero checkout exit ends
-# the run before the command, and backups use the R2 binding because the sandbox cannot reach R2.
+# the run before the command, backups use the R2 binding because the sandbox cannot reach R2, and a
+# cached workspace is reused only by the commit that produced it, so a deleted file cannot linger.
 # SDK files that fail Railhead's stricter type checks get `@ts-nocheck`: the SDK ships TypeScript
 # source written for looser compiler options. Drop each change once upstream provides it.
 patchedDependencies:
