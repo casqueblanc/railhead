@@ -12,9 +12,11 @@ import {
 import { FakeArtifacts } from "../src/artifacts/fake";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { InboxPort, QueuedItem } from "../src/contracts/inbox";
+import type { DecisionsPort } from "../src/contracts/decisions";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { ok, type PortResult } from "../src/contracts/result";
 import { createClaims } from "../src/modules/claims/module";
+import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
@@ -48,8 +50,8 @@ function grant(title: string): GrantFor<"issue.file"> {
 
 interface World {
   fake: FakeArtifacts;
-  /** What the decisions port's fence reader answers. */
-  versions: DecisionRef[] | null;
+  /** `real` for the decisions module, otherwise what a fake decisions fence reader answers. */
+  versions: "real" | DecisionRef[] | null;
   /** Whether the Artifacts module is installed. */
   artifacts: boolean;
 }
@@ -57,6 +59,7 @@ interface World {
 interface Setup {
   port: ClaimsPort;
   inbox: InboxPort;
+  decisions: DecisionsPort;
   log: EventLog;
   sql: SqlStorage;
   events: () => RailheadEvent[];
@@ -69,7 +72,7 @@ interface Setup {
 /** Runs `body` in a fresh Repo with real claims and inbox, fake Artifacts and fake decisions. */
 function withReady<T>(
   body: (setup: Setup, world: World) => Promise<T>,
-  world: World = { fake: new FakeArtifacts(), versions: [], artifacts: true },
+  world: World = { fake: new FakeArtifacts(), versions: "real", artifacts: true },
 ): Promise<T> {
   const stub: DurableObjectStub<Repo> = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
@@ -85,16 +88,23 @@ function withReady<T>(
           { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
         )
       : base.artifacts;
+    const { versions } = world;
+    const decisions =
+      versions === "real"
+        ? createDecisions(context, () => ports)
+        : { ...base.decisions, currentVersions: () => versions };
+    const port: ClaimsPort = createClaims(context, () => ports);
     const ports: RepoPorts = {
       ...base,
+      claims: port,
       artifacts,
+      decisions,
       mainWriter: { ...base.mainWriter, head: async () => ok(HEAD) },
-      decisions: { ...base.decisions, currentVersions: () => world.versions },
     };
-    const port = createClaims(context, () => ports);
     const setup: Setup = {
       port,
       inbox: base.inbox,
+      decisions,
       log,
       sql: state.storage.sql,
       events: () => log.replay(0, 256).events,
@@ -152,33 +162,64 @@ function expectFailure(result: PortResult<unknown>, code: string): void {
 
 describe("ready", () => {
   it("pins the exact commit with the current decision versions and revokes the fork's tokens", async () => {
-    const versions = [{ decisionId: "dec_decision1", version: 2 }];
-    await withReady(
-      async (setup, { fake }) => {
-        const { claim, fork } = await setup.open();
-        setup.push(fork, WORK);
-        const write = fake.mintFor(fork, "write", 600);
+    await withReady(async (setup, { fake }) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const write = fake.mintFor(fork, "write", 600);
+      const asked = await setup.decisions.ask(agent(1), claim.claimId, {
+        generation: 1,
+        requestId: "req_upload0000000001",
+        text: "Should uploads above 10 MB be rejected or chunked?",
+        options: [
+          { key: "reject", label: "Reject them" },
+          { key: "chunk", label: "Upload them in chunks" },
+        ],
+        scope: ["src/upload.ts"],
+      });
+      if (!asked.ok) throw new Error(`ask refused: ${asked.code}`);
+      const { decisionId } = asked.value;
+      const recorded = await setup.decisions.record({
+        kind: "human",
+        userId: "usr_owner0001",
+        repoId: REPO,
+        grantId: crypto.randomUUID(),
+        action: { kind: "decision.record", decisionId, option: "chunk", expectedVersion: null },
+      });
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
 
-        const result = await setup.port.ready(agent(1), claim.claimId, request(WORK));
+      // The decision's inbox item blocks ready until the agent acknowledges it.
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      const delivered = await setup.inbox.pending(agent(1), 1);
+      const item = delivered.ok ? delivered.value.items[0]?.item : undefined;
+      if (item === undefined) throw new Error("the decision was not delivered");
+      await setup.inbox.ack(agent(1), item, "Upload in chunks.");
 
-        expect(result).toEqual({
-          ok: true,
-          value: { claim: { ...claim, state: "ready", readyCommit: WORK }, repeated: false },
-        });
-        expect(setup.events().at(-1)).toMatchObject({
-          actor: { kind: "agent", id: "agt_agent0001" },
-          type: "claim.ready",
-          data: { claimId: claim.claimId, generation: 1, commit: WORK, decisions: versions },
-        });
-        expect(fake.accepts(write.plaintext)).toBe(false);
-        expect(fake.liveTokens(fork)).toEqual([]);
-        expect(await setup.port.pin(claim.claimId)).toEqual({
-          ok: true,
-          value: { claimId: claim.claimId, generation: 1, commit: WORK },
-        });
-      },
-      { fake: new FakeArtifacts(), versions, artifacts: true },
-    );
+      const result = await setup.port.ready(agent(1), claim.claimId, request(WORK));
+
+      expect(result).toEqual({
+        ok: true,
+        value: { claim: { ...claim, state: "ready", readyCommit: WORK }, repeated: false },
+      });
+      expect(setup.events().at(-1)).toMatchObject({
+        actor: { kind: "agent", id: "agt_agent0001" },
+        type: "claim.ready",
+        data: {
+          claimId: claim.claimId,
+          generation: 1,
+          commit: WORK,
+          decisions: [{ decisionId, version: 1 }],
+        },
+      });
+      expect(fake.accepts(write.plaintext)).toBe(false);
+      expect(fake.liveTokens(fork)).toEqual([]);
+      expect(await setup.port.pin(claim.claimId)).toEqual({
+        ok: true,
+        value: { claimId: claim.claimId, generation: 1, commit: WORK },
+      });
+    });
   });
 
   it("answers a repeat with the same pin and records nothing new", async () => {
