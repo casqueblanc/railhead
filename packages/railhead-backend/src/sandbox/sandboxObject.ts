@@ -107,6 +107,19 @@ export class RailheadSandbox extends Sandbox<Env> {
     await this.#fence.expire();
   }
 
+  /**
+   * Runs the SDK's alarm, which calls `railheadExpire` when it is due. Afterwards, once the fence is
+   * `disposable`, deletes the object's alarm and all its storage, so a sandbox leaves no object
+   * behind. The deletion follows the SDK's alarm rather than running inside it, which still writes
+   * its schedule table after each callback.
+   */
+  override async alarm(alarmProps?: AlarmInvocationInfo): Promise<void> {
+    await super.alarm(alarmProps);
+    if (!this.#fence.disposable()) return;
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+  }
+
   // The SDK calls a CI run issues on this object, each run through `fenceSandbox`.
   readonly #sdk = fenceSandbox(this.#fence, {
     restoreBackup: (backup) => super.restoreBackup(backup),

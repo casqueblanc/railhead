@@ -41,7 +41,16 @@
 // fails too, the incarnation stays retiring, the failure reports both, and the next wake-up or
 // release destroys it. Retries back off and stop after `MAX_TEARDOWN_ATTEMPTS`; the repository keeps
 // the sandbox's slot until it releases the sandbox itself, whatever the fence confirmed.
+//
+// A retired incarnation's record is needed only while a start for it could still arrive. Every
+// start carries its slot's deadline, and one that arrives at or after that deadline starts nothing,
+// so once retirement is confirmed and the deadline has passed the object may forget the record and
+// all its storage (`disposable`); a retirement confirmed early asks to be woken at the deadline for
+// that. A sandbox retired before it ever started records a deadline `MAX_SANDBOX_LIFETIME_MS` from
+// then: its slot was admitted earlier, so its deadline, and that of any start still on the way, is no
+// later.
 
+import { MAX_SANDBOX_LIFETIME_MS } from "./admission";
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
 import type { BoundedOutput } from "./output";
 import type { SandboxGrant, SandboxPolicy } from "./policy";
@@ -109,9 +118,9 @@ export class SandboxFenceError extends Error {
 }
 
 /**
- * The fence's durable record. `deadline` is when the incarnation must be gone, `0` when it was
- * retired before it started. Once it leaves `live` it never returns: `retiring` means a destroy is
- * not yet confirmed, `retired` that the last one succeeded.
+ * The fence's durable record. `deadline` is when the incarnation must be gone; for one retired
+ * before it started, the latest deadline its slot can have. Once it leaves `live` it never returns:
+ * `retiring` means a destroy is not yet confirmed, `retired` that the last one succeeded.
  */
 type FenceState =
   | { phase: "live"; deadline: number }
@@ -252,7 +261,7 @@ export class SandboxFence {
    * destroy fails; either way a retry is left scheduled.
    */
   async retire(): Promise<void> {
-    const deadline = this.#read()?.deadline ?? 0;
+    const deadline = this.#read()?.deadline ?? this.#clock() + MAX_SANDBOX_LIFETIME_MS;
     const outstanding = [...this.#inflight, ...this.#effects];
     const confirmed = await this.#destroy(deadline);
     if (outstanding.length === 0 && confirmed) return;
@@ -263,7 +272,8 @@ export class SandboxFence {
 
   /**
    * The scheduled wake-up. Before the deadline it schedules itself again; at the deadline it retires
-   * the incarnation; while a destroy is unconfirmed it retries it.
+   * the incarnation; while a destroy is unconfirmed it retries it; once retired early, it asks to be
+   * woken at the deadline, when the object becomes `disposable`.
    */
   async expire(): Promise<void> {
     const state = this.#read();
@@ -290,10 +300,27 @@ export class SandboxFence {
       case "retiring":
         return this.retire();
       case "retired":
+        if (this.#clock() < state.deadline) await this.#container.wake(state.deadline);
         return;
       default:
         throw new Error(`unknown fence phase: ${state satisfies never}`);
     }
+  }
+
+  /**
+   * Whether the object may delete its storage: retirement is confirmed, its deadline has passed, so
+   * no start can still begin an incarnation, and nothing it ran is still outstanding. A record that
+   * was never written is not disposable: there is nothing to delete.
+   */
+  disposable(): boolean {
+    const state = this.#read();
+    return (
+      state !== null &&
+      state.phase === "retired" &&
+      this.#clock() >= state.deadline &&
+      this.#inflight.size === 0 &&
+      this.#effects.size === 0
+    );
   }
 
   // Runs one command, aborting it at its timeout: the SDK does not stop a streaming command itself.

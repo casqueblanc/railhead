@@ -47,30 +47,52 @@ const BACKUP_ID = "0b6c5f0e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
 /** The SDK's largest log returned whole; a larger one is read as its tail. */
 const INLINE_LOG_BYTES = 300_000;
 
+/** When the runner asks for the checkout in the gatewayCheckout tests. */
+const NOW = 1_800_000_000_000;
+
+/** The sandbox the repository admitted for the run, as `sandboxName` names one. */
+const SANDBOX = `sbx-${"0".repeat(32)}`;
+
+/** The admitted slot: its sandbox, and its deadline as admission at `NOW` sets it. */
+const SLOT = { sandbox: SANDBOX, deadline: NOW + MAX_SANDBOX_LIFETIME_MS };
+
 const SOURCE = {
   owner: NAMESPACE,
   repo: REPO,
   sha: SHA,
-  providerData: { namespace: NAMESPACE },
+  providerData: { namespace: NAMESPACE, slot: SLOT },
 };
 
 /** The one repository the adapter and its checkouts cover. */
 const REPOSITORY = { owner: NAMESPACE, repo: REPO };
 
-/** When the runner asks for the checkout in the gatewayCheckout tests. */
-const NOW = 1_800_000_000_000;
-
 describe("gatewayCheckout", () => {
-  it("names the exact commit, no token, and a read-only grant for one repository", () => {
-    expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW)).toEqual({
+  it("names the exact commit, no token, the admitted sandbox and a grant ending at its deadline", () => {
+    expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT)).toEqual({
       kind: "git",
       remote: `https://${HOST}/git/railhead/demo.git`,
       sha: SHA,
       fence: {
         policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
         expiresAt: NOW + MAX_SANDBOX_LIFETIME_MS,
+        sandbox: SANDBOX,
       },
     });
+  });
+
+  it("takes the grant's end from the slot, never from when it is asked", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW + 1_000);
+    const deadline = NOW + 60_000;
+
+    const checkout = gatewayCheckout(
+      REPOSITORY,
+      { ...SOURCE, providerData: { namespace: NAMESPACE, slot: { sandbox: SANDBOX, deadline } } },
+      ACCOUNT,
+    );
+
+    vi.useRealTimers();
+    expect(checkout.fence).toEqual(expect.objectContaining({ expiresAt: deadline }));
   });
 
   it.each([
@@ -78,39 +100,47 @@ describe("gatewayCheckout", () => {
     ["a long SHA", { ...SOURCE, sha: "a".repeat(41) }],
     ["an uppercase SHA", { ...SOURCE, sha: "A".repeat(40) }],
     ["a branch name", { ...SOURCE, sha: "refs/heads/main" }],
-    ["another namespace", { ...SOURCE, providerData: { namespace: "other" } }],
+    ["another namespace", { ...SOURCE, providerData: { namespace: "other", slot: SLOT } }],
     ["missing provider data", { ...SOURCE, providerData: null }],
+    ["no admitted slot", { ...SOURCE, providerData: { namespace: NAMESPACE } }],
     ["another repository in the namespace", { ...SOURCE, repo: "other" }],
     [
       "another namespace with matching provider data",
-      { ...SOURCE, owner: "other", providerData: { namespace: "other" } },
+      { ...SOURCE, owner: "other", providerData: { namespace: "other", slot: SLOT } },
     ],
   ])("refuses %s before any sandbox starts", (_name, source) => {
-    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT, NOW)).toThrow();
+    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT)).toThrow();
   });
 
   it("refuses an invalid repository name, even as the adapter's own", () => {
     const repository = { owner: NAMESPACE, repo: "../main" };
 
-    expect(() => gatewayCheckout(repository, { ...SOURCE, repo: "../main" }, ACCOUNT, NOW)).toThrow(
+    expect(() => gatewayCheckout(repository, { ...SOURCE, repo: "../main" }, ACCOUNT)).toThrow(
       "invalid repository",
     );
   });
 
   it("refuses an account ID that would make another host", () => {
-    expect(() => gatewayCheckout(REPOSITORY, SOURCE, "evil.example.com/x", NOW)).toThrow(
+    expect(() => gatewayCheckout(REPOSITORY, SOURCE, "evil.example.com/x")).toThrow(
       "invalid Cloudflare account ID",
     );
   });
 
-  it.each([Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 2])(
-    "refuses a checkout time of %s, which would make a grant the gateway rejects",
-    (now) => {
-      expect(() => gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, now)).toThrow(
-        "invalid checkout time",
-      );
-    },
-  );
+  it.each([
+    ["a deadline that is not a number", { sandbox: SANDBOX, deadline: "soon" }],
+    ["a fractional deadline", { sandbox: SANDBOX, deadline: 1.5 }],
+    ["an unsafe deadline", { sandbox: SANDBOX, deadline: Number.MAX_SAFE_INTEGER + 2 }],
+    ["a zero deadline", { sandbox: SANDBOX, deadline: 0 }],
+    ["a sandbox name admission never gives", { sandbox: "chk-runner", deadline: SLOT.deadline }],
+    ["an uppercase sandbox name", { sandbox: SANDBOX.toUpperCase(), deadline: SLOT.deadline }],
+    ["no sandbox name", { deadline: SLOT.deadline }],
+  ])("refuses a slot with %s", (_name, slot) => {
+    const source = { ...SOURCE, providerData: { namespace: NAMESPACE, slot } };
+
+    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT)).toThrow(
+      "check source names no admitted sandbox slot",
+    );
+  });
 });
 
 /**
@@ -214,7 +244,7 @@ function fetchRefs(remote: string): Request {
 function checkoutAt(at: number) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(at);
-  return gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW);
+  return gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT);
 }
 
 describe("the checkout's grant at the registered Git gateway", () => {
@@ -231,7 +261,8 @@ describe("the checkout's grant at the registered Git gateway", () => {
 
       const response = await gateway.serve(fetchRefs(remote), grant);
 
-      expect(recorder.routed).toEqual([grant]);
+      // The fence routes the grant alone; the sandbox's name never reaches the gateway.
+      expect(recorder.routed).toEqual([{ policy: grant.policy, expiresAt: grant.expiresAt }]);
       expect(response.status).toBe(200);
       expect(await response.text()).toBe("upstream");
       expect(gateway.minted).toEqual(["read:demo:60"]);
@@ -548,7 +579,11 @@ function settle(): Promise<void> {
  */
 function withRailheadSandbox(
   bucket: unknown,
-  body: (sandbox: RailheadSandbox, container: RecordingContainer) => Promise<void>,
+  body: (
+    sandbox: RailheadSandbox,
+    container: RecordingContainer,
+    state: DurableObjectState,
+  ) => Promise<void>,
 ): Promise<void> {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
@@ -577,8 +612,72 @@ function withRailheadSandbox(
     await sandbox.setTransport("rpc");
     // As `railheadStart` records it, which would also probe the container.
     state.storage.kv.put("railhead:fence", { phase: "live", deadline: Date.now() + 60_000 });
-    await body(sandbox, container);
+    await body(sandbox, container, state);
   });
+}
+
+describe("RailheadSandbox's storage after retirement", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // The object's fence reads the real clock, so these deadlines are a few real milliseconds away.
+  it("deletes its alarm and all its storage at the first alarm past the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.railheadRetire();
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(stored(state).tables).toContain("container_schedules");
+
+      await pastDeadline(deadline);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("keeps its record and a wake-up at an alarm before the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 60_000;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.railheadRetire();
+
+      await sandbox.alarm();
+
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("keeps the record of a teardown it never confirmed, though the deadline passed", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() - 1_000;
+      const retiring = { phase: "retiring", deadline, attempts: 9 };
+      state.storage.kv.put("railhead:fence", retiring);
+
+      await sandbox.alarm();
+
+      expect(stored(state).fence).toEqual(retiring);
+    });
+  });
+});
+
+/** The object's own tables and keys: what would keep it stored. */
+function stored(state: DurableObjectState): { tables: string[]; fence: unknown } {
+  const tables = state.storage.sql
+    .exec<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'",
+    )
+    .toArray()
+    .map((row) => row.name);
+  return { tables, fence: state.storage.kv.get("railhead:fence") };
+}
+
+/** Waits, in real time, until `deadline` has passed. */
+async function pastDeadline(deadline: number): Promise<void> {
+  while (Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 describe("RailheadSandbox's SDK transport at retirement", () => {
@@ -1040,6 +1139,8 @@ async function run(options: {
   testEnv?: Record<string, string>;
   /** Whether the test runner is chained on the install; defaults to true. */
   chained?: boolean;
+  /** Whether the run carries the slot the repository admitted for it; defaults to true. */
+  admitted?: boolean;
   /** Whether the Worker has a BACKUP_BUCKET binding; defaults to true. */
   backupBucket?: boolean;
   /** The size of every command's logs; the SDK reads a log above its inline limit as its tail. */
@@ -1080,6 +1181,8 @@ async function run(options: {
     },
   });
   const artifacts = new RecordingArtifacts();
+  // Every sandbox name the runner opens.
+  const opened: string[] = [];
   const bindings = {
     CF_TOKEN: "cf-secret-token",
     R2_ACCESS_KEY_ID: "r2-key-id",
@@ -1090,7 +1193,13 @@ async function run(options: {
       : {}),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-    SANDBOX: { idFromName: (name: string) => name, get: () => observed },
+    SANDBOX: {
+      idFromName: (name: string) => {
+        opened.push(name);
+        return name;
+      },
+      get: () => observed,
+    },
     CI_WORKFLOW: {},
   };
   // Workerd constructs a Workflow only for a real instance, so the test builds one from the
@@ -1108,10 +1217,17 @@ async function run(options: {
     do: async (_name: string, _config: unknown, body: (ctx: { attempt: number }) => unknown) =>
       body({ attempt: 1 }),
   };
+  // The slot the repository admitted for the run, as admission now would set it.
+  const providerData = {
+    namespace: NAMESPACE,
+    ...((options.admitted ?? true)
+      ? { slot: { sandbox: SANDBOX, deadline: Date.now() + MAX_SANDBOX_LIFETIME_MS } }
+      : {}),
+  };
   const event: WorkflowEvent<CiParams<CloudflareArtifacts>> = {
     payload: {
       provider: "cloudflare-artifacts",
-      providerData: { namespace: NAMESPACE },
+      providerData,
       event: { type: "push" },
       owner: NAMESPACE,
       repo: REPO,
@@ -1125,7 +1241,14 @@ async function run(options: {
   };
   // The fakes implement only what the engine calls, not the SDK's full binding and step types.
   await Reflect.apply(CheckRun.prototype.run, workflow, [event, step]);
-  return { outcome: workflow.outcome, output: workflow.output, sandbox, artifacts, runnerCalls };
+  return {
+    outcome: workflow.outcome,
+    output: workflow.output,
+    sandbox,
+    artifacts,
+    runnerCalls,
+    opened,
+  };
 }
 
 const SECRETS = [
@@ -1143,9 +1266,11 @@ describe("a check run through the patched SDK", () => {
   });
 
   it("checks out through the gateway with no credential anywhere in the sandbox", async () => {
-    const { outcome, sandbox, artifacts } = await run({});
+    const { outcome, sandbox, artifacts, opened } = await run({});
 
     expect(outcome).toEqual({ kind: "pass" });
+    // Both runners open the admitted slot's sandbox, never one of their own naming.
+    expect(new Set(opened)).toEqual(new Set([SANDBOX]));
     expect(sandbox.calls).toEqual([
       "start",
       "checkout",
@@ -1481,6 +1606,18 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
     });
+    expect(sandbox.calls).toEqual([]);
+    expect(artifacts.calls).toEqual([]);
+  });
+
+  it("runs nothing and opens no sandbox for a run without an admitted slot", async () => {
+    const { outcome, sandbox, artifacts, opened } = await run({ admitted: false });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+    });
+    expect(opened).toEqual([]);
     expect(sandbox.calls).toEqual([]);
     expect(artifacts.calls).toEqual([]);
   });

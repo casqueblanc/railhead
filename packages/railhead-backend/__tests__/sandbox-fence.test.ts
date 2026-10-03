@@ -9,6 +9,7 @@ import {
   teardownRetryDelay,
   type FencedContainer,
 } from "../src/sandbox/fence";
+import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
 import { MAX_OUTPUT_BYTES } from "../src/sandbox/entry";
 import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import { readBoundedExec } from "../src/sandbox/output";
@@ -122,6 +123,8 @@ interface Harness {
   reopen: () => SandboxFence;
   /** The fence's durable phase. */
   phase: () => string | null;
+  /** Deletes the object's storage, as `RailheadSandbox` does once the fence is disposable. */
+  forget: () => Promise<void>;
   /** A fence over the same storage that drives `container` instead of the fake. */
   over: (container: FencedContainer) => SandboxFence;
   /**
@@ -145,6 +148,7 @@ function withFence(body: (harness: Harness) => Promise<void>): Promise<void> {
       advance: (ms) => (now += ms),
       reopen,
       over: (container) => new SandboxFence(state.storage, container, clock, SETTLE_MS),
+      forget: () => state.storage.deleteAll(),
       phase: () => {
         const stored: unknown = state.storage.kv.get("railhead:fence");
         if (typeof stored !== "object" || stored === null || !("phase" in stored)) return null;
@@ -435,6 +439,88 @@ function gateway(fence: () => SandboxFence, clock: () => number) {
       serveGitGateway(request, { policy: POLICY, expiresAt: DEADLINE }, deps),
   };
 }
+
+describe("sandbox fence disposal", () => {
+  it("is disposable only once retired and past the deadline, never while live", async () => {
+    await withFence(async ({ fence, fake, advance, forget, reopen }) => {
+      expect(fence.disposable()).toBe(false);
+      await fence.start(POLICY, DEADLINE);
+      expect(fence.disposable()).toBe(false);
+
+      await fence.retire();
+      expect(fence.disposable()).toBe(false);
+      advance(DEADLINE - START - 1);
+      expect(fence.disposable()).toBe(false);
+      advance(1);
+
+      expect(fence.disposable()).toBe(true);
+      expect(await refusal(fence.start(POLICY, DEADLINE))).toBe("retired");
+
+      // Once the storage is gone, a late start for the incarnation is past its deadline and starts
+      // nothing; the object is disposable again.
+      await forget();
+      const commands = fake.commands.length;
+      const grants = fake.grants.length;
+      const restarted = reopen();
+      expect(await refusal(restarted.start(POLICY, DEADLINE))).toBe("expired");
+      expect(fake.commands).toHaveLength(commands);
+      expect(fake.grants).toHaveLength(grants);
+      expect(fake.running).toBe(false);
+      expect(restarted.disposable()).toBe(true);
+    });
+  });
+
+  it("asks to be woken at the deadline after an early retirement, then becomes disposable", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
+      await fence.start(POLICY, DEADLINE);
+      await fence.retire();
+      // The deadline wake-up from the start is spent, as when the SDK ran it early.
+      fake.scheduled.length = 0;
+
+      advance(5_000);
+      await fence.expire();
+      expect(fake.wakes.at(-1)).toBe(DEADLINE);
+      expect(fence.disposable()).toBe(false);
+
+      advance(DEADLINE - START - 5_000);
+      await alarm();
+      expect(fence.disposable()).toBe(true);
+    });
+  });
+
+  it("is not disposable while a destroy is unconfirmed, though the deadline passed", async () => {
+    await withFence(async ({ fence, fake, advance, phase }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyFails = true;
+      await fence.retire().catch(noop);
+      advance(DEADLINE - START);
+
+      expect(phase()).toBe("retiring");
+      expect(fence.disposable()).toBe(false);
+
+      fake.destroyFails = false;
+      await fence.expire();
+      expect(phase()).toBe("retired");
+      expect(fence.disposable()).toBe(true);
+    });
+  });
+
+  it("keeps a sandbox released before it started refused until any deadline its slot had passed", async () => {
+    await withFence(async ({ fence, fake, advance }) => {
+      await fence.retire();
+      const latest = START + MAX_SANDBOX_LIFETIME_MS;
+
+      advance(MAX_SANDBOX_LIFETIME_MS - 1);
+      expect(fence.disposable()).toBe(false);
+      expect(await refusal(fence.start(POLICY, latest))).toBe("retired");
+      advance(1);
+
+      expect(fence.disposable()).toBe(true);
+      expect(fake.commands).toEqual([]);
+      expect(fake.grants).toEqual([]);
+    });
+  });
+});
 
 describe("sandbox grant at retirement", () => {
   it("holds only for the live incarnation's own deadline, until that deadline", async () => {
