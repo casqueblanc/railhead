@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { RailheadEvent } from "@railhead/shared/events";
+import type { Actor, RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
@@ -57,12 +57,13 @@ const fakeReader = (
     repo?: string;
     reset?: { events: readonly unknown[]; history: string };
     ignoreHistory?: boolean;
+    history?: string;
   } = {},
 ) => {
   const calls: number[] = [];
   const histories: (string | undefined)[] = [];
   let events = initial;
-  let history = HISTORY;
+  let history = options.history ?? HISTORY;
   const reader: CaptureReader = {
     readEvents: async (cursor, limit, asked) => {
       calls.push(cursor);
@@ -393,6 +394,18 @@ const withBody = (body: string): IssueEvent => ({
   data: { ...issue(1).data, body },
 });
 
+/** An Artifacts token naming `field`, so a test that misses one names the field that leaked. */
+const tokenIn = (field: string) => `art_v1_${field}0123456789abcdef`;
+
+const sha = (digit: string) => digit.repeat(40);
+
+const header = (seq: number): Pick<RailheadEvent, "v" | "seq" | "at" | "repo"> => ({
+  v: 1,
+  seq,
+  at: SYNTH_START_MS + seq,
+  repo: SYNTH_REPO,
+});
+
 describe("captureLog redaction", () => {
   it.each([
     ["a session token", `rh login gave ${SESSION_TOKEN} to me`, "rh login gave [redacted] to me"],
@@ -473,6 +486,156 @@ describe("captureLog redaction", () => {
   it("never lengthens text: the shortest match is as long as the replacement", async () => {
     const result = await capturedEvents([withBody("Bearer 12345678")]);
     expect(result.capture.events).toEqual([withBody("[redacted]")]);
+  });
+
+  it("redacts a credential in every string field the written file holds", async () => {
+    const agent: Actor = { kind: "agent", id: "agt_synthatlas" };
+    const events: RailheadEvent[] = [
+      {
+        ...header(1),
+        actor: SYNTH_OWNER,
+        type: "issue.filed",
+        data: { issueId: "iss_synth000001", title: tokenIn("title"), body: tokenIn("body") },
+      },
+      {
+        ...header(2),
+        actor: agent,
+        type: "claim.pushed",
+        data: {
+          claimId: "clm_synthatlas",
+          generation: 1,
+          ref: `refs/heads/${tokenIn("ref")}`,
+          from: null,
+          to: sha("a"),
+        },
+      },
+      {
+        ...header(3),
+        actor: agent,
+        type: "question.asked",
+        data: {
+          questionId: "qst_synthsize",
+          claimId: "clm_synthatlas",
+          decisionId: "dec_synthsize",
+          text: tokenIn("text"),
+          options: [
+            { key: "a", label: tokenIn("label") },
+            { key: "b", label: "Keep it" },
+          ],
+        },
+      },
+      {
+        ...header(4),
+        actor: SYNTH_OWNER,
+        type: "decision.recorded",
+        data: {
+          decisionId: "dec_synthsize",
+          version: 1,
+          questionId: "qst_synthsize",
+          option: "a",
+          supersedes: null,
+          scope: ["src/upload.ts", `secrets/${tokenIn("scope")}`],
+        },
+      },
+      {
+        ...header(5),
+        actor: { kind: "system", id: "sys_train" },
+        type: "inbox.queued",
+        data: {
+          agentId: "agt_synthatlas",
+          claimId: "clm_synthatlas",
+          item: 1,
+          entry: { kind: "conflict", otherClaimId: "clm_synthbeacon", path: tokenIn("entrypath") },
+        },
+      },
+      {
+        ...header(6),
+        actor: agent,
+        type: "inbox.acked",
+        data: {
+          agentId: "agt_synthatlas",
+          claimId: "clm_synthatlas",
+          item: 1,
+          plan: tokenIn("plan"),
+        },
+      },
+      {
+        ...header(7),
+        actor: { kind: "system", id: "sys_train" },
+        type: "train.check",
+        data: {
+          checkRunId: "chk_synthrun",
+          candidate: sha("b"),
+          check: `lint ${tokenIn("check")}`,
+          result: "pass",
+          acceptance: null,
+        },
+      },
+      {
+        ...header(8),
+        actor: { kind: "system", id: "sys_train" },
+        type: "train.conflict",
+        data: {
+          claims: ["clm_synthatlas", "clm_synthbeacon"],
+          path: `src/${tokenIn("conflictpath")}`,
+          class: "compatible",
+          probability: 0.5,
+          route: "redo",
+        },
+      },
+    ];
+    const source: Extract<CaptureSource, { kind: "captured" }> = {
+      ...SOURCE,
+      origin: "https://agt_x:hunter2hunter2@railhead.example",
+      org: tokenIn("org"),
+      name: tokenIn("name"),
+    };
+    const planted = [
+      "title",
+      "body",
+      "ref",
+      "text",
+      "label",
+      "scope",
+      "entrypath",
+      "plan",
+      "check",
+      "conflictpath",
+      "org",
+      "name",
+      "history",
+    ].map(tokenIn);
+    const { reader } = fakeReader(events, { history: tokenIn("history") });
+
+    const result = await captureLog(reader, source, NO_DEADLINE);
+    if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
+    const written = serializeCapture(result.capture);
+    if (!written.ok) throw new Error(`serialize failed: ${written.error.kind}`);
+
+    for (const secret of [...planted, "hunter2hunter2"]) expect(written.text).not.toContain(secret);
+    expect(written.text).not.toContain("art_v1_");
+    expect(result.redacted).toBe(planted.length + 1);
+    // Identifiers and commits are not secret-shaped and survive; redacted fields stay valid.
+    const reopened = parseCapture(written.text);
+    if (!reopened.ok) throw new Error(`reopen failed: ${reopened.error.kind}`);
+    expect(reopened.capture.source).toEqual({
+      ...SOURCE,
+      origin: "https://[redacted]@railhead.example",
+      org: "[redacted]",
+      name: "[redacted]",
+    });
+    expect(reopened.capture.history).toBe("[redacted]");
+    expect(reopened.capture.events[1]).toMatchObject({
+      data: { claimId: "clm_synthatlas", ref: "refs/heads/[redacted]", to: sha("a") },
+    });
+    expect(reopened.capture.events[3]).toMatchObject({
+      data: { scope: ["src/upload.ts", "secrets/[redacted]"] },
+    });
+    expect(reopened.capture.events[4]).toMatchObject({
+      data: { entry: { otherClaimId: "clm_synthbeacon", path: "[redacted]" } },
+    });
+    expect(reopened.capture.events[6]).toMatchObject({ data: { check: "lint [redacted]" } });
+    expect(reopened.capture.events[7]).toMatchObject({ data: { path: "src/[redacted]" } });
   });
 });
 

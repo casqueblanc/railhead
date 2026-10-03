@@ -9,9 +9,9 @@
 // with it never reaches the file. Each event is copied field by field and validated by the board's
 // capture module before anything is written. Every page after the first is read under the first
 // page's history, so a repository reset while capturing fails the capture instead of splicing two
-// logs. Free text in events is copied as written except for the secret shapes the capture module
-// redacts (session tokens, Artifacts tokens, Authorization values, URL passwords): treat the file
-// as being as sensitive as the board log itself. The file appears whole or not at all, and an
+// logs. Every string in the file, in any field, is copied as written except for the secret shapes
+// the capture module redacts (session tokens, Artifacts tokens, Authorization values, URL
+// passwords): treat the file as being as sensitive as the board log itself. The file appears whole or not at all, and an
 // existing file is never replaced (see `write-new-file.ts`): a capture killed partway can leave a
 // `.<file>.<uuid>.partial` file beside the output, which is safe to delete.
 //
@@ -167,12 +167,16 @@ const capture = async ({ origin, org, name, out }) => {
   }
 };
 
+/** `count` followed by `noun`, plural unless `count` is 1. */
+const counted = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+
 try {
   const options = parseOptions(process.argv.slice(2));
   const { capture: captured, redacted } = await capture(options);
-  const redactions = redacted === 0 ? "" : ` (${redacted} secret-shaped values redacted)`;
+  const redactions =
+    redacted === 0 ? "" : ` (${counted(redacted, "secret-shaped value")} redacted)`;
   process.stderr.write(
-    `captured ${captured.head} events of ${options.org}/${options.name} from ${options.origin} into ${options.out}${redactions}\n`,
+    `captured ${counted(captured.head, "event")} of ${options.org}/${options.name} from ${options.origin} into ${options.out}${redactions}\n`,
   );
 } catch (error) {
   // Only this script's own sentences are printed: a library error can quote what the backend sent.

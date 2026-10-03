@@ -7,12 +7,13 @@
 // secret by contract (`@railhead/shared/events`), and the capture reads the public board log, so
 // the script needs no credential and the file records none.
 //
-// Free text in events (agent names, issue titles and bodies, question text and option labels,
-// acknowledgement plans) is written by people and agents, and one may paste a credential into it.
-// `captureLog` replaces the shapes Railhead issues or carries with `[redacted]`: session tokens and
-// other JWTs, Artifacts tokens, `Bearer` and `Basic` credentials, `Authorization` values and
-// passwords in URLs. Any other free text is copied as is, so a capture file is as sensitive as the
-// board log it was read from. Opening a file redacts nothing: it holds what its author chose.
+// Text in events is written by people and agents: names, titles and bodies, question text, plans,
+// but also refs, repository paths and check names, and one may paste a credential into any of them.
+// `captureLog` passes every string the file will hold, in whatever field, through one redactor that
+// replaces the shapes Railhead issues or carries with `[redacted]`: session tokens and other JWTs,
+// Artifacts tokens, `Bearer` and `Basic` credentials, `Authorization` values and passwords in URLs.
+// Any other text is copied as is, so a capture file is as sensitive as the board log it was read
+// from. Opening a file redacts nothing: it holds what its author chose.
 //
 // A capture is one history of the log. Resetting a repository starts a new history whose `seq`
 // numbers restart at 1 under the same repository, so `captureLog` reads every page after the first
@@ -183,9 +184,10 @@ function isBoardErrorCode(code: string): code is BoardErrorCode {
  * head the first page reports, so events appended while capturing are left out rather than mixing
  * two moments. Every later page is read under the first page's history, and a page from another
  * history, or a `cursor_ahead` refusal, fails the capture with `history_changed`: a reset mid-capture
- * must not splice two logs into one. Every event is copied field by field, redacted (see the module
- * comment) and validated; any page that breaks the gapless log, names another repository or makes
- * no progress fails the capture.
+ * must not splice two logs into one. Every event is copied field by field; the whole capture is then
+ * redacted (see the module comment) and read back as a file is, so a redaction that breaks an event
+ * fails the capture rather than writing it. Any page that breaks the gapless log, names another
+ * repository or makes no progress fails the capture.
  *
  * `deadline` bounds the whole read, however slowly the backend pages: once it aborts, the pending
  * page is abandoned and the capture fails with `timed_out`. The caller cancels that page's call by
@@ -249,13 +251,13 @@ export const captureLog = async (
       if (events.length === head) break;
       const copied = readEvent(value, `events[${events.length}]`);
       if (!copied.ok) return copied;
-      events.push(redactEvent(copied.event, redact));
+      events.push(copied.event);
     }
   }
   if (repo === null || head === null || history === null) {
     return { ok: false, error: { kind: "empty" } };
   }
-  const checked = checkCapture({
+  const capture: Capture = {
     format: CAPTURE_FORMAT,
     version: CAPTURE_VERSION,
     source: { ...source },
@@ -263,7 +265,14 @@ export const captureLog = async (
     history,
     head,
     events,
-  });
+  };
+  // Every string the file will hold passes through `redact`, whatever field it is in: the reviver
+  // visits each string in the serialized capture, and reading the result back copies and checks it
+  // as a file being opened is.
+  const redactedValue: unknown = JSON.parse(JSON.stringify(capture), (_key, value: unknown) =>
+    typeof value === "string" ? redact(value) : value,
+  );
+  const checked = readCapture(redactedValue);
   return checked.ok ? { ...checked, redacted } : checked;
 };
 
@@ -288,54 +297,6 @@ const SECRET_SHAPES: readonly (readonly [RegExp, (match: string[]) => string])[]
 ];
 
 const REDACTED = "[redacted]";
-
-/** `event` with `redact` applied to each free-text field. */
-const redactEvent = (event: RailheadEvent, redact: (text: string) => string): RailheadEvent => {
-  switch (event.type) {
-    case "agent.invited":
-      return { ...event, data: { ...event.data, name: redact(event.data.name) } };
-    case "agent.joined":
-      return { ...event, data: { ...event.data, name: redact(event.data.name) } };
-    case "issue.filed":
-      return {
-        ...event,
-        data: { ...event.data, title: redact(event.data.title), body: redact(event.data.body) },
-      };
-    case "question.asked":
-      return {
-        ...event,
-        data: {
-          ...event.data,
-          text: redact(event.data.text),
-          options: event.data.options.map((option) => ({
-            ...option,
-            label: redact(option.label),
-          })),
-        },
-      };
-    case "inbox.acked":
-      return { ...event, data: { ...event.data, plan: redact(event.data.plan) } };
-    case "agent.confirmed":
-    case "agent.revoked":
-    case "claim.opened":
-    case "claim.pushed":
-    case "claim.ready":
-    case "claim.refused":
-    case "claim.reopened":
-    case "claim.expired":
-    case "claim.reassigned":
-    case "decision.recorded":
-    case "inbox.queued":
-    case "inbox.delivered":
-    case "train.check":
-    case "train.conflict":
-    case "train.intent":
-    case "train.main":
-      return event;
-    default:
-      return unreachable(event);
-  }
-};
 
 const ABORTED = Symbol("aborted");
 
@@ -384,6 +345,11 @@ export const parseCapture = (text: string): CaptureResult => {
   } catch {
     return { ok: false, error: { kind: "not_json" } };
   }
+  return readCapture(value);
+};
+
+/** Copies and checks a capture from parsed JSON, field by field. */
+const readCapture = (value: unknown): CaptureResult => {
   if (!isRecord(value) || value.format !== CAPTURE_FORMAT) {
     return { ok: false, error: { kind: "wrong_format" } };
   }

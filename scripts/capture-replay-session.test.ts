@@ -360,7 +360,7 @@ test("redacts a session token pasted into an issue body and says how many it red
     assert.equal(result.code, 0);
     assert.equal(
       result.stderr,
-      `captured 2 events of demo/upload-app from http://127.0.0.1:${board.port} into ${out} (1 secret-shaped values redacted)\n`,
+      `captured 2 events of demo/upload-app from http://127.0.0.1:${board.port} into ${out} (1 secret-shaped value redacted)\n`,
     );
     const text = readFileSync(out, "utf8");
     assert.doesNotMatch(text, /eyJ/);
