@@ -1678,6 +1678,122 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
     Ok(())
 }
 
+/// Lapses `atlas`'s stored session and gives it a key, so its next command logs in. Returns the
+/// lapsed record and the challenge response for that login.
+fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
+    let origin = world.server.uri();
+    let atlas = world.home.path().join("agents/atlas");
+    let lapsed = session_record(&origin, TOKEN, 1);
+    fs::remove_file(atlas.join("session"))?;
+    write_private(&atlas.join("session"), &lapsed)?;
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+    write_private(&atlas.join("key"), &key.to_openssh(LineEnding::LF)?)?;
+    let message = format!(
+        "railhead-login-v1\norigin={origin}\nrepo=casqueblanc/demo\nagent=agt_atlas01\nchallenge={CHALLENGE}\nexpires={EXPIRES}\n"
+    );
+    let challenge = json_response(
+        200,
+        &json!({"ok": true, "data": {"challengeId": CHALLENGE, "expiresAt": EXPIRES,
+            "message": message}, "inbox": null, "next": null}),
+    );
+    Ok((lapsed, challenge))
+}
+
+#[tokio::test]
+async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> anyhow::Result<()> {
+    let world = world().await?;
+    let (lapsed, challenge) = lapse_session(&world)?;
+    // The challenge answers just before the deadline, and the session request then stalls: each
+    // fits one request timeout, but the two together do not fit the wait.
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session/challenge")))
+        .respond_with(challenge.set_delay(Duration::from_millis(3_500)))
+        .mount(&world.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session")))
+        .respond_with(
+            json_response(
+                200,
+                &json!({"ok": true, "data": {"token": FRESH, "expiresAt": 4_102_444_800_000_u64,
+                    "agent": {"agentId": "agt_atlas01", "name": "atlas",
+                    "ownerId": "usr_lemarier", "state": "confirmed"}, "repoId": "rep_demo0001"},
+                    "inbox": null, "next": null}),
+            )
+            .set_delay(Duration::from_secs(20)),
+        )
+        .mount(&world.server)
+        .await;
+
+    let started = Instant::now();
+    let run = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
+    )?;
+    let elapsed = started.elapsed();
+    // Without the deadline the session request alone would run to 7.5 s.
+    assert!(
+        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_millis(6_500),
+        "{elapsed:?}"
+    );
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("timeout"));
+    assert_eq!(run.at("/error/next")?, json!("rh ask"));
+    // The login reached its session request, no poll was sent, and the lapsed session is kept.
+    assert_eq!(received(&world, "/session").await.len(), 1);
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
+    let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
+    assert_eq!(stored, lapsed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Result<()> {
+    let world = world().await?;
+    let (lapsed, challenge) = lapse_session(&world)?;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/session/challenge")))
+        .respond_with(challenge)
+        .mount(&world.server)
+        .await;
+    // Another process holds the session lock, as a login of its own would, well past the wait. It
+    // lets go after 10 s so that a wait the deadline does not end fails instead of hanging.
+    let lock = world.home.path().join("agents/atlas/.session.lock");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)?;
+    held.lock()?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        drop(held);
+    });
+
+    let started = Instant::now();
+    let run = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
+    )?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
+        "{elapsed:?}"
+    );
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("timeout"));
+    assert_eq!(run.at("/error/next")?, json!("rh ask"));
+    // Nothing was sent while the lock was held, and the lapsed session is kept.
+    assert_eq!(requests(&world).await, 0);
+    let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
+    assert_eq!(stored, lapsed);
+    release
+        .join()
+        .map_err(|_| anyhow::anyhow!("the lock holder panicked"))?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_wait_that_fails_after_asking_names_the_question_to_resume() -> anyhow::Result<()> {
     let world = world().await?;

@@ -10,8 +10,8 @@ use railhead_protocol::{AckRequest, AckResult, AgentErrorCode, NextCommand, Safe
 use serde::Serialize;
 
 use crate::commands::claim::session;
-use crate::commands::sync::quoted;
 use crate::http::{self, Endpoint};
+use crate::output::quoted;
 use crate::output::{LocalCode, Output, Render, command_line};
 use crate::{Agent, Error, Result};
 
