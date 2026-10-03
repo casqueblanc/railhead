@@ -37,8 +37,10 @@
 // error, and a report arriving at or after the deadline is refused, so a late pass can never
 // authorize a landing. An attempt the check port holds for a person (`check_held`: the candidate
 // edits protected check paths) is not an outage: the train records it, asks the port nothing more,
-// waits for the deadline without backing off, and then fails the batch with `check_held`, sending
-// its pins back without counting a retry, so a held pin is never dropped for waiting.
+// waits for the deadline without backing off, and then fails the batch with `check_held`, counting
+// no retry, so a held pin is never dropped for waiting. A shared batch goes back split into isolated
+// pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
+// queue, so it cannot hold the pins behind it.
 
 import {
   isCommitSha,
@@ -714,9 +716,19 @@ export function createTrain(
     const entries = orderAsBatch(batch, batchedEntries(sql));
     settleBatch(sql, batch.batchId, { state: "failed", failure }, now);
     if (failure === "check_held") {
-      // Waiting for a person is no fault of the pins: they go back as they were, with no retry
-      // counted, so a held pin is never dropped for it.
-      requeueFront(sql, entries, now);
+      // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
+      if (entries.length > 1) {
+        requeueFront(
+          sql,
+          entries.map((entry) => ({ pin: entry.pin, isolate: true, retries: entry.retries })),
+          now,
+        );
+        return;
+      }
+      // Held alone, the pin is the one that edits a protected path. It is parked, keeping its pin,
+      // so the queue behind it moves. A new push enqueues the claim's next generation as a new
+      // entry. The approval action (#174) is the other way back: it will requeue this entry.
+      for (const entry of entries) settleEntry(sql, entry.pin, "parked", "check_held", now);
       return;
     }
     const definitive = isDefinitive(failure);

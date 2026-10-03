@@ -1254,7 +1254,7 @@ function heldEnvironment(repository: FakeRepository): {
 }
 
 describe("a held check through the train", () => {
-  it("blocks without backoff until the deadline, then requeues the pin without counting a retry", async () => {
+  it("blocks without backoff until the deadline, then parks the lone pin without counting a retry", async () => {
     const { stub, repoId } = await initializedRepository();
     const repository = new FakeRepository();
     repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: definitionText() });
@@ -1320,14 +1320,13 @@ describe("a held check through the train", () => {
     expect(seen.wakeWhileHeld).toBe(seen.first?.checkDeadline);
     expect(seen.readsAgain).toBe(seen.reads);
     expect(seen.held).toEqual({ kind: "held", paths: [CHECK_DEFINITION_PATH] });
-    // Past the deadline the held batch fails as held, and the pin goes back unharmed: a new batch
-    // holds it again, with no retry counted and nothing dropped.
+    // Past the deadline the held batch fails as held. The pin, held alone, is parked out of the
+    // queue with its pin kept: no new batch holds it again, no retry is counted, nothing is dropped.
     expect(seen.batches.map((batch) => [batch.state, batch.failure])).toEqual([
-      ["checking", null],
       ["failed", "check_held"],
     ]);
     expect(seen.entry).toEqual(
-      expect.objectContaining({ pin, state: "batched", retries: 0, reason: null }),
+      expect.objectContaining({ pin, state: "parked", retries: 0, reason: "check_held" }),
     );
     // Nothing ran: no sandbox admitted and started, no Workflow created.
     expect(starts).toEqual([]);

@@ -89,7 +89,11 @@ export type EntryState =
   | "landed"
   /** Removed from the train; `reason` says why. */
   | "dropped"
-  /** Held with the claim it conflicts with. Nothing returns it to the queue yet (#118). */
+  /**
+   * Out of the queue until something returns it: held with the claim it conflicts with (#118), or
+   * waiting for a person to approve the protected check paths it edits (#174). Neither returns it
+   * yet; a new push enqueues the claim's next generation.
+   */
   | "parked";
 
 /** Why a pin left the queue without landing. */
@@ -105,7 +109,9 @@ export type DropReason =
   /** The pin's batches failed for reasons outside it too many times. */
   | "retries_exhausted"
   /** The pin conflicts with another claim in its batch. */
-  | "conflict";
+  | "conflict"
+  /** Checked alone, the pin's candidate edits protected check paths and waits for a person. */
+  | "check_held";
 
 /** One pin in the train's queue. */
 export interface QueueEntry {
@@ -663,6 +669,7 @@ const DROP_REASONS = [
   "compose_failed",
   "retries_exhausted",
   "conflict",
+  "check_held",
 ] as const;
 const BATCH_STATES = ["composing", "checking", "passed", "landed", "failed"] as const;
 const BATCH_FAILURES = [
