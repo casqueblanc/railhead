@@ -83,6 +83,8 @@ class Fakes {
   readonly pins = new Map<string, ClaimPin>();
   /** Requirements returned per claim. */
   readonly requirements = new Map<string, DecisionRef[]>();
+  /** When true, the decisions fence reader reports every claim's versions unknown. */
+  unknownVersions = false;
   composeCalls: { main: CommitSha; pins: ClaimPin[] }[] = [];
   started: CheckAttempt[] = [];
   authorized: string[] = [];
@@ -111,8 +113,12 @@ class Fakes {
     for (const p of pins) this.pins.set(p.claimId, p);
   }
 
+  /** Every port call the train made, in order. */
+  readonly reached: PortCall[] = [];
+
   /** Never settles while `call` is the hung one. */
   async answer(call: PortCall): Promise<void> {
+    this.reached.push(call);
     if (this.hang === call) await new Promise<never>(() => {});
     await this.holds.get(call);
   }
@@ -137,6 +143,7 @@ class Fakes {
           const current = this.pins.get(claimId);
           return current === undefined ? fail("not_found", "No such claim.") : ok(current);
         },
+        currentGeneration: (claimId) => this.pins.get(claimId)?.generation ?? null,
       },
       decisions: {
         ...real.decisions,
@@ -144,6 +151,10 @@ class Fakes {
           await this.answer("decisions.requirements");
           return ok(this.requirements.get(claimId) ?? []);
         },
+        currentVersions: (claimId) =>
+          this.pins.has(claimId) && !this.unknownVersions
+            ? (this.requirements.get(claimId) ?? [])
+            : null,
       },
       merge: {
         compose: async (main, pins) => {
@@ -1574,6 +1585,63 @@ describe("train ready episodes", () => {
       expect(train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_fail"]);
       expect(lastStarted(fakes).pins).toEqual([newer]);
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", retries: 0 });
+    }, fakes);
+  });
+});
+
+describe("train batch fence", () => {
+  it("forms no batch when a pin's decision versions move while main is read, then forms under the new ones", async () => {
+    const fakes = new Fakes();
+    const v1: DecisionRef = { decisionId: "dec_upload001", version: 1 };
+    const v2: DecisionRef = { decisionId: "dec_upload001", version: 2 };
+    fakes.requirements.set(pin(1).claimId, [v1]);
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      fakes.requirements.set(pin(1).claimId, [v2]);
+      release();
+      await enqueued;
+
+      // The first form was refused; the next one read the new requirements and the same pin.
+      expect(train.batches(8)).toHaveLength(1);
+      expect(lastStarted(fakes).decisions).toEqual([v2]);
+    }, fakes);
+  });
+
+  it("forms no batch when a claim changes owner while main is read, and drops the old pin", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      fakes.ready(pin(1, 2));
+      release();
+      await enqueued;
+
+      expect(train.batches(8)).toEqual([]);
+      expect(fakes.composeCalls).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "dropped", reason: "pin_changed" });
+    }, fakes);
+  });
+
+  it("forms no batch while the decisions module cannot answer for a claim", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      // The fence reader reports the claim unknown while the async reads still answer.
+      fakes.unknownVersions = true;
+      release();
+      await enqueued;
+
+      expect(train.batches(8)).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "queued" });
+      expect(sql.exec("SELECT COUNT(*) AS n FROM train_batches").one().n).toBe(0);
     }, fakes);
   });
 });

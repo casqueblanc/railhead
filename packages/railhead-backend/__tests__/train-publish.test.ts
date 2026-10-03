@@ -179,8 +179,9 @@ function withRepo<R>(
           const found = current.get(claimId);
           return found === undefined ? fail("not_found", "No such claim.") : ok(found);
         },
+        currentGeneration,
       },
-      decisions: { ...real.decisions, requirements: async () => ok([]) },
+      decisions: { ...real.decisions, requirements: async () => ok([]), currentVersions },
       merge: {
         compose: async (main, composed) =>
           ok({ kind: "clean", candidate: candidateOf(main, composed) }),
