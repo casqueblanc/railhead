@@ -319,4 +319,26 @@ describe("logging", () => {
       expect(line).not.toContain(text);
     }
   });
+
+  it("counts a model call that failed, but not a conflict never sent", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const failing = replay(answer(0.97), async () => ({ model: "clef", answers: {}, usage: {} }));
+    await createConflicts(REPO, failing.ai, Date.now).classify(conflict([REGION, REGION]));
+    expect(JSON.parse(String(info.mock.calls[0]?.[0]))).toMatchObject({
+      reason: "malformed",
+      calls: 2,
+      inputTokens: 400,
+    });
+
+    const unsent = replay(answer(0.99));
+    await createConflicts(REPO, unsent.ai, Date.now).classify({
+      ...conflict([REGION]),
+      oursIntent: "",
+    });
+    expect(JSON.parse(String(info.mock.calls[1]?.[0]))).toMatchObject({
+      reason: "missing_intent",
+      calls: 0,
+      inputTokens: 0,
+    });
+  });
 });

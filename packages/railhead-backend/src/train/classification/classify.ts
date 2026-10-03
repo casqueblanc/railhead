@@ -99,9 +99,9 @@ export type ConflictVerdict =
 
 /** What a classification costs, for the caller's log. Never any of the conflict's text. */
 export interface ClassificationUsage {
-  /** Model calls made. */
+  /** Model calls made, including any that failed or timed out. */
   readonly calls: number;
-  /** Input tokens those calls used. */
+  /** Input tokens the answered calls reported; a failed call reports none. */
   readonly inputTokens: number;
 }
 
@@ -159,8 +159,9 @@ export async function classifyConflict(
       theirsIntent,
     };
     const answer = await askChoice(ai, state, QUESTION, left);
+    // Every call that reached the model counts, answered or not; a too-large state never did.
+    if (answer.kind === "answer" || answer.reason !== "too_large") usage.calls += 1;
     if (answer.kind === "failed") return unjudged(answer.reason, usage);
-    usage.calls += 1;
     usage.inputTokens += answer.inputTokens;
     const compatible = answer.probabilities.get("compatible") ?? 0;
     switch (answer.choice) {
