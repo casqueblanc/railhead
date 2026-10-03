@@ -41,10 +41,19 @@
 // fails too, the incarnation stays retiring, the failure reports both, and the next wake-up or
 // release destroys it. Retries back off and stop after `MAX_TEARDOWN_ATTEMPTS`; the repository keeps
 // the sandbox's slot until it releases the sandbox itself, whatever the fence confirmed.
+//
+// A retired incarnation's record is needed only while a start for it could still arrive. Every
+// start carries its slot's deadline, and one that arrives at or after that deadline starts nothing,
+// so once retirement is confirmed and the deadline has passed the object may forget the record and
+// all its storage (`disposable`); the destroy that confirms it asks to be woken at the deadline for
+// that, whatever its retry budget, and fails when it cannot. A sandbox retired before it ever
+// started records a deadline `MAX_SANDBOX_LIFETIME_MS` from then: its slot was admitted earlier, so
+// its deadline, and that of any start still on the way, is no later.
 
+import { MAX_SANDBOX_LIFETIME_MS } from "./admission";
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
 import type { BoundedOutput } from "./output";
-import type { SandboxGrant, SandboxPolicy } from "./policy";
+import { parseSandboxPolicy, type SandboxGrant, type SandboxPolicy } from "./policy";
 
 /** The command that confirms a started container answers. */
 export const START_PROBE = "git --version";
@@ -87,12 +96,8 @@ export function teardownRetryDelay(attempts: number): number {
 
 /** Why the fence refused an operation. */
 export type FenceRefusal =
-  | "retired"
-  | "expired"
-  | "not_started"
-  | "probe_failed"
-  | "timed_out"
-  | "unsettled";
+  /** A start or join named another policy or deadline than the live incarnation's. */
+  "mismatch" | "retired" | "expired" | "not_started" | "probe_failed" | "timed_out" | "unsettled";
 
 /**
  * A refused or failed operation. A start or command left nothing running; `unsettled`, from
@@ -109,12 +114,12 @@ export class SandboxFenceError extends Error {
 }
 
 /**
- * The fence's durable record. `deadline` is when the incarnation must be gone, `0` when it was
- * retired before it started. Once it leaves `live` it never returns: `retiring` means a destroy is
- * not yet confirmed, `retired` that the last one succeeded.
+ * The fence's durable record. `deadline` is when the incarnation must be gone; for one retired
+ * before it started, the latest deadline its slot can have. Once it leaves `live` it never returns:
+ * `retiring` means a destroy is not yet confirmed, `retired` that the last one succeeded.
  */
 type FenceState =
-  | { phase: "live"; deadline: number }
+  | { phase: "live"; deadline: number; policy: SandboxPolicy }
   | { phase: "retiring"; deadline: number; attempts: number }
   | { phase: "retired"; deadline: number };
 
@@ -146,14 +151,22 @@ export class SandboxFence {
     this.#settleMs = settleMs;
   }
 
-  /** Starts the incarnation under `policy` until `deadline` and confirms it answers. */
+  /**
+   * Starts the incarnation under `policy` until `deadline` and confirms it answers. A repeat for the
+   * live incarnation must name the same policy and deadline; one that names another is refused with
+   * `mismatch` and changes nothing, so no caller can replace the grant the sandbox was admitted
+   * under.
+   */
   start(policy: SandboxPolicy, deadline: number): Promise<void> {
     return this.#track(async () => {
       const state = this.#read();
       if (state !== null && state.phase !== "live") throw new SandboxFenceError("retired");
       if (state !== null && state.deadline !== deadline) throw new SandboxFenceError("retired");
+      if (state !== null && !samePolicy(state.policy, policy)) {
+        throw new SandboxFenceError("mismatch");
+      }
       if (this.#clock() >= deadline) return this.#expireFrom(deadline);
-      this.#write({ phase: "live", deadline });
+      this.#write({ phase: "live", deadline, policy });
       try {
         await this.#container.wake(deadline);
         await this.#container.route({ policy, expiresAt: deadline });
@@ -164,6 +177,28 @@ export class SandboxFence {
       } catch (error) {
         return this.#failClosed(deadline, error);
       }
+    });
+  }
+
+  /**
+   * Admits a caller to the incarnation a start already made live, under the same `policy` and
+   * `deadline`; it starts, routes and runs nothing itself. Only the sandbox module's admission
+   * starts an incarnation, so a caller naming a sandbox that was never admitted is refused with
+   * `not_started`, and the name is retired so no later start can use it. A join that names another
+   * policy or deadline is refused with `mismatch` and leaves the live incarnation as it was.
+   */
+  join(policy: SandboxPolicy, deadline: number): Promise<void> {
+    return this.#track(async () => {
+      const state = this.#read();
+      if (state === null) {
+        await this.#destroy(Math.min(deadline, this.#clock() + MAX_SANDBOX_LIFETIME_MS));
+        throw new SandboxFenceError("not_started");
+      }
+      if (state.phase !== "live") throw new SandboxFenceError("retired");
+      if (state.deadline !== deadline || !samePolicy(state.policy, policy)) {
+        throw new SandboxFenceError("mismatch");
+      }
+      if (this.#clock() >= deadline) return this.#expireFrom(deadline);
     });
   }
 
@@ -252,7 +287,7 @@ export class SandboxFence {
    * destroy fails; either way a retry is left scheduled.
    */
   async retire(): Promise<void> {
-    const deadline = this.#read()?.deadline ?? 0;
+    const deadline = this.#read()?.deadline ?? this.#clock() + MAX_SANDBOX_LIFETIME_MS;
     const outstanding = [...this.#inflight, ...this.#effects];
     const confirmed = await this.#destroy(deadline);
     if (outstanding.length === 0 && confirmed) return;
@@ -263,7 +298,8 @@ export class SandboxFence {
 
   /**
    * The scheduled wake-up. Before the deadline it schedules itself again; at the deadline it retires
-   * the incarnation; while a destroy is unconfirmed it retries it.
+   * the incarnation; while a destroy is unconfirmed it retries it; once retired early, it asks to be
+   * woken at the deadline, when the object becomes `disposable`.
    */
   async expire(): Promise<void> {
     const state = this.#read();
@@ -290,10 +326,27 @@ export class SandboxFence {
       case "retiring":
         return this.retire();
       case "retired":
+        if (this.#clock() < state.deadline) await this.#container.wake(state.deadline);
         return;
       default:
         throw new Error(`unknown fence phase: ${state satisfies never}`);
     }
+  }
+
+  /**
+   * Whether the object may delete its storage: retirement is confirmed, its deadline has passed, so
+   * no start can still begin an incarnation, and nothing it ran is still outstanding. A record that
+   * was never written is not disposable: there is nothing to delete.
+   */
+  disposable(): boolean {
+    const state = this.#read();
+    return (
+      state !== null &&
+      state.phase === "retired" &&
+      this.#clock() >= state.deadline &&
+      this.#inflight.size === 0 &&
+      this.#effects.size === 0
+    );
   }
 
   // Runs one command, aborting it at its timeout: the SDK does not stop a streaming command itself.
@@ -382,9 +435,11 @@ export class SandboxFence {
     try {
       await this.#destroy(deadline);
     } catch (destroyError) {
-      throw new AggregateError([error, destroyError], "the sandbox failed and was not destroyed", {
-        cause: destroyError,
-      });
+      throw new AggregateError(
+        [error, destroyError],
+        "the sandbox failed and its teardown did not complete",
+        { cause: destroyError },
+      );
     }
     throw error;
   }
@@ -447,6 +502,14 @@ export class SandboxFence {
     // destroy that follows the last settlement confirms.
     if (this.#effects.size > 0 || this.#settlements !== settlements) return false;
     this.#write({ phase: "retired", deadline });
+    // The wake-up that ran this attempt is spent, and a retry wake-up, when one was scheduled, may
+    // come before the deadline or not at all: without one at the deadline nothing deletes the
+    // object's storage. One that cannot be scheduled fails the attempt, so a release or the next
+    // wake-up confirms the retirement again and schedules it.
+    const retryPending = attempts < MAX_TEARDOWN_ATTEMPTS && unscheduled === null;
+    if (this.#clock() < deadline || !retryPending) {
+      await this.#container.wake(Math.max(deadline, this.#clock()));
+    }
     return true;
   }
 
@@ -473,21 +536,16 @@ export class SandboxFence {
   #read(): FenceState | null {
     const value: unknown = this.#storage.kv.get(KEY);
     if (value === undefined) return null;
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      "phase" in value &&
-      "deadline" in value &&
-      typeof value.deadline === "number"
-    ) {
-      const { deadline } = value;
-      if (value.phase === "live" || value.phase === "retired")
-        return { phase: value.phase, deadline };
-      if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
-        return { phase: "retiring", deadline, attempts: value.attempts };
-      }
+    const state = parseFenceState(value);
+    if (state === null) throw new Error("stored sandbox fence is not valid");
+    // Written when a retirement before the start recorded no deadline. Its slot was admitted before
+    // now, so no start for it can carry a later deadline than the one recorded here.
+    if (state.phase !== "live" && state.deadline === 0) {
+      const migrated = { ...state, deadline: this.#clock() + MAX_SANDBOX_LIFETIME_MS };
+      this.#write(migrated);
+      return migrated;
     }
-    throw new Error("stored sandbox fence is not valid");
+    return state;
   }
 
   #write(state: FenceState): void {
@@ -496,3 +554,36 @@ export class SandboxFence {
 }
 
 function noop(): void {}
+
+// The stored record, or null when it is not one.
+function parseFenceState(value: unknown): FenceState | null {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("phase" in value) ||
+    !("deadline" in value) ||
+    typeof value.deadline !== "number"
+  ) {
+    return null;
+  }
+  const { deadline } = value;
+  if (value.phase === "live") {
+    // Written before live records kept their policy: no join or grant can match it, so it is only
+    // ever destroyed.
+    if (!("policy" in value)) return { phase: "retiring", deadline, attempts: 0 };
+    const policy = parseSandboxPolicy(value.policy);
+    return policy === null ? null : { phase: "live", deadline, policy };
+  }
+  if (value.phase === "retired") return { phase: "retired", deadline };
+  if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
+    return { phase: "retiring", deadline, attempts: value.attempts };
+  }
+  return null;
+}
+
+// Whether two policies grant the same access. Each is parsed again, since a policy may arrive over
+// RPC; parsed policies have one field order, so equal ones serialize alike.
+function samePolicy(left: unknown, right: unknown): boolean {
+  const parsed = parseSandboxPolicy(left);
+  return parsed !== null && JSON.stringify(parsed) === JSON.stringify(parseSandboxPolicy(right));
+}
