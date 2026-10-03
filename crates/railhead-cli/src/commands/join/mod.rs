@@ -26,8 +26,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use railhead_protocol::{
-    AgentErrorCode, ChallengeRequest, ChallengeResult, EnrollmentState, InboxDigest, JoinRequest,
-    JoinResult, NextCommand, SessionRequest, SessionResult,
+    AgentErrorCode, AgentRoute, ChallengeRequest, ChallengeResult, EnrollmentState, InboxDigest,
+    JoinRequest, JoinResult, NextCommand, SessionRequest, SessionResult,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -175,7 +175,7 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
             };
             enrollment.check(&identity, &answer.data)?;
         }
-        let login = login(&client, &identity, &key).await?;
+        let login = login(&client, &identity, &key, None).await?;
         store.save_session(&name, &login.session)?;
         store.remove_enrollment(&name)?;
         let joined = Joined {
@@ -255,21 +255,40 @@ impl Authenticated {
 ///
 /// [`LocalCode::NoSession`] in those cases; otherwise when the store fails or the login fails.
 pub fn session(agent: &Agent<'_>) -> Result<Authenticated> {
-    session_with(agent, &agent.client()?)
+    session_with(agent, &agent.client()?, None)
 }
 
-/// As [`session`], logging in through `client`, so a caller can bound the login's requests.
+/// As [`session`], logging in through `client` and, given a `deadline`, giving up on the session
+/// lock and the login once it passes, so a caller can bound the whole renewal.
 ///
 /// # Errors
 ///
-/// As [`session`].
-pub fn session_with(agent: &Agent<'_>, client: &http::Client) -> Result<Authenticated> {
+/// As [`session`]; with a `deadline`, [`LocalCode::Timeout`] when another process still holds the
+/// session lock then, and [`http::Error::Timeout`] when the login has not finished by then.
+pub fn session_with(
+    agent: &Agent<'_>,
+    client: &http::Client,
+    deadline: Option<std::time::Instant>,
+) -> Result<Authenticated> {
     if let Some(token) = agent.stored_session()? {
         return Ok(Authenticated::Stored(token));
     }
     let identity = &agent.identity;
     let store = agent.invocation.context.store();
-    let lock = store.lock_session(&identity.name)?;
+    let lock = match deadline {
+        None => store.lock_session(&identity.name)?,
+        Some(deadline) => store
+            .lock_session_until(&identity.name, deadline)?
+            .ok_or_else(|| Error::Local {
+                code: LocalCode::Timeout,
+                message: format!(
+                    "another rh process was still renewing the session of {}",
+                    identity.name
+                ),
+                retryable: true,
+                next: None,
+            })?,
+    };
     match lock.load()? {
         Some(stored) if !stored.issued_to(identity) => {
             return Err(no_session(
@@ -287,7 +306,7 @@ pub fn session_with(agent: &Agent<'_>, client: &http::Client) -> Result<Authenti
     let login = agent
         .invocation
         .runtime
-        .block_on(login(client, identity, &key))
+        .block_on(login(client, identity, &key, deadline))
         .map_err(|error| match error {
             Error::Http(http::Error::Rejected { error, .. })
                 if error.code == AgentErrorCode::IdentityPending =>
@@ -322,23 +341,32 @@ fn no_session(identity: &Identity, why: &str) -> Error {
 
 /// Logs in as `identity`: asks for a challenge, signs it when it is exactly the message `rh`
 /// builds, and redeems it for a session bound to `identity` with the expiry the backend gave.
+/// Given a `deadline`, each request gives up when it passes as well as at the client's timeout.
 ///
 /// # Errors
 ///
-/// When a request fails, or the backend proposes another message, names another agent or returns
-/// a malformed token. Nothing is signed for a message `rh` did not build.
-pub async fn login(client: &http::Client, identity: &Identity, key: &SigningKey) -> Result<Login> {
+/// When a request fails or the deadline passes, or the backend proposes another message, names
+/// another agent or returns a malformed token. Nothing is signed for a message `rh` did not build.
+pub async fn login(
+    client: &http::Client,
+    identity: &Identity,
+    key: &SigningKey,
+    deadline: Option<std::time::Instant>,
+) -> Result<Login> {
     let agent_id = identity.agent_id.to_string();
-    let challenge = client
-        .send::<_, ChallengeResult>(
+    let challenge = by(
+        deadline,
+        AgentRoute::Challenge,
+        client.send::<_, ChallengeResult>(
             &Endpoint::Challenge,
             None,
             &ChallengeRequest {
                 agent_id: agent_id.clone(),
             },
-        )
-        .await?
-        .data;
+        ),
+    )
+    .await?
+    .data;
     if !is_challenge_id(&challenge.challenge_id) {
         return Err(malformed(
             "the login challenge is malformed; nothing was signed",
@@ -356,17 +384,21 @@ pub async fn login(client: &http::Client, identity: &Identity, key: &SigningKey)
             "the login challenge is not the message rh signs; nothing was signed",
         ));
     }
-    let response = client
-        .send::<_, SessionResult>(
+    let signature = key.sign(&message)?;
+    let response = by(
+        deadline,
+        AgentRoute::Session,
+        client.send::<_, SessionResult>(
             &Endpoint::Session,
             None,
             &SessionRequest {
                 agent_id,
                 challenge_id: challenge.challenge_id,
-                signature: key.sign(&message)?,
+                signature,
             },
-        )
-        .await?;
+        ),
+    )
+    .await?;
     let session = response.data;
     if session.agent.agent_id != identity.agent_id.as_str() {
         return Err(malformed(
@@ -380,6 +412,21 @@ pub async fn login(client: &http::Client, identity: &Identity, key: &SigningKey)
         inbox: response.inbox,
         next: response.next,
     })
+}
+
+/// Runs `request` until it ends or `deadline` passes, failing as a timeout of `route` then.
+async fn by<T>(
+    deadline: Option<std::time::Instant>,
+    route: AgentRoute,
+    request: impl Future<Output = http::Result<T>>,
+) -> http::Result<T> {
+    let Some(deadline) = deadline else {
+        return request.await;
+    };
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    tokio::time::timeout(left, request)
+        .await
+        .unwrap_or(Err(http::Error::Timeout(route)))
 }
 
 /// `chl_` and 16 to 64 letters or digits.
