@@ -23,6 +23,7 @@ const scratch = mkdtempSync(join(tmpdir(), "railhead-demo-cli-test-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
 const CHECKS = "demo/upload-app/acceptance/checks.json";
+const MANIFEST = "fixtures/demo/seed.json";
 const gitEnv = {
   ...process.env,
   GIT_CONFIG_NOSYSTEM: "1",
@@ -45,7 +46,12 @@ function git(cwd: string, args: string[]): string {
  */
 function sourceRepo(name: string): string {
   const source = join(scratch, name);
-  for (const path of ["demo/upload-app", "fixtures/demo/standalone", "scripts/assert-workerd.ts"]) {
+  for (const path of [
+    "demo/upload-app",
+    MANIFEST,
+    "fixtures/demo/standalone",
+    "scripts/assert-workerd.ts",
+  ]) {
     mkdirSync(dirname(join(source, path)), { recursive: true });
     cpSync(join(root, path), join(source, path), {
       recursive: true,
@@ -179,7 +185,71 @@ test("the acceptance checks are read from the selected commit, never the working
   // A commit whose checks are not JSON is refused, naming that commit.
   writeFileSync(join(repo, CHECKS), "{");
   git(repo, ["commit", "--quiet", "--all", "-m", "chore: break the checks"]);
-  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), /are not JSON/);
+  await assert.rejects(
+    run(["seed", "--dry-run", "--source-root", repo]),
+    /acceptance checks at [0-9a-f]{40}:demo\/upload-app\/acceptance\/checks\.json is not JSON/,
+  );
+});
+
+test("the manifest is read from the selected commit, never the working tree", async () => {
+  const repo = sourceRepo("manifest");
+  const committed = readFileSync(join(repo, MANIFEST), "utf8");
+  const [first] = manifest.issues;
+  assert.ok(first !== undefined);
+  // An uncommitted manifest that renames the first issue and points at another directory.
+  const edited: unknown = JSON.parse(committed);
+  assert.ok(typeof edited === "object" && edited !== null && "issues" in edited);
+  assert.ok(Array.isArray(edited.issues));
+  const dirty = {
+    ...edited,
+    source: "fixtures/demo/standalone",
+    issues: edited.issues.map((issue: unknown, index) =>
+      index === 0 && typeof issue === "object" && issue !== null
+        ? { ...issue, title: "An uncommitted title" }
+        : issue,
+    ),
+  };
+  writeFileSync(join(repo, MANIFEST), `${JSON.stringify(dirty)}\n`);
+
+  // The plan, the issues printed and the bundle all follow the committed manifest.
+  const lines = await run(["seed", "--dry-run", "--source-root", repo]);
+  assert.ok(lines.includes(first.title));
+  assert.equal(lines.includes("An uncommitted title"), false);
+  const out = join(scratch, "manifest.bundle");
+  const [head] = await run(["bundle", "--out", out, "--source-root", repo]);
+  assert.equal(head, lines[0]);
+  const clone = join(scratch, "manifest-clone");
+  execFileSync("git", ["clone", "--quiet", "--branch", "main", out, clone]);
+  assert.equal(existsSync(join(clone, "acceptance", "checks.json")), true);
+
+  // An explicit --manifest is the override, read from disk.
+  const override = join(scratch, "override.json");
+  writeFileSync(override, `${JSON.stringify({ ...dirty, source: manifest.source })}\n`);
+  const overridden = await run([
+    "seed",
+    "--dry-run",
+    "--source-root",
+    repo,
+    "--manifest",
+    override,
+  ]);
+  assert.ok(overridden.includes("An uncommitted title"));
+
+  // A commit without a manifest, or with one that is not JSON, is refused.
+  git(repo, ["rm", "--quiet", "--force", MANIFEST]);
+  git(repo, ["commit", "--quiet", "-m", "chore: drop the manifest"]);
+  await assert.rejects(
+    run(["seed", "--dry-run", "--source-root", repo]),
+    /has no file fixtures\/demo\/seed\.json/,
+  );
+  mkdirSync(join(repo, "fixtures", "demo"), { recursive: true });
+  writeFileSync(join(repo, MANIFEST), "{");
+  git(repo, ["add", MANIFEST]);
+  git(repo, ["commit", "--quiet", "-m", "chore: break the manifest"]);
+  await assert.rejects(
+    run(["reset", "--dry-run", "--source-root", repo]),
+    /manifest at [0-9a-f]{40}:fixtures\/demo\/seed\.json is not JSON/,
+  );
 });
 
 test("the bundle is a repository that installs and runs its checks on its own", async () => {

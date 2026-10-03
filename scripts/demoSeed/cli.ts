@@ -6,11 +6,13 @@
 //   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
 //                       refuses --dry-run, since seed --dry-run is the preview
 //
-// `--org` and `--repo` may be given, and anything but demo/upload-app is refused. Seed and reset
+// The manifest, the checks and the history are all read from `--revision`; `--manifest FILE` is
+// an explicit override read from disk. `--org` and `--repo` may be given, and anything but
+// demo/upload-app is refused. Seed and reset
 // only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing
 // here creates a Cloudflare resource or reads a secret.
 
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
   planHistory,
@@ -20,13 +22,22 @@ import {
   type ImportedHistory,
   type ImportRequest,
 } from "./history.ts";
-import { assertDemoTarget, assertMatchesChecks, loadManifest, SeedRefusal } from "./manifest.ts";
+import {
+  assertDemoTarget,
+  assertMatchesChecks,
+  loadManifest,
+  parseManifest,
+  SeedRefusal,
+} from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
 import { describeIssues, describePlan, planReset, planSeed } from "./reconcile.ts";
 import { STANDALONE_OVERLAY, STANDALONE_SUBJECT } from "./standalone.ts";
 
 /** The repository root, which holds the default manifest and the demo app's history. */
 const ROOT = resolve(import.meta.dirname, "..", "..");
+
+/** The manifest's path in the source repository, read at the selected commit. */
+const MANIFEST_PATH = "fixtures/demo/seed.json";
 
 /** Runs one command and returns the lines it prints. Throws `SeedRefusal` on a refused request. */
 export async function run(argv: readonly string[]): Promise<string[]> {
@@ -36,7 +47,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     strict: true,
     options: {
       "dry-run": { type: "boolean", default: false },
-      manifest: { type: "string", default: join(ROOT, "fixtures", "demo", "seed.json") },
+      manifest: { type: "string" },
       "source-root": { type: "string", default: ROOT },
       revision: { type: "string", default: "HEAD" },
       org: { type: "string" },
@@ -51,17 +62,31 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     throw new SeedRefusal("bundle has no dry run; use seed --dry-run to plan the import.");
   }
 
-  const manifest = loadManifest(values.manifest);
+  // Resolved once, so the manifest, the checks validated below and the history exported are the
+  // same commit's.
+  const sourceRoot = values["source-root"];
+  const commit = resolveCommit(sourceRoot, values.revision);
+  const manifest =
+    values.manifest === undefined
+      ? parseManifest(readJsonAt(sourceRoot, commit, MANIFEST_PATH, "manifest"))
+      : loadManifest(resolve(values.manifest));
   assertDemoTarget(values.org ?? manifest.org, values.repo ?? manifest.repo);
-  // Resolved once, so the checks validated below and the history exported are the same commit's.
   const request: ImportRequest = {
-    sourceRoot: values["source-root"],
-    commit: resolveCommit(values["source-root"], values.revision),
+    sourceRoot,
+    commit,
     directory: manifest.source,
     overlay: STANDALONE_OVERLAY,
     overlaySubject: STANDALONE_SUBJECT,
   };
-  assertMatchesChecks(manifest, readChecks(request));
+  assertMatchesChecks(
+    manifest,
+    readJsonAt(
+      sourceRoot,
+      commit,
+      `${manifest.source}/acceptance/checks.json`,
+      "acceptance checks",
+    ),
+  );
 
   switch (command) {
     case "seed": {
@@ -94,17 +119,14 @@ export async function run(argv: readonly string[]): Promise<string[]> {
   }
 }
 
-/** The app's acceptance checks as committed at the import's commit, never the working tree's. */
-function readChecks({ sourceRoot, commit, directory }: ImportRequest): unknown {
-  const path = `${directory}/acceptance/checks.json`;
+/** A JSON file as committed at `commit`, never the working tree's. */
+function readJsonAt(sourceRoot: string, commit: string, path: string, what: string): unknown {
   // A missing file is already a refusal; a failure to read the repository is not one.
   const text = readFileAt(sourceRoot, commit, path);
   try {
     return JSON.parse(text);
   } catch (error) {
-    throw new SeedRefusal(`The app's acceptance checks at ${commit}:${path} are not JSON.`, {
-      cause: error,
-    });
+    throw new SeedRefusal(`The ${what} at ${commit}:${path} is not JSON.`, { cause: error });
   }
 }
 
