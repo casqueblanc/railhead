@@ -47,6 +47,9 @@ const SYNC = new Map<string, unknown>([
   ["authorization.unsettled", "throws"],
   ["claims.currentGeneration", null],
   ["decisions.currentVersions", null],
+  ["decisions.transfer", "throws"],
+  ["decisions.relied", "throws"],
+  ["decisions.obligations", null],
   ["inbox.queue", "throws"],
   ["train.attemptOutcome", null],
 ]);
