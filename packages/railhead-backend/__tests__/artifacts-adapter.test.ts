@@ -598,6 +598,90 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("keeps a debt a release records while a request's debt sweep is listing", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
+      // Every live token is revoked, but the page still cannot show that none is left.
+      fake.pageTokens(2, "live-first");
+      expect(await port.revokeTokens(repo)).toEqual(PENDING_DEBT);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+
+      // The request's debt sweep holds its final listing while a release lists a partial page.
+      const paused = fake.pauseNext("listTokens");
+      const requesting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      fake.pageTokens(1, "creation");
+      expect(await port.revokeTokens(repo)).toEqual(PENDING_DEBT);
+      fake.pageTokens(null);
+      paused.release();
+
+      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
+      expect(debtRows(storage)).toHaveLength(1);
+      // The release's debt still refuses the next holder's write token, without a mint.
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      expect(fake.createTokenCalls).toBe(0);
+    });
+  });
+
+  it("keeps a debt an overlapping release records when an earlier clean release ends", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      fake.mintFor(repo, "write", 600);
+
+      // The first release lists after the second has recorded its partial page.
+      const paused = fake.pauseNext("listTokens");
+      const first = port.revokeTokens(repo);
+      await paused.reached;
+      fake.pageTokens(1, "creation");
+      expect(await port.revokeTokens(repo)).toEqual(PENDING_DEBT);
+      fake.pageTokens(null);
+      paused.release();
+
+      // Its clean listing saw no debt before it began, so it cannot settle the newer one.
+      expect(await first).toEqual(PENDING_DEBT);
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(debtRows(storage)).toHaveLength(1);
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(fake.createTokenCalls).toBe(0);
+
+      // A clean release that began after the debt clears it, and minting resumes.
+      expect(await port.revokeTokens(repo)).toEqual(REVOKED);
+      expect(debtRows(storage)).toEqual([]);
+      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
+    });
+  });
+
+  it("returns no token from a mint during which a release recorded a debt", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const hidden = fake.mintFor(repo, "write", 600);
+
+      const paused = fake.pauseNext("createTokenBeforeMint");
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      // The page holds only the fork's revoked initial token, hiding the other holder's.
+      fake.pageTokens(1, "creation");
+      // The mint is unanswered, so the release is busy, but its partial page is still a debt.
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(debtRows(storage)).toHaveLength(1);
+      paused.release();
+
+      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.createTokenCalls).toBe(1);
+      // The minted token was revoked; only the one the page hid is still live.
+      expect(fake.liveTokens(repo)).toEqual([hidden]);
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      expect(fake.createTokenCalls).toBe(1);
+    });
+  });
+
   it("drops the debt once every token the fork may hold has expired", async () => {
     await withArtifacts(async ({ fake, storage, adapter }) => {
       const port = adapter();

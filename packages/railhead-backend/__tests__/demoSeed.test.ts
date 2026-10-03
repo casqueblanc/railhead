@@ -1,7 +1,7 @@
 import { SELF, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { newWebSocketRpcSession } from "capnweb";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
 import {
   MAX_DEMO_BUNDLE_BYTES,
@@ -1460,6 +1460,14 @@ async function openSession(): Promise<WebSocket> {
 }
 
 describe("demo seed entry", () => {
+  // The pool declares the Worker's `ARTIFACTS` binding but cannot reach it, as it is remote only.
+  // The demo object reads the binding when its seed target is first built, so it is removed first.
+  beforeEach(async () => {
+    await runInDurableObject(env.REPO.getByName(DEMO_OBJECT_NAME), (instance) => {
+      Reflect.set(instance, "env", { ...env, ARTIFACTS: undefined });
+    });
+  });
+
   it("reports a fresh instance's demo repository as absent and refuses without an owner", async () => {
     using api = newWebSocketRpcSession<RailheadApi>(await openSession());
     using seed = await api.demoSeed();

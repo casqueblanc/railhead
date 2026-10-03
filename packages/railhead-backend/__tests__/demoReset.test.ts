@@ -98,8 +98,8 @@ describe("demo reset", () => {
     const artifacts = new MainOnly();
     const main = await mainRepoName(demoRepoId(env));
     artifacts.fake.seed(main, [HEAD]);
-    // The pool has no Artifacts binding; the object reads one from its env when the seed target is
-    // first built, so lend it the fake before that.
+    // The pool cannot reach the remote Artifacts binding; the object reads one from its env when
+    // the seed target is first built, so lend it the fake before that.
     await runInDurableObject(stub, async (instance) => {
       Reflect.set(instance, "env", { ...env, ARTIFACTS: artifacts });
       expect(await instance.demoSeedState()).toEqual(ok(null));
