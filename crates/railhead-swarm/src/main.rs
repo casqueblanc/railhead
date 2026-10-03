@@ -13,9 +13,11 @@
 //! directory that is removed when the run ends, on Ctrl-C included; every child process is killed
 //! first, on an error included. Each agent's progress is kept in `<homes>/progress/swarm-NN.json`,
 //! so running a stopped scenario again resumes it; a record that is damaged or belongs to another
-//! scenario file stops the run until `--discard-progress` removes it. A run holds
-//! `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a second run on the same
-//! homes refuses to start.
+//! scenario file stops the run until `--discard-progress` removes it. A run holds an
+//! operating-system lock on `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a
+//! second run on the same homes refuses to start; the lock ends with the process, so a run that
+//! was killed leaves nothing to clean up before the next. Ctrl-C is listened for before anything
+//! else, so one pressed during startup still stops the run cleanly.
 //!
 //! The exit code is 0 only when every agent finished every planned task; 1 when an agent failed or
 //! stalled, or the run timed out; 130 on Ctrl-C; 2 when the run could not start. A task whose claim
@@ -172,6 +174,31 @@ fn load_progress(
     Ok((file, record))
 }
 
+/// Ctrl-C, recorded from the moment the listener is made: until then the default action would
+/// end the process without removing its clones.
+struct Interrupt(
+    #[cfg(unix)] tokio::signal::unix::Signal,
+    #[cfg(windows)] tokio::signal::windows::CtrlC,
+);
+
+impl Interrupt {
+    fn listen() -> io::Result<Self> {
+        #[cfg(unix)]
+        let listener = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+        #[cfg(windows)]
+        let listener = tokio::signal::windows::ctrl_c();
+        listener.map(Self)
+    }
+
+    /// Resolves on the first Ctrl-C since [`Interrupt::listen`], one before this call included.
+    async fn recv(&mut self) {
+        // `None` means no further signal can arrive, so the run is never interrupted.
+        if self.0.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// How a run ended.
 struct Ended {
     stopped_by: StopReason,
@@ -179,6 +206,7 @@ struct Ended {
 }
 
 async fn run(cli: &Cli) -> anyhow::Result<Ended> {
+    let mut interrupt = Interrupt::listen().context("listening for Ctrl-C")?;
     let (scenario, key) = read_scenario(&cli.scenario)?;
     let homes = (0..scenario.agents)
         .map(|index| {
@@ -263,7 +291,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     let stop = async move {
         tokio::select! {
             biased;
-            _ = tokio::signal::ctrl_c() => StopReason::Interrupted,
+            () = interrupt.recv() => StopReason::Interrupted,
             () = tokio::time::sleep(run_timeout) => StopReason::TimedOut,
         }
     };

@@ -10,10 +10,11 @@
 //! or does not fit the scenario's plan stops the run before any agent acts: it is the only map from a live claim to its planned
 //! task, so it is never dropped silently. `--discard-progress` removes it on purpose.
 //!
-//! One run at a time may use an agent's home: [`HomeLock`] holds a lock file beside the record
-//! for the length of the run.
+//! One run at a time may use an agent's home: [`HomeLock`] holds an operating-system lock on a
+//! file beside the record for the length of the run.
 
 use std::fmt::Write as _;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -189,11 +190,8 @@ impl ProgressFile {
 /// Why an agent's home could not be locked.
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    /// Another run holds it, or a stopped one left its lock file.
-    #[error(
-        "another run is using agent {name} (lock file {}, {holder}); remove the file if no run is",
-        path.display()
-    )]
+    /// Another run holds it.
+    #[error("another run is using agent {name} (lock file {}, {holder})", path.display())]
     Held {
         /// The agent.
         name: String,
@@ -202,7 +200,7 @@ pub enum LockError {
         /// Who holds it, as the file says.
         holder: String,
     },
-    /// The lock file could not be made.
+    /// The lock file could not be opened or locked.
     #[error("locking agent {name} with {}: {source}", path.display())]
     Io {
         /// The agent.
@@ -214,16 +212,25 @@ pub enum LockError {
     },
 }
 
-/// The exclusive use of one agent's home for one run, released when dropped.
+/// The exclusive use of one agent's home for one run.
+///
+/// It is an advisory lock the operating system holds on the open lock file, so it ends with the
+/// process however that stops, killed included, and the file left behind locks nothing. The file
+/// is never removed: a run could otherwise lock a file another has just unlinked while a third
+/// locks its replacement.
 #[derive(Debug)]
-pub struct HomeLock(PathBuf);
+pub struct HomeLock {
+    /// Held open for the lock, which closing it releases.
+    _file: File,
+}
 
 impl HomeLock {
-    /// Locks agent `name`'s home with a lock file in `dir` that holds this process's id.
+    /// Locks agent `name`'s home through the lock file in `dir`, which then holds this process's
+    /// id for the operator.
     ///
     /// # Errors
     ///
-    /// When another run holds the lock or the file cannot be made.
+    /// When another run holds the lock or the file cannot be opened or locked.
     pub fn acquire(dir: &Path, name: &str) -> Result<Self, LockError> {
         let path = dir.join(format!("{name}.lock"));
         let failed = |source| LockError::Io {
@@ -232,16 +239,23 @@ impl HomeLock {
             source,
         };
         std::fs::create_dir_all(dir).map_err(failed)?;
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
         {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let holder = std::fs::read_to_string(&path)
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
+        }
+        let mut file = options.open(&path).map_err(failed)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                let holder = (&file)
+                    .take(MAX_RECORD_BYTES)
+                    .read_to_string(&mut text)
                     .ok()
-                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .and_then(|_| text.trim().parse::<u32>().ok())
                     .map_or_else(|| "holder unknown".to_owned(), |pid| format!("pid {pid}"));
                 return Err(LockError::Held {
                     name: name.to_owned(),
@@ -249,19 +263,11 @@ impl HomeLock {
                     holder,
                 });
             }
-            Err(error) => return Err(failed(error)),
-        };
-        let lock = Self(path.clone());
+            Err(TryLockError::Error(error)) => return Err(failed(error)),
+        }
+        file.set_len(0).map_err(failed)?;
         writeln!(file, "{}", std::process::id()).map_err(failed)?;
-        Ok(lock)
-    }
-}
-
-impl Drop for HomeLock {
-    fn drop(&mut self) {
-        // Drop cannot report a failure; a lock file left behind makes the next run refuse and
-        // name the file.
-        let _ = std::fs::remove_file(&self.0);
+        Ok(Self { _file: file })
     }
 }
 
@@ -461,10 +467,58 @@ mod tests {
         // Another agent's home is its own.
         let other = HomeLock::acquire(dir.path(), "swarm-01")?;
         drop(lock);
-        assert!(!path.exists());
+        // The file stays, unlocked, and the next run takes it.
+        assert!(path.exists());
         let again = HomeLock::acquire(dir.path(), "swarm-00")?;
         drop((again, other));
-        assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_lock_file_a_stopped_run_left_is_taken_over() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("swarm-00.lock");
+        // A longer id than this process's, so a stale tail would show.
+        std::fs::write(&path, "4294967295\n")?;
+        let lock = HomeLock::acquire(dir.path(), "swarm-00")?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            format!("{}\n", std::process::id())
+        );
+        drop(lock);
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_lock_with_an_unreadable_holder_is_still_held() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("swarm-00.lock");
+        std::fs::write(&path, "not a pid")?;
+        let holder = File::open(&path)?;
+        holder.try_lock()?;
+        let refused = HomeLock::acquire(dir.path(), "swarm-00").err();
+        assert!(
+            matches!(&refused, Some(LockError::Held { holder, .. }) if holder == "holder unknown"),
+            "{refused:?}"
+        );
+        // Refusing leaves the holder's file alone.
+        assert_eq!(std::fs::read_to_string(&path)?, "not a pid");
+        drop(holder);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_lock_file_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "kept")?;
+        std::os::unix::fs::symlink(&target, dir.path().join("swarm-00.lock"))?;
+        assert!(matches!(
+            HomeLock::acquire(dir.path(), "swarm-00"),
+            Err(LockError::Io { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&target)?, "kept");
         Ok(())
     }
 }

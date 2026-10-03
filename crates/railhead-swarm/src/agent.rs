@@ -845,10 +845,11 @@ impl Run<'_> {
             {
                 Ok(status) => status,
                 Err(error) => {
-                    failures += 1;
-                    if error.retry().is_none() || failures > bounds.retries {
+                    let Some(after) = error.retry().filter(|_| failures < bounds.retries) else {
                         return Err(self.fail(Step::Status, error.code()).await);
-                    }
+                    };
+                    failures += 1;
+                    self.pause(Step::Status, failures, after).await?;
                     continue;
                 }
             };

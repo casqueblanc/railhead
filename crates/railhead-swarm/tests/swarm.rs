@@ -199,6 +199,11 @@ struct State {
     limit_work_ms: Option<u64>,
     /// `work` requests received.
     works: u64,
+    /// The delay the next `status` after a `ready` asks for while it answers `rate_limited`
+    /// instead.
+    limit_status_ms: Option<u64>,
+    /// When each `status` request arrived, and whether it was refused.
+    statuses: Vec<(std::time::Instant, bool)>,
 }
 
 /// The fake backend.
@@ -549,6 +554,14 @@ impl Fake {
         let method = request.method.as_str();
         match (method, segments.as_slice()) {
             ("GET", ["status"]) => {
+                let limit = state.limit_status_ms.filter(|_| state.readies > 0);
+                state
+                    .statuses
+                    .push((std::time::Instant::now(), limit.is_some()));
+                if let Some(after) = limit {
+                    state.limit_status_ms = None;
+                    return Ok(failure(AgentErrorCode::RateLimited, Some(after)));
+                }
                 // The train also moves between pins, as a real one does.
                 if state.held_polls > 0 {
                     state.held_polls -= 1;
@@ -857,8 +870,9 @@ impl Run {
 fn run(command: &mut Command) -> anyhow::Result<Run> {
     let output = command.output()?;
     let stdout = String::from_utf8(output.stdout)?;
-    // Visible with `--nocapture`, so a run can be watched.
+    // Visible with `--nocapture`, so a run can be watched and a refusal read.
     println!("{stdout}");
+    println!("{}", String::from_utf8_lossy(&output.stderr));
     let events = stdout
         .lines()
         .map(serde_json::from_str)
@@ -1257,6 +1271,13 @@ async fn an_invalid_scenario_starts_nothing() -> anyhow::Result<()> {
 /// holds that pin. Returns the scenario and the pinned claim.
 #[cfg(unix)]
 fn interrupt_after_the_first_pin(world: &World) -> anyhow::Result<(PathBuf, String)> {
+    stop_after_the_first_pin(world, "INT")
+}
+
+/// Runs a two-round scenario until its first claim is pinned, then sends the driver `signal`
+/// while the train holds that pin. Returns the scenario and the pinned claim.
+#[cfg(unix)]
+fn stop_after_the_first_pin(world: &World, signal: &str) -> anyhow::Result<(PathBuf, String)> {
     let scenario = world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     world.state().paused = true;
     let mut child = world.driver(&scenario)?.spawn()?;
@@ -1276,14 +1297,19 @@ fn interrupt_after_the_first_pin(world: &World) -> anyhow::Result<(PathBuf, Stri
             break claim.to_owned();
         }
     };
-    let interrupted = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+    let stopped = Command::new("kill")
+        .args([&format!("-{signal}"), &child.id().to_string()])
         .status()?;
-    assert!(interrupted.success());
+    assert!(stopped.success());
     for line in lines {
         line?;
     }
-    assert_eq!(child.wait()?.code(), Some(130));
+    let status = child.wait()?;
+    if signal == "INT" {
+        assert_eq!(status.code(), Some(130));
+    } else {
+        assert_eq!(status.code(), None, "the driver outlived {signal}");
+    }
     let mut saved: Value =
         serde_json::from_str(&fs::read_to_string(world.progress_file("swarm-00"))?)?;
     let digest = saved
@@ -1511,6 +1537,9 @@ async fn a_second_run_on_the_same_homes_refuses_to_start() -> anyhow::Result<()>
     let lock = world.dir.path().join("homes/progress/swarm-00.lock");
     private_dir(&world.dir.path().join("homes/progress"))?;
     fs::write(&lock, "4242\n")?;
+    // This test plays the other run, holding the lock as it would.
+    let other = fs::File::open(&lock)?;
+    other.try_lock()?;
     let stderr = refused(&world, &mut world.driver(&scenario)?).await?;
     assert!(
         stderr.contains("another run is using agent swarm-00") && stderr.contains("pid 4242"),
@@ -1522,11 +1551,68 @@ async fn a_second_run_on_the_same_homes_refuses_to_start() -> anyhow::Result<()>
     assert!(world.state().claims.is_empty());
     assert!(world.work_is_empty()?);
 
-    // Once it is gone the run goes ahead, and releases the lock when it ends.
-    fs::remove_file(&lock)?;
+    // Once it is released the run goes ahead, and releases the lock when it ends.
+    drop(other);
     let run = run(&mut world.driver(&scenario)?)?;
     assert_eq!(run.code, Some(0));
-    assert!(!lock.exists());
+    fs::File::open(&lock)?.try_lock()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_killed_run_leaves_no_lock_and_resumes_when_run_again() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = stop_after_the_first_pin(&world, "KILL")?;
+    // A killed run cannot remove its clones; the operator's next run uses a new directory.
+    for entry in fs::read_dir(world.dir.path().join("work"))? {
+        fs::remove_dir_all(entry?.path())?;
+    }
+    // Its lock file is still there, but locks nothing.
+    assert!(
+        world
+            .dir
+            .path()
+            .join("homes/progress/swarm-00.lock")
+            .exists()
+    );
+    world.state().paused = false;
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_resumed(&world, &rerun, &pinned)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_c_during_startup_stops_the_run_cleanly() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let written = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    // The driver reads the scenario from a pipe, so startup waits for this test to write it.
+    let fifo = world.dir.path().join("scenario.fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status()?;
+    assert!(made.success());
+    let child = world.driver(&fifo)?.spawn()?;
+    // Opening the pipe returns once the driver opened it, after it began listening for Ctrl-C.
+    let mut pipe = fs::OpenOptions::new().write(true).open(&fifo)?;
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()?;
+    assert!(interrupted.success());
+    pipe.write_all(&fs::read(&written)?)?;
+    drop(pipe);
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    let last = String::from_utf8(output.stdout)?
+        .lines()
+        .last()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    assert_eq!(
+        last.as_ref().and_then(|summary| summary.get("stoppedBy")),
+        Some(&json!("interrupted"))
+    );
+    assert!(world.work_is_empty()?, "the run left clones behind");
+    fs::File::open(world.dir.path().join("homes/progress/swarm-00.lock"))?.try_lock()?;
     Ok(())
 }
 
@@ -1872,5 +1958,53 @@ async fn a_retry_delay_past_the_run_deadline_stops_the_agent_without_retrying() 
     assert_eq!(waited.code, Some(0), "{:?}", waited.of_type("failed"));
     assert_eq!(near.state().works, 2);
     assert!(started.elapsed() >= std::time::Duration::from_millis(1_500));
+    Ok(())
+}
+
+/// The time from the refused `status` to the next one, if both arrived.
+fn after_the_refused_status(world: &World) -> Option<std::time::Duration> {
+    let state = world.state();
+    let refused = state.statuses.iter().position(|&(_, refused)| refused)?;
+    let (at, _) = state.statuses.get(refused)?;
+    let (next, _) = state.statuses.get(refused + 1)?;
+    Some(next.duration_since(*at))
+}
+
+#[tokio::test]
+async fn a_retry_delay_on_a_status_poll_is_waited_out() -> anyhow::Result<()> {
+    // Polled every 50 ms, the backend asks for 1.5 s once the claim is ready.
+    let near = world(1, 1, false).await?;
+    near.state().limit_status_ms = Some(1_500);
+    let scenario = near.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let waited = run(&mut near.driver(&scenario)?)?;
+    assert_eq!(waited.code, Some(0), "{:?}", waited.of_type("failed"));
+    assert_eq!(waited.total("landings"), Some(1));
+    let gap = after_the_refused_status(&near);
+    assert!(
+        gap.is_some_and(|gap| gap >= std::time::Duration::from_millis(1_500)),
+        "{gap:?}"
+    );
+
+    // A delay past the run's deadline stops the agent without polling again.
+    let far = world(1, 1, false).await?;
+    far.state().limit_status_ms = Some(600_000);
+    let scenario = far.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let started = std::time::Instant::now();
+    let stopped = run(&mut far.driver(&scenario)?)?;
+    assert_eq!(stopped.code, Some(1));
+    assert_eq!(
+        stopped
+            .of_type("failed")
+            .first()
+            .map(|e| (e.get("step"), e.get("code"))),
+        Some((Some(&json!("status")), Some(&json!("retry_after_deadline"))))
+    );
+    let state = far.state();
+    assert_eq!(
+        state.statuses.last().map(|&(_, refused)| refused),
+        Some(true)
+    );
+    drop(state);
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
     Ok(())
 }
