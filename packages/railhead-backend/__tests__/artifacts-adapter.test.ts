@@ -495,6 +495,59 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("mints nothing for a request whose debt sweep a release overlapped", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
+      fake.pageTokens(2, "creation");
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      fake.pageTokens(null);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+
+      // The request's debt sweep is held while a release revokes the fork and finishes.
+      const paused = fake.pauseNext("listTokens");
+      const requesting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      paused.release();
+
+      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.createTokenCalls).toBe(0);
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(debtRows(storage)).toEqual([]);
+    });
+  });
+
+  it("refuses a request whose debt sweep a release started during, until the release ends", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
+      fake.pageTokens(2, "creation");
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      fake.pageTokens(null);
+      fake.advance(TOKEN_DEBT_RETRY_MS);
+
+      // The release is still listing when the request's debt sweep ends.
+      const requestPaused = fake.pauseNext("listTokens");
+      const requesting = port.token(repo, "write", 10 * MINUTE);
+      await requestPaused.reached;
+      const releasePaused = fake.pauseNext("listTokens");
+      const releasing = port.revokeTokens(repo);
+      await releasePaused.reached;
+      requestPaused.release();
+      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
+      releasePaused.release();
+      expect(await releasing).toEqual({ ok: true, value: undefined });
+
+      expect(fake.createTokenCalls).toBe(0);
+      expect(fake.liveTokens(repo)).toEqual([]);
+      // Once the release has ended, the claim's next holder receives a token.
+      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
+    });
+  });
+
   it("drops the debt once every token the fork may hold has expired", async () => {
     await withArtifacts(async ({ fake, storage, adapter }) => {
       const port = adapter();

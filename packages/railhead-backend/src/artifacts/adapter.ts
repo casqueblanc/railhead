@@ -285,11 +285,13 @@ class ArtifactsAdapter implements ArtifactsPort {
     ttlMs: number,
     key: string,
   ): Promise<PortResult<ArtifactsToken>> {
+    // Settled first: from the fence check below to `#beginMint`, nothing may be awaited, or a
+    // revocation could start and finish in the gap and the mint would outlive its sweep.
+    const owed = await this.#settleDebt(repo);
+    if (!owed.ok) return owed;
     if (this.#revoking.has(repo)) {
       return fail("busy", "The repository's tokens are being revoked; try again.");
     }
-    const owed = await this.#settleDebt(repo);
-    if (!owed.ok) return owed;
     const claimId = target.kind === "fork" ? target.claimId : null;
     const now = this.#context.clock();
     const cached = this.#cache.get(key);
@@ -507,13 +509,20 @@ class ArtifactsAdapter implements ArtifactsPort {
         repo,
       );
     });
+    let epoch = 0;
     const swept = await this.#fenced(repo, async () => {
+      epoch = this.#epoch(repo);
       using handle = await this.#open(repo);
       return await sweepTokens(handle, this.#limits);
     });
     if (swept === "partial") return owing;
     if (swept !== "clean") return swept;
     this.#clearDebt(repo);
+    // A release or takeover that revoked during this sweep may have finished already; the request
+    // that began before it gets no token.
+    if (this.#epoch(repo) !== epoch) {
+      return fail("busy", "The repository's tokens were revoked while its debt was settled.");
+    }
     return ok(undefined);
   }
 
