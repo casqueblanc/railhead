@@ -342,7 +342,7 @@ const enrollmentPort = (enrollment: PromiseLike<EnrollmentSession>): EnrollmentP
  * sent, and a result for anything but the requested decision, or none before the deadline, is a
  * failure. Never throws.
  */
-export const recordDecision = async (
+const recordDecision = async (
   owner: OwnerSession,
   authenticator: Authenticator,
   control: AttemptControl,

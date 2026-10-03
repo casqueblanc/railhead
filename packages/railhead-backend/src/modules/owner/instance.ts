@@ -19,7 +19,7 @@ import { verifyRegistration } from "./registration";
 export const MIN_BOOTSTRAP_TOKEN_LENGTH = 32;
 
 /** The most characters of a presented bootstrap token that are read. */
-export const MAX_BOOTSTRAP_TOKEN_LENGTH = 512;
+const MAX_BOOTSTRAP_TOKEN_LENGTH = 512;
 
 /** The most enrollment ceremonies that may be open at once. */
 export const MAX_OPEN_ENROLLMENTS = 4;
