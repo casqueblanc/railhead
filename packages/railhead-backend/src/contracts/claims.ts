@@ -68,7 +68,8 @@ export interface ClaimsPort {
   claim(agent: AgentPrincipal, issueId: IssueId): Promise<PortResult<ClaimResult>>;
   /**
    * Pins a commit at the agent's current generation. Refuses a stale generation, an unacknowledged
-   * affecting decision, an unknown commit or a different commit after ready.
+   * affecting decision, an unknown commit or a different commit after ready. If the train's alarm
+   * write fails after the pin commits, it fails with `unavailable` and the repeat asks again.
    */
   ready(
     agent: AgentPrincipal,

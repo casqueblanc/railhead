@@ -1090,6 +1090,12 @@ export function createTrain(
     }
   }
 
+  function armWake(): Promise<boolean> {
+    const wake = readWake(sql);
+    if (wake === null || isExhausted(wake)) return Promise.resolve(true);
+    return context.wake(wake.dueAt);
+  }
+
   function queue(
     _tx: EventTransaction,
     pin: ClaimPin,
@@ -1214,6 +1220,7 @@ export function createTrain(
     recordCheck,
     attemptOutcome,
     holdsLiveEntry,
+    armWake,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),

@@ -31,7 +31,7 @@ import {
 import { insertEntry, readWake, settleEntry } from "../src/modules/train/store";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
-import { EarliestAlarm } from "../src/repo/storage";
+import { EarliestAlarm, type AlarmStorage } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
 
 const REPO = "rep_handoff0001";
@@ -104,6 +104,8 @@ interface HandoffOptions {
   fake: FakeArtifacts;
   /** Whether wakes reach the object's storage alarm, as the Repo's do, rather than a list only. */
   realAlarm: boolean;
+  /** How many of the first storage alarm writes reject, as a storage fault would. */
+  failedAlarmWrites?: number;
 }
 
 /**
@@ -120,14 +122,25 @@ function withHandoff<T>(
     realAlarm: false,
   },
 ): Promise<T> {
-  const { stub, fake, realAlarm } = options;
+  const { stub, fake, realAlarm, failedAlarmWrites = 0 } = options;
   return runInDurableObject(stub, async (_instance, state) => {
     const mainRepo = await mainRepoName(REPO);
     if (!fake.repos.has(mainRepo)) fake.seed(mainRepo, [ROOT, MAIN]);
     const log = EventLog.open(state.storage, REPO, fake.clock);
     const wakes: number[] = [];
     // A failed alarm write fails `fireAlarm`, since `settle` throws for it.
-    const alarm = new EarliestAlarm(state.storage, () => {});
+    let failing = failedAlarmWrites;
+    const alarmStorage: AlarmStorage = {
+      getAlarm: (alarmOptions) => state.storage.getAlarm(alarmOptions),
+      setAlarm: async (at, alarmOptions) => {
+        if (failing > 0) {
+          failing -= 1;
+          throw new Error("alarm write failed");
+        }
+        return state.storage.setAlarm(at, alarmOptions);
+      },
+    };
+    const alarm = new EarliestAlarm(alarmStorage, () => {});
     if (realAlarm) await alarm.load();
     const context = {
       repoId: REPO,
@@ -135,9 +148,9 @@ function withHandoff<T>(
       log,
       clock: fake.clock,
       env,
-      wake: (at: number) => {
+      wake: async (at: number) => {
         wakes.push(at);
-        if (realAlarm) void alarm.request(at);
+        return realAlarm ? alarm.request(at) : true;
       },
     };
     const composed: ClaimPin[][] = [];
@@ -358,8 +371,10 @@ describe("ready hands its pin to the train", () => {
 
       expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
       expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
-      // The pin asks for the alarm, and nothing drives before the alarm does.
-      expect(setup.wakes.length).toBe(before + 1);
+      // The pin asks for the alarm, and ready confirms that wake once the pin commits. Nothing
+      // drives before the alarm does.
+      const due = readWake(setup.sql)?.dueAt;
+      expect(setup.wakes.slice(before)).toEqual([due, due]);
       expect(setup.composed).toEqual([]);
 
       await setup.train.resume();
@@ -426,6 +441,60 @@ describe("ready hands its pin to the train", () => {
     );
   });
 
+  it("refuses a ready whose alarm write failed, and a repeat arms the wake and drives the pin", async () => {
+    // The clock runs an hour ahead, so the runtime never fires a stored alarm on its own. The first
+    // two alarm writes reject: ready's own, and the repeat's.
+    const options: HandoffOptions = {
+      stub: env.REPO.getByName(crypto.randomUUID()),
+      fake: new FakeArtifacts(Date.now() + 60 * 60_000),
+      realAlarm: true,
+      failedAlarmWrites: 2,
+    };
+    await withHandoff(
+      async (setup) => {
+        const claim = await setup.open(WORK);
+        const request = { generation: 1, commit: WORK };
+
+        // The pin commits, but no alarm holds its drive, so ready does not report success.
+        expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+          ok: false,
+          code: "unavailable",
+        });
+        expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+        expect(readWake(setup.sql)).toMatchObject({ failures: 0 });
+        expect(await setup.storedAlarm()).toBeNull();
+        const head = setup.log.head();
+
+        // A repeat finds the entry live and asks for the wake again; that write fails too.
+        expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+          ok: false,
+          code: "unavailable",
+        });
+        expect(await setup.storedAlarm()).toBeNull();
+
+        const repaired = await setup.claims.ready(agent(1), claim.claimId, request);
+        expect(repaired).toMatchObject({ ok: true, value: { repeated: true } });
+        const due = readWake(setup.sql)?.dueAt;
+        expect(due).toBeDefined();
+        expect(await setup.storedAlarm()).toBe(due);
+        // The repeats recorded no second ready and queued no second entry.
+        expect(setup.log.head()).toBe(head);
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+        expect(setup.composed).toEqual([]);
+
+        await setup.fireAlarm();
+
+        const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+        expect(setup.composed).toEqual([[pin]]);
+        expect(setup.started).toHaveLength(1);
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      },
+      undefined,
+      options,
+    );
+  });
+
   it("queues nothing for a repeated ready of the same pin", async () => {
     await withHandoff(async (setup) => {
       const claim = await setup.open(WORK);
@@ -438,7 +507,8 @@ describe("ready hands its pin to the train", () => {
 
       expect(again).toMatchObject({ ok: true, value: { repeated: true } });
       expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
-      expect(setup.wakes.length).toBe(wakes);
+      // The repeat asks again only for the wake the train already owes.
+      expect(setup.wakes.slice(wakes)).toEqual([readWake(setup.sql)?.dueAt]);
       expect(setup.composed).toHaveLength(1);
     });
   });
@@ -943,8 +1013,9 @@ describe("a re-ready while the train's retries have run out", () => {
       expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
 
       // The re-ready restarts the exhausted wake and asks for the alarm; main is back.
-      expect(readWake(setup.sql)).toMatchObject({ failures: 0 });
-      expect(setup.wakes.length).toBe(asked + 1);
+      const restarted = readWake(setup.sql);
+      expect(restarted).toMatchObject({ failures: 0 });
+      expect(setup.wakes.slice(asked)).toEqual([restarted?.dueAt, restarted?.dueAt]);
       setup.mainUp = true;
       await setup.train.resume();
       expect(setup.composed).toEqual([[{ claimId: claim.claimId, generation: 1, commit: LATER }]]);

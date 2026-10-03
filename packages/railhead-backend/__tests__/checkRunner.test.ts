@@ -297,7 +297,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       log: EventLog.open(state.storage, repoId),
       clock: () => NOW,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const world = new World();
     const repository = new FakeRepository();
@@ -1342,7 +1342,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env: configured,
-        wake: () => {},
+        wake: async () => true,
       });
       const definitions = await ports.checks.definitions(MAIN);
       const first = await ports.checks.start(attemptFor(check.definition));
@@ -1374,7 +1374,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
-        wake: () => {},
+        wake: async () => true,
       });
       return ports.checks.start(await attempt());
     });
@@ -1446,7 +1446,10 @@ describe("a held check through the train", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => now,
         env: configured,
-        wake: (at) => wakes.push(at),
+        wake: async (at) => {
+          wakes.push(at);
+          return true;
+        },
       };
       const composed = composeRepo(context);
       const ports = (): RepoPorts => ({

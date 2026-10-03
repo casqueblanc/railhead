@@ -316,7 +316,10 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       log,
       clock: () => (now += 1),
       env,
-      wake: (at) => (forDiscard(at) ? discardWakes : wakes).push(at),
+      wake: async (at) => {
+        (forDiscard(at) ? discardWakes : wakes).push(at);
+        return true;
+      },
     };
     const ports = fakes.ports(composeRepo(context), state.storage.sql);
     const build = () =>
@@ -1885,7 +1888,7 @@ describe("train module", () => {
         log,
         clock: () => 0,
         env,
-        wake: () => {},
+        wake: async () => true,
       };
       // The real claims module would drop a pin for a claim it never opened, so its port is the
       // missing one here: the pin must wait for it rather than be dropped.
