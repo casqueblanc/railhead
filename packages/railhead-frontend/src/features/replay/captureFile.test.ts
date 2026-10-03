@@ -851,11 +851,11 @@ describe("parseCapture", () => {
 
   it("refuses an event from a newer schema before reading its shape", () => {
     const events: unknown[] = issues(3);
-    events[0] = { v: 2, seq: 1 };
+    events[0] = { v: 3, seq: 1 };
     expect(parsedError(fileOf({ events }))).toEqual({
       kind: "invalid_event",
       seq: 1,
-      message: "unsupported schema version 2",
+      message: "unsupported schema version 3",
     });
   });
 
@@ -939,6 +939,7 @@ describe("held check events", () => {
   const DIGEST = "d".repeat(64);
   const held: Extract<RailheadEvent, { type: "train.held" }> = {
     ...header(4),
+    v: 2,
     actor: TRAIN,
     type: "train.held",
     data: {
@@ -952,6 +953,7 @@ describe("held check events", () => {
   };
   const approved: Extract<RailheadEvent, { type: "check.approved" }> = {
     ...header(5),
+    v: 2,
     actor: SYNTH_OWNER,
     type: "check.approved",
     data: { checkRunId: "chk_synthheld", candidate: sha("b"), digest: DIGEST },

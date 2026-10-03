@@ -5,6 +5,7 @@ import {
   MAX_LIST_LENGTH,
   MAX_OPTIONS,
   MAX_TITLE_LENGTH,
+  eventVersion,
   isCommitSha,
   isId,
   validateEvent,
@@ -212,7 +213,7 @@ function event<T extends EventType>(
   // here. Each `VALID` entry is still checked against its own event type.
   const payload = { type, data } as EventPayload;
   return {
-    v: EVENT_SCHEMA_VERSION,
+    v: eventVersion(type),
     seq: 1,
     at: 1_790_000_000_000,
     repo: "rep_railhead",
@@ -240,8 +241,22 @@ describe("validateEvent", () => {
   });
 
   describe("envelope", () => {
-    it("rejects an unsupported schema version", () => {
-      expect(() => validateEvent({ ...event("issue.filed"), v: 2 })).toThrow(/schema version/);
+    it.each([0, EVENT_SCHEMA_VERSION + 1, 1.5])("rejects unsupported schema version %s", (v) => {
+      expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
+    });
+
+    it("writes the held check events at version 2 and every older type at version 1", () => {
+      const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
+      expect(later).toEqual(["train.held", "check.approved"]);
+      expect(EVENT_SCHEMA_VERSION).toBe(2);
+    });
+
+    it.each([
+      ["train.held", 1],
+      ["check.approved", 1],
+      ["issue.filed", 2],
+    ] as const)("rejects %s stamped at version %s", (type, v) => {
+      expect(() => validateEvent({ ...event(type), v })).toThrow(/is written at schema version/);
     });
 
     it.each([0, -1, 1.5, Number.NaN])("rejects seq %s", (seq) => {

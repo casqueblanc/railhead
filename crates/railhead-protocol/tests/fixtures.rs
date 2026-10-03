@@ -118,6 +118,49 @@ fn decodes_and_round_trips_one_event_of_every_type() -> TestResult {
     Ok(())
 }
 
+/// The event types a schema version 1 reader, such as `rh` and the board before held checks,
+/// decodes. It refuses any `v` other than 1 first, then any type outside this list as a shape error.
+const VERSION_1_TYPES: [&str; 22] = [
+    "agent.invited",
+    "agent.joined",
+    "agent.confirmed",
+    "agent.revoked",
+    "issue.filed",
+    "claim.opened",
+    "claim.pushed",
+    "claim.ready",
+    "claim.refused",
+    "claim.reopened",
+    "claim.expired",
+    "claim.reassigned",
+    "claim.adapted",
+    "question.asked",
+    "decision.recorded",
+    "inbox.queued",
+    "inbox.delivered",
+    "inbox.acked",
+    "train.check",
+    "train.conflict",
+    "train.intent",
+    "train.main",
+];
+
+#[test]
+fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestResult {
+    let fixture: Value = serde_json::from_str(EVENTS)?;
+    let mut newer = 0;
+    for value in list(&fixture, "valid")? {
+        let event = decode_event(&value.to_string())?;
+        let known = VERSION_1_TYPES.contains(&event.payload.type_name());
+        assert_eq!(event.v == 1, known, "{}", event.payload.type_name());
+        if !known {
+            newer += 1;
+        }
+    }
+    assert_eq!(newer, 2, "train.held and check.approved");
+    Ok(())
+}
+
 #[test]
 fn accepts_the_largest_safe_sequence_number() -> TestResult {
     let fixture: Value = serde_json::from_str(EVENTS)?;

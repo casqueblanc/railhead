@@ -18,7 +18,7 @@
 
 import { INVITE_TTL_MS } from "@railhead/shared/board-api";
 import {
-  EVENT_SCHEMA_VERSION,
+  isReadableVersion,
   validateEvent,
   type AgentId,
   type CheckResult,
@@ -442,7 +442,7 @@ class FoldDraft {
 /** `foldEvent`, writing through `draft`. */
 const foldInto = (state: BoardState, event: RailheadEvent, draft: FoldDraft): BoardState => {
   if (state.stream.kind === "halted") return state;
-  if (event.v !== EVENT_SCHEMA_VERSION) {
+  if (!isReadableVersion(event.v)) {
     return halt(state, { kind: "unsupported_version", seq: event.seq, version: event.v });
   }
   try {

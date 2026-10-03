@@ -1,12 +1,7 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import {
-  EVENT_SCHEMA_VERSION,
-  MAX_LIST_LENGTH,
-  type ClaimId,
-  type DecisionRef,
-} from "@railhead/shared/events";
+import { MAX_LIST_LENGTH, type ClaimId, type DecisionRef } from "@railhead/shared/events";
 import type { EpisodePin, ReadyPin } from "../src/contracts/claims";
 import type { ReadyGate } from "../src/contracts/inbox";
 import type { PortErrorCode, PortResult } from "../src/contracts/result";
@@ -205,7 +200,7 @@ describe("authorize", () => {
       // record's; generations, status and attempts stay in the durable record.
       expect(h.log.replay(0, 10).events).toEqual([
         {
-          v: EVENT_SCHEMA_VERSION,
+          v: 1,
           seq: 1,
           at: NOW,
           repo: REPO,

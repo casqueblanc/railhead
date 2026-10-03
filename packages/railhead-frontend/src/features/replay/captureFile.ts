@@ -37,8 +37,8 @@
 
 import type { BoardErrorCode } from "@railhead/shared/board-api";
 import {
-  EVENT_SCHEMA_VERSION,
   REOPEN_REASON_BEFORE_REASONS,
+  isReadableVersion,
   validateEvent,
   type Actor,
   type DecisionRef,
@@ -919,7 +919,7 @@ const readEvent = (
     const fields = record(value, path);
     const v = integer(fields, "v", path);
     const seq = integer(fields, "seq", path);
-    if (v !== EVENT_SCHEMA_VERSION) {
+    if (!isReadableVersion(v)) {
       return {
         ok: false,
         error: { kind: "invalid_event", seq, message: `unsupported schema version ${v}` },

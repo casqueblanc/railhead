@@ -27,8 +27,10 @@
 // render it as inert text. No event ever carries a token, key or other secret.
 //
 // Evolution: capnweb-validate refuses a union member it does not know, so adding an event type is
-// a breaking change for older readers. `v` names the schema version; a reader that meets a newer
-// version must stop and say so rather than guess.
+// a breaking change for older readers. `v` names the schema version an event needs: each type is
+// written at the version that introduced it (`eventVersion`), so a log keeps the events an older
+// reader can still read at the version it knows. A reader that meets a newer version must stop and
+// say so rather than guess; the board reloads into newer code when it does.
 
 // =======================================================================================
 // Identifiers
@@ -79,8 +81,49 @@ export type IdKind = keyof typeof ID_PREFIXES;
 // =======================================================================================
 // Limits
 
-/** The schema version this module reads and writes. */
-export const EVENT_SCHEMA_VERSION = 1;
+/** The newest schema version this module reads and writes. It reads every version from 1 to this. */
+export const EVENT_SCHEMA_VERSION = 2;
+
+/**
+ * The schema version each event type is written at: the version that introduced it. An older
+ * reader then refuses a newer type by its version rather than mistaking it for corruption.
+ */
+const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
+  "agent.invited": 1,
+  "agent.joined": 1,
+  "agent.confirmed": 1,
+  "agent.revoked": 1,
+  "issue.filed": 1,
+  "claim.opened": 1,
+  "claim.pushed": 1,
+  "claim.ready": 1,
+  "claim.refused": 1,
+  "claim.reopened": 1,
+  "claim.expired": 1,
+  "claim.reassigned": 1,
+  "claim.adapted": 1,
+  "question.asked": 1,
+  "decision.recorded": 1,
+  "inbox.queued": 1,
+  "inbox.delivered": 1,
+  "inbox.acked": 1,
+  "train.check": 1,
+  "train.conflict": 1,
+  "train.intent": 1,
+  "train.main": 1,
+  "train.held": 2,
+  "check.approved": 2,
+};
+
+/** The schema version an event of `type` is written at. */
+export function eventVersion(type: EventType): number {
+  return EVENT_VERSIONS[type];
+}
+
+/** True when this module reads events of schema version `v`. */
+export function isReadableVersion(v: number): boolean {
+  return Number.isInteger(v) && v >= 1 && v <= EVENT_SCHEMA_VERSION;
+}
 
 /** Maximum length of an issue title, in UTF-16 code units. */
 export const MAX_TITLE_LENGTH = 256;
@@ -358,7 +401,7 @@ export type EventType = EventPayload["type"];
 
 /** One entry in a repository's log. */
 export type RailheadEvent = {
-  /** The schema version, `EVENT_SCHEMA_VERSION` for events this module writes. */
+  /** The schema version, `eventVersion(type)` for events this module writes. */
   v: number;
   /** Position in the repository's log: 1 for the first event, then gapless and increasing. */
   seq: number;
@@ -432,8 +475,11 @@ export function isCommitSha(value: string): boolean {
  * boundary note at the top of this module.
  */
 export function validateEvent(event: RailheadEvent): void {
-  if (event.v !== EVENT_SCHEMA_VERSION) {
+  if (!isReadableVersion(event.v)) {
     throw new Error(`event schema version is not supported: ${event.v}`);
+  }
+  if (event.v !== eventVersion(event.type)) {
+    throw new Error(`${event.type} is written at schema version ${eventVersion(event.type)}`);
   }
   requirePositiveInteger(event.seq, "seq");
   requirePositiveInteger(event.at, "at");
