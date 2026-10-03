@@ -23,7 +23,8 @@
 // as `claim.pushed` only for the refs the upstream itself reported updated, once its response has
 // ended, and only if the claim is still working at the push's generation then. The
 // gateway reads a push's response to its end whether or not the client keeps reading it, so a client
-// that stops reading or goes away after its push was applied does not lose the record. A refused,
+// that stops reading or goes away after its push was applied does not lose the record; a client
+// that falls more than a bounded buffer behind loses its response instead. A refused,
 // failed, cut-off or unreadable push records nothing, nor does one that outlived its claim. A push
 // the upstream applied but that was left unrecorded, because its claim changed or the record failed,
 // is logged as `git_push_unrecorded` with its claim and generation, for reconciliation. So is a push
@@ -131,7 +132,7 @@ const FORWARDED_REQUEST_HEADERS = ["accept", "content-encoding", "content-type",
 const textEncoder = new TextEncoder();
 /**
  * How much of a push's response the gateway holds for a client that is not reading it, in bytes. A
- * receive-pack response is progress and a report capped at 64 KiB, so this holds a whole one.
+ * client further behind than this is dropped, while the gateway reads on to the report.
  */
 const PUSH_RESPONSE_BUFFER_BYTES = 1024 * 1024;
 /**
@@ -516,7 +517,7 @@ class GitGateway implements GitPort {
     );
     // A push's response is read to its end by the gateway, not by the client's reads, so its report
     // is recorded even when the client stops reading, and a response cut off by the deadline, the
-    // size bound or the upstream is seen too.
+    // size bound or the upstream is seen too. A client that falls a whole buffer behind is dropped.
     const passed = (
       push === null
         ? read
@@ -1096,11 +1097,12 @@ function inspected(
 }
 
 /**
- * Reads `source` to its end whatever its own reader does, holding at most `buffer` unread bytes for
- * it. Past that, it waits for the reader to catch up, so a reader that stalls is still bounded by
- * whatever bounds `source`. Once the reader cancels, the rest of `source` is read and dropped. If
- * `source` errors, `failed` is called once, whether the reader is still there, gone, or stalled
- * with the buffer full, and the reader sees the same error.
+ * Reads `source` to its end whatever its own reader does, holding at most `buffer` unread bytes,
+ * plus the chunk that overflows them, for that reader. A reader that falls further behind is
+ * dropped: its stream errors, its queue is released, and the rest of `source` is read and
+ * discarded, as it is once the reader cancels. Reading `source` never waits for the reader, so
+ * whatever `source` carries is seen whether the reader keeps up, stalls or goes away. If `source`
+ * errors, `failed` is called once, and a reader still there sees the same error.
  */
 function drained(
   source: ReadableStream<Uint8Array>,
@@ -1108,37 +1110,24 @@ function drained(
   failed: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
-  // Waiting for room alone would miss a `source` that errors meanwhile, such as at its deadline.
-  let ended = false;
-  const settled = reader.closed.then(() => {
-    ended = true;
-  });
-  settled.catch(() => undefined);
   let gone = false;
-  let wake: (() => void) | null = null;
-  const resume = (): void => {
-    wake?.();
-    wake = null;
-  };
   return new ReadableStream<Uint8Array>(
     {
       start(controller) {
-        // `cancel` sets `gone`, and `source` ending sets `ended`, while the pump waits.
-        const full = (): boolean => !gone && !ended && (controller.desiredSize ?? 0) <= 0;
         const pump = async (): Promise<void> => {
           for (;;) {
-            while (full()) {
-              const room = new Promise<void>((resolve) => {
-                wake = resolve;
-              });
-              await Promise.race([room, settled]);
-            }
             const { done, value } = await reader.read();
             if (done) {
               if (!gone) controller.close();
               return;
             }
-            if (!gone) controller.enqueue(value);
+            if (gone) continue;
+            if ((controller.desiredSize ?? 0) <= 0) {
+              gone = true;
+              controller.error(new Error("the client stopped reading the response"));
+              continue;
+            }
+            controller.enqueue(value);
           }
         };
         // `source` errors only when the exchange is cut off, which records nothing; the reader, if
@@ -1149,10 +1138,8 @@ function drained(
           if (!gone) controller.error(error);
         });
       },
-      pull: resume,
       cancel() {
         gone = true;
-        resume();
       },
     },
     new ByteLengthQueuingStrategy({ highWaterMark: buffer }),

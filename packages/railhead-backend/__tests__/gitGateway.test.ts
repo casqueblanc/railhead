@@ -1956,6 +1956,44 @@ describe("a client that stops reading a push's response", () => {
     });
   });
 
+  it("records a push whose report follows more progress than the client buffer holds, and drops the client", async () => {
+    await withGateway(async (world) => {
+      const sent = [...PROGRESS_FLOOD, PUSH_RESULT];
+      let pulled = 0;
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              const chunk = sent[pulled];
+              if (chunk === undefined) {
+                controller.close();
+                return;
+              }
+              pulled += 1;
+              controller.enqueue(chunk);
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      // The client neither reads nor cancels while the gateway reads past its buffer to the report.
+      await until(() => pushedEvents(world).length === 1);
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { claimId: CLAIM, generation: 3, ref: "refs/heads/feature", to: PUSHED } },
+      ]);
+      expect(pulled).toBe(sent.length);
+      expect(unknownOutcomes()).toBe(0);
+      // The client fell more than the buffer behind, so its response was dropped.
+      await expect(bytesOf(response)).rejects.toThrow();
+    });
+  });
+
   it("still has the push recorded when it goes away before the report arrives", async () => {
     await withGateway(async (world) => {
       let finish: (() => void) | undefined;
@@ -2017,7 +2055,7 @@ describe("a client that stops reading a push's response", () => {
     });
   });
 
-  it("ends the exchange at its deadline and logs the unknown outcome while the buffer is full", async () => {
+  it("ends the exchange at its deadline and logs the unknown outcome when the progress never ends", async () => {
     await withGateway(async (world) => {
       let upstreamCancelled = false;
       world.respond = () =>
