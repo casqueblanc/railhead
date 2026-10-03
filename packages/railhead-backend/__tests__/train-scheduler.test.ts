@@ -1667,6 +1667,53 @@ describe("train ready episodes", () => {
     }, fakes);
   });
 
+  it("retries a same-commit re-ready as fresh work after the earlier episode used its retries", async () => {
+    const fakes = new Fakes();
+    let timeouts = MAX_RETRIES;
+    // Main becomes unreachable once episode 1 has used its last retry, so the drive stops with the
+    // entry still queued instead of failing it once more.
+    let thenMainDown = true;
+    fakes.compose = (main, pins) => {
+      if (timeouts === 0) return ok({ kind: "clean", candidate: candidateOf(main, pins) });
+      timeouts -= 1;
+      if (timeouts === 0 && thenMainDown) fakes.head = () => fail("unavailable", "Main is down.");
+      return ok({ kind: "error", reason: "timeout" });
+    };
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      expect(await train.enqueue(pin(1), 1)).toEqual(ok({ queued: true }));
+      expect(fakes.composeCalls).toHaveLength(MAX_RETRIES);
+      expect(train.entries(1)[0]).toMatchObject({
+        state: "queued",
+        episode: 1,
+        retries: MAX_RETRIES,
+      });
+
+      // Episode 2 readies the same commit and starts with no retries counted.
+      expect(await train.enqueue(pin(1), 2)).toEqual(ok({ queued: false }));
+      expect(train.entries(1)[0]).toMatchObject({
+        state: "queued",
+        episode: 2,
+        retries: 0,
+        isolate: false,
+        reason: null,
+      });
+
+      // Its first merge times out: the entry is retried, not dropped, and the retry is checked.
+      timeouts = 1;
+      thenMainDown = false;
+      fakes.head = () => ok(fakes.main);
+      await train.drive();
+      expect(fakes.composeCalls).toHaveLength(MAX_RETRIES + 2);
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched", episode: 2, retries: 1 });
+      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      expect(train.entries(1)[0]).toMatchObject({ state: "landed", reason: null });
+      expect(fakes.main).toBe(candidateOf(MAIN, [pin(1)]));
+    }, fakes);
+  });
+
   it("schedules the held commit when the batch fails and drops the old one", async () => {
     const fakes = new Fakes();
     await withTrain(async ({ train }) => {

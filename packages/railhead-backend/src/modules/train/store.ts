@@ -12,7 +12,8 @@
 //
 // A queue entry is keyed by claim and generation, and each call to queue a pin is a new ready episode
 // of that claim: a claim reopened after a superseded decision keeps its generation, so its next pin
-// reuses the entry. A waiting entry takes the new commit, a settled one is queued again, and a
+// reuses the entry. A waiting entry takes the new commit, a settled one is queued again, both as
+// fresh work with retries, isolation and drop reason cleared even when the commit is unchanged, and a
 // batched one keeps its commit for the active batch and holds the new one in `next_commit` until
 // that batch settles. `episode` records the claim's episode of the pin the entry holds, and
 // `next_episode` that of `next_commit`; a drive that read an entry settles it only while its
@@ -344,8 +345,9 @@ export function insertEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now
 
 /**
  * Queues ready episode `episode` of a claim whose entry is waiting or settled: the entry takes the
- * commit and episode with fresh counters. A waiting entry keeps its place; a settled one goes to the
- * back.
+ * commit and episode as fresh work, with its retries, isolation, drop reason and held commit
+ * cleared, even when the commit is the one it already held. A waiting entry keeps its place; a
+ * settled one goes to the back.
  */
 export function requeueEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
@@ -360,22 +362,6 @@ export function requeueEntry(sql: SqlStorage, pin: ClaimPin, episode: number, no
     now,
     pin.claimId,
     pin.generation,
-  );
-}
-
-/**
- * Records that the waiting entry of `pin`, which already holds its commit, was queued again for
- * ready episode `episode`.
- */
-export function renewEpisode(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
-  sql.exec(
-    `UPDATE train_queue SET episode = ?, updated_at = ?
-     WHERE claim_id = ? AND generation = ? AND state = 'queued' AND commit_sha = ?`,
-    episode,
-    now,
-    pin.claimId,
-    pin.generation,
-    pin.commit,
   );
 }
 

@@ -111,7 +111,6 @@ import {
   recordCandidate,
   recordCheckResult,
   recordIntent,
-  renewEpisode,
   requeueEntry,
   requeueFront,
   requestCheck,
@@ -964,13 +963,11 @@ export function createTrain(
           queued = false;
           break;
         case "queued":
-          if (existing.pin.commit === pin.commit) {
-            // Still waiting with this commit, but a drive reading it judged the earlier episode.
-            renewEpisode(sql, pin, episode, now);
-            queued = false;
-          } else {
-            requeueEntry(sql, pin, episode, now);
-          }
+          // A new episode is fresh work, even with the commit the entry already holds: retries
+          // counted for the earlier episode must not drop this one. A drive reading the entry
+          // judged the earlier episode, so it leaves the entry queued.
+          requeueEntry(sql, pin, episode, now);
+          queued = existing.pin.commit !== pin.commit;
           break;
         case "landed":
           // Main already holds this commit, merged under the decision versions of an earlier
