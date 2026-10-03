@@ -415,11 +415,11 @@ describe("authorization across a change", () => {
     });
   });
 
-  it("keeps rework of merged work pending when no one holds the claim, sending nothing", async () => {
+  it("keeps rework of landed work pending when no one holds the claim, sending nothing", async () => {
     await withDecisions(async (h) => {
       const decisionId = await answered(h);
       h.relied([{ decisionId, version: 1 }]);
-      // The work merged: the claim has no holder.
+      // The work landed and the claim then expired: it has no holder.
       h.generation(null);
       expect(await h.record(decisionId, "reject", 1)).toEqual(ok({ decisionId, version: 2 }));
 

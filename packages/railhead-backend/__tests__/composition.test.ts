@@ -8,6 +8,7 @@ import {
   type AgentView,
   type ClaimResult,
   type ClaimView,
+  type ClosedClaimView,
   type InboxDigest,
 } from "@railhead/shared/agent-api";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
@@ -298,6 +299,7 @@ async function withFakePorts<R>(
     authenticate?: PortResult<AgentPrincipal>;
     view?: PortResult<AgentView>;
     activeClaim?: PortResult<ClaimView | null>;
+    lastClosed?: PortResult<ClosedClaimView | null>;
     work?: PortResult<ClaimResult>;
     digest?: PortResult<InboxDigest>;
   },
@@ -335,6 +337,10 @@ async function withFakePorts<R>(
         activeClaim: async () => {
           calls.push("activeClaim");
           return overrides.activeClaim ?? ok(null);
+        },
+        lastClosed: async () => {
+          calls.push("lastClosed");
+          return overrides.lastClosed ?? ok(null);
         },
         work: async () => {
           calls.push("work");
@@ -509,11 +515,12 @@ describe("agent dispatch", () => {
 
       expect(reply).toEqual({
         ok: true,
-        data: { agent: VIEW, claim: claim.claim },
+        data: { agent: VIEW, claim: claim.claim, closed: null },
         inbox: { items: [], pending: 0 },
         next: null,
       });
-      expect(calls).toEqual(["authenticate", "view", "activeClaim", "digest"]);
+      // The closed claim is read after the active one, whose read may expire it.
+      expect(calls).toEqual(["authenticate", "view", "activeClaim", "lastClosed", "digest"]);
     });
   });
 
@@ -526,10 +533,28 @@ describe("agent dispatch", () => {
         ),
       ).toEqual({
         ok: true,
-        data: { agent: VIEW, claim: null },
+        data: { agent: VIEW, claim: null, closed: null },
         inbox: { items: [], pending: 0 },
         next: null,
       });
+    });
+  });
+
+  it("answers status with the agent's last closed claim and why it closed", async () => {
+    const closed: ClosedClaimView = {
+      claimId: claim.claim.claimId,
+      issueId: claim.claim.issueId,
+      generation: 1,
+      reason: { kind: "merged", commit: "c".repeat(40) },
+      closedAt: 5,
+    };
+    await withFakePorts({ lastClosed: ok(closed) }, async (ports) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
+        ),
+      ).toMatchObject({ ok: true, data: { agent: VIEW, claim: null, closed } });
     });
   });
 
@@ -544,6 +569,14 @@ describe("agent dispatch", () => {
       expect(calls).toEqual(["authenticate", "view"]);
     });
     await withFakePorts({ activeClaim: fail("unavailable", "Claims are down.") }, async (ports) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
+        ),
+      ).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    });
+    await withFakePorts({ lastClosed: fail("unavailable", "Claims are down.") }, async (ports) => {
       expect(
         await dispatchAgent(
           { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },

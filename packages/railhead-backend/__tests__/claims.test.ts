@@ -354,19 +354,24 @@ describe("currentGeneration", () => {
     });
   });
 
-  it("reads as unknown once a claim is no longer held", async () => {
+  it("reads as unknown once a claim expires, and keeps a merged claim's for its decisions", async () => {
     await withClaims(async ({ port, sql }) => {
       await fileIssues(port, 1);
       const held = claimed(await port.work(agent(1)));
-      for (const state of ["merged", "expired"]) {
+      const set = (state: string) =>
         sql.exec(
           "UPDATE claims_claims SET state = ? WHERE claim_id = ?",
           state,
           held.claim.claimId,
         );
-        expect(port.currentGeneration(held.claim.claimId)).toBeNull();
-      }
-      sql.exec("UPDATE claims_claims SET state = 'ready' WHERE claim_id = ?", held.claim.claimId);
+      set("expired");
+      expect(port.currentGeneration(held.claim.claimId)).toBeNull();
+      set("merged");
+      expect(port.currentGeneration(held.claim.claimId)).toBe(1);
+      // A merged claim has no pin for the train and takes no push.
+      expect(port.readyPin(held.claim.claimId)).toBeNull();
+      expect(port.workingGeneration(held.claim.claimId)).toBeNull();
+      set("ready");
       expect(port.currentGeneration(held.claim.claimId)).toBe(1);
     });
   });

@@ -2,8 +2,15 @@
 // generation the agent last saw; the port compares them with current state inside the Repo
 // transaction, so a stale owner is refused at the time of use.
 
-import type { ClaimResult, ClaimView, ReadyRequest, ReadyResult } from "@railhead/shared/agent-api";
+import type {
+  ClaimResult,
+  ClaimView,
+  ClosedClaimView,
+  ReadyRequest,
+  ReadyResult,
+} from "@railhead/shared/agent-api";
 import type { ClaimId, CommitSha, DecisionRef, IssueId } from "@railhead/shared/events";
+import type { EventTransaction } from "../repo/eventLog";
 import type { ArtifactsRepoName } from "./artifacts";
 import type { AgentPrincipal, GrantFor } from "./principals";
 import type { PortResult } from "./result";
@@ -26,6 +33,14 @@ export interface ReadyPin {
   episode: number;
   /** The decision versions the pin was recorded under. */
   decisions: DecisionRef[];
+}
+
+/** A pin the train landed, with the ready episode its batch was checked for. */
+export interface LandedPin {
+  /** The landed pin. */
+  pin: ClaimPin;
+  /** The claim's ready episode the train holds for the pin. */
+  episode: number;
 }
 
 /** What a Git request asks to do. */
@@ -62,6 +77,8 @@ export interface GitGrant {
 export interface ClaimsPort {
   /** The agent's active claim, or `null`. */
   activeClaim(agent: AgentPrincipal): Promise<PortResult<ClaimView | null>>;
+  /** The agent's most recently closed claim and why it closed, or `null` when none has. */
+  lastClosed(agent: AgentPrincipal): Promise<PortResult<ClosedClaimView | null>>;
   /** Claims the next ready issue, or returns the agent's active claim. */
   work(agent: AgentPrincipal): Promise<PortResult<ClaimResult>>;
   /** Claims a named issue, or returns the agent's active claim on it. */
@@ -84,8 +101,10 @@ export interface ClaimsPort {
   pin(claimId: ClaimId): Promise<PortResult<ClaimPin>>;
   /**
    * The claim's current ownership generation, or `null` when it is unknown, such as for an unknown
-   * or released claim or a missing module. Call it only inside the caller's transaction; a pin is
-   * current only if its generation equals this one, and `null` is a refusal.
+   * or expired claim, a lapsed lease or a missing module. A merged claim keeps its generation, so a
+   * later decision version still reaches its holder; it has no pin, so `readyPin` refuses it. Call it
+   * only inside the caller's transaction; a pin is current only if its generation equals this one,
+   * and `null` is a refusal.
    */
   currentGeneration(claimId: ClaimId): number | null;
   /**
@@ -109,6 +128,25 @@ export interface ClaimsPort {
    * mergeable only while they are equal.
    */
   readyPin(claimId: ClaimId): ReadyPin | null;
+  /**
+   * Merges the claim of each landed pin that is still ready with that pin in that episode, and
+   * records `main`, the commit the landing published, as each holder's closed claim. A pin whose
+   * claim was reopened, re-pinned or taken over is left as it is. A merged claim no longer counts
+   * as its holder's, so the holder may reopen a merged claim waiting for rework, as
+   * `reopenMerged` does. Writes inside `tx`, the transaction that settles the landing, after
+   * anything that reads the claims as held. Throws when the module is missing, so the landing rolls
+   * back rather than leaving its claims ready.
+   */
+  merged(tx: EventTransaction, landed: readonly LandedPin[], main: CommitSha): void;
+  /**
+   * Called inside `tx`, the transaction that queued a decision item to the holder of the claim.
+   * When a newer decision version superseded the pin of a merged claim, the claim reopens to working
+   * and `claim.reopened` is appended, provided its holder holds no other active claim; otherwise it
+   * waits, and reopens in the transaction that closes that claim. Any other claim is left as it is.
+   * A missing module does nothing: with no claims module, no claim has a current generation, so no
+   * item is queued to one.
+   */
+  reopenMerged(tx: EventTransaction, claimId: ClaimId): void;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */

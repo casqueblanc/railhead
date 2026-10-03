@@ -32,9 +32,21 @@
 // barrier whose sweep outlived `expires_at` is presumed lost; it keeps refusing grants until a new
 // sweep replaces it and records its outcome. Each barrier keeps its attempt's mint cutoff and start,
 // which bound what that sweep may revoke: never a token minted after the attempt began.
+//
+// A merged claim's pin landed on main. It takes no push and does not count against its agent, but
+// keeps its generation and pin, so a decision version recorded after the landing can still reach
+// its holder and reopen it. A merge can find a pin readied again with the same commit still owing its
+// revocation, so a merged claim's revocation is swept and settled like an expired or ready claim's.
+// `rework_waiting` marks a merged claim whose pin a newer decision superseded while its holder held
+// another active claim; it reopens, oldest first, once that claim closes.
+//
+// `claims_closed` keeps, per agent, the claim that most recently stopped being that agent's and why:
+// merged, expired, or taken over by a successor. It is written in the transaction that closes the
+// claim, and one row per agent bounds it.
 
-import type { ClaimState } from "@railhead/shared/agent-api";
+import type { ClaimState, ClosedClaimView } from "@railhead/shared/agent-api";
 import {
+  isCommitSha,
   isId,
   type AgentId,
   type ClaimId,
@@ -90,6 +102,19 @@ const MIGRATIONS: readonly string[] = [
   "CREATE INDEX claims_barriers_by_expiry ON claims_revocation_barriers (expires_at)",
   "ALTER TABLE claims_revocation_barriers ADD COLUMN mint_cutoff INTEGER",
   "ALTER TABLE claims_revocation_barriers ADD COLUMN started_at INTEGER",
+  `CREATE TABLE claims_closed (
+    agent_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL REFERENCES claims_claims (claim_id),
+    issue_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    reason TEXT NOT NULL CHECK (reason IN ('merged', 'expired', 'taken_over')),
+    commit_sha TEXT,
+    closed_at INTEGER NOT NULL,
+    CHECK ((reason = 'merged') = (commit_sha IS NOT NULL))
+  ) STRICT`,
+  "ALTER TABLE claims_claims ADD COLUMN rework_waiting INTEGER",
+  `CREATE INDEX claims_rework_waiting ON claims_claims (agent_id, rework_waiting)
+    WHERE state = 'merged' AND rework_waiting IS NOT NULL`,
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -329,7 +354,7 @@ export function beginRevocation(
     .exec<{ revoke_attempt: number }>(
       `UPDATE claims_claims SET revoke_attempt = revoke_attempt + 1
        WHERE claim_id = ? AND generation = ? AND state = ? AND revoke_due = ?
-         AND state IN ('expired', 'ready')
+         AND state IN ('expired', 'ready', 'merged')
        RETURNING revoke_attempt`,
       expected.claimId,
       expected.generation,
@@ -436,9 +461,9 @@ export type RevocationOutcome =
 /**
  * Records the outcome of the sweep `attempt` of a claim at `generation`, and lowers the barrier
  * that attempt raised: the sweep has ended, so it can no longer revoke a token minted after this.
- * A settled sweep clears `revoke_due` of an expired or ready claim only when it is the latest
- * attempt and nothing newer is owed. An owed one always keeps the revocation of an expired or ready
- * claim due, even after another sweep cleared it, so a late partial listing is never lost.
+ * A settled sweep clears `revoke_due` of an expired, ready or merged claim only when it is the latest
+ * attempt and nothing newer is owed. An owed one always keeps the revocation of an expired, ready or
+ * merged claim due, even after another sweep cleared it, so a late partial listing is never lost.
  */
 export function recordRevocation(
   sql: SqlStorage,
@@ -456,7 +481,7 @@ export function recordRevocation(
     case "settled":
       sql.exec(
         `UPDATE claims_claims SET revoke_due = NULL
-         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready', 'merged')
            AND revoke_attempt = ?`,
         claimId,
         generation,
@@ -466,7 +491,7 @@ export function recordRevocation(
     case "owed":
       sql.exec(
         `UPDATE claims_claims SET revoke_due = ?
-         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')`,
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready', 'merged')`,
         outcome.retryAt,
         claimId,
         generation,
@@ -653,30 +678,63 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
- * and the revocation the pin owed, since its holder may push again, raises its episode and forgets
- * its last refusal. A sweep the pin started keeps its barrier, so the holder pushes only once that
- * sweep has ended.
- * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
+ * Returns a claim that is `from`, ready or merged, at `generation` to working with a lease until
+ * `leaseUntil`, clears its pin and the revocation the pin owed, since its holder may push again,
+ * raises its episode, forgets its last refusal and any rework it waited with. A sweep the pin
+ * started keeps its barrier, so the holder pushes only once that sweep has ended.
+ * Returns `false`, and writes nothing, when the claim is no longer `from` at that generation.
  */
-export function reopenReady(
+export function reopenClaim(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
+  from: "ready" | "merged",
   leaseUntil: number,
 ): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL
-       WHERE claim_id = ? AND generation = ? AND state = 'ready'
+         episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL,
+         rework_waiting = NULL
+       WHERE claim_id = ? AND generation = ? AND state = ?
        RETURNING claim_id`,
       leaseUntil,
       claimId,
       generation,
+      from,
     )
     .toArray();
   return updated.length === 1;
+}
+
+/**
+ * Marks a merged claim at `generation` as waiting at `now` to reopen for rework, keeping an earlier
+ * mark, so the oldest waits first. Writes nothing for a claim no longer merged at that generation.
+ */
+export function markReworkWaiting(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  now: number,
+): void {
+  sql.exec(
+    `UPDATE claims_claims SET rework_waiting = COALESCE(rework_waiting, ?)
+     WHERE claim_id = ? AND generation = ? AND state = 'merged'`,
+    now,
+    claimId,
+    generation,
+  );
+}
+
+/** The agent's merged claim that has waited longest to reopen for rework, or `null`. */
+export function waitingRework(sql: SqlStorage, agentId: AgentId): ClaimRow | null {
+  return first(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.agent_id = ? AND c.state = 'merged' AND c.rework_waiting IS NOT NULL
+       ORDER BY c.rework_waiting, c.claim_id LIMIT 1`,
+      agentId,
+    ),
+  );
 }
 
 /**
@@ -695,6 +753,105 @@ export function noteRefusal(sql: SqlStorage, claimId: ClaimId, refusal: string):
     )
     .toArray();
   return updated.length === 1;
+}
+
+/**
+ * Merges a ready claim at `generation` and `episode` whose pin is `commit`, keeping its pin, its
+ * decision versions and any revocation still owed. Returns the merged claim, or `null`, having
+ * written nothing, when the claim is no longer ready with that pin in that episode.
+ */
+export function mergeClaim(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  episode: number,
+  commit: CommitSha,
+): ClaimRow | null {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'merged', last_refusal = NULL
+       WHERE claim_id = ? AND generation = ? AND episode = ? AND state = 'ready'
+         AND ready_commit = ?
+       RETURNING claim_id`,
+      claimId,
+      generation,
+      episode,
+      commit,
+    )
+    .toArray();
+  return updated.length === 1 ? claimById(sql, claimId) : null;
+}
+
+/** Why a claim closed, as `claims_closed` stores it. */
+export type ClosedReason = ClosedClaimView["reason"];
+
+/**
+ * Records `claim`, at the generation `agentId` held it, as that agent's most recently closed claim,
+ * replacing the one recorded before.
+ */
+export function recordClosed(
+  sql: SqlStorage,
+  agentId: AgentId,
+  claim: Pick<ClaimRow, "claimId" | "issueId" | "generation">,
+  reason: ClosedReason,
+  now: number,
+): void {
+  sql.exec(
+    `INSERT INTO claims_closed (agent_id, claim_id, issue_id, generation, reason, commit_sha, closed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (agent_id) DO UPDATE SET claim_id = excluded.claim_id,
+       issue_id = excluded.issue_id, generation = excluded.generation, reason = excluded.reason,
+       commit_sha = excluded.commit_sha, closed_at = excluded.closed_at`,
+    agentId,
+    claim.claimId,
+    claim.issueId,
+    claim.generation,
+    reason.kind,
+    reason.kind === "merged" ? reason.commit : null,
+    now,
+  );
+}
+
+/** The agent's most recently closed claim, or `null`. */
+export function closedOf(sql: SqlStorage, agentId: AgentId): ClosedClaimView | null {
+  const [row] = sql
+    .exec<{
+      claim_id: string;
+      issue_id: string;
+      generation: number;
+      reason: string;
+      commit_sha: string | null;
+      closed_at: number;
+    }>(
+      `SELECT claim_id, issue_id, generation, reason, commit_sha, closed_at
+       FROM claims_closed WHERE agent_id = ?`,
+      agentId,
+    )
+    .toArray();
+  if (row === undefined) return null;
+  return {
+    claimId: row.claim_id,
+    issueId: row.issue_id,
+    generation: row.generation,
+    reason: closedReason(row.reason, row.commit_sha),
+    closedAt: row.closed_at,
+  };
+}
+
+function closedReason(reason: string, commit: string | null): ClosedReason {
+  switch (reason) {
+    case "merged":
+      if (commit === null || !isCommitSha(commit)) {
+        throw new Error("claims_closed holds a merge without a commit");
+      }
+      return { kind: "merged", commit };
+    case "expired":
+      return { kind: "expired" };
+    case "taken_over":
+      return { kind: "taken_over" };
+    default:
+      throw new Error("claims_closed holds an unknown reason");
+  }
 }
 
 /** The issue filed with `grantId`, or `null`. */

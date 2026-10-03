@@ -1328,7 +1328,7 @@ impl Respond for Status {
         json_response(
             200,
             &json!({"ok": true, "data": {"agent": {"agentId": AGENT, "name": "atlas",
-                "ownerId": "usr_lemarier", "state": "confirmed"}, "claim": null},
+                "ownerId": "usr_lemarier", "state": "confirmed"}, "claim": null, "closed": null},
                 "inbox": null, "next": null}),
         )
     }

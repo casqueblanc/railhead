@@ -2,9 +2,9 @@
 
 use railhead_protocol::Error;
 use railhead_protocol::{
-    Actor, AgentErrorCode, AgentResponse, AskRequest, EventPayload, InboxResult, JoinRequest,
-    MAX_SAFE_INTEGER, PinBatchState, PinResult, PinTrainState, QuestionOption, ReadyRequest,
-    SafeInteger, StatusResult, decode_event, decode_response,
+    Actor, AgentErrorCode, AgentResponse, AskRequest, ClosedReason, EventPayload, InboxResult,
+    JoinRequest, MAX_SAFE_INTEGER, PinBatchState, PinResult, PinTrainState, QuestionOption,
+    ReadyRequest, SafeInteger, StatusResult, decode_event, decode_response,
 };
 use serde_json::{Value, json};
 
@@ -407,6 +407,7 @@ fn status_response() -> Value {
         "data": {
             "agent": {"agentId": "agt_atlas01", "name": "atlas", "ownerId": "usr_lemarier", "state": "confirmed"},
             "claim": null,
+            "closed": null,
         },
         "inbox": {"items": [], "pending": 0},
         "next": null,
@@ -430,7 +431,7 @@ fn decodes_a_success_and_writes_it_back() -> TestResult {
 
 #[test]
 fn refuses_a_response_without_a_boolean_ok_or_with_omitted_nulls() -> TestResult {
-    for pointer in ["/ok", "/inbox", "/next", "/data/claim"] {
+    for pointer in ["/ok", "/inbox", "/next", "/data/claim", "/data/closed"] {
         let mut body = status_response();
         let (parent, key) = pointer.rsplit_once('/').ok_or("no slash")?;
         let parent = if parent.is_empty() {
@@ -450,6 +451,67 @@ fn refuses_a_response_without_a_boolean_ok_or_with_omitted_nulls() -> TestResult
     let mut body = status_response();
     set(&mut body, "/ok", json!("true"))?;
     assert!(serde_json::from_value::<AgentResponse<StatusResult>>(body).is_err());
+    Ok(())
+}
+
+fn closed_status(reason: &Value) -> Value {
+    let mut body = status_response();
+    if let Some(data) = body.pointer_mut("/data") {
+        data["closed"] = json!({
+            "claimId": "clm_42abcd", "issueId": "iss_upload1", "generation": 2,
+            "reason": reason, "closedAt": 1_790_000_000_000_u64,
+        });
+    }
+    body
+}
+
+fn closed_reason(body: Value) -> Result<Option<ClosedReason>, serde_json::Error> {
+    let response: AgentResponse<StatusResult> = serde_json::from_value(body)?;
+    Ok(match response {
+        AgentResponse::Success(success) => success.data.closed.map(|closed| closed.reason),
+        AgentResponse::Failure(_) => None,
+    })
+}
+
+#[test]
+fn decodes_each_closed_reason_and_refuses_unknown_or_incomplete_ones() -> TestResult {
+    let commit = "c".repeat(40);
+    assert_eq!(
+        closed_reason(closed_status(&json!({"kind": "merged", "commit": commit})))?,
+        Some(ClosedReason::Merged { commit })
+    );
+    assert_eq!(
+        closed_reason(closed_status(&json!({"kind": "expired"})))?,
+        Some(ClosedReason::Expired)
+    );
+    assert_eq!(
+        closed_reason(closed_status(&json!({"kind": "taken_over"})))?,
+        Some(ClosedReason::TakenOver)
+    );
+    // A reason written back keeps its tag and fields.
+    let body = closed_status(&json!({"kind": "taken_over"}));
+    let response: AgentResponse<StatusResult> = serde_json::from_value(body.clone())?;
+    assert_eq!(serde_json::to_value(&response)?, body);
+    for reason in [
+        json!({"kind": "released"}),
+        json!({"kind": "takenOver"}),
+        json!({"kind": "merged"}),
+        json!({"kind": "merged", "commit": null}),
+        json!({}),
+        json!("expired"),
+    ] {
+        assert!(
+            closed_reason(closed_status(&reason)).is_err(),
+            "accepted {reason}"
+        );
+    }
+    let mut body = closed_status(&json!({"kind": "expired"}));
+    set(
+        &mut body,
+        "/data/closed/generation",
+        json!(MAX_SAFE_INTEGER + 1),
+    )?;
+    assert!(closed_reason(body).is_err());
     Ok(())
 }
 

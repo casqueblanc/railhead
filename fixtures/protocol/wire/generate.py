@@ -223,6 +223,9 @@ def claim_view(state: str = "working", ready: str | None = None, generation: int
     }
 
 
+def closed_view(reason: dict, claim: str = "clm_42abcd") -> dict:
+    return {"claimId": claim, "issueId": "iss_upload1", "generation": 1, "reason": reason, "closedAt": NOW - 60_000}
+
 
 def pin_view(state: dict, next_commit: str | None = None) -> dict:
     return {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_HEAD, "nextCommit": next_commit, "state": state}
@@ -396,12 +399,27 @@ def agent_fixtures() -> dict:
                 exchange(
                     "shows the agent, its claim and its inbox first",
                     request(None, True),
-                    success({"agent": AGENT_VIEW, "claim": claim_view()}, DIGEST, "sync"),
+                    success({"agent": AGENT_VIEW, "claim": claim_view(), "closed": None}, DIGEST, "sync"),
                 ),
                 exchange(
                     "an agent without a claim",
                     request(None, True),
-                    success({"agent": AGENT_VIEW, "claim": None}, EMPTY_DIGEST, "work"),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": None}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim merged with the landed main commit",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "merged", "commit": SHA_OTHER})}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim expired",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "expired"})}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim was taken over, and it holds a new one",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": claim_view(), "closed": closed_view({"kind": "taken_over"}, "clm_41abcd")}, EMPTY_DIGEST, None),
                 ),
                 exchange(
                     "refuses a revoked agent at its next call",
