@@ -14,14 +14,20 @@ import type { ClaimPin, ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
-import { ok } from "../src/contracts/result";
+import { fail, ok } from "../src/contracts/result";
 import type { CheckAttempt, TrainPort } from "../src/contracts/train";
 import { unavailableTrain } from "../src/contracts/unavailable";
 import { createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
-import { createTrain, MAX_QUEUE, type Train } from "../src/modules/train/scheduler";
-import { insertEntry } from "../src/modules/train/store";
+import {
+  createTrain,
+  EXHAUSTED_FAILURES,
+  MAX_QUEUE,
+  MAX_WAKE_FAILURES,
+  type Train,
+} from "../src/modules/train/scheduler";
+import { insertEntry, readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { createAuthorization } from "../src/train/authorize";
@@ -64,6 +70,12 @@ interface Setup {
   ackAll(): Promise<void>;
   /** Pushes `commit` to the claim's fork. */
   push(claimId: string, commit: string): Promise<void>;
+  /** Whether main can be read; while false, every read refuses with `unavailable`. */
+  mainUp: boolean;
+  /** Moves the Repo's clock forward. */
+  advance(ms: number): void;
+  /** The Repo's clock. */
+  now(): number;
 }
 
 /**
@@ -112,7 +124,10 @@ function withHandoff<T>(
       decisions,
       train: install(train),
       authorization,
-      mainWriter: { ...base.mainWriter, head: async () => ok(MAIN) },
+      mainWriter: {
+        ...base.mainWriter,
+        head: async () => (setup.mainUp ? ok(MAIN) : fail("unavailable", "Main cannot be read.")),
+      },
       checks: {
         definitions: async (main) =>
           ok([{ name: "test", source: main, digest: "d".repeat(64), acceptance: null }]),
@@ -209,6 +224,9 @@ function withHandoff<T>(
         }
       },
       push,
+      mainUp: true,
+      advance: (ms) => fake.advance(ms),
+      now: () => fake.clock(),
     };
     return body(setup);
   });
@@ -391,6 +409,76 @@ describe("a re-ready after a superseded decision", () => {
       expect(setup.composed.at(-1)).toEqual([pin]);
       expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
       expect(setup.entries()).toEqual([{ commit: LATER, state: "batched", next: null }]);
+    });
+  });
+});
+
+describe("a re-ready while the train's retries have run out", () => {
+  it("asks for a drive again, so the new commit is scheduled without another call", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      setup.mainUp = false;
+      for (let drive = 0; drive <= MAX_WAKE_FAILURES; drive += 1) {
+        const wake = readWake(setup.sql);
+        if (wake === null || wake.failures === EXHAUSTED_FAILURES) break;
+        setup.advance(Math.max(wake.dueAt - setup.now(), 0));
+        await setup.train.resume();
+      }
+      expect(readWake(setup.sql)?.failures).toBe(EXHAUSTED_FAILURES);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+
+      // The holder adapts to a newer version while the old entry still waits.
+      await setup.decide(claim.claimId, first.decisionId);
+      expect((await setup.claims.activeClaim(agent(1))).ok).toBe(true);
+      await setup.push(claim.claimId, LATER);
+      await setup.ackAll();
+      const asked = setup.wakes.length;
+      const ready = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: LATER,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+
+      // The re-ready restarts the exhausted wake and asks for the alarm; main is back.
+      expect(readWake(setup.sql)).toMatchObject({ failures: 0 });
+      expect(setup.wakes.length).toBe(asked + 1);
+      setup.mainUp = true;
+      await setup.train.resume();
+      expect(setup.composed).toEqual([[{ claimId: claim.claimId, generation: 1, commit: LATER }]]);
+    });
+  });
+});
+
+describe("a re-ready of a commit that already landed", () => {
+  it("is refused after a superseding decision, so no ready skips the new version's check", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await setup.train.resume();
+      const attempt = setup.started[0];
+      if (attempt === undefined) throw new Error("no check was started");
+      // The landing is recorded as the train's main writer would leave it.
+      setup.sql.exec(
+        "UPDATE train_queue SET state = 'landed' WHERE claim_id = ? AND generation = 1",
+        claim.claimId,
+      );
+
+      await setup.decide(claim.claimId, first.decisionId);
+      expect((await setup.claims.activeClaim(agent(1))).ok).toBe(true);
+      await setup.ackAll();
+      const head = setup.log.head();
+
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+      ).toMatchObject({ ok: false, code: "decision_superseded" });
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.log.head()).toBe(head);
+
+      // Adapted work under a new commit is queued.
+      await setup.push(claim.claimId, LATER);
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: LATER }),
+      ).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(setup.entries()).toEqual([{ commit: LATER, state: "queued", next: null }]);
     });
   });
 });

@@ -1087,7 +1087,8 @@ describe("train wake", () => {
       expect(readWake(sql)).toBeNull();
       const asked = wakes.length;
 
-      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+      // The landed commit is not work again, so the train refuses it and stores nothing.
+      expect(await train.enqueue(pin(1))).toMatchObject({ ok: false, code: "decision_superseded" });
       expect(readWake(sql)).toBeNull();
       // With nothing owed, the drive asks for no alarm either.
       expect(wakes).toHaveLength(asked);
@@ -1509,9 +1510,9 @@ describe("train ready episodes", () => {
       expect(train.batches(2).map((batch) => batch.state)).toEqual(["checking", "landed"]);
       expect(lastStarted(fakes).pins).toEqual([newer]);
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", nextCommit: null });
-      // A landed commit is not work again.
+      // A landed commit is not work again: a new episode must bring a new commit.
       await train.recordCheck(report(lastStarted(fakes), "pass"));
-      expect(await train.enqueue(newer)).toEqual(ok({ queued: false }));
+      expect(await train.enqueue(newer)).toMatchObject({ ok: false, code: "decision_superseded" });
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "landed" });
     }, fakes);
   });

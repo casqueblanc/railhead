@@ -148,8 +148,10 @@ export interface TrainPort {
   /**
    * Queues a ready pin and drives the train. Each call is a new ready episode of the claim: a pin
    * already waiting is a no-op, a waiting entry of the same claim and generation takes the new
-   * commit, a dropped, parked or landed one is queued again, and a batched one takes the new commit
-   * once its batch settles. A pin of an older generation than one queued is `stale_generation`.
+   * commit, a dropped or parked one is queued again, a landed one is queued again with another
+   * commit and refused with `decision_superseded` with the same one, and a batched one takes the
+   * new commit once its batch settles. Every accepted pin asks for a drive, restarting a wake whose
+   * retries ran out. A pin of an older generation than one queued is `stale_generation`.
    */
   enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>>;
   /**
