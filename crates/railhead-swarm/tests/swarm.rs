@@ -1172,7 +1172,18 @@ fn interrupt_after_the_first_pin(world: &World) -> anyhow::Result<(PathBuf, Stri
         line?;
     }
     assert_eq!(child.wait()?.code(), Some(130));
-    let saved: Value = serde_json::from_str(&fs::read_to_string(world.progress_file("swarm-00"))?)?;
+    let mut saved: Value =
+        serde_json::from_str(&fs::read_to_string(world.progress_file("swarm-00"))?)?;
+    let digest = saved
+        .as_object_mut()
+        .and_then(|record| record.remove("scenario"));
+    assert!(
+        digest
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{digest:?}"
+    );
     assert_eq!(
         saved,
         json!({"seed": 211, "round": 0, "scaffold": false, "claimId": pinned})
@@ -1281,5 +1292,139 @@ async fn a_pin_that_closed_between_runs_without_evidence_stops_the_rerun() -> an
     // Nothing was claimed or delivered again.
     assert_eq!(world.state().claims.len(), 1);
     assert_eq!(rerun.total("pushes"), Some(0));
+    Ok(())
+}
+
+/// Runs the driver expecting it to refuse to start, and returns what it printed on stderr.
+async fn refused(world: &World, command: &mut Command) -> anyhow::Result<String> {
+    let requests = world
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .len();
+    let output = command.output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    // Not one more request reached the backend.
+    assert_eq!(
+        world
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        requests
+    );
+    Ok(String::from_utf8(output.stderr)?)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rerun_of_a_changed_scenario_refuses_the_old_progress() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (_, _) = interrupt_after_the_first_pin(&world)?;
+    let record = fs::read_to_string(world.progress_file("swarm-00"))?;
+    world.state().paused = false;
+    // The same seed, another mix: the pinned claim is not this plan's round 0.
+    let changed = world.scenario_of(1, 2, "casqueblanc/demo", &mix(0, 1, 0), &fast_bounds())?;
+    let stderr = refused(&world, &mut world.driver(&changed)?).await?;
+    assert!(
+        stderr.contains("belongs to another scenario or seed")
+            && stderr.contains("--discard-progress"),
+        "{stderr}"
+    );
+    assert_eq!(world.state().claims.len(), 1);
+    assert_eq!(fs::read_to_string(world.progress_file("swarm-00"))?, record);
+
+    // Discarding the record starts the changed scenario over.
+    let rerun = run(world.driver(&changed)?.arg("--discard-progress"))?;
+    assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
+    assert!(!world.progress_file("swarm-00").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn damaged_progress_stops_the_rerun_before_any_request() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
+    world.state().paused = false;
+    let path = world.progress_file("swarm-00");
+    let record = fs::read_to_string(&path)?;
+    for (text, message) in [
+        ("not json".to_owned(), "is damaged"),
+        (
+            record.replace(&pinned, "../../etc"),
+            "names an invalid claim",
+        ),
+    ] {
+        fs::write(&path, &text)?;
+        let stderr = refused(&world, &mut world.driver(&scenario)?).await?;
+        assert!(
+            stderr.contains(message) && stderr.contains("--discard-progress"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&path)?, text);
+    }
+    assert_eq!(world.state().claims.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_run_on_the_same_homes_refuses_to_start() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let lock = world.dir.path().join("homes/progress/swarm-00.lock");
+    private_dir(&world.dir.path().join("homes/progress"))?;
+    fs::write(&lock, "4242\n")?;
+    let stderr = refused(&world, &mut world.driver(&scenario)?).await?;
+    assert!(
+        stderr.contains("another run is using agent swarm-00") && stderr.contains("pid 4242"),
+        "{stderr}"
+    );
+    // The other run's lock and state are left alone.
+    assert_eq!(fs::read_to_string(&lock)?, "4242\n");
+    assert!(!world.progress_file("swarm-00").exists());
+    assert!(world.state().claims.is_empty());
+    assert!(world.work_is_empty()?);
+
+    // Once it is gone the run goes ahead, and releases the lock when it ends.
+    fs::remove_file(&lock)?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(0));
+    assert!(!lock.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_planted_symlink_never_redirects_an_edit_outside_the_clone() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let sentinel = world.dir.path().join("sentinel.txt");
+    fs::write(&sentinel, "untouched\n")?;
+    // Repository content links the agent's first planned file to a file outside any clone.
+    let seed = world.dir.path().join("seed");
+    fs::create_dir_all(seed.join("swarm/agents/swarm-00"))?;
+    std::os::unix::fs::symlink(&sentinel, seed.join("swarm/agents/swarm-00/round-000.txt"))?;
+    git(&seed, &["add", "--all"])?;
+    git(&seed, &["commit", "--quiet", "-m", "plant a link"])?;
+    let main = world.fake.main_repo();
+    git(
+        &seed,
+        &["push", "--quiet", &main.display().to_string(), "main"],
+    )?;
+
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.steps_of("swarm-00"), ["claimed", "failed"]);
+    assert_eq!(
+        run.of_type("failed").first().and_then(|e| e.get("code")),
+        Some(&json!("unsafe_path"))
+    );
+    assert_eq!(fs::read_to_string(&sentinel)?, "untouched\n");
+    assert_eq!(run.total("pushes"), Some(0));
+    assert!(world.work_is_empty()?, "the run left clones behind");
     Ok(())
 }

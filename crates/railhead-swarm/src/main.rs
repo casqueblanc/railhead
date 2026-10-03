@@ -11,8 +11,11 @@
 //! already hold that agent, joined to the scenario's origin and repository. The driver checks each
 //! identity before any agent runs and refuses to start on a mismatch. Clones go in a temporary
 //! directory that is removed when the run ends, on Ctrl-C included; every child process is killed
-//! first. Each agent's progress is kept in `<homes>/progress/swarm-NN.json`, so running a stopped
-//! scenario again resumes it.
+//! first, on an error included. Each agent's progress is kept in `<homes>/progress/swarm-NN.json`,
+//! so running a stopped scenario again resumes it; a record that is damaged or belongs to another
+//! scenario file stops the run until `--discard-progress` removes it. A run holds
+//! `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a second run on the same
+//! homes refuses to start.
 //!
 //! The exit code is 0 only when every agent landed every planned task; 1 when the run ended with
 //! a task not landed, an agent failed or stalled, or the run timed out; 130 on Ctrl-C; 2 when the
@@ -24,13 +27,15 @@
 //! ```
 
 mod agent;
+mod confined;
 mod events;
 mod plan;
 mod process;
 mod progress;
 mod scenario;
 
-use std::io::{self, Read as _};
+use std::future::Future;
+use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -38,13 +43,14 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Parser;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::agent::{Agent, Landings, Shared};
 use crate::events::{Emitter, Event, StopReason, Writer};
 use crate::plan::Plan;
 use crate::process::{AgentEnv, Runner};
-use crate::progress::ProgressFile;
+use crate::progress::{HomeLock, Progress, ProgressFile, RunKey};
 use crate::scenario::{MAX_SCENARIO_BYTES, Scenario};
 
 /// Largest identity record read from an agent home, in bytes.
@@ -69,6 +75,11 @@ struct Cli {
     /// Where the run's temporary directory of clones is made. Defaults to the system's.
     #[arg(long, value_name = "DIR")]
     workdir: Option<PathBuf>,
+
+    /// Removes every agent's progress record first, so the scenario starts over instead of
+    /// resuming.
+    #[arg(long)]
+    discard_progress: bool,
 }
 
 /// The name of agent `index`.
@@ -97,7 +108,8 @@ async fn main() -> ExitCode {
     }
 }
 
-fn read_scenario(path: &Path) -> anyhow::Result<Scenario> {
+/// Reads the scenario and the key its progress records are bound to.
+fn read_scenario(path: &Path) -> anyhow::Result<(Scenario, RunKey)> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening the scenario {}", path.display()))?;
     let mut text = String::new();
@@ -105,7 +117,9 @@ fn read_scenario(path: &Path) -> anyhow::Result<Scenario> {
     file.take(limit)
         .read_to_string(&mut text)
         .with_context(|| format!("reading the scenario {}", path.display()))?;
-    Ok(Scenario::parse(&text)?)
+    let scenario = Scenario::parse(&text)?;
+    let key = RunKey::new(scenario.seed, text.as_bytes());
+    Ok((scenario, key))
 }
 
 /// The part of an `rh` identity record the driver checks.
@@ -135,6 +149,26 @@ fn check_home(scenario: &Scenario, home: &Path, name: &str) -> anyhow::Result<()
     Ok(())
 }
 
+/// Agent `name`'s progress file in `dir` and the record an earlier run of `key` left there, or
+/// none after removing it when `discard`.
+fn load_progress(
+    dir: &Path,
+    name: &str,
+    key: &RunKey,
+    discard: bool,
+) -> anyhow::Result<(ProgressFile, Option<Progress>)> {
+    let file = ProgressFile::new(dir, name);
+    if discard {
+        file.clear()
+            .with_context(|| format!("discarding the progress of {name}"))?;
+        return Ok((file, None));
+    }
+    let record = file
+        .load(key)
+        .map_err(|error| anyhow::anyhow!("{error}; run with --discard-progress to start over"))?;
+    Ok((file, record))
+}
+
 /// How a run ended.
 struct Ended {
     stopped_by: StopReason,
@@ -142,7 +176,7 @@ struct Ended {
 }
 
 async fn run(cli: &Cli) -> anyhow::Result<Ended> {
-    let scenario = read_scenario(&cli.scenario)?;
+    let (scenario, key) = read_scenario(&cli.scenario)?;
     let homes = (0..scenario.agents)
         .map(|index| {
             let name = agent_name(index);
@@ -152,6 +186,13 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let progress = cli.homes.join("progress");
+    // Declared before the clones, so the locks are released only after the clones are removed.
+    let _locks = (0..scenario.agents)
+        .map(|index| HomeLock::acquire(&progress, &agent_name(index)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let saved = (0..scenario.agents)
+        .map(|index| load_progress(&progress, &agent_name(index), &key, cli.discard_progress))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut builder = tempfile::Builder::new();
     builder.prefix("railhead-swarm-");
     let clones = match &cli.workdir {
@@ -187,41 +228,38 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
         scenario.rounds,
         scenario.mix,
     );
-    let mut agents = JoinSet::new();
-    for (slot, home) in (0..scenario.agents).zip(homes) {
+    // Every agent is prepared before any runs, so a failure here leaves nothing to stop.
+    let mut prepared = Vec::with_capacity(homes.len());
+    for ((slot, home), (progress, saved)) in (0..scenario.agents).zip(homes).zip(saved) {
         let name = agent_name(slot);
         let workdir = clones.path().join(&name);
         std::fs::create_dir(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
-        let agent = Agent {
+        prepared.push(Agent {
             slot,
-            progress: ProgressFile::new(&progress, &name),
+            progress,
+            saved,
             env: AgentEnv { name, home },
             workdir,
             edits: plan.agent(usize::try_from(slot)?).to_vec(),
-            seed: scenario.seed,
-        };
+            key: key.clone(),
+        });
+    }
+    let mut agents = JoinSet::new();
+    for agent in prepared {
         agents.spawn(agent.run(Arc::clone(&shared)));
     }
     // The agents hold the only emitters now, so the stream ends when the last agent does.
     drop(shared);
 
-    let deadline = tokio::time::sleep(scenario.bounds.run_timeout);
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(deadline, interrupt);
-    let stopped_by = loop {
+    let run_timeout = scenario.bounds.run_timeout;
+    let stop = async move {
         tokio::select! {
             biased;
-            _ = &mut interrupt => break StopReason::Interrupted,
-            () = &mut deadline => break StopReason::TimedOut,
-            event = received.recv() => match event {
-                Some(event) => writer.write(&event)?,
-                None => break StopReason::Completed,
-            },
+            _ = tokio::signal::ctrl_c() => StopReason::Interrupted,
+            () = tokio::time::sleep(run_timeout) => StopReason::TimedOut,
         }
     };
-    // Aborting drops each agent's children, which kills them, before the clones are removed.
-    agents.abort_all();
-    while agents.join_next().await.is_some() {}
+    let stopped_by = supervise(&mut writer, &mut agents, &mut received, stop).await?;
     while let Ok(event) = received.try_recv() {
         writer.write(&event)?;
     }
@@ -235,9 +273,130 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     })
 }
 
+/// Writes the agents' events until the last agent ends or `stop` resolves, then stops every
+/// agent and waits for it, whatever ended the loop, a write error included. Aborting an agent
+/// drops its children, which kills them, so none outlives this and writes into a clone the run
+/// is about to remove.
+async fn supervise<W: Write>(
+    writer: &mut Writer<W>,
+    agents: &mut JoinSet<()>,
+    received: &mut mpsc::Receiver<Event>,
+    stop: impl Future<Output = StopReason>,
+) -> io::Result<StopReason> {
+    let outcome = async {
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                biased;
+                reason = &mut stop => break Ok(reason),
+                event = received.recv() => match event {
+                    Some(event) => writer.write(&event)?,
+                    None => break Ok(StopReason::Completed),
+                },
+            }
+        }
+    }
+    .await;
+    agents.abort_all();
+    while agents.join_next().await.is_some() {}
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::events::AgentState;
+
+    /// Sets its flag when dropped, as an agent's children are killed when it is.
+    struct Child(Arc<AtomicBool>);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Standard output closed under the run, as when it is piped to `head`.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn agent_holding(agents: &mut JoinSet<()>) -> Arc<AtomicBool> {
+        let killed = Arc::new(AtomicBool::new(false));
+        let child = Child(Arc::clone(&killed));
+        agents.spawn(async move {
+            let _child = child;
+            std::future::pending::<()>().await;
+        });
+        killed
+    }
+
+    #[tokio::test]
+    async fn a_write_error_stops_and_joins_every_agent_before_returning() -> anyhow::Result<()> {
+        let (events, mut received) = Emitter::channel();
+        let mut agents = JoinSet::new();
+        let killed = agent_holding(&mut agents);
+        events
+            .emit(Event::AgentState {
+                agent: agent_name(0),
+                state: AgentState::Claiming,
+            })
+            .await;
+        let mut writer = Writer::new(Closed, Instant::now());
+        let outcome = supervise(
+            &mut writer,
+            &mut agents,
+            &mut received,
+            std::future::pending(),
+        )
+        .await;
+        assert!(outcome.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe));
+        assert!(agents.is_empty());
+        assert!(killed.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_also_stops_and_joins_every_agent() -> anyhow::Result<()> {
+        let (_events, mut received) = Emitter::channel();
+        let mut agents = JoinSet::new();
+        let killed = agent_holding(&mut agents);
+        let mut writer = Writer::new(Vec::new(), Instant::now());
+        let stopped = supervise(&mut writer, &mut agents, &mut received, async {
+            StopReason::TimedOut
+        })
+        .await?;
+        assert_eq!(stopped, StopReason::TimedOut);
+        assert!(agents.is_empty());
+        assert!(killed.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_when_the_last_agent_does() -> anyhow::Result<()> {
+        let (events, mut received) = Emitter::channel();
+        drop(events);
+        let mut agents = JoinSet::new();
+        let mut writer = Writer::new(Vec::new(), Instant::now());
+        let stopped = supervise(
+            &mut writer,
+            &mut agents,
+            &mut received,
+            std::future::pending(),
+        )
+        .await?;
+        assert_eq!(stopped, StopReason::Completed);
+        Ok(())
+    }
 
     #[test]
     fn agents_are_named_by_index() {
@@ -251,7 +410,9 @@ mod tests {
         assert!(Cli::try_parse_from(["railhead-swarm", "--scenario", "s.json"]).is_err());
         let cli =
             Cli::try_parse_from(["railhead-swarm", "--scenario", "s.json", "--homes", "homes"]);
-        assert!(cli.is_ok_and(|cli| cli.rh == Path::new("rh") && cli.workdir.is_none()));
+        assert!(cli.is_ok_and(|cli| cli.rh == Path::new("rh")
+            && cli.workdir.is_none()
+            && !cli.discard_progress));
     }
 
     #[test]

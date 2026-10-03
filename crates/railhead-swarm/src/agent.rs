@@ -17,7 +17,8 @@
 //! any new edit.
 //!
 //! The agent writes only inside the clone `rh work` made under its own working directory, and
-//! only to a clone whose fork belongs to the scenario's repository.
+//! only to a clone whose fork belongs to the scenario's repository. It never follows a symbolic
+//! link the repository planted there (see [`crate::confined`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,10 +30,11 @@ use railhead_protocol::{
 };
 use serde::Deserialize;
 
+use crate::confined;
 use crate::events::{AgentState, Emitter, Event, Step, TaskClass, millis};
 use crate::plan::{ApplyError, Edit, scaffold};
 use crate::process::{self, AgentEnv, Envelope, Runner};
-use crate::progress::{Progress, ProgressFile};
+use crate::progress::{Progress, ProgressFile, RunKey};
 use crate::scenario::Bounds;
 
 /// The plan an agent writes when it acknowledges an item.
@@ -69,10 +71,12 @@ pub struct Agent {
     pub workdir: PathBuf,
     /// Its planned edits.
     pub edits: Vec<Edit>,
-    /// The scenario seed its plan came from.
-    pub seed: u64,
+    /// The run its plan came from, which its progress records name.
+    pub key: RunKey,
     /// Where its progress is kept between runs.
     pub progress: ProgressFile,
+    /// The progress an earlier run of the same scenario recorded, read before any agent started.
+    pub saved: Option<Progress>,
 }
 
 /// The agent stopped; an event already says why.
@@ -239,9 +243,7 @@ impl Run<'_> {
                 self.shared.runner.rh(&self.agent.env, workdir, &["status"])
             })
             .await?;
-        let Ok(saved) = self.agent.progress.load(self.agent.seed) else {
-            return Err(self.fail(Step::Progress, "progress".to_owned()).await);
-        };
+        let saved = self.agent.saved.clone();
         let mut next = saved.as_ref().map_or(0, |saved| saved.round);
         // The claim an earlier run left may have closed while no run watched it.
         if let Some(saved) = &saved
@@ -371,7 +373,8 @@ impl Run<'_> {
     /// Records that the agent is on planned task `round`, holding `claim_id`.
     async fn save(&self, round: u32, scaffold: bool, claim_id: Option<&str>) -> Outcome<()> {
         let progress = Progress {
-            seed: self.agent.seed,
+            seed: self.agent.key.seed,
+            scenario: self.agent.key.scenario.clone(),
             round,
             scaffold,
             claim_id: claim_id.map(str::to_owned),
@@ -493,15 +496,24 @@ impl Run<'_> {
         let written = match edit {
             None => scaffold()
                 .iter()
-                .filter(|(path, _)| !dir.join(path).exists())
-                .try_for_each(|(path, contents)| write_file(dir, path, contents)),
+                .filter(|(path, _)| !confined::is_file(dir, path))
+                .try_for_each(|(path, contents)| {
+                    confined::write(dir, path, contents).map_err(|error| error.code())
+                }),
             Some(edit) => {
                 let path = edit.path(&self.agent.env.name);
-                let current = std::fs::read_to_string(dir.join(&path)).ok();
-                match edit.apply(self.agent.slot, &self.agent.env.name, current.as_deref()) {
-                    Ok(contents) => write_file(dir, &path, &contents),
-                    Err(ApplyError::NoScaffold) => Err("no_scaffold"),
-                    Err(ApplyError::Unrecognised) => Err("unrecognised_file"),
+                match confined::read(dir, &path) {
+                    Err(error) => Err(error.code()),
+                    Ok(current) => {
+                        match edit.apply(self.agent.slot, &self.agent.env.name, current.as_deref())
+                        {
+                            Ok(contents) => {
+                                confined::write(dir, &path, &contents).map_err(|error| error.code())
+                            }
+                            Err(ApplyError::NoScaffold) => Err("no_scaffold"),
+                            Err(ApplyError::Unrecognised) => Err("unrecognised_file"),
+                        }
+                    }
                 }
             }
         };
@@ -814,7 +826,9 @@ fn task_index(round: u32) -> usize {
 
 /// Whether the clone has both scaffold files.
 fn has_scaffold(dir: &Path) -> bool {
-    scaffold().iter().all(|(path, _)| dir.join(path).is_file())
+    scaffold()
+        .iter()
+        .all(|(path, _)| confined::is_file(dir, path))
 }
 
 /// A relative path of plain segments, as the protocol's path rule requires.
@@ -825,14 +839,6 @@ fn is_repo_path(path: &str) -> bool {
             .split('/')
             .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
         && !path.chars().any(char::is_control)
-}
-
-fn write_file(dir: &Path, path: &str, contents: &str) -> Result<(), &'static str> {
-    let target = dir.join(path);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| "write")?;
-    }
-    std::fs::write(target, contents).map_err(|_| "write")
 }
 
 #[cfg(test)]
@@ -900,9 +906,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         assert!(!has_scaffold(dir.path()));
         let [(shared, shared_text), (contested, contested_text)] = scaffold();
-        write_file(dir.path(), contested, "kept\n").map_err(anyhow::Error::msg)?;
+        confined::write(dir.path(), contested, "kept\n")?;
         assert!(!has_scaffold(dir.path()));
-        write_file(dir.path(), shared, &shared_text).map_err(anyhow::Error::msg)?;
+        confined::write(dir.path(), shared, &shared_text)?;
         assert!(has_scaffold(dir.path()));
         assert_ne!(
             std::fs::read_to_string(dir.path().join(contested))?,
