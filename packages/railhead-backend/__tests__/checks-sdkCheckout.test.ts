@@ -7,14 +7,15 @@ import {
 } from "@cloudflare/ci";
 import type { CiBindings } from "@cloudflare/ci/worker";
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
-import type {
-  BackupOptions,
-  DirectoryBackup,
-  ExecOptions,
-  ExecResult,
-  ListFilesOptions,
-  Process,
-  ProcessOptions,
+import {
+  Sandbox,
+  type BackupOptions,
+  type DirectoryBackup,
+  type ExecOptions,
+  type ExecResult,
+  type ListFilesOptions,
+  type Process,
+  type ProcessOptions,
 } from "@cloudflare/sandbox";
 import { runInDurableObject } from "cloudflare:test";
 import { env, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
@@ -30,7 +31,9 @@ import { SandboxFence } from "../src/sandbox/fence";
 import { parseSandboxGrant, type SandboxGrant } from "../src/sandbox/policy";
 import {
   FENCED_SANDBOX_METHODS,
+  LOCAL_CLIENT_MEMBERS,
   RailheadSandbox,
+  admitSandboxClient,
   fenceSandbox,
   type FencedSandboxCalls,
 } from "../src/sandbox/sandboxObject";
@@ -484,6 +487,187 @@ describe("fenceSandbox, the wrapping RailheadSandbox applies to its SDK calls", 
   });
 });
 
+/** What reached the container through the SDK, beneath every RailheadSandbox override. */
+interface RecordingContainer {
+  /** Each request the SDK sent to start or reach the container, the RPC upgrade among them. */
+  readonly requests: string[];
+  /** Each message the SDK sent over an RPC connection the container accepted. */
+  readonly messages: string[];
+}
+
+/** An R2 binding whose reads wait until the test answers, as a slow archive read does. */
+function pausedBucket() {
+  const r2 = deferred();
+  const reading = deferred();
+  let reads = 0;
+  const binding = {
+    get: async () => {
+      reads += 1;
+      reading.resolve();
+      await r2.promise;
+      // The backup's metadata, then its archive.
+      return reads === 1
+        ? { json: async () => ({ createdAt: new Date().toISOString(), ttl: 3_600 }) }
+        : { body: new ReadableStream(), arrayBuffer: async () => new ArrayBuffer(0) };
+    },
+    put: async () => null,
+    head: async () => null,
+    delete: async () => undefined,
+    list: async () => ({ objects: [] }),
+  };
+  return { binding, reading: reading.promise, answer: r2.resolve };
+}
+
+/** Lets the recording container receive what the SDK sent. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 20));
+}
+
+/**
+ * Runs `body` with a real RailheadSandbox over the storage of a Durable Object no other test
+ * touches, its fence live until a minute from now. The pool runs no containers, so the object has
+ * a stopped stand-in, and the SDK's own `containerFetch`, which every RailheadSandbox override
+ * calls last, is a recording container that accepts the RPC transport's WebSocket upgrade.
+ */
+function withRailheadSandbox(
+  bucket: unknown,
+  body: (sandbox: RailheadSandbox, container: RecordingContainer) => Promise<void>,
+): Promise<void> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const stopped = { running: false, start: noop, destroy: async () => undefined };
+    Object.defineProperty(state, "container", { value: stopped });
+    const container: RecordingContainer = { requests: [], messages: [] };
+    vi.spyOn(Sandbox.prototype, "containerFetch").mockImplementation(async (request) => {
+      container.requests.push(request instanceof Request ? request.url : String(request));
+      const [client, server] = Object.values(new WebSocketPair());
+      if (client === undefined || server === undefined) throw new Error("no WebSocket pair");
+      server.accept();
+      server.addEventListener("message", (event) => {
+        container.messages.push(String(event.data));
+      });
+      return new Response(null, { status: 101, webSocket: client });
+    });
+    const sandboxEnv = { ...env, BACKUP_BUCKET: bucket };
+    // The pool types the object's props as `unknown`; the SDK's constructor declares none.
+    const sandbox = new RailheadSandbox(
+      state as ConstructorParameters<typeof RailheadSandbox>[0],
+      sandboxEnv,
+    );
+    // The constructor's storage reads finish before the object serves its first call.
+    await state.blockConcurrencyWhile(async () => undefined);
+    // The patched runner opens each sandbox over the RPC transport.
+    await sandbox.setTransport("rpc");
+    // As `railheadStart` records it, which would also probe the container.
+    state.storage.kv.put("railhead:fence", { phase: "live", deadline: Date.now() + 60_000 });
+    await body(sandbox, container);
+  });
+}
+
+describe("RailheadSandbox's SDK transport at retirement", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    { destroy: "failed, leaving its connection open", fails: true },
+    { destroy: "closed its connection", fails: false },
+  ])(
+    "sends nothing over RPC when a restore resumes after a retirement whose destroy $destroy",
+    async ({ fails }) => {
+      const bucket = pausedBucket();
+      await withRailheadSandbox(bucket.binding, async (sandbox, container) => {
+        // An earlier call opened the RPC connection while the sandbox was live.
+        await sandbox.client.connect();
+        expect(container.requests).toEqual(["http://localhost:3000/rpc"]);
+        const restore = sandbox
+          .restoreBackup({ id: BACKUP_ID, dir: "/workspace", localBucket: true })
+          .then(
+            () => "restored",
+            (error: unknown) => (error instanceof Error ? error.message : "unknown"),
+          );
+        await bucket.reading;
+
+        // The retirement's destroy fails or succeeds; any later one succeeds.
+        const destroyed = deferred();
+        const destroy = sandbox.destroy.bind(sandbox);
+        let destroys = 0;
+        vi.spyOn(sandbox, "destroy").mockImplementation(async () => {
+          destroys += 1;
+          try {
+            if (fails && destroys === 1) throw new Error("scripted destroy failure");
+            await destroy();
+          } finally {
+            destroyed.resolve();
+          }
+        });
+        const release = sandbox.railheadRetire().then(
+          () => "retired",
+          (error: unknown) => (error instanceof Error ? error.message : "unknown"),
+        );
+        await destroyed.promise;
+        expect(sandbox.client.isWebSocketConnected()).toBe(fails);
+        const requests = container.requests.length;
+        const messages = container.messages.length;
+
+        // The archive read returns after retirement; the restore goes on to make its session.
+        bucket.answer();
+        const outcome = await Promise.race([restore, settle().then(() => "still running")]);
+        await settle();
+
+        // Nothing reached the container: no session, command, file write or extraction, and no
+        // upgrade that could start it again.
+        expect(container.messages.slice(messages)).toEqual([]);
+        expect(container.requests.slice(requests)).toEqual([]);
+        expect(outcome).toBe("sandbox operation refused: retired");
+        expect(await release).toBe(fails ? "scripted destroy failure" : "retired");
+      });
+    },
+  );
+
+  it.each(["rpc", "http"] as const)(
+    "admits every %s client member that can reach the container only while live",
+    async (transport) => {
+      await withRailheadSandbox(null, async (sandbox) => {
+        await sandbox.setTransport(transport);
+        const members = clientMembers(sandbox.client);
+        const reaching = members.filter((member) => !LOCAL_CLIENT_MEMBERS.has(member));
+        expect(reaching).toEqual(expect.arrayContaining(["backup", "commands", "files", "utils"]));
+        for (const member of members) Reflect.get(sandbox.client, member);
+
+        await sandbox.railheadRetire();
+
+        const refused = reaching.filter((member) => {
+          try {
+            Reflect.get(sandbox.client, member);
+            return false;
+          } catch (error) {
+            return error instanceof Error && error.message === "sandbox operation refused: retired";
+          }
+        });
+        expect(refused).toEqual(reaching);
+        // Closing the connection stays possible, so a destroy can still run.
+        sandbox.client.disconnect();
+        expect(sandbox.client.isWebSocketConnected()).toBe(false);
+      });
+    },
+  );
+});
+
+/** Every member a client has, on itself and its prototypes, except its constructor. */
+function clientMembers(client: object): string[] {
+  const members = new Set<string>();
+  for (
+    let level: object | null = client;
+    level !== null && level !== Object.prototype;
+    level = Reflect.getPrototypeOf(level)
+  ) {
+    for (const member of Object.getOwnPropertyNames(level)) members.add(member);
+  }
+  members.delete("constructor");
+  return [...members].toSorted();
+}
+
 function noop(): void {}
 
 /** A promise the test settles by hand. */
@@ -559,7 +743,8 @@ type ScriptedCommand = (command: string, workspace: ReadonlySet<string>) => Scri
  * workspace as a set of paths: a fresh checkout replaces it with the fetched commit's tree, an
  * overlay adds that tree without deleting anything, and a backup restores the paths it captured.
  * Given a fence, its SDK calls pass through `fenceSandbox`, as `RailheadSandbox`'s do, and each
- * scripted call reaches the container through the fenced `containerFetch`, as the SDK's do.
+ * scripted call reaches the container through a transport client that `admitSandboxClient` admits
+ * on the fence, as the SDK's calls reach it through `RailheadSandbox.client`.
  */
 class ScriptedSandbox {
   readonly calls: string[] = [];
@@ -591,7 +776,11 @@ class ScriptedSandbox {
     private readonly fence: SandboxFence | null,
   ) {
     this.sdk = fence === null ? this.scripted() : fenceSandbox(fence, this.scripted());
+    if (fence !== null) admitSandboxClient(this.transport, () => fence.admit());
   }
+
+  /** The SDK's transport client, which sends each scripted call to the container. */
+  private readonly transport = { client: { send: async () => undefined } };
 
   /** `RailheadSandbox.railheadStart`, through `fence` when the test gives one. */
   async railheadStart(policy: unknown, expiresAt: unknown) {
@@ -629,9 +818,9 @@ class ScriptedSandbox {
     return this.sdk.listFiles(path, options);
   }
 
-  /** Reaches the container as the SDK does, through the (fenced) `containerFetch`. */
+  /** Reaches the container as the SDK does, through its (admitted) transport client. */
   private async reach(): Promise<void> {
-    await this.sdk.containerFetch("http://container/");
+    await this.transport.client.send();
   }
 
   private scripted(): FencedSandboxCalls {
