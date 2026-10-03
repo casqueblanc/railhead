@@ -7,7 +7,9 @@
 // The app's GET /api/revision must report `--expect` before any upload is sent and again after the
 // last one, so every observation belongs to that commit. A different, missing or `unknown` revision
 // fails without uploading anything. Option A expects 11 MB refused with 413; option B expects it
-// accepted in parts. Both expect 9 MB accepted in one request and read back byte for byte.
+// accepted in parts. Both expect 9 MB accepted in one request. Every accepted upload must report the
+// size sent and read back byte for byte; any other answer, including a missing or partial read-back,
+// fails.
 //
 // The record is printed as JSON and, with `--out`, written to that file. Exit codes: 0 every check
 // held, 1 a check failed or the app could not be reached, 2 the arguments are invalid. Uploaded
@@ -130,6 +132,22 @@ const uploadId = (body, what) => {
 };
 
 /**
+ * The id of an upload the app reports as stored, failing unless it reports exactly the size sent,
+ * and the SHA-256 sent when it reports one. A wrong report fails before the file is read back.
+ */
+const storedId = (body, what, sent) => {
+  if (body.size !== sent.byteLength) {
+    throw new CheckFailed(
+      `${what} reported ${typeof body.size === "number" ? `size ${body.size}` : "no size"}, not the ${sent.byteLength} bytes sent.`,
+    );
+  }
+  if (body.sha256 !== undefined && body.sha256 !== sha256(sent)) {
+    throw new CheckFailed(`${what} reported a SHA-256 other than that of the bytes sent.`);
+  }
+  return uploadId(body, what);
+};
+
+/**
  * Reads upload `id` back and compares its digest with the bytes sent. The body is hashed as it
  * arrives and never held whole: more bytes than were sent fail at once, so an oversized or endless
  * answer cannot exhaust memory. A body that breaks off or outlasts the timeout is a failed check.
@@ -191,7 +209,7 @@ const nineInOneRequest = async (origin) => {
     await response.body?.cancel();
     throw new CheckFailed(`A 9 MB upload returned ${response.status}, not 201.`);
   }
-  const id = uploadId(await readJson(response, "The 9 MB upload"), "The 9 MB upload");
+  const id = storedId(await readJson(response, "The 9 MB upload"), "The 9 MB upload", body);
   return `201; read back intact (${body.byteLength} bytes, SHA-256 ${await readBack(origin, id, body)})`;
 };
 
@@ -268,9 +286,10 @@ const elevenInParts = async (origin) => {
     await complete.body?.cancel();
     throw new CheckFailed(`Completing the chunked upload returned ${complete.status}, not 201.`);
   }
-  const stored = uploadId(
+  const stored = storedId(
     await readJson(complete, "Completing the chunked upload"),
     "Completing the chunked upload",
+    body,
   );
   const digest = await readBack(origin, stored, body);
   return `201 in ${parts} parts; read back intact (${body.byteLength} bytes, SHA-256 ${digest})`;

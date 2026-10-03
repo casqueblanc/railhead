@@ -89,6 +89,32 @@ describe("uploads from the board's sandboxed frame", () => {
     expect(await empty.json()).toEqual({ error: "The file is empty." });
   });
 
+  it("lets an opaque origin read the server error when storing the upload throws", async () => {
+    let sent = false;
+    const failing = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent) {
+          controller.error(new Error("client went away"));
+          return;
+        }
+        controller.enqueue(new Uint8Array(1000));
+        sent = true;
+      },
+    });
+    // Called directly: through SELF the client-side error arrives as a clean end of body.
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}/api/uploads`, {
+        method: "POST",
+        headers: { origin: "null", "content-type": "application/octet-stream" },
+        body: failing,
+      }),
+      env,
+    );
+    expect(response.status).toBe(500);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(await response.json()).toEqual({ error: "The upload failed." });
+  });
+
   it("keeps every other route and method closed to other origins", async () => {
     const cases: [string, string][] = [
       ["OPTIONS", "/"],

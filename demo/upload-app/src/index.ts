@@ -13,6 +13,18 @@ const UPLOAD_PREFLIGHT = {
   "access-control-max-age": "600",
 };
 
+/** Logs an unexpected failure by type and message only, and answers 500. Bodies are never logged. */
+function failed(error: unknown): Response {
+  console.error(
+    JSON.stringify({
+      event: "upload.error",
+      error: error instanceof Error ? error.name : "unknown",
+      message: error instanceof Error ? error.message : String(error),
+    }),
+  );
+  return errorResponse(500, "The upload failed.");
+}
+
 async function route(request: Request, env: Env): Promise<Response> {
   const { pathname } = new URL(request.url);
   if (pathname === "/") {
@@ -41,7 +53,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST") {
       return errorResponse(405, "Method not allowed.", { allow: "POST" });
     }
-    const response = await receiveUpload(request, env);
+    // A thrown failure is answered here, not by the outer handler, so the frame can read it too.
+    const response = await receiveUpload(request, env).catch(failed);
     const headers = new Headers(response.headers);
     headers.set("access-control-allow-origin", "*");
     return new Response(response.body, { status: response.status, headers });
@@ -61,15 +74,7 @@ export default {
     try {
       return await route(request, env);
     } catch (error) {
-      // Only the error's type and message: request bodies are never logged.
-      console.error(
-        JSON.stringify({
-          event: "upload.error",
-          error: error instanceof Error ? error.name : "unknown",
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      return errorResponse(500, "The upload failed.");
+      return failed(error);
     }
   },
 } satisfies ExportedHandler<Env>;

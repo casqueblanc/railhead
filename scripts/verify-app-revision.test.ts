@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
@@ -20,8 +21,16 @@ interface FakeApp {
   noLimit?: boolean;
   /** Serves the chunked routes of option B. */
   chunked?: boolean;
-  /** How a file is read back: changed by one byte, cut off after half, or followed by endless bytes. */
-  readBack?: "corrupt" | "brokenOff" | "endless";
+  /**
+   * How a file is read back: changed by one byte, cut off after half, followed by endless bytes, or
+   * not found.
+   */
+  readBack?: "corrupt" | "brokenOff" | "endless" | "missing";
+  /**
+   * What an accepted upload reports instead of its true size and digest: size 0, no size, or the
+   * true size with a wrong SHA-256. The bytes are still stored intact.
+   */
+  report?: "zeroSize" | "noSize" | "wrongSha";
 }
 
 interface Started {
@@ -45,6 +54,25 @@ const json = (response: ServerResponse, status: number, body: unknown) => {
   response.end(JSON.stringify(body));
 };
 
+/** The body an accepted upload answers with, as {@link FakeApp.report} distorts it. */
+const accepted = (app: FakeApp, id: string, file: Buffer): Record<string, unknown> => {
+  const sha256 = createHash("sha256").update(file).digest("hex");
+  switch (app.report) {
+    case undefined:
+      return { id, size: file.byteLength, sha256 };
+    case "zeroSize":
+      return { id, size: 0, sha256 };
+    case "noSize":
+      return { id };
+    case "wrongSha":
+      return { id, size: file.byteLength, sha256: "0".repeat(64) };
+    default: {
+      const unreachable: never = app.report;
+      return unreachable;
+    }
+  }
+};
+
 /** An in-memory stand-in for the demo app's HTTP interface. */
 const startApp = async (app: FakeApp): Promise<Started> => {
   const files = new Map<string, Buffer>();
@@ -66,7 +94,7 @@ const startApp = async (app: FakeApp): Promise<Started> => {
         }
         const id = `up-${(next += 1)}`;
         files.set(id, body);
-        return json(response, 201, { id, size: body.byteLength });
+        return json(response, 201, accepted(app, id, body));
       }
       if (app.chunked === true && path === "/api/uploads/chunked" && request.method === "POST") {
         const id = `ch-${(next += 1)}`;
@@ -84,11 +112,12 @@ const startApp = async (app: FakeApp): Promise<Started> => {
         const ordered = [...session.parts.entries()].toSorted(([a], [b]) => a - b);
         const file = Buffer.concat(ordered.map(([, bytes]) => bytes));
         files.set(complete[1], file);
-        return json(response, 201, { id: complete[1], size: file.byteLength });
+        return json(response, 201, accepted(app, complete[1], file));
       }
       if (read?.[1] !== undefined && request.method === "GET") {
         const file = files.get(read[1]);
-        if (file === undefined) return json(response, 404, { error: "Not found." });
+        if (file === undefined || app.readBack === "missing")
+          return json(response, 404, { error: "Not found." });
         const served = Buffer.from(file);
         if (app.readBack === "corrupt" && served.byteLength > 0) {
           served[0] = (served[0] ?? 0) ^ 0xff;
@@ -376,6 +405,92 @@ describe("verify-app-revision", () => {
         ok: false,
         observed: "Upload up-1 read back as more than the 9000000 bytes sent.",
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("fails an accepted 9 MB upload that reports the wrong size, before reading it back", async () => {
+    const cases = [
+      {
+        report: "zeroSize",
+        observed: "The 9 MB upload reported size 0, not the 9000000 bytes sent.",
+      },
+      {
+        report: "noSize",
+        observed: "The 9 MB upload reported no size, not the 9000000 bytes sent.",
+      },
+      {
+        report: "wrongSha",
+        observed: "The 9 MB upload reported a SHA-256 other than that of the bytes sent.",
+      },
+    ] as const;
+    for (const { report, observed } of cases) {
+      const app = await startApp({ revision: () => MAIN, report });
+      const out = join(scratch, `${report}.json`);
+      try {
+        const result = await run([
+          "--url",
+          app.origin,
+          "--expect",
+          MAIN,
+          "--option",
+          "A",
+          "--out",
+          out,
+        ]);
+        assert.equal(result.code, 1, report);
+        const written = record(readFileSync(out, "utf8"));
+        assert.equal(written.result, "fail", report);
+        assert.deepEqual(written.observations[0], {
+          name: "9 MB in one request",
+          ok: false,
+          observed,
+        });
+        assert.match(result.stderr, /does not hold at .*: 9 MB in one request\./);
+        assert.deepEqual(
+          app.requests.filter((r) => r.startsWith("GET /api/uploads/")),
+          [],
+          report,
+        );
+      } finally {
+        await app.close();
+      }
+    }
+  });
+
+  test("fails option B when the completed upload reports the wrong size", async () => {
+    const app = await startApp({ revision: () => MAIN, chunked: true, report: "zeroSize" });
+    try {
+      const result = await run(["--url", app.origin, "--expect", MAIN, "--option", "B"]);
+      assert.equal(result.code, 1);
+      const written = record(result.stdout);
+      assert.equal(written.result, "fail");
+      assert.deepEqual(written.observations[1], {
+        name: "11 MB in parts",
+        ok: false,
+        observed: "Completing the chunked upload reported size 0, not the 11000000 bytes sent.",
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("fails when an accepted upload cannot be read back", async () => {
+    const app = await startApp({ revision: () => MAIN, chunked: true, readBack: "missing" });
+    try {
+      const result = await run(["--url", app.origin, "--expect", MAIN, "--option", "B"]);
+      assert.equal(result.code, 1);
+      const [nine, eleven] = record(result.stdout).observations;
+      assert.deepEqual(
+        [nine?.ok, nine?.observed, eleven?.ok, eleven?.observed],
+        [
+          false,
+          "Reading upload up-1 back returned 404.",
+          false,
+          "Reading upload ch-2 back returned 404.",
+        ],
+      );
     } finally {
       await app.close();
     }
