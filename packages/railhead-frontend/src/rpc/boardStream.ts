@@ -70,7 +70,11 @@ const stopFor = (code: BoardErrorCode): StreamStop => {
   }
 };
 
-/** The board's side of one subscription. It forwards only while it is the current one. */
+/**
+ * The board's side of one subscription. It forwards only while it is the current one. The backend
+ * can also drop a subscription without calling `ended` (it does on a delivery failure); Cap'n Web
+ * then disposes this target, which the stream treats as a lost subscription.
+ */
 class Listener extends RpcTarget implements BoardListener {
   readonly #stream: BoardStream;
 
@@ -85,6 +89,10 @@ class Listener extends RpcTarget implements BoardListener {
 
   async ended(reason: SubscriptionEnd): Promise<void> {
     this.#stream.endedBy(this, reason);
+  }
+
+  [Symbol.dispose](): void {
+    this.#stream.releasedBy(this);
   }
 }
 
@@ -132,6 +140,16 @@ export class BoardStream implements Disposable {
       default:
         unreachable(reason);
     }
+  }
+
+  /**
+   * Called when the backend releases a listener. Releasing the current one without `ended` leaves
+   * nothing to deliver events, so the stream catches up and subscribes again, within the resync
+   * bound. A listener the stream already replaced or dropped is ignored.
+   */
+  releasedBy(listener: Listener): void {
+    if (!this.#isCurrent(listener)) return;
+    this.#resync();
   }
 
   [Symbol.dispose](): void {

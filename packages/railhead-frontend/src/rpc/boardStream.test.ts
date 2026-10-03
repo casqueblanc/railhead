@@ -9,7 +9,7 @@ import {
   type StreamPhase,
   type StreamSink,
 } from "./boardStream";
-import { FakeBoard } from "./fakeApi";
+import { FakeBoard, releaseTarget } from "./fakeApi";
 
 const LOG = checkBeforeLand.events;
 const HEAD = LOG.length;
@@ -154,6 +154,101 @@ describe("BoardStream", () => {
     expect(sink.stops).toEqual(["revoked"]);
     expect(board.subscriptions).toHaveLength(1);
     expect(board.latest().handle.disposed).toBe(true);
+  });
+
+  describe("when the backend releases the listener without ending it", () => {
+    it("leaves live, catches up and subscribes again", async () => {
+      const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
+      const sink = folding();
+      stream = new BoardStream(board, sink.sink, 0);
+      await settle();
+      const first = board.latest();
+
+      board.append(...LOG.slice(2));
+      first.handle.release();
+      expect(sink.phases.at(-1)).toBe("catching_up");
+      await settle();
+
+      expect(board.reads).toEqual([0, 2]);
+      expect(board.subscriptions.map((s) => s.cursor)).toEqual([2, HEAD]);
+      expect(sink.board().cursor).toBe(HEAD);
+      expect(sink.phases).toEqual(["catching_up", "live", "catching_up", "live"]);
+    });
+
+    it("ignores the late release of a listener it already replaced", async () => {
+      const board = new FakeBoard(SYNTH_REPO, LOG);
+      const sink = folding();
+      stream = new BoardStream(board, sink.sink, 0);
+      await settle();
+      const first = board.latest();
+      await first.listener.ended("restart");
+      await settle();
+      const reads = board.reads.length;
+
+      // The client disposed the first handle, which released its listener; this is a second release.
+      releaseTarget(first.listener);
+      await settle();
+
+      expect(board.subscriptions).toHaveLength(2);
+      expect(board.reads).toHaveLength(reads);
+      expect(sink.phases.at(-1)).toBe("live");
+    });
+
+    it("subscribes again when the release arrives before subscribe resolves", async () => {
+      const gate: { answer?: () => void } = {};
+      const board = new FakeBoard(SYNTH_REPO, LOG);
+      const subscribe = board.subscribe.bind(board);
+      board.subscribe = (cursor, listener) => {
+        board.subscribe = subscribe;
+        return new Promise((resolve) => {
+          gate.answer = () => {
+            const result = subscribe(cursor, listener);
+            releaseTarget(listener);
+            resolve(result);
+          };
+        });
+      };
+      const sink = folding();
+      stream = new BoardStream(board, sink.sink, 0);
+      await settle();
+      if (gate.answer === undefined) throw new Error("the stream never subscribed");
+      gate.answer();
+      await settle();
+
+      expect(board.subscriptions).toHaveLength(2);
+      expect(board.subscriptions[0]?.handle.disposed).toBe(true);
+      expect(board.latest().handle.disposed).toBe(false);
+      expect(sink.phases).toEqual(["catching_up", "catching_up", "live"]);
+    });
+
+    it("stops after a bounded number of releases that make no progress", async () => {
+      const board = new FakeBoard(SYNTH_REPO, LOG);
+      const sink = folding();
+      stream = new BoardStream(board, sink.sink, 0);
+      await settle();
+
+      for (let i = 0; i <= MAX_RESYNCS_WITHOUT_PROGRESS + 2; i += 1) {
+        board.latest().handle.release();
+        await settle();
+      }
+
+      expect(board.subscriptions).toHaveLength(MAX_RESYNCS_WITHOUT_PROGRESS + 1);
+      expect(sink.stops).toEqual(["failed"]);
+    });
+
+    it("ignores the release that follows its own disposal", async () => {
+      const board = new FakeBoard(SYNTH_REPO, LOG);
+      const sink = folding();
+      const disposed = new BoardStream(board, sink.sink, 0);
+      await settle();
+
+      disposed[Symbol.dispose]();
+      await settle();
+
+      expect(board.latest().handle.disposed).toBe(true);
+      expect(board.reads).toEqual([0]);
+      expect(sink.phases).toEqual(["catching_up", "live"]);
+    });
   });
 
   it("stops after a bounded number of restarts that make no progress", async () => {

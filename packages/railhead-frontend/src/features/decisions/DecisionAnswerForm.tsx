@@ -1,14 +1,11 @@
 import { Button, Radio, Text } from "@cloudflare/kumo";
 import { LockSimpleIcon } from "@phosphor-icons/react";
-import { useRef, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import type { DecisionId, QuestionOption } from "@railhead/shared/events";
-import { blockMessage, type DecisionCardAction } from "./decisionActions";
+import { usePortAttempt } from "../enrollment/usePortAttempt";
+import { blockMessage, type DecisionCardAction, type RecordDecision } from "./decisionActions";
 
-type Submission =
-  | { kind: "idle" }
-  | { kind: "pending" }
-  | { kind: "recorded"; version: number }
-  | { kind: "failed"; message: string };
+type Outcome = { kind: "recorded"; version: number } | { kind: "failed"; message: string };
 
 interface DecisionAnswerFormProps {
   decisionId: DecisionId;
@@ -18,7 +15,11 @@ interface DecisionAnswerFormProps {
   action: DecisionCardAction;
 }
 
-/** Records the first answer to a decision, or replaces its current one. */
+/**
+ * Records the first answer to a decision, or replaces its current one. An answer belongs to the
+ * callback it started with: when the action is blocked or replaced mid-request it is withdrawn and
+ * its late outcome is dropped.
+ */
 export const DecisionAnswerForm = ({
   decisionId,
   options,
@@ -27,9 +28,9 @@ export const DecisionAnswerForm = ({
 }: DecisionAnswerFormProps) => {
   const [option, setOption] = useState<string | null>(null);
   const [invalid, setInvalid] = useState<string | null>(null);
-  const [submission, setSubmission] = useState<Submission>({ kind: "idle" });
-  // `pending` is captured at render, so two submits in one tick would both pass it.
-  const inFlight = useRef(false);
+  const { state: submission, start } = usePortAttempt<RecordDecision, Outcome>(
+    action.kind === "available" ? action.onRecordDecision : null,
+  );
 
   const verb = current === null ? "Record answer" : "Replace answer";
   const blocked = action.kind === "blocked";
@@ -37,7 +38,7 @@ export const DecisionAnswerForm = ({
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (action.kind !== "available" || inFlight.current) return;
+    if (action.kind !== "available") return;
     if (option === null) {
       setInvalid("Choose an option.");
       return;
@@ -47,27 +48,21 @@ export const DecisionAnswerForm = ({
       return;
     }
     setInvalid(null);
-    inFlight.current = true;
-    setSubmission({ kind: "pending" });
-    try {
-      const outcome = await action.onRecordDecision({
-        decisionId,
-        option,
-        expectedVersion: current?.version ?? null,
-      });
-      setSubmission(
-        outcome.ok
+    const record = action.onRecordDecision;
+    const request = { decisionId, option, expectedVersion: current?.version ?? null };
+    await start(record, async (control): Promise<Outcome> => {
+      try {
+        const outcome = await record(request, control);
+        return outcome.ok
           ? { kind: "recorded", version: outcome.version }
-          : { kind: "failed", message: outcome.message },
-      );
-    } catch {
-      setSubmission({
-        kind: "failed",
-        message: "The answer was not confirmed as recorded. Check the history, then try again.",
-      });
-    } finally {
-      inFlight.current = false;
-    }
+          : { kind: "failed", message: outcome.message };
+      } catch {
+        return {
+          kind: "failed",
+          message: "The answer was not confirmed as recorded. Check the history, then try again.",
+        };
+      }
+    });
   };
 
   return (
@@ -108,6 +103,13 @@ export const DecisionAnswerForm = ({
         {submission.kind === "failed" && (
           <Text variant="error" DANGEROUS_className="break-words">
             {submission.message}
+          </Text>
+        )}
+        {submission.kind === "withdrawn" && (
+          <Text variant="error" DANGEROUS_className="break-words">
+            {submission.sent
+              ? "The board stopped being current after the answer was sent. Check the decision's history before answering again."
+              : "Stopped: the board stopped being current before the answer was sent. Nothing was recorded."}
           </Text>
         )}
       </div>

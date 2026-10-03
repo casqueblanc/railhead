@@ -8,7 +8,7 @@ import { FakeApi, FakeBoard, type Fault } from "../../rpc/fakeApi";
 import type { RecordDecisionRequest } from "../decisions/decisionActions";
 import { FAKE_ENCODED, fakeAuthenticator, type FakeAnswer } from "../enrollment/fakeAuthenticator";
 import type { Authenticator } from "../enrollment/webauthn";
-import type { BoardPorts } from "./boardPorts";
+import { gateOnConnection, type BoardPorts } from "./boardPorts";
 import { useLiveBoardPorts } from "./liveConnection";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -20,6 +20,11 @@ const REQUEST: RecordDecisionRequest = {
   decisionId: "dec_size",
   option: "chunk",
   expectedVersion: 1,
+};
+
+const WITHDRAWN = {
+  ok: false,
+  message: "The board lost its session before the answer was sent. Nothing was recorded.",
 };
 
 const event = (seq: number): RailheadEvent => {
@@ -70,7 +75,10 @@ describe("useLiveBoardPorts", () => {
   /** Records `REQUEST` through the decisions port, failing the test when it is unavailable. */
   const record = async () => {
     if (ports.decisions.kind !== "available") throw new Error("decisions unavailable");
-    return ports.decisions.onRecordDecision(REQUEST);
+    return ports.decisions.onRecordDecision(REQUEST, {
+      signal: new AbortController().signal,
+      onSent: () => {},
+    });
   };
 
   beforeEach(() => {
@@ -137,6 +145,27 @@ describe("useLiveBoardPorts", () => {
       expect(ports.connection).toBe("lost");
       expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
       expect(cursor()).toBe(HEAD - 2);
+    });
+
+    it("leaves live while a silently released subscription is replaced, then resumes", async () => {
+      const first = board.latest();
+      const subscribe = board.subscribe.bind(board);
+      const gate: { answer?: () => void } = {};
+      board.subscribe = (from, listener) =>
+        new Promise((resolve) => {
+          gate.answer = () => resolve(subscribe(from, listener));
+        });
+
+      await act(async () => first.handle.release());
+
+      expect(ports.connection).toBe("connected");
+      expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+      expect(gateOnConnection(ports).decisions).toEqual({ kind: "unavailable", reason: "offline" });
+      expect(board.reads).toEqual([0, HEAD - 2]);
+
+      await act(async () => gate.answer?.());
+      expect(feed()).toMatchObject({ kind: "board", connection: "live" });
+      expect(board.latest().cursor).toBe(HEAD - 2);
     });
 
     it("replays from its cursor on reconnect and reports the board recovered", async () => {
@@ -265,6 +294,62 @@ describe("useLiveBoardPorts", () => {
         message: "The board lost its session before the answer was sent. Nothing was recorded.",
       });
       expect(board.ownerStub.performed).toHaveLength(0);
+    });
+
+    describe("when the board stops being current while the passkey prompt is open", () => {
+      let sign: (() => void) | null;
+
+      beforeEach(() => {
+        sign = null;
+        const signer = fakeAuthenticator().authenticator;
+        authenticator = {
+          get: (options) =>
+            new Promise((resolve) => {
+              sign = () => resolve(signer.get(options));
+            }),
+          create: signer.create,
+        };
+      });
+
+      const signed = async (pending: Promise<unknown>) => {
+        if (sign === null) throw new Error("the passkey prompt never opened");
+        sign();
+        return pending;
+      };
+
+      it("performs nothing once access to the repository is revoked", async () => {
+        await mount();
+        const pending = record();
+        await act(async () => {});
+
+        await act(async () => board.latest().listener.ended("revoked"));
+
+        expect(await signed(pending)).toEqual(WITHDRAWN);
+        expect(board.ownerStub.performed).toHaveLength(0);
+        expect(feed()).toMatchObject({ kind: "board", connection: "lost" });
+      });
+
+      it("performs nothing once the subscription is released and the board catches up", async () => {
+        await mount();
+        const pending = record();
+        await act(async () => {});
+
+        await act(async () => board.latest().handle.release());
+
+        expect(await signed(pending)).toEqual(WITHDRAWN);
+        expect(board.ownerStub.performed).toHaveLength(0);
+        expect(feed()).toMatchObject({ kind: "board", connection: "live" });
+      });
+
+      it("performs a later answer once the board is live again", async () => {
+        await mount();
+        await act(async () => board.latest().handle.release());
+        const pending = record();
+        await act(async () => {});
+
+        expect(await signed(pending)).toEqual({ ok: true, version: 7 });
+        expect(board.ownerStub.performed).toHaveLength(1);
+      });
     });
 
     it("is unavailable without a passkey in this browser", async () => {

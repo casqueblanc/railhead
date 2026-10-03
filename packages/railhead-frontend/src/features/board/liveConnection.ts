@@ -23,6 +23,7 @@ import type {
   RecordDecisionOutcome,
   RecordDecisionRequest,
 } from "../decisions/decisionActions";
+import type { AttemptControl } from "../enrollment/ownerActions";
 import { browserAuthenticator, signAction, type Authenticator } from "../enrollment/webauthn";
 import type { BoardPorts, BoardRead, EnrollmentPort, OwnerPort } from "./boardPorts";
 import { type BoardState, emptyBoardState, foldEvents } from "./boardState";
@@ -75,6 +76,9 @@ export const useLiveBoardPorts = (
     const controller = new AbortController();
     let stream: BoardStream | null = null;
     let live = false;
+    // Aborted whenever the board leaves live, so an answer started on a board that stopped being
+    // current is never sent. A new period of being live gets a fresh one.
+    let liveAccess = new AbortController();
 
     const update = (patch: Partial<SessionView>) => {
       if (current)
@@ -101,6 +105,8 @@ export const useLiveBoardPorts = (
       onPhase: (phase) => {
         if (!current) return;
         live = phase.kind === "live";
+        if (!live) liveAccess.abort();
+        else if (liveAccess.signal.aborted) liveAccess = new AbortController();
         const before = kept.current;
         if (live && before !== null) {
           keep({ ...before, everLive: true, recovered: before.everLive });
@@ -151,8 +157,20 @@ export const useLiveBoardPorts = (
             ? { kind: "unavailable", reason: "no_passkey" }
             : {
                 kind: "available",
-                onRecordDecision: (request) =>
-                  recordDecision(owner, authenticator, controller.signal, request),
+                onRecordDecision: (request, control) =>
+                  recordDecision(
+                    owner,
+                    authenticator,
+                    {
+                      signal: AbortSignal.any([
+                        controller.signal,
+                        liveAccess.signal,
+                        control.signal,
+                      ]),
+                      onSent: control.onSent,
+                    },
+                    request,
+                  ),
               },
       });
     };
@@ -256,16 +274,17 @@ const enrollmentPort = (enrollment: PromiseLike<EnrollmentSession>): EnrollmentP
 
 /**
  * Records a decision with a fresh passkey assertion bound to exactly that answer. Nothing is
- * performed once `signal` aborts, and a result for anything but the requested decision is a
- * failure. Never throws.
+ * performed once `control.signal` aborts, `control.onSent` is called just before the answer is
+ * sent, and a result for anything but the requested decision is a failure. Never throws.
  */
 export const recordDecision = async (
   owner: OwnerSession,
   authenticator: Authenticator,
-  signal: AbortSignal,
+  control: AttemptControl,
   request: RecordDecisionRequest,
 ): Promise<RecordDecisionOutcome> => {
   const { decisionId } = request;
+  const { signal } = control;
   try {
     const prepared = await owner.prepare({ kind: "decision.record", ...request });
     if (!prepared.ok) return { ok: false, message: refusal(prepared.code) };
@@ -282,6 +301,7 @@ export const recordDecision = async (
         return unreachable(signed);
     }
     if (signal.aborted) return WITHDRAWN;
+    control.onSent();
     const performed = await owner.perform(prepared.value.challengeId, signed.value);
     if (!performed.ok) return { ok: false, message: refusal(performed.code) };
     const result = performed.value;

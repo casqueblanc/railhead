@@ -38,16 +38,40 @@ const fault = <T>(
   return Promise.resolve(scripted === null ? answer() : failure(scripted));
 };
 
+/** Disposes `listener` the way Cap'n Web disposes a target once its last remote reference goes. */
+export const releaseTarget = (listener: BoardListener): void => {
+  const dispose: unknown = Reflect.get(listener, Symbol.dispose);
+  if (typeof dispose === "function") dispose.call(listener);
+};
+
+/**
+ * A subscription handle. Like the backend, it releases the client's listener when the handle is
+ * disposed or cancelled, so a client sees that disposal arrive for a subscription it dropped.
+ */
 export class FakeSubscription implements SubscriptionSession {
   disposed = false;
+  #listener: BoardListener | null;
+
+  constructor(listener: BoardListener) {
+    this.#listener = listener;
+  }
+
+  /** Releases the listener without calling `ended`, as the backend does on a delivery failure. */
+  release(): void {
+    const listener = this.#listener;
+    this.#listener = null;
+    if (listener !== null) releaseTarget(listener);
+  }
 
   cancel(): Promise<void> {
     this.disposed = true;
+    this.release();
     return Promise.resolve();
   }
 
   [Symbol.dispose](): void {
     this.disposed = true;
+    this.release();
   }
 }
 
@@ -162,7 +186,7 @@ export class FakeBoard implements BoardSession {
 
   subscribe(cursor: number, listener: BoardListener): Promise<BoardResult<SubscriptionSession>> {
     return fault(this.subscribeFault, () => {
-      const handle = new FakeSubscription();
+      const handle = new FakeSubscription(listener);
       this.subscriptions.push({ cursor, listener, handle });
       return { ok: true, value: handle };
     });
