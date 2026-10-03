@@ -757,3 +757,44 @@ describe("folding a long log", () => {
     expect({ ...halted, stream: null }).toEqual({ ...fold(log.events.slice(0, 3)), stream: null });
   });
 });
+
+describe("totals and recent activity", () => {
+  it("counts each human event once, however often a replay repeats it", () => {
+    const once = fold(checkBeforeLand.events);
+    const replayed = fold(withReplayOverlap(checkBeforeLand, 2, 12));
+
+    expect(once.totals).toEqual({
+      humanActions: 7,
+      firstAt: SYNTH_START_MS,
+      lastAt: SYNTH_START_MS + (last(checkBeforeLand) - 1) * 1000,
+    });
+    expect(replayed.totals).toEqual(once.totals);
+    expect(replayed.recent).toEqual(once.recent);
+  });
+
+  it("counts a landed merge's claims but not a rejected one's", () => {
+    const beforeRejection = after(checkBeforeLand, isMain("int_synth10"));
+    const rejected = after(checkBeforeLand, isMain("int_synth11"));
+    const landed = after(checkBeforeLand, isMain("int_synth12"));
+
+    expect(beforeRejection.recent.at(-1)?.changesLanded).toBe(1);
+    expect(rejected.recent.at(-1)?.changesLanded).toBe(1);
+    expect(landed.recent.at(-1)?.changesLanded).toBe(2);
+  });
+
+  it("leaves the counts unchanged when an event halts the fold", () => {
+    const base = fold(checkBeforeLand.events);
+    const halted = append(base, checkResult("chk_synthbad", "not-a-commit", "test", "fail"));
+
+    expect(halted.stream.kind).toBe("halted");
+    expect(halted.totals).toBe(base.totals);
+    expect(halted.recent).toBe(base.recent);
+  });
+
+  it("starts with no counts and no recent activity", () => {
+    const empty = emptyBoardState(SYNTH_REPO);
+
+    expect(empty.totals).toEqual({ humanActions: 0, firstAt: null, lastAt: null });
+    expect(empty.recent).toEqual([]);
+  });
+});

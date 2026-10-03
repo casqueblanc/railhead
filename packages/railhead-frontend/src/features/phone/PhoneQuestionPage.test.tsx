@@ -68,6 +68,7 @@ const ports = (board: BoardState, decisions: DecisionActions, patch: Partial<Boa
     decisions,
     owner: { kind: "unavailable", reason: "module_unavailable" },
     enrollment: { kind: "unavailable", reason: "module_unavailable" },
+    checks: { kind: "unavailable", reason: "module_unavailable" },
     ...patch,
   }) satisfies BoardPorts;
 

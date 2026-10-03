@@ -29,7 +29,13 @@ import type {
 } from "../decisions/decisionActions";
 import type { AttemptControl } from "../enrollment/ownerActions";
 import { browserAuthenticator, signAction, type Authenticator } from "../enrollment/webauthn";
-import type { BoardPorts, BoardRead, EnrollmentPort, OwnerPort } from "./boardPorts";
+import type {
+  BoardPorts,
+  BoardRead,
+  CheckDetailPort,
+  EnrollmentPort,
+  OwnerPort,
+} from "./boardPorts";
 import { type BoardState, emptyBoardState, foldEvents } from "./boardState";
 
 /** The folded board, kept across sessions for one repository. */
@@ -52,6 +58,7 @@ interface SessionView {
   owner: OwnerPort;
   enrollment: EnrollmentPort;
   decisions: DecisionActions;
+  checks: CheckDetailPort;
 }
 
 const OFFLINE = { kind: "unavailable", reason: "offline" } as const;
@@ -110,6 +117,7 @@ export const useLiveBoardPorts = (
         owner: OFFLINE,
         enrollment: OFFLINE,
         decisions: OFFLINE,
+        checks: OFFLINE,
       });
       release();
     };
@@ -155,6 +163,7 @@ export const useLiveBoardPorts = (
       owner: OFFLINE,
       enrollment: enrollmentPort(enrollment),
       decisions: OFFLINE,
+      checks: OFFLINE,
     });
 
     const open = async () => {
@@ -171,6 +180,12 @@ export const useLiveBoardPorts = (
       }
       const board = opened.value;
       held.push(board);
+      update({
+        checks: {
+          kind: "available",
+          onReadCheck: (checkRunId) => settle(() => board.checkDetail(checkRunId)),
+        },
+      });
       const resume = kept.current;
       stream = new BoardStream(
         board,
@@ -236,6 +251,7 @@ export const useLiveBoardPorts = (
     decisions: bound?.decisions ?? OFFLINE,
     owner: bound?.owner ?? OFFLINE,
     enrollment: bound?.enrollment ?? OFFLINE,
+    checks: bound?.checks ?? OFFLINE,
   };
 };
 

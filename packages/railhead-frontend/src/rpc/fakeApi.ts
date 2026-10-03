@@ -9,6 +9,7 @@ import {
   type BoardFailure,
   type BoardListener,
   type BoardResult,
+  type CheckDetail,
   type EnrollmentChallenge,
   type EventPage,
   type OwnerAction,
@@ -16,7 +17,7 @@ import {
   type PasskeyAssertion,
   type PasskeyRegistration,
 } from "@railhead/shared/board-api";
-import type { RailheadEvent, RepoId, UserId } from "@railhead/shared/events";
+import type { CheckRunId, RailheadEvent, RepoId, UserId } from "@railhead/shared/events";
 import type {
   ApiSession,
   BoardSession,
@@ -174,13 +175,18 @@ export class FakeBoard implements BoardSession {
   pageSize: number = MAX_EVENT_PAGE;
   readFault: Fault | null = null;
   subscribeFault: Fault | null = null;
-  readonly stalls = new Stalls<"readEvents" | "subscribe" | "owner">();
+  readonly stalls = new Stalls<"readEvents" | "subscribe" | "owner" | "checkDetail">();
   /** The cursor of every `readEvents` call. */
   readonly reads: number[] = [];
   /** The history every `readEvents` call sent, or `undefined` when it sent none. */
   readonly readHistories: (string | undefined)[] = [];
   readonly subscriptions: Subscribed[] = [];
   readonly ownerStub = new FakeOwner();
+  /** The check runs `checkDetail` knows; any other id is `not_found`. */
+  readonly checks = new Map<CheckRunId, CheckDetail>();
+  checkFault: Fault | null = null;
+  /** The id of every `checkDetail` call. */
+  readonly checkReads: CheckRunId[] = [];
   readonly #repo: RepoId;
   #log: RailheadEvent[];
   #history = "history-1";
@@ -256,6 +262,16 @@ export class FakeBoard implements BoardSession {
 
   owner(): Promise<OwnerSession> {
     return this.stalls.gate("owner", () => Promise.resolve(this.ownerStub));
+  }
+
+  checkDetail(checkRunId: CheckRunId): Promise<BoardResult<CheckDetail>> {
+    this.checkReads.push(checkRunId);
+    return this.stalls.gate("checkDetail", () =>
+      fault(this.checkFault, (): BoardResult<CheckDetail> => {
+        const detail = this.checks.get(checkRunId);
+        return detail === undefined ? failure("not_found") : { ok: true, value: detail };
+      }),
+    );
   }
 
   /** The newest subscription. */
