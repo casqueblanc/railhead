@@ -513,35 +513,63 @@ impl FileStore {
         let staged = Staged {
             dir,
             temp,
-            published: false,
+            settled: false,
         };
         write(&mut file)
             .and_then(|()| file.sync_all())
             .map_err(|source| io_error("writing", &staged.temp, source))?;
         Ok(staged)
     }
+
+    /// Removes `kind`'s file, then passes the agent's directory to `sync` so the removal survives
+    /// a crash. The directory is synced when the file is already gone too: an earlier attempt may
+    /// have removed it and stopped before its sync.
+    fn remove_with(
+        &self,
+        agent: &AgentName,
+        kind: SecretKind,
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        if !self.check_dirs(Some(agent))? {
+            return Ok(());
+        }
+        let dir = self.agent_dir(agent);
+        remove_if_present(&dir.join(kind.file_name()))?;
+        sync(&dir)
+    }
 }
 
 /// A complete file written under a name only its own write uses, not yet at its destination.
-/// Dropping it unpublished removes it.
+/// Dropping it unsettled removes it.
 #[derive(Debug)]
 struct Staged {
     dir: PathBuf,
     temp: PathBuf,
-    published: bool,
+    /// Whether the temporary name is gone, renamed to its destination or removed.
+    settled: bool,
 }
 
 impl Staged {
     /// Renames the file over `path`, which then holds exactly the staged bytes.
     fn publish(mut self, path: &Path) -> Result<()> {
         fs::rename(&self.temp, path).map_err(|source| io_error("replacing", path, source))?;
-        self.published = true;
+        self.settled = true;
         sync_dir(&self.dir)
     }
 
     /// Links the file at `path` only if nothing is there, so `path` then holds exactly the staged
-    /// bytes and an existing file is never touched. The temporary name is removed on drop.
+    /// bytes and an existing file is never touched.
     fn publish_new(self, path: &Path) -> Result<()> {
+        self.publish_new_with(path, sync_dir)
+    }
+
+    /// Publishes as [`Staged::publish_new`] does, removing the temporary name before passing the
+    /// directory to `sync`, so one sync makes both the new name and that removal durable.
+    fn publish_new_with(
+        mut self,
+        path: &Path,
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         fs::hard_link(&self.temp, path).map_err(|source| {
             if source.kind() == io::ErrorKind::AlreadyExists {
                 Error::AlreadyExists(path.to_owned())
@@ -549,15 +577,27 @@ impl Staged {
                 io_error("creating", path, source)
             }
         })?;
-        sync_dir(&self.dir)
+        self.discard();
+        sync(&self.dir)
+    }
+
+    /// Removes the temporary name. A file left behind when that fails is never read, so the
+    /// failure does not fail the write.
+    fn discard(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            let _ = fs::remove_file(&self.temp);
+        }
     }
 }
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        if !self.published {
-            // The write already failed or was abandoned; a file left behind is never read.
-            let _ = fs::remove_file(&self.temp);
+        if !self.settled {
+            // The write already failed or was abandoned. The sync is best effort: a removal it
+            // fails to make durable leaves only a file that is never read.
+            self.discard();
+            let _ = sync_dir(&self.dir);
         }
     }
 }
@@ -593,10 +633,7 @@ impl SecretStore for FileStore {
     }
 
     fn remove(&self, agent: &AgentName, kind: SecretKind) -> Result<()> {
-        if !self.check_dirs(Some(agent))? {
-            return Ok(());
-        }
-        remove_if_present(&self.agent_dir(agent).join(kind.file_name()))
+        self.remove_with(agent, kind, sync_dir)
     }
 }
 
@@ -713,7 +750,7 @@ fn check_owner(path: &Path, metadata: &fs::Metadata, forbidden: u32) -> Result<(
     }
 }
 
-/// Makes a rename or link in `dir` survive a crash.
+/// Makes a rename, link or removal in `dir` survive a crash.
 fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(dir)
@@ -1001,6 +1038,129 @@ mod tests {
         assert_eq!(read.as_ref().map(Secret::expose), Some("two"));
         store.remove(&atlas, SecretKind::SessionToken)?;
         assert_eq!(store.read(&atlas, SecretKind::SessionToken)?, None);
+        Ok(())
+    }
+
+    /// Removes `kind` as the store does, recording each synced directory and the files it held
+    /// at that moment.
+    fn remove_recording_syncs(
+        store: &FileStore,
+        home: &Path,
+        agent: &AgentName,
+        kind: SecretKind,
+    ) -> (Result<()>, Vec<(PathBuf, Vec<String>)>) {
+        let mut synced = Vec::new();
+        let removed = store.remove_with(agent, kind, |dir| {
+            synced.push((dir.to_owned(), atlas_files(home).unwrap_or_default()));
+            sync_dir(dir)
+        });
+        (removed, synced)
+    }
+
+    #[test]
+    fn a_removal_is_synced_after_the_file_is_gone() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let key = Secret::new("key".to_owned());
+        store.create(&atlas, SecretKind::SigningKey, &key)?;
+        store.replace(&atlas, SecretKind::SessionToken, &key)?;
+        let dir = home.path().join("agents/atlas");
+
+        let (removed, synced) =
+            remove_recording_syncs(&store, home.path(), &atlas, SecretKind::SessionToken);
+        removed?;
+        assert_eq!(synced, [(dir, vec!["key".to_owned()])]);
+        assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, Some(key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_removal_syncs_again() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        store.replace(
+            &atlas,
+            SecretKind::SessionToken,
+            &Secret::new("one".to_owned()),
+        )?;
+        let dir = home.path().join("agents/atlas");
+
+        // An attempt that unlinked the token and stopped before its sync.
+        fs::remove_file(dir.join("session"))?;
+        let (removed, synced) =
+            remove_recording_syncs(&store, home.path(), &atlas, SecretKind::SessionToken);
+        removed?;
+        assert_eq!(synced, [(dir, Vec::new())]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_removal_from_a_store_never_created_syncs_and_creates_nothing() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path().join("railhead"));
+        let atlas = AgentName::new("atlas")?;
+        let (removed, synced) =
+            remove_recording_syncs(&store, home.path(), &atlas, SecretKind::SessionToken);
+        removed?;
+        assert_eq!(synced, Vec::new());
+        assert_eq!(fs::read_dir(home.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_removal_sync_is_reported() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        store.replace(
+            &atlas,
+            SecretKind::SessionToken,
+            &Secret::new("one".to_owned()),
+        )?;
+        let dir = home.path().join("agents/atlas");
+        let failed = store.remove_with(&atlas, SecretKind::SessionToken, |dir| {
+            Err(io_error("syncing", dir, io::ErrorKind::Other.into()))
+        });
+        assert!(matches!(failed, Err(Error::Io { action: "syncing", path, .. }) if path == dir));
+        assert_eq!(store.read(&atlas, SecretKind::SessionToken)?, None);
+
+        // The retry finds the file gone and makes its removal durable.
+        let (removed, synced) =
+            remove_recording_syncs(&store, home.path(), &atlas, SecretKind::SessionToken);
+        removed?;
+        assert_eq!(synced, [(dir, Vec::new())]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_key_drops_its_temporary_name_before_the_sync() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+
+        let mut synced = Vec::new();
+        store
+            .stage(&atlas, b"key")?
+            .publish_new_with(&dir.join("key"), |parent| {
+                synced.push((
+                    parent.to_owned(),
+                    atlas_files(home.path()).unwrap_or_default(),
+                ));
+                sync_dir(parent)
+            })?;
+        assert_eq!(synced, [(dir.clone(), vec!["key".to_owned()])]);
+
+        // A failed sync is reported; the key is linked and the temporary name is gone.
+        let failed = store
+            .stage(&atlas, b"identity")?
+            .publish_new_with(&dir.join("identity.json"), |parent| {
+                Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+            });
+        assert!(matches!(failed, Err(Error::Io { action: "syncing", path, .. }) if path == dir));
+        assert_eq!(atlas_files(home.path())?, ["identity.json", "key"]);
         Ok(())
     }
 
