@@ -267,22 +267,30 @@ class GitGateway implements GitPort {
 
   /**
    * Reads a push's head within the head time limit and `deadline`. Once either passes, the client's
-   * body is cancelled, so a client that stalls inside its head holds nothing open.
+   * body is cancelled, so a client that stalls inside its head holds nothing open. After the head,
+   * the deadline ends the upload through the forwarding pipe instead.
    */
   async #readHead(
     body: ReadableStream<Uint8Array>,
     deadline: Deadline,
   ): Promise<PushHead | { readonly kind: "late" }> {
+    const reading = new AbortController();
+    const stop = (): void => {
+      reading.abort(deadline.signal.reason);
+    };
+    if (deadline.signal.aborted) stop();
+    else deadline.signal.addEventListener("abort", stop, { once: true });
     const headTimer = setTimeout(() => {
       deadline.expire();
     }, this.#limits.headTimeoutMs);
     try {
-      return await readReceivePackHead(cancelledOnAbort(body, deadline.signal));
+      return await readReceivePackHead(cancelledOnAbort(body, reading.signal));
     } catch (error) {
       if (deadline.expired) return { kind: "late" };
       throw error;
     } finally {
       clearTimeout(headTimer);
+      deadline.signal.removeEventListener("abort", stop);
     }
   }
 
@@ -370,7 +378,8 @@ class GitGateway implements GitPort {
     try {
       response = await untilAborted(this.#context.upstream(upstreamRequest), deadline.signal);
     } catch {
-      deadline.clear();
+      // The upstream may have failed without reading the upload: end the exchange, which cancels it.
+      deadline.abort();
       if (sent?.exceeded === true) {
         return text(413, "railhead: the request is larger than Railhead accepts");
       }
@@ -389,13 +398,13 @@ class GitGateway implements GitPort {
         : `application/x-${route.service}-result`;
     if (response.status !== 200 || response.headers.get("content-type") !== expectedType) {
       // A redirect, a refusal of Railhead's own token or an error page: none is the client's to see.
-      deadline.clear();
+      deadline.abort();
       await response.body?.cancel().catch(() => undefined);
       logFailure(route, `status_${response.status}`);
       return text(502, "railhead: the repository store refused the request");
     }
     if (response.body === null) {
-      deadline.clear();
+      deadline.abort();
       return text(502, "railhead: the repository store sent no body");
     }
 
@@ -707,7 +716,10 @@ function untilAborted(work: Promise<Response>, signal: AbortSignal): Promise<Res
   });
 }
 
-/** The time limit of one upstream exchange; expiring it aborts the call and errors both bodies. */
+/**
+ * The time limit of one upstream exchange. Expiring it, or ending the exchange early, aborts the
+ * call and errors both bodies, which cancels the client's upload.
+ */
 class Deadline {
   readonly #controller = new AbortController();
   readonly #timer: ReturnType<typeof setTimeout>;
@@ -730,16 +742,30 @@ class Deadline {
   expire(): void {
     if (this.#controller.signal.aborted) return;
     this.#expired = true;
+    this.#end(new Error("the Git exchange took too long"));
+  }
+
+  /** Ends the exchange after a failure; unlike `expire`, it does not count as a timeout. */
+  abort(): void {
+    if (this.#controller.signal.aborted) return;
+    this.#end(new Error("the Git exchange failed"));
+  }
+
+  #end(reason: Error): void {
     clearTimeout(this.#timer);
-    this.#controller.abort(new Error("the Git exchange took too long"));
+    this.#controller.abort(reason);
   }
 
   clear(): void {
     clearTimeout(this.#timer);
   }
 
-  /** Errors `controller`'s stream when the deadline expires. */
+  /** Errors `controller`'s stream when the deadline expires or the exchange ends. */
   watch(controller: TransformStreamDefaultController<Uint8Array>): void {
+    if (this.#controller.signal.aborted) {
+      controller.error(this.#controller.signal.reason);
+      return;
+    }
     this.#controller.signal.addEventListener(
       "abort",
       () => {

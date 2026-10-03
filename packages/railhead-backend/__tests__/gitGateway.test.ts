@@ -1066,6 +1066,78 @@ describe("upstream responses", () => {
   });
 });
 
+describe("an upstream that fails before reading the upload", () => {
+  const failures: [string, () => Promise<Response>][] = [
+    ["rejects", () => Promise.reject(new Error("connection reset"))],
+    [
+      "redirects",
+      async () =>
+        new Response(null, { status: 302, headers: { location: "https://elsewhere.invalid/" } }),
+    ],
+    ["answers the wrong type", async () => new Response("<html></html>", { status: 200 })],
+  ];
+
+  it("cancels the client's still-open upload and aborts the upstream call", async () => {
+    for (const service of ["git-upload-pack", "git-receive-pack"] as const) {
+      for (const [label, failure] of failures) {
+        const name = `${service} ${label}`;
+        await withGateway(async (world) => {
+          let cancelled = false;
+          const sent: { signal: AbortSignal | null } = { signal: null };
+          world.upstream = (request) => {
+            sent.signal = request.signal;
+            return failure();
+          };
+          // The whole push head, or a fetch's first bytes, then nothing: the upload never ends.
+          const first =
+            service === "git-receive-pack"
+              ? pushBody([`${ROOT} ${HEAD} refs/heads/a`])
+              : encoder.encode("0000");
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(first);
+            },
+            cancel() {
+              cancelled = true;
+            },
+          });
+          const response = await world.gateway.serve(rpc(service, body), FORK, `/${service}`);
+          expect(response.status, name).toBe(502);
+          await until(() => cancelled);
+          expect(sent.signal?.aborted, name).toBe(true);
+          expect(world.minted(), name).toBe(1);
+          expect(pushedEvents(world), name).toEqual([]);
+        });
+      }
+    }
+  });
+  it("cuts off a push whose pack stalls after its head while the upstream reads it", async () => {
+    await withGateway(async (world) => {
+      let cancelled = false;
+      world.upstream = async (request) => {
+        await request.arrayBuffer();
+        return gitResponse("git-receive-pack", "result", PUSH_RESULT);
+      };
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(pushBody([`${ROOT} ${HEAD} refs/heads/a`]));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", body),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(504);
+      await until(() => cancelled);
+      expect(pushedEvents(world)).toEqual([]);
+    });
+  });
+});
+
 describe("push reports", () => {
   it("reads a plain report-status-v2 report and drops a ref the server rewrote", () => {
     const reader = new PushReportReader("plain");
@@ -1093,18 +1165,45 @@ describe("push reports", () => {
   });
 });
 
-/** A fake Artifacts binding whose `info` answers with `answer`, counting `get` calls. */
+/** A fake Artifacts binding whose `info` answers with `answer`, counting `get` calls and disposals. */
 function namespace(answer: () => Promise<{ remote: string }>): {
   calls: () => number;
+  disposed: () => number;
   get: (name: string) => Promise<Disposable & { info(): Promise<{ remote: string }> }>;
 } {
   let calls = 0;
+  let disposed = 0;
   return {
     calls: () => calls,
+    disposed: () => disposed,
     get: async () => {
       calls += 1;
-      return { info: answer, [Symbol.dispose]: () => undefined };
+      return {
+        info: answer,
+        [Symbol.dispose]: () => {
+          disposed += 1;
+        },
+      };
     },
+  };
+}
+
+/** A promise settled from outside, for a binding call that answers only when the test says so. */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+} {
+  let resolve: ((value: T) => void) | undefined;
+  let reject: ((reason: unknown) => void) | undefined;
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return {
+    promise,
+    resolve: (value) => resolve?.(value),
+    reject: (reason) => reject?.(reason),
   };
 }
 
@@ -1127,10 +1226,64 @@ describe("artifactsRemotes", () => {
     expect(result).toMatchObject({ ok: false, code: "internal" });
     expect(JSON.stringify(result)).not.toContain("secret detail");
     const slow = namespace(() => new Promise(() => undefined));
-    const resolveSlow = artifactsRemotes(slow, { timeoutMs: 20, maxCached: 1 });
+    const resolveSlow = artifactsRemotes(slow, { timeoutMs: 20, maxCached: 1, maxPending: 4 });
     expect(await resolveSlow("r")).toMatchObject({ ok: false, code: "busy" });
-    expect(await resolveSlow("r")).toMatchObject({ ok: false, code: "busy" });
-    expect(slow.calls()).toBe(2);
+    expect(slow.calls()).toBe(1);
+  });
+
+  it("shares one lookup between concurrent misses of the same repository", async () => {
+    const answer = deferred<{ remote: string }>();
+    const binding = namespace(() => answer.promise);
+    const resolve = artifactsRemotes(binding, { timeoutMs: 1_000, maxCached: 4, maxPending: 4 });
+    const first = resolve("r");
+    const second = resolve("r");
+    answer.resolve({ remote: "https://x.artifacts.cloudflare.net/r.git" });
+    expect(await first).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(await second).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(binding.calls()).toBe(1);
+    expect(binding.disposed()).toBe(1);
+  });
+
+  it("starts no more binding calls while a timed-out lookup is still outstanding", async () => {
+    const binding = namespace(() => new Promise(() => undefined));
+    const resolve = artifactsRemotes(binding, { timeoutMs: 20, maxCached: 4, maxPending: 4 });
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      expect(await resolve("r"), `attempt ${attempt}`).toMatchObject({ ok: false, code: "busy" });
+    }
+    expect(binding.calls()).toBe(1);
+    // The stalled lookup's handle is released when it times out, not when the call settles.
+    expect(binding.disposed()).toBe(1);
+  });
+
+  it("answers busy without calling the binding once the outstanding lookups reach the bound", async () => {
+    const answer = deferred<{ remote: string }>();
+    const binding = namespace(() => answer.promise);
+    const resolve = artifactsRemotes(binding, { timeoutMs: 20, maxCached: 4, maxPending: 2 });
+    expect(await resolve("a")).toMatchObject({ ok: false, code: "busy" });
+    expect(await resolve("b")).toMatchObject({ ok: false, code: "busy" });
+    expect(await resolve("c")).toMatchObject({ ok: false, code: "busy" });
+    expect(binding.calls()).toBe(2);
+    // Once the stalled calls settle, their slots are free again: the next miss reaches the binding.
+    answer.reject(new Error("late"));
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(await resolve("c")).toMatchObject({ ok: false, code: "internal" });
+    expect(binding.calls()).toBe(3);
+    expect(binding.disposed()).toBe(3);
+  });
+
+  it("keeps a remote that arrives after its lookup timed out, and calls nothing more for it", async () => {
+    const answer = deferred<{ remote: string }>();
+    const binding = namespace(() => answer.promise);
+    const resolve = artifactsRemotes(binding, { timeoutMs: 20, maxCached: 4, maxPending: 1 });
+    expect(await resolve("r")).toMatchObject({ ok: false, code: "busy" });
+    answer.resolve({ remote: "https://x.artifacts.cloudflare.net/r.git" });
+    await new Promise((settle) => setTimeout(settle, 0));
+    expect(await resolve("r")).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(binding.calls()).toBe(1);
+    expect(binding.disposed()).toBe(1);
+    // The settled lookup freed its slot: another repository can be looked up.
+    expect(await resolve("s")).toEqual(ok("https://x.artifacts.cloudflare.net/r.git"));
+    expect(binding.calls()).toBe(2);
   });
 
   it("is refused by the gateway when it is not plain HTTPS", async () => {
