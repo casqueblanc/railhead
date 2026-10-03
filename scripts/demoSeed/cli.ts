@@ -20,9 +20,10 @@
 // and there is no command-line signer yet (#148): without `--assertion` the write stops after
 // `prepare`, prints the challenge and exits 3, writing nothing; `--assertion FILE` performs it with
 // `{ challengeId, assertion }` the owner signed for that challenge. The owner's steps are in
-// `docs/demo-seed.md`. A refusal exits 2; a backend failure or timeout prints the backend's sentence
-// and exits 1. A write sent whose answer timed out or was lost exits 4 and says what to do next: run
-// a seed again, since it reads first; inspect the instance before approving another reset. Nothing
+// `docs/demo-seed.md`. A refusal exits 2, including a repository that changed while a seed planned;
+// a backend failure or timeout prints the backend's sentence and exits 1. A write sent whose answer
+// timed out, was lost, or was a failure that may follow a partial write exits 4 and says what to do
+// next: run a seed again, since it reads first; inspect the instance before approving another reset. Nothing
 // here creates a Cloudflare resource or reads a secret.
 
 import { readFileSync } from "node:fs";
@@ -76,6 +77,10 @@ const ROOT = resolve(import.meta.dirname, "..", "..");
 
 /** The manifest's path in the source repository, read at the selected commit. */
 const MANIFEST_PATH = "fixtures/demo/seed.json";
+
+/** What a plan against a live target cannot promise: nothing locks the target while it reads. */
+const SNAPSHOT_NOTE =
+  "note the plan is a best-effort snapshot, so run one operator at a time against this instance";
 
 /** Opens the session `--target` names; tests pass their own. */
 export type OpenSession = (origin: string) => LiveSession;
@@ -186,11 +191,18 @@ export async function run(
           ...describeIssues(plan),
           ...decision,
           `note planned against ${live.origin}`,
+          SNAPSHOT_NOTE,
         ];
       }
       const bundle = buildMainBundle(request);
       const plan = await seed(manifest, bundle, target, target);
-      return [...header(bundle), ...describePlan(plan), ...describeIssues(plan), ...decision];
+      return [
+        ...header(bundle),
+        ...describePlan(plan),
+        ...describeIssues(plan),
+        ...decision,
+        SNAPSHOT_NOTE,
+      ];
     }
     case "bundle": {
       if (values.out === undefined) throw new SeedRefusal("bundle needs --out FILE.");

@@ -171,7 +171,7 @@ test("a signed seed imports main once, sending the bundle's bytes, and a repeat 
   assert.equal(backend.received.length, 1);
 });
 
-test("the backend's refusals reach the seed as refusals, and its failures as errors", async () => {
+test("the backend's refusals reach the seed as refusals, and its answered failures as uncertain", async () => {
   // A main the read cannot see, at another head: the reconciler's "reset first".
   const stale = new FakeBackend();
   stale.main = OTHER_HEAD;
@@ -199,12 +199,59 @@ test("the backend's refusals reach the seed as refusals, and its failures as err
     withTarget(backend, wrong, (target) => seed(manifest, bundleAt(HEAD), target, target)),
     (error: unknown) => error instanceof SeedRefusal && /proof_invalid/.test(error.message),
   );
+  // `internal` may follow a partial write, so it is uncertain, never a plain failure.
   backend.failNextPerform = "internal";
   await assert.rejects(
     withTarget(backend, signed(needed), (target) => seed(manifest, bundleAt(HEAD), target, target)),
-    (error: unknown) => error instanceof BackendFailure && /internal/.test(error.message),
+    (error: unknown) =>
+      error instanceof WriteUncertain &&
+      error.action.kind === "demo.seed" &&
+      error.message === "demo.seed failed with internal: The fake backend refused with internal.",
   );
   assert.equal(backend.exists, false);
+});
+
+test("a reset that deletes some forks and then answers internal is uncertain", async () => {
+  const backend = withLog(0);
+  backend.forks = ["fork-1", "fork-2", "fork-3"];
+  const needed = await withTarget(backend, { kind: "prepare" }, (target) =>
+    reset(DEMO_REF, target).then(
+      () => assert.fail("the reset should stop after prepare"),
+      (thrown: unknown) => thrown,
+    ),
+  );
+  assert.ok(needed instanceof ApprovalNeeded);
+  backend.failResetAfterForks = 2;
+  await assert.rejects(
+    withTarget(backend, signed(needed), (target) => reset(DEMO_REF, target)),
+    (error: unknown) =>
+      error instanceof WriteUncertain &&
+      error.action.kind === "demo.reset" &&
+      error.message === "demo.reset failed with internal: The fake backend refused with internal.",
+  );
+  // Part of the reset happened: two forks are gone, main and one fork remain.
+  assert.deepEqual(backend.forks, ["fork-3"]);
+  assert.equal(backend.main, HEAD);
+});
+
+test("a busy answer to perform is uncertain, and a refusal before acting is not", async () => {
+  const busy = new FakeBackend();
+  busy.failNextPerform = "busy";
+  await assert.rejects(
+    withTarget(busy, signed(await preparedSeed(busy, HEAD)), (t) =>
+      t.seed(DEMO_REF, bundleAt(HEAD)),
+    ),
+    (error: unknown) => error instanceof WriteUncertain && /failed with busy/.test(error.message),
+  );
+  const expired = new FakeBackend();
+  expired.failNextPerform = "proof_expired";
+  await assert.rejects(
+    withTarget(expired, signed(await preparedSeed(expired, HEAD)), (t) =>
+      t.seed(DEMO_REF, bundleAt(HEAD)),
+    ),
+    (error: unknown) =>
+      error instanceof SeedRefusal && /failed with proof_expired/.test(error.message),
+  );
 });
 
 test("a target spends its approval on one write and refuses a second", async () => {
@@ -283,6 +330,37 @@ test("a repository reset between the read and the board read fails the plan", as
       error instanceof SeedRefusal &&
       error.message ===
         "demo/upload-app changed during planning: it was read, then the board did not find it; run again.",
+  );
+  assert.equal(backend.prepared.length, 0);
+});
+
+test("a repository reset and reseeded at another head during the board read fails the plan", async () => {
+  const backend = withLog(0);
+  backend.onOpenBoard = () => {
+    backend.onOpenBoard = null;
+    backend.main = OTHER_HEAD;
+    backend.events = [];
+  };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => seed(manifest, bundleAt(HEAD), t, t)),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message === "The repository demo/upload-app changed during planning; run again.",
+  );
+  assert.equal(backend.prepared.length, 0);
+  assert.equal(backend.main, OTHER_HEAD);
+});
+
+test("a repository seeded by someone else during the board read fails the plan", async () => {
+  const backend = new FakeBackend();
+  backend.onOpenBoard = () => {
+    backend.onOpenBoard = null;
+    backend.exists = true;
+    backend.main = OTHER_HEAD;
+  };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => seed(manifest, bundleAt(HEAD), t, t)),
+    /changed during planning; run again/,
   );
   assert.equal(backend.prepared.length, 0);
 });

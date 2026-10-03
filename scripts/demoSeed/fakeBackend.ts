@@ -66,6 +66,8 @@ export class FakeBackend {
   main: string | null = null;
   exists = false;
   events: RailheadEvent[] = [];
+  /** The demo repository's recorded forks, which a reset deletes one by one before main. */
+  forks: string[] = [];
   /** The bundles `perform` received, as bytes. */
   readonly received: Uint8Array[] = [];
   readonly prepared: DemoSeedAction[] = [];
@@ -73,6 +75,11 @@ export class FakeBackend {
   readonly performed: DemoSeedAction["kind"][] = [];
   /** A failure the next `perform` answers with, before doing anything. */
   failNextPerform: BoardErrorCode | null = null;
+  /**
+   * When set, the next reset deletes this many forks and then answers `internal`, as the backend
+   * does when a later deletion fails after earlier ones succeeded.
+   */
+  failResetAfterForks: number | null = null;
   /** Whether the next `perform` applies its action and then never answers, as a lost response. */
   withholdNextAnswer = false;
   /** Runs as `openBoard` is called, before it looks up the repository. */
@@ -121,7 +128,13 @@ export class FakeBackend {
         this.performed.push(action.kind);
         return { ok: true, value: { kind: "demo.seed", repo: REPO_ID, head: action.head } };
       case "demo.reset": {
+        if (this.failResetAfterForks !== null) {
+          this.forks = this.forks.slice(this.failResetAfterForks);
+          this.failResetAfterForks = null;
+          return fail("internal");
+        }
         const deleted = this.exists || this.main !== null;
+        this.forks = [];
         this.exists = false;
         this.main = null;
         this.events = [];

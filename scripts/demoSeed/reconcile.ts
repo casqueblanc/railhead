@@ -122,7 +122,10 @@ export function demoRef(ref: RepoRef): RepoRef {
   return { org: ref.org, repo: ref.repo };
 }
 
-/** Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. */
+/**
+ * Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. It
+ * reads `target` before and after `board`, and refuses when the two reads differ.
+ */
 export async function planSeed(
   manifest: SeedManifest,
   history: ImportedHistory,
@@ -143,6 +146,13 @@ export async function planSeed(
   }
   const titles = new Set(manifest.issues.map((issue) => issue.title));
   const filed = Map.groupBy(await board.issues(ref, titles), (issue) => issue.title);
+  // The board read may have seen a repository another operator reset and seeded since the first
+  // read; the plan would then mark a main done that is not this one. This narrows the window but
+  // does not close it: the plan is several calls, not one snapshot.
+  const again = await target.read(ref);
+  if ((again === null) !== (state === null) || again?.main !== state?.main) {
+    throw new SeedRefusal(`The repository ${name} changed during planning; run again.`);
+  }
 
   return [
     {

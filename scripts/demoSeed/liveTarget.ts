@@ -8,10 +8,12 @@
 // challenge, once. The backend binds a challenge to its action, head included, so an assertion for
 // another action or head is refused there, never here.
 //
-// Every backend call is bounded by a timeout. A write whose answer times out or is lost is not
-// repeated here: it fails with `WriteUncertain`. The next seed reads the target first, so an
-// uncertain seed is reconciled before anything is written a second time; a reset reads nothing
-// first, so the owner inspects the instance before approving another.
+// Every backend call is bounded by a timeout. A write is not repeated here when its answer times
+// out, is lost, or is anything but a success or a refusal the backend makes before acting
+// (`PRE_ACTION_REFUSALS`): a reset that fails after deleting some forks answers `internal`. Each
+// fails with `WriteUncertain`. The next seed reads the target first, so an uncertain seed is
+// reconciled before anything is written a second time; a reset reads nothing first, so the owner
+// inspects the instance before approving another.
 //
 // The board has no issue query, so `issues` replays the log from its start. It keeps only the
 // issues whose titles the caller asks for and stops with an incomplete plan past
@@ -27,6 +29,7 @@ import type { RepoSegment } from "../../packages/railhead-shared/src/agent-api.t
 import type { RailheadApi } from "../../packages/railhead-shared/src/api.ts";
 import type {
   ActionChallenge,
+  BoardErrorCode,
   BoardResult,
   DemoSeedAction,
   DemoSeedResult,
@@ -135,8 +138,9 @@ export class BackendFailure extends Error {
 }
 
 /**
- * A write was sent and its answer timed out or was lost, so it may have happened. It is never
- * repeated here; what the owner does next depends on the action.
+ * A write was sent and its answer timed out, was lost, was a failure the backend may have answered
+ * after acting, or was not the action's result, so it may have happened, in part or whole. It is
+ * never repeated here; what the owner does next depends on the action.
  */
 export class WriteUncertain extends Error {
   override readonly name = "WriteUncertain";
@@ -239,17 +243,25 @@ export class LiveTarget implements SeedTarget, BoardIssues {
 
   async seed(ref: RepoRef, bundle: MainBundle): Promise<void> {
     demoRef(ref);
-    const result = await this.#write({ kind: "demo.seed", head: bundle.head }, bundle.bytes);
+    const action: DemoSeedAction = { kind: "demo.seed", head: bundle.head };
+    const result = await this.#write(action, bundle.bytes);
     if (result.kind !== "demo.seed" || result.head !== bundle.head) {
-      throw new Error(`The backend answered the seed of ${bundle.head} with another result.`);
+      throw new WriteUncertain(
+        action,
+        new BackendFailure(`The backend answered the seed of ${bundle.head} with another result.`),
+      );
     }
   }
 
   async reset(ref: RepoRef): Promise<boolean> {
     demoRef(ref);
-    const result = await this.#write({ kind: "demo.reset" }, null);
+    const action: DemoSeedAction = { kind: "demo.reset" };
+    const result = await this.#write(action, null);
     if (result.kind !== "demo.reset") {
-      throw new Error("The backend answered the reset with another result.");
+      throw new WriteUncertain(
+        action,
+        new BackendFailure("The backend answered the reset with another result."),
+      );
     }
     return result.deleted;
   }
@@ -326,13 +338,32 @@ export class LiveTarget implements SeedTarget, BoardIssues {
           if (error instanceof BackendFailure) throw new WriteUncertain(action, error);
           throw error;
         }
-        return valueOf(performed, action.kind);
+        if (performed.ok || PRE_ACTION_REFUSALS.has(performed.code)) {
+          return valueOf(performed, action.kind);
+        }
+        throw new WriteUncertain(
+          action,
+          new BackendFailure(`${action.kind} failed with ${performed.code}: ${performed.message}`),
+        );
       }
       default:
         return unreachable(approval);
     }
   }
 }
+
+/**
+ * The failures `perform` answers before it acts: the challenge or bundle is refused, the target
+ * holds something else, or the instance has no Artifacts binding. Any other failure may follow a
+ * partial write.
+ */
+const PRE_ACTION_REFUSALS: ReadonlySet<BoardErrorCode> = new Set<BoardErrorCode>([
+  "invalid_request",
+  "proof_invalid",
+  "proof_expired",
+  "action_stale",
+  "unavailable",
+]);
 
 /**
  * The value of a board call, or the error its failure maps to: `action_stale` is `ActionStale`, the
