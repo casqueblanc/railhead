@@ -12,11 +12,13 @@
     "clean": "rm -rf .wrangler"
   },
   "dependencies": {
+    "@cloudflare/sandbox": "catalog:",
     "@railhead/shared": "workspace:*",
     "capnweb": "catalog:",
     "capnweb-validate": "catalog:"
   },
   "devDependencies": {
+    "@cloudflare/config": "0.22.0",
     "@cloudflare/vitest-plugin": "catalog:",
     "@railhead/scripts": "workspace:*",
     "typescript": "catalog:",

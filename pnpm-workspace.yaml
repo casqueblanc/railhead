@@ -15,6 +15,10 @@ catalog:
   "@cloudflare/vitest-plugin": 1.3.4
   # Types follow the Node runtime pinned in .node-version, not the newest Node.
   "@types/node": 24.19.0
+  # Not 1.x: @cloudflare/ci 0.2.0, which runs the trusted checks, pins exactly 0.12.1, so merges and
+  # checks share one Sandbox class and one container image. The image tag in
+  # containers/railhead/Dockerfile moves with this pin.
+  "@cloudflare/sandbox": 0.12.1
   capnweb: 0.12.0
   # Pinned in lockstep with capnweb (declared as a >=0.7.0 peer).
   capnweb-validate: 0.3.0
