@@ -179,6 +179,7 @@ impl Error {
             code: Code::Local(code),
             message: self.to_string(),
             retryable,
+            retry_after_ms: None,
             next,
         };
         match self {
@@ -216,6 +217,7 @@ impl Error {
                     code: Code::Agent(error.code),
                     message: format!("{route}: {}", error.message),
                     retryable: error.retryable,
+                    retry_after_ms: error.retry_after_ms,
                     next: error.next,
                 },
             },
@@ -253,6 +255,7 @@ fn identity_failure(error: &identity::Error, whole: &Error) -> Failure {
         code: Code::Local(code),
         message: whole.to_string(),
         retryable: false,
+        retry_after_ms: None,
         next,
     }
 }
@@ -379,6 +382,7 @@ fn refuse_arguments(error: &clap::Error, mode: Mode) -> ExitCode {
         code: Code::Local(LocalCode::InvalidInput),
         message,
         retryable: false,
+        retry_after_ms: None,
         next: None,
     });
     u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
@@ -442,8 +446,9 @@ fn as_agent(cli: &Cli, command: impl FnOnce(&Agent<'_>) -> Result<()>) -> Result
 mod tests {
     use std::io::{self, Write};
 
+    use anyhow::Context as _;
     use clap::error::ErrorKind;
-    use railhead_protocol::{AgentError, AgentErrorCode, AgentRoute, NextCommand};
+    use railhead_protocol::{AgentError, AgentErrorCode, AgentRoute, NextCommand, SafeInteger};
 
     use super::*;
 
@@ -643,7 +648,7 @@ mod tests {
                 envelope,
                 serde_json::json!({"ok": false, "error": {"code": wire,
                     "message": format!("{wire} happened."), "retryable": retryable,
-                    "next": next.map(output::command_line)}})
+                    "retryAfterMs": null, "next": next.map(output::command_line)}})
             );
             assert_eq!(stderr, "");
 
@@ -657,6 +662,50 @@ mod tests {
             let (stdout, stderr) = print(Mode::Credential, &error)?;
             assert_eq!(stdout, "", "credential mode wrote a {wire} failure to Git");
             assert_eq!(stderr, format!("rh: {wire} happened.\n{hint}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejection_keeps_the_backends_retry_delay() -> anyhow::Result<()> {
+        let rejected = |retry_after_ms: Option<u64>| -> anyhow::Result<Error> {
+            Ok(Error::Http(http::Error::Rejected {
+                route: AgentRoute::Work,
+                status: 429,
+                error: AgentError {
+                    code: AgentErrorCode::RateLimited,
+                    message: "Too many requests.".to_owned(),
+                    retryable: true,
+                    retry_after_ms: retry_after_ms
+                        .map(|ms| SafeInteger::new(ms).context("unsafe delay"))
+                        .transpose()?,
+                    next: Some(NextCommand::Work),
+                },
+            }))
+        };
+        for (delay, wait_line) in [
+            (Some(30_000), "retry after: 30000 ms\n"),
+            (Some(0), "retry after: 0 ms\n"),
+            (None, ""),
+        ] {
+            let error = rejected(delay)?;
+            assert_eq!(error.failure().retry_after_ms.map(u64::from), delay);
+
+            let (stdout, stderr) = print(Mode::Json, &error)?;
+            let envelope: serde_json::Value = serde_json::from_str(&stdout)?;
+            assert_eq!(
+                envelope,
+                serde_json::json!({"ok": false, "error": {"code": "rate_limited",
+                    "message": "work: Too many requests.", "retryable": true,
+                    "retryAfterMs": delay, "next": "rh work"}})
+            );
+            assert_eq!(stderr, "");
+
+            let expected = format!("rh: work: Too many requests.\n{wait_line}next: rh work\n");
+            let (stdout, stderr) = print(Mode::Text, &error)?;
+            assert_eq!((stdout.as_str(), stderr.as_str()), ("", expected.as_str()));
+            let (stdout, stderr) = print(Mode::Credential, &error)?;
+            assert_eq!((stdout.as_str(), stderr.as_str()), ("", expected.as_str()));
         }
         Ok(())
     }

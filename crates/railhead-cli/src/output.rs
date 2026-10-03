@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Write};
 
-use railhead_protocol::{AgentErrorCode, InboxDigest, NextCommand};
+use railhead_protocol::{AgentErrorCode, InboxDigest, NextCommand, SafeInteger};
 use serde::Serialize;
 
 /// Where output goes and in what form.
@@ -92,6 +92,8 @@ pub struct Failure {
     pub message: String,
     /// Whether repeating the command may succeed.
     pub retryable: bool,
+    /// How long the backend asked to wait before a retry, in milliseconds, or `None` for no advice.
+    pub retry_after_ms: Option<SafeInteger>,
     /// The command to run next.
     pub next: Option<NextCommand>,
 }
@@ -140,10 +142,12 @@ struct FailureEnvelope<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FailureBody<'a> {
     code: Code,
     message: &'a str,
     retryable: bool,
+    retry_after_ms: Option<SafeInteger>,
     next: Option<&'static str>,
 }
 
@@ -198,12 +202,16 @@ impl<'a> Output<'a> {
                         code: failure.code,
                         message: &failure.message,
                         retryable: failure.retryable,
+                        retry_after_ms: failure.retry_after_ms,
                         next: failure.next.map(command_line),
                     },
                 },
             ),
             Mode::Text | Mode::Credential => {
                 writeln!(self.stderr, "rh: {}", inert(&failure.message))?;
+                if let Some(wait) = failure.retry_after_ms {
+                    writeln!(self.stderr, "retry after: {wait} ms")?;
+                }
                 if let Some(next) = failure.next {
                     writeln!(self.stderr, "next: {}", command_line(next))?;
                 }
@@ -324,7 +332,6 @@ pub fn inert(text: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use railhead_protocol::SafeInteger;
     use serde_json::{Value, json};
 
     use super::*;
@@ -367,6 +374,7 @@ mod tests {
             code: Code::Agent(AgentErrorCode::UnackedDecision),
             message: "Acknowledge item 17 first.".to_owned(),
             retryable: false,
+            retry_after_ms: None,
             next: Some(NextCommand::Sync),
         }
     }
@@ -414,7 +422,8 @@ mod tests {
         assert_eq!(
             envelope,
             json!({"ok": false, "error": {"code": "unacked_decision",
-                "message": "Acknowledge item 17 first.", "retryable": false, "next": "rh sync"}})
+                "message": "Acknowledge item 17 first.", "retryable": false, "retryAfterMs": null,
+                "next": "rh sync"}})
         );
         assert_eq!(text(&out.stderr), "");
         let local = Failure {
