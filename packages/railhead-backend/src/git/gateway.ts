@@ -32,10 +32,16 @@
 // the Repo's alarm is asked for once the exchange must have ended; if it cannot be saved, the bytes
 // are withheld. Its report settles it: the record and the pending row are written in one
 // transaction, and a complete refusal drops it. A push the report does not settle, because the
-// outcome is unknown or the record failed, is left to the alarm, which reads the fork's branches
-// back and records each ref found at the commit the push sent it to, while the claim is still
-// working at the push's generation. A pending push whose claim moved on is dropped and logged as
-// `git_push_unrecorded`; that a claim can move on after its push's last bytes were sent is #159.
+// outcome is unknown or the record failed, is left to the alarm. Finding a branch at the commit the
+// push sent proves nothing on its own: a stale push Git refused can find the fork already there. So
+// before a push is released, the gateway reads the branches it names, and keeps that read only if
+// no other push to the fork was in flight or released meanwhile; each fork counts the pushes
+// released to it. The alarm records a branch read at the push's old id then and at its new id now,
+// with no push released to the fork since, while the claim is still working at the push's
+// generation. Otherwise it records nothing and logs the outcome as unknown. This assumes the
+// gateway is the fork's only writer once its claim is working. A pending push whose claim moved on
+// is dropped and logged as `git_push_unrecorded`; that a claim can move on after its push's last
+// bytes were sent is #159.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -173,6 +179,11 @@ const MIGRATIONS: readonly string[] = [
     attempts INTEGER NOT NULL
   ) STRICT`,
   "CREATE INDEX git_pending_push_due ON git_pending_push (due_at)",
+  // How many pushes each fork has had released to it, and each pending push's place in that count
+  // with the fork's branches as read before it was released, or NULL when no read can stand for them.
+  "CREATE TABLE git_fork_release (repo TEXT PRIMARY KEY, released INTEGER NOT NULL) STRICT",
+  "ALTER TABLE git_pending_push ADD COLUMN release INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE git_pending_push ADD COLUMN prior TEXT",
 ];
 /** How many pending pushes one alarm reconciles; the alarm is asked for again for the rest. */
 const RECONCILE_BATCH = 8;
@@ -310,14 +321,18 @@ class GitGateway implements GitPort {
       );
     }
     let pending: number | null = null;
+    let observed: Observed | null = null;
     return this.#forward(request, route, grant, {
       head,
       body: parsed.body,
       deadline,
       admit: () => this.#readmit(route, access, grant, head),
+      observe: async () => {
+        observed = await this.#observe(grant.repo, head);
+      },
       release: () => {
         try {
-          pending = this.#save(principal, fence, grant.repo, head);
+          pending = this.#save(principal, fence, grant.repo, head, observed);
         } catch (error) {
           logPush("git_push_unsaved", fence, { error: errorName(error) });
           return "unsaved";
@@ -337,15 +352,49 @@ class GitGateway implements GitPort {
   }
 
   /**
-   * Saves a push about to be released as pending and asks the alarm for it once the exchange must
-   * have ended, in one transaction, if the claim is still working at the push's generation.
-   * Returns the pending row, or `null` when the claim changed.
+   * Reads the branches of `repo` that a push names before it is released, for reconciliation to
+   * tell whether the push moved them. The read stands for the fork at the push's release only if no
+   * push was in flight to the fork when it began and none is released before this one, which
+   * `#save` checks. Returns `null` when a push was in flight or the fork could not be read; the push
+   * goes ahead either way.
+   */
+  async #observe(repo: ArtifactsRepoName, head: ReceivePackHead): Promise<Observed | null> {
+    const inFlight = this.#context.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM git_pending_push WHERE repo = ?",
+        repo,
+      )
+      .one().count;
+    if (inFlight > 0) return null;
+    const released = this.#released(repo);
+    const refs = await this.#readRefs(
+      repo,
+      head.updates.map((update) => update.ref),
+    );
+    return refs === null ? null : { released, refs };
+  }
+
+  /** How many pushes have been released to `repo`. */
+  #released(repo: string): number {
+    const row = this.#context.storage.sql
+      .exec<{ released: number }>("SELECT released FROM git_fork_release WHERE repo = ?", repo)
+      .toArray()[0];
+    return row?.released ?? 0;
+  }
+
+  /**
+   * Saves a push about to be released as pending, counts its release to the fork, and asks the alarm
+   * for it once the exchange must have ended, in one transaction, if the claim is still working at
+   * the push's generation. The fork's branches `observed` before are kept only if no other push was
+   * released to the fork since they were read. Returns the pending row, or `null` when the claim
+   * changed.
    */
   #save(
     principal: AgentPrincipal,
     fence: Fence,
     repo: ArtifactsRepoName,
     head: ReceivePackHead,
+    observed: Observed | null,
   ): number | null {
     const updates = head.updates.flatMap(pushedRef);
     const dueAt = this.#context.clock() + this.#limits.maxDurationMs;
@@ -353,17 +402,35 @@ class GitGateway implements GitPort {
       if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
         return null;
       }
-      const row = this.#context.storage.sql
+      const { sql } = this.#context.storage;
+      const before = this.#released(repo);
+      const prior =
+        observed === null || observed.released !== before
+          ? null
+          : JSON.stringify(
+              Object.fromEntries(
+                updates.map((update) => [update.ref, observed.refs.get(update.ref) ?? null]),
+              ),
+            );
+      sql.exec(
+        `INSERT INTO git_fork_release (repo, released) VALUES (?, ?)
+         ON CONFLICT (repo) DO UPDATE SET released = excluded.released`,
+        repo,
+        before + 1,
+      );
+      const row = sql
         .exec<{ id: number }>(
           `INSERT INTO git_pending_push
-             (claim_id, generation, agent_id, repo, updates, due_at, attempts)
-           VALUES (?, ?, ?, ?, ?, ?, 0) RETURNING id`,
+             (claim_id, generation, agent_id, repo, updates, due_at, attempts, release, prior)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) RETURNING id`,
           fence.claimId,
           fence.generation,
           principal.agentId,
           repo,
           JSON.stringify(updates),
           dueAt,
+          before + 1,
+          prior,
         )
         .one();
       this.#context.wake(dueAt);
@@ -390,7 +457,7 @@ class GitGateway implements GitPort {
     try {
       const due = this.#context.storage.sql
         .exec<PendingRow>(
-          `SELECT id, claim_id, generation, agent_id, repo, updates, attempts
+          `SELECT id, claim_id, generation, agent_id, repo, updates, attempts, release, prior
            FROM git_pending_push WHERE due_at <= ? ORDER BY due_at, id LIMIT ?`,
           this.#context.clock(),
           RECONCILE_BATCH,
@@ -410,14 +477,18 @@ class GitGateway implements GitPort {
   }
 
   /**
-   * Reads the fork of one pending push back and records each ref found at the commit the push sent
-   * it to. A ref found elsewhere was not updated by this push, or was moved on by a later one that
-   * has its own record. A push whose claim moved on is dropped.
+   * Reads the fork of one pending push back and records each ref the push is proven to have moved:
+   * read at the push's old id just before its release and found at its new id now, with no other
+   * push released to the fork since. Finding a ref at the new id alone proves nothing, since a stale
+   * push that was refused can find the fork already there. Without that before-read, or once another
+   * push was released after this one, nothing is recorded and the outcome is logged as unknown. A
+   * push whose claim moved on is dropped.
    */
   async #reconcile(row: PendingRow): Promise<void> {
     const fence: Fence = { claimId: row.claim_id, generation: row.generation };
     const updates = parsePushedRefs(row.updates);
-    if (updates === null) {
+    const prior = row.prior === null ? null : parsePrior(row.prior);
+    if (updates === null || prior === undefined) {
       this.#drop(row.id, fence);
       logUnrecorded(fence, "unreadable_record");
       return;
@@ -425,6 +496,18 @@ class GitGateway implements GitPort {
     if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
       this.#drop(row.id, fence);
       logUnrecorded(fence, "claim_changed");
+      return;
+    }
+    const unproven: Unproven | null =
+      prior === null
+        ? "unobserved"
+        : this.#released(row.repo) !== row.release
+          ? "later_push"
+          : null;
+    if (prior === null || unproven !== null) {
+      if (this.#settle(row.id, row.agent_id, fence, []) !== "settled") {
+        logUnrecorded(fence, "outcome_unknown", unproven ?? "unobserved");
+      }
       return;
     }
     const refs = await this.#readRefs(
@@ -435,7 +518,10 @@ class GitGateway implements GitPort {
       this.#retryLater(row, null);
       return;
     }
-    const applied = updates.filter((update) => refs.get(update.ref) === update.to);
+    // A ref read at the push's old id can have moved only by this push; one read elsewhere refused it.
+    const applied = updates.filter(
+      (update) => prior.get(update.ref) === update.from && refs.get(update.ref) === update.to,
+    );
     const outcome = this.#settle(row.id, row.agent_id, fence, applied);
     switch (outcome) {
       case "recorded":
@@ -657,6 +743,7 @@ class GitGateway implements GitPort {
     // token is minted for it, and again after, so a closure during the mint is seen too.
     const before = await push?.admit();
     if (before !== undefined && before !== null) return release(before);
+    await push?.observe();
     const ports = this.#context.ports();
     const { tokenTtlMs, maxDurationMs } = this.#limits;
     const ttlMs = Math.max(tokenTtlMs, 2 * maxDurationMs);
@@ -882,7 +969,20 @@ interface PendingRow extends Record<string, SqlStorageValue> {
   repo: string;
   updates: string;
   attempts: number;
+  release: number;
+  prior: string | null;
 }
+
+/** The branches a push names as read from its fork before the push was released. */
+interface Observed {
+  /** How many pushes had been released to the fork when the read began. */
+  readonly released: number;
+  /** The id of each branch found; a branch not found is absent. */
+  readonly refs: ReadonlyMap<string, string>;
+}
+
+/** Why reconciliation cannot prove what a pending push moved. */
+type Unproven = "unobserved" | "later_push";
 
 /** What a push's release decided. */
 type Release = "released" | "claim_changed" | "unsaved";
@@ -925,6 +1025,27 @@ function parsePushedRefs(stored: string): PushedRef[] | null {
   return refs;
 }
 
+/**
+ * Reads the branches a pending push saved as read before its release: each branch's id, or `null`
+ * where it was absent. Returns `undefined` if they are not what `#save` wrote.
+ */
+function parsePrior(stored: string): ReadonlyMap<string, string | null> | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(stored);
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const prior = new Map<string, string | null>();
+  for (const [ref, id] of Object.entries(value)) {
+    if (!ref.startsWith(BRANCH_PREFIX)) return undefined;
+    if (id !== null && (typeof id !== "string" || !isCommitSha(id))) return undefined;
+    prior.set(ref, id);
+  }
+  return prior;
+}
+
 interface PendingPush {
   readonly head: ReceivePackHead;
   /** The whole request body, head included. */
@@ -933,6 +1054,8 @@ interface PendingPush {
   readonly deadline: Deadline;
   /** Decides the push again against current claim state: `null` to go ahead, or the refusal. */
   readonly admit: () => Promise<Response | null>;
+  /** Reads the fork's branches the push names, before anything of it can reach the fork. */
+  readonly observe: () => Promise<void>;
   /**
    * Decides, without awaiting, whether the push's last bytes may be sent: only while the claim is
    * still working at the push's generation, and only once the push is saved as pending.
@@ -1191,8 +1314,9 @@ function logUnrecorded(
     | "outcome_unknown"
     | "reconcile_failed"
     | "unreadable_record",
+  unproven?: Unproven,
 ): void {
-  logPush("git_push_unrecorded", fence, { reason });
+  logPush("git_push_unrecorded", fence, unproven === undefined ? { reason } : { reason, unproven });
 }
 
 /** Logs one event about a push: its claim, generation and Railhead's own codes and counts. */

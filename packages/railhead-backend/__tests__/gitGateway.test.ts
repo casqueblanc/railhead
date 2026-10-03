@@ -131,8 +131,17 @@ interface World {
   authorize: ((access: GitAccess) => PortResult<GitGrant>) | null;
   /** When set, the next `times` reads of `workingGeneration` throw `error`. */
   generationFault: { times: number; error: Error } | null;
-  /** The requests the default upstream received, with their bodies. */
+  /** The requests the default upstream received, with their bodies, apart from `observations`. */
   seen: Seen[];
+  /** The fork reads the gateway made while serving a push, before releasing it. */
+  observations: Seen[];
+  /**
+   * The fork's branches, each `[id, ref]`, as the default upstream advertises them to
+   * `observations`, or `null` to fail those reads.
+   */
+  fork: (readonly [string, string])[] | null;
+  /** How many pushes the gateway is serving, up to the response it returns. */
+  pushing: number;
   /** What the default upstream answers once it has read a request carrying a live token. */
   respond: (request: Request, body: Uint8Array) => Promise<Response> | Response;
   /** The outbound call; replace it to observe a request as it streams. */
@@ -155,6 +164,8 @@ interface World {
   restart: () => void;
   /** The pushes waiting for their record, as stored. */
   pending: () => { claim_id: string; generation: number; attempts: number; due_at: number }[];
+  /** Runs one statement on the gateway's storage. */
+  exec: (query: string, ...bindings: SqlStorageValue[]) => void;
 }
 
 /** A `ClaimsPort` whose `authorizeGit` follows the A21 contract over one mutable claim. */
@@ -253,10 +264,15 @@ function withGateway(
       authorize: null,
       generationFault: null,
       seen: [],
+      observations: [],
+      fork: [[HEAD, "refs/heads/main"]],
+      pushing: 0,
       respond: () => new Response(null, { status: 500 }),
       upstream: async (request) => {
         const bytes = new Uint8Array(await request.arrayBuffer());
-        world.seen.push({
+        // A read while a push is served, before its response, is the gateway's read of the fork.
+        const observation = world.pushing > 0 && request.method === "GET";
+        (observation ? world.observations : world.seen).push({
           url: request.url,
           method: request.method,
           headers: request.headers,
@@ -265,7 +281,10 @@ function withGateway(
         // The fake Git endpoint refuses any token Artifacts would refuse.
         const bearer = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
         if (!fake.accepts(bearer)) return new Response("bad token", { status: 401 });
-        return world.respond(request, bytes);
+        if (!observation) return world.respond(request, bytes);
+        return world.fork === null
+          ? new Response(null, { status: 500 })
+          : advertisement(world.fork);
       },
       remote: async (repo) => ok(`https://fake.artifacts.invalid/${repo}.git`),
       events: () => log.replay(0, 100).events,
@@ -283,10 +302,13 @@ function withGateway(
             "SELECT claim_id, generation, attempts, due_at FROM git_pending_push ORDER BY id",
           )
           .toArray(),
+      exec: (query, ...bindings) => {
+        state.storage.sql.exec(query, ...bindings);
+      },
     };
     const claims = claimsFor(world);
-    const build = (): GitPort =>
-      createGitGateway(
+    const build = (): GitPort => {
+      const gateway = createGitGateway(
         {
           log,
           storage: state.storage,
@@ -300,6 +322,19 @@ function withGateway(
         },
         limits,
       );
+      return {
+        async serve(request, target, path) {
+          const push = request.method === "POST" && path === "/git-receive-pack";
+          if (push) world.pushing += 1;
+          try {
+            return await gateway.serve(request, target, path);
+          } finally {
+            if (push) world.pushing -= 1;
+          }
+        },
+        resume: () => gateway.resume(),
+      };
+    };
     world.gateway = build();
     await body(world);
   });
@@ -382,9 +417,21 @@ let logged: string[] = [];
 
 /** The warning for a push that moved the claim's fork without a `claim.pushed` event. */
 function unrecorded(
-  reason: "claim_changed" | "record_failed" | "outcome_unknown" | "reconcile_failed",
+  reason:
+    | "claim_changed"
+    | "record_failed"
+    | "outcome_unknown"
+    | "reconcile_failed"
+    | "unreadable_record",
+  unproven?: "unobserved" | "later_push",
 ): string {
-  return JSON.stringify({ event: "git_push_unrecorded", claimId: CLAIM, generation: 3, reason });
+  return JSON.stringify({
+    event: "git_push_unrecorded",
+    claimId: CLAIM,
+    generation: 3,
+    reason,
+    ...(unproven === undefined ? {} : { unproven }),
+  });
 }
 
 /** The `outcome_unknown` warnings logged so far, after checking no line names a ref or commit. */
@@ -477,7 +524,16 @@ describe("stock Git through the gateway", () => {
       expect(await bytesOf(response)).toEqual(PUSH_RESULT);
 
       expect(world.seen[0]?.body).toEqual(PUSH_REQUEST);
-      expect(world.fake.liveTokens(world.forkName).map((token) => token.scope)).toEqual(["write"]);
+      // The fork was read once before the push was released, under a read token of its own.
+      expect(world.observations.map((seen) => seen.url)).toEqual([
+        `https://fake.artifacts.invalid/${world.forkName}.git/info/refs?service=git-upload-pack`,
+      ]);
+      expect(
+        world.fake
+          .liveTokens(world.forkName)
+          .map((token) => token.scope)
+          .toSorted(),
+      ).toEqual(["read", "write"]);
       expect(pushedEvents(world)).toMatchObject([
         {
           actor: { kind: "agent", id: AGENT.agentId },
@@ -1203,7 +1259,8 @@ describe("a push decided again after it was admitted", () => {
       revokeTokens: (repo) => base.revokeTokens(repo),
       async token(repo, scope, ttlMs) {
         const minted = await base.token(repo, scope, ttlMs);
-        await duringMint?.();
+        // The read token is the fork read's before release; the push's own is the write token.
+        if (scope === "write") await duringMint?.();
         return minted;
       },
     });
@@ -1219,8 +1276,11 @@ describe("a push decided again after it was admitted", () => {
           duringMint = step === "token" ? close : null;
           if (step === "remote") {
             const remote = world.remote;
+            let lookups = 0;
             world.remote = async (repo) => {
-              await close();
+              // The first lookup is the fork read's before release; the second is the push's own.
+              lookups += 1;
+              if (lookups === 2) await close();
               return remote(repo);
             };
           }
@@ -1233,8 +1293,9 @@ describe("a push decided again after it was admitted", () => {
           expect(decoder.decode(await bytesOf(response)), step).toContain(
             "ng refs/heads/feature The claim is closed.",
           );
-          // A token was minted before the claim closed, and the closure revoked it.
-          expect(world.minted(), step).toBe(1);
+          // The fork read's token and the push's were minted before the claim closed, and the
+          // closure revoked both.
+          expect(world.minted(), step).toBe(2);
           expect(world.fake.liveTokens(world.forkName), step).toEqual([]);
           expect(world.authorizations, step).toHaveLength(3);
           expect(world.seen, step).toEqual([]);
@@ -1947,7 +2008,8 @@ describe("an upstream that fails before reading the upload", () => {
           expect(response.status, name).toBe(502);
           await until(() => cancelled);
           expect(sent.signal?.aborted, name).toBe(true);
-          expect(world.minted(), name).toBe(1);
+          // A push also minted a read token for the fork read before its release.
+          expect(world.minted(), name).toBe(service === "git-receive-pack" ? 2 : 1);
           expect(pushedEvents(world), name).toEqual([]);
         });
       }
@@ -2409,6 +2471,8 @@ describe("a push left pending", () => {
     await withGateway(async (world) => {
       const created = "a".repeat(40);
       const moved = "b".repeat(40);
+      // Before the push, `a` is absent and `b` is at the push's old id.
+      world.fork = [[HEAD, "refs/heads/b"]];
       world.respond = () =>
         gitResponse(
           "git-receive-pack",
@@ -2513,10 +2577,136 @@ describe("a push left pending", () => {
     });
   });
 
+  it("records nothing for a stale push Git refused whose response was lost, though the fork is at its new id", async () => {
+    await withGateway(async (world) => {
+      const moved = "b".repeat(40);
+      // An earlier push already moved `feature` to `moved`; this one still names `HEAD` as its old id,
+      // so Git refuses it, and its response is lost.
+      world.fork = [[moved, "refs/heads/feature"]];
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${HEAD} ${moved} refs/heads/feature`])),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(502);
+      expect(world.pending()).toHaveLength(1);
+
+      world.respond = () => advertisement([[moved, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      expect(forkReads(world)).toHaveLength(1);
+      expect(logged.at(-1)).toBe(reconciled(0, 1));
+    });
+  });
+
+  it("records an update the fork shows moved from its old id to its new id after a lost response", async () => {
+    await withGateway(async (world) => {
+      const moved = "b".repeat(40);
+      world.fork = [[HEAD, "refs/heads/feature"]];
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${HEAD} ${moved} refs/heads/feature`])),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(world.observations).toHaveLength(1);
+
+      world.respond = () => advertisement([[moved, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(pushedEvents(world)).toMatchObject([
+        {
+          actor: { kind: "agent", id: AGENT.agentId },
+          data: { claimId: CLAIM, generation: 3, ref: "refs/heads/feature", from: HEAD, to: moved },
+        },
+      ]);
+      expect(world.pending()).toEqual([]);
+      expect(unknownOutcomes()).toBe(1);
+      expect(logged.at(-1)).toBe(reconciled(1, 0));
+    });
+  });
+
+  it("records neither of two pushes whose responses were lost while the other was in flight", async () => {
+    await withGateway(async (world) => {
+      const first = "a".repeat(40);
+      const second = "b".repeat(40);
+      world.fork = [[HEAD, "refs/heads/feature"]];
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      for (const [from, to] of [
+        [HEAD, first],
+        [first, second],
+      ] as const) {
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody([`${from} ${to} refs/heads/feature`])),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status).toBe(502);
+      }
+      // The second push was not read before release: the first was still in flight.
+      expect(world.observations).toHaveLength(1);
+      expect(world.pending()).toHaveLength(2);
+
+      world.respond = () => advertisement([[second, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      // Neither can be proven, so the fork is not read for either.
+      expect(forkReads(world)).toEqual([]);
+      expect(logged.slice(-2)).toEqual([
+        unrecorded("outcome_unknown", "later_push"),
+        unrecorded("outcome_unknown", "unobserved"),
+      ]);
+    });
+  });
+
+  it("records nothing when the fork could not be read before release", async () => {
+    await withGateway(async (world) => {
+      world.fork = null;
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      // The push still goes ahead without the read.
+      expect(response.status).toBe(502);
+      expect(world.seen.map((seen) => seen.body)).toEqual([PUSH_REQUEST]);
+
+      world.respond = () => advertisement([[PUSHED, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      expect(forkReads(world)).toEqual([]);
+      expect(logged.at(-1)).toBe(unrecorded("outcome_unknown", "unobserved"));
+    });
+  });
+
+  it("drops and logs a pending push whose saved fork read is unreadable", async () => {
+    await withGateway(async (world) => {
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      await world.gateway.serve(rpc("git-receive-pack", PUSH_REQUEST), FORK, "/git-receive-pack");
+      world.exec("UPDATE git_pending_push SET prior = ?", '{"refs/heads/feature":"not a commit"}');
+      world.respond = () => advertisement([[PUSHED, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      expect(forkReads(world)).toEqual([]);
+      expect(logged.at(-1)).toBe(unrecorded("unreadable_record"));
+    });
+  });
+
   it("withholds the push's last bytes when it cannot be saved", async () => {
     await withGateway(async (world) => {
       const received: number[] = [];
       world.upstream = async (request) => {
+        if (request.method === "GET") return advertisement(world.fork ?? []);
         try {
           received.push((await request.arrayBuffer()).byteLength);
         } catch {
