@@ -87,7 +87,17 @@ export async function serveGitGateway(
   const token = await deps.mint(repo, write ? "write" : "read");
   if (lapsed()) return refuse("policy");
   headers.set("Authorization", `Bearer ${token}`);
-  return deps.fetch(new Request(url, { method: request.method, headers, body, signal: deadline }));
+  // A redirect goes back to the sandbox, so the token never follows it to an unchecked URL and the
+  // sandbox's next request passes through these checks again.
+  return deps.fetch(
+    new Request(url, {
+      method: request.method,
+      headers,
+      body,
+      signal: deadline,
+      redirect: "manual",
+    }),
+  );
 }
 
 type PushCheck =

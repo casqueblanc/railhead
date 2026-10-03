@@ -58,18 +58,22 @@ function fetchRefs(repo = "main-repo"): Request {
 function recorder(): GatewayDeps & {
   minted: [string, string][];
   forwarded: { url: string; auth: string | null; body: string }[];
+  redirects: string[];
 } {
   const minted: [string, string][] = [];
   const forwarded: { url: string; auth: string | null; body: string }[] = [];
+  const redirects: string[] = [];
   return {
     minted,
     forwarded,
+    redirects,
     mint: async (repo, scope) => {
       minted.push([repo, scope]);
       return `tok-${scope}-${repo}`;
     },
     now: Date.now,
     fetch: async (request) => {
+      redirects.push(request.redirect);
       forwarded.push({
         url: request.url,
         auth: request.headers.get("Authorization"),
@@ -103,6 +107,8 @@ describe("serveGitGateway", () => {
         body: "",
       },
     ]);
+    // A redirect is returned to the sandbox instead of carrying the token to another URL.
+    expect(deps.redirects).toEqual(["manual"]);
   });
 
   it("forwards a candidate push with its pack bytes intact", async () => {
