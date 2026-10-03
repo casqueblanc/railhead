@@ -494,6 +494,11 @@ export function createClaims(
       }
     },
 
+    workingGeneration(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      return row?.state === "working" ? row.generation : null;
+    },
+
     async ready(agent, claimId, request) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;

@@ -143,6 +143,7 @@ export interface Resumable {
 export function resumables(ports: RepoPorts): readonly Resumable[] {
   return [
     { module: "claims", resume: () => ports.claims.resume() },
+    { module: "git", resume: () => ports.git.resume() },
     { module: "train", resume: () => ports.train.resume() },
   ];
 }
