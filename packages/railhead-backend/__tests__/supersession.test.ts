@@ -111,7 +111,7 @@ async function withDecisions<R>(
   const { stub, repoId } = repo ?? (await freshRepo());
   return runInDurableObject(stub, async (_instance, state) => {
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
+    const context = { repoId, storage: state.storage, log, clock, env, wake: async () => true };
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let inbox: InboxPort = realInbox;
@@ -355,6 +355,13 @@ function authorizer(h: Harness, scheduled: CheckAttempt): AuthorizationPort {
           : null,
       currentGeneration: (claimId) => h.ports().claims.currentGeneration(claimId),
       currentVersions: (claimId) => h.decisions.currentVersions(claimId),
+      // Each pin is ready under the versions the check was scheduled under.
+      readyPin: (claimId) => {
+        const pin = scheduled.pins.find((scheduledPin) => scheduledPin.claimId === claimId);
+        return pin === undefined ? null : { pin, episode: 1, decisions: scheduled.decisions };
+      },
+      // Each pin was marked ready once its holder had acknowledged, as `ready` requires.
+      readyGateNow: () => ({ kind: "clear" }),
     },
     () => "int_intent01",
   );

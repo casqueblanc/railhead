@@ -44,6 +44,7 @@ import { CHECK_DEADLINE_MS, createTrain } from "../src/modules/train/scheduler";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { MAX_SANDBOX_LIFETIME_MS, type Admission } from "../src/sandbox/admission";
 import type { SandboxPolicy } from "../src/sandbox/policy";
+import { queueing } from "./trainQueue";
 
 const MAIN = "1".repeat(40);
 const CANDIDATE = "2".repeat(40);
@@ -296,7 +297,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       log: EventLog.open(state.storage, repoId),
       clock: () => NOW,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const world = new World();
     const repository = new FakeRepository();
@@ -1341,7 +1342,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env: configured,
-        wake: () => {},
+        wake: async () => true,
       });
       const definitions = await ports.checks.definitions(MAIN);
       const first = await ports.checks.start(attemptFor(check.definition));
@@ -1373,7 +1374,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
-        wake: () => {},
+        wake: async () => true,
       });
       return ports.checks.start(await attempt());
     });
@@ -1445,22 +1446,34 @@ describe("a held check through the train", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => now,
         env: configured,
-        wake: (at) => wakes.push(at),
+        wake: async (at) => {
+          wakes.push(at);
+          return true;
+        },
       };
       const composed = composeRepo(context);
       const ports = (): RepoPorts => ({
         ...composed,
-        claims: { ...composed.claims, pin: async () => ok(pin) },
-        decisions: { ...composed.decisions, requirements: async () => ok([]) },
+        claims: {
+          ...composed.claims,
+          pin: async () => ok(pin),
+          currentGeneration: () => pin.generation,
+          readyPin: () => ({ pin, episode: 1, decisions: [] }),
+        },
+        decisions: {
+          ...composed.decisions,
+          requirements: async () => ok([]),
+          currentVersions: () => [],
+        },
         mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
         merge: {
           compose: async () => ok({ kind: "clean", candidate: CANDIDATE }),
           discard: async () => ok({ removed: 1 }),
         },
       });
-      const train = createTrain(context, ports);
+      const train = queueing(createTrain(context, ports), context.log);
 
-      await train.enqueue(pin);
+      await train.enqueue(pin, 1);
       const first = train.batches(1)[0];
       const blockedOutcome = await train.drive();
       const wakeWhileHeld = wakes.at(-1);

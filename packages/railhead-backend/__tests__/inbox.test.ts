@@ -93,7 +93,7 @@ async function withInbox<R>(
     let now = NOW;
     const clock = () => now;
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
+    const context = { repoId, storage: state.storage, log, clock, env, wake: async () => true };
     const inbox = createInbox(context);
     const agent = (id = "agt_atlas01"): AgentPrincipal => ({
       kind: "agent",

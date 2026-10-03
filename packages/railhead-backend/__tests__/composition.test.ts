@@ -260,7 +260,7 @@ describe("unavailable modules", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => 0,
         env,
-        wake: () => {},
+        wake: async () => true,
       });
       return Promise.all([
         ports.checks.start({
@@ -311,7 +311,7 @@ async function withFakePorts<R>(
       log: EventLog.open(state.storage, repoId),
       clock: () => 0,
       env,
-      wake: () => {},
+      wake: async () => true,
     });
     const calls: string[] = [];
     const ports: RepoPorts = {
@@ -361,7 +361,10 @@ describe("Repo alarm", () => {
     const context = {
       repoId: "rep_alarm0001",
       clock: () => 5_000,
-      wake: (at: number) => wakes.push(at),
+      wake: async (at: number) => {
+        wakes.push(at);
+        return true;
+      },
     };
     try {
       await resumeAll(context, [
@@ -403,7 +406,10 @@ describe("Repo alarm", () => {
     const context = {
       repoId: "rep_alarm0001",
       clock: () => 0,
-      wake: (at: number) => wakes.push(at),
+      wake: async (at: number) => {
+        wakes.push(at);
+        return true;
+      },
     };
     await expect(resumeAll(context, [])).resolves.toBeUndefined();
     // Nothing failed, so no retry wake is asked for.
@@ -417,7 +423,7 @@ describe("Repo alarm", () => {
           log: EventLog.open(state.storage, repoId),
           clock: () => 0,
           env,
-          wake: () => {},
+          wake: async () => true,
         }),
       ).map((entry) => entry.module),
     );

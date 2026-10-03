@@ -6,7 +6,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { CommitSha, RailheadEvent } from "@railhead/shared/events";
-import type { ClaimPin } from "../src/contracts/claims";
+import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
+import type { ReadyGate } from "../src/contracts/inbox";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -21,10 +22,11 @@ import {
   MAX_WRITE_ATTEMPTS,
 } from "../src/modules/mainWriter/mainWriter";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
-import { readWake } from "../src/modules/train/store";
+import { readEntry, readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { createAuthorization } from "../src/train/authorize";
+import { queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_publish01";
 const MAIN = "1".repeat(40);
@@ -114,11 +116,13 @@ class FakeMain implements MainRefPort {
 }
 
 interface Harness {
-  train: Train;
+  train: QueueingTrain;
   ref: FakeMain;
   authorization: AuthorizationPort;
   /** Each claim's current pin; a test replaces one to model a change of owner. */
   claims: Map<string, ClaimPin>;
+  /** Inbox gates that override the real inbox's, by claim; a test sets one to block a claim. */
+  gates: Map<string, ReadyGate>;
   started: CheckAttempt[];
   events(): RailheadEvent[];
   sql: SqlStorage;
@@ -150,7 +154,7 @@ function withRepo<R>(
       log,
       clock: () => (now += 1),
       env,
-      wake: () => undefined,
+      wake: async () => true,
     };
     const current = new Map(pins.map((p) => [p.claimId, p]));
     const currentGeneration = (claimId: string): number | null =>
@@ -158,10 +162,23 @@ function withRepo<R>(
     const currentVersions = (claimId: string): [] | null => (current.has(claimId) ? [] : null);
     const started: CheckAttempt[] = [];
     const real = composeRepo(context);
+    const readyPin = (claimId: string): ReadyPin | null => {
+      const found = current.get(claimId);
+      const entry =
+        found === undefined ? null : readEntry(state.storage.sql, claimId, found.generation);
+      return found === undefined || entry === null
+        ? null
+        : { pin: found, episode: entry.episode, decisions: [] };
+    };
+    const gates = new Map<string, ReadyGate>();
+    const readyGateNow = (claimId: string, generation: number): ReadyGate | null =>
+      gates.get(claimId) ?? real.inbox.readyGateNow(claimId, generation);
     const readers = {
       attemptOutcome: (attemptId: string) => train.attemptOutcome(attemptId),
       currentGeneration,
       currentVersions,
+      readyPin,
+      readyGateNow,
     };
     const authorization = createAuthorization(context, readers);
     const mainWriter: MainWriterPort = createMainWriter(
@@ -172,14 +189,17 @@ function withRepo<R>(
     );
     const ports: RepoPorts = {
       ...real,
+      inbox: { ...real.inbox, readyGateNow },
       claims: {
         ...real.claims,
         pin: async (claimId) => {
           const found = current.get(claimId);
           return found === undefined ? fail("not_found", "No such claim.") : ok(found);
         },
+        currentGeneration,
+        readyPin,
       },
-      decisions: { ...real.decisions, requirements: async () => ok([]) },
+      decisions: { ...real.decisions, requirements: async () => ok([]), currentVersions },
       merge: {
         compose: async (main, composed) =>
           ok({ kind: "clean", candidate: candidateOf(main, composed) }),
@@ -199,12 +219,16 @@ function withRepo<R>(
       authorization,
       mainWriter,
     };
-    const train = createTrain(context, () => ports);
+    const train = queueing(
+      createTrain(context, () => ports),
+      log,
+    );
     return body({
       train,
       ref,
       authorization,
       claims: current,
+      gates,
       started,
       events: () => log.replay(0, 256).events,
       sql: state.storage.sql,
@@ -393,6 +417,61 @@ describe("the train publishes through the real main writer", () => {
         { intentId, outcome: "reconciled", main: first.candidate },
       ]);
       expect(ref.updates).toHaveLength(1);
+    });
+  });
+
+  it("holds a batch whose inbox gate blocks while its write may still land, and lands it late", async () => {
+    const ref = new FakeMain(MAIN, ["hang"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      expect(ref.late).toHaveLength(1);
+
+      // An item affecting the claim arrives while the timed-out update is still on its way.
+      h.gates.set(pin(1).claimId, { kind: "blocked", items: [7] });
+      await h.alarm();
+      await h.alarm();
+      expect(batchStates(h.train)).toEqual([["passed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "batched" });
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized", attempts: 1 });
+      expect(ref.updates).toHaveLength(1);
+
+      // The update lands: the batch records the landing rather than a refusal.
+      ref.release();
+      await h.alarm();
+      expect(ref.main).toBe(first.candidate);
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(mainOutcomes(h.events())).toEqual([
+        { intentId, outcome: "reconciled", main: first.candidate },
+      ]);
+      expect(ref.updates).toHaveLength(1);
+    });
+  });
+
+  it("fails a batch whose inbox gate blocks only once its write can no longer land", async () => {
+    const ref = new FakeMain(MAIN, ["hang"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      await pass(h);
+      const intentId = latestIntent(h.train);
+      const attemptAt = h.authorization.record(intentId)?.updatedAt ?? 0;
+      h.gates.set(pin(1).claimId, { kind: "blocked", items: [7] });
+
+      let drives = 0;
+      while (batchStates(h.train)[0]?.[0] === "passed") {
+        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_EXPIRY_MS + 5 * 60_000);
+        await h.alarm();
+        drives += 1;
+      }
+      expect(drives).toBeGreaterThan(1);
+      expect(h.now() - attemptAt).toBeGreaterThanOrEqual(MAIN_UPDATE_EXPIRY_MS);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "reconciled", main: MAIN });
+      expect(mainOutcomes(h.events())).toEqual([{ intentId, outcome: "reconciled", main: MAIN }]);
+      expect(batchStates(h.train)[0]).toEqual(["failed", "main_rejected"]);
+      expect(ref.updates).toHaveLength(1);
+      expect(ref.main).toBe(MAIN);
     });
   });
 

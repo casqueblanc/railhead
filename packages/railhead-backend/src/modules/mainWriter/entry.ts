@@ -9,12 +9,14 @@ export const mainWriter: MainWriterFactory = (context, ports, mainRef) =>
   createMainWriter(
     context,
     () => {
-      const { authorization, claims, decisions, train } = ports();
+      const { authorization, claims, decisions, inbox, train } = ports();
       return {
         authorization,
         attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
         currentGeneration: (claimId) => claims.currentGeneration(claimId),
         currentVersions: (claimId) => decisions.currentVersions(claimId),
+        readyPin: (claimId) => claims.readyPin(claimId),
+        readyGateNow: (claimId, generation) => inbox.readyGateNow(claimId, generation),
       };
     },
     mainRef,
