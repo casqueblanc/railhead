@@ -7,7 +7,11 @@
 // `readEvents` page by page) and needs no credential: it takes none, sends none and writes none.
 // The origin is reduced to scheme, host and port, so a user name, password, path or query given
 // with it never reaches the file. Each event is copied field by field and validated by the board's
-// capture module before anything is written. The file appears whole or not at all, and an
+// capture module before anything is written. Every page after the first is read under the first
+// page's history, so a repository reset while capturing fails the capture instead of splicing two
+// logs. Free text in events is copied as written except for the secret shapes the capture module
+// redacts (session tokens, Artifacts tokens, Authorization values, URL passwords): treat the file
+// as being as sensitive as the board log itself. The file appears whole or not at all, and an
 // existing file is never replaced (see `write-new-file.ts`): a capture killed partway can leave a
 // `.<file>.<uuid>.partial` file beside the output, which is safe to delete.
 //
@@ -126,7 +130,13 @@ const capture = async ({ origin, org, name, out }) => {
     }
     board = opened.value;
     const reader = {
-      readEvents: (cursor, limit) => withTimeout(board.readEvents(cursor, limit), "readEvents"),
+      readEvents: (cursor, limit, history) =>
+        withTimeout(
+          history === undefined
+            ? board.readEvents(cursor, limit)
+            : board.readEvents(cursor, limit, history),
+          "readEvents",
+        ),
     };
     // Closing the session in `finally` cancels a page still pending when the deadline passes.
     const result = await captureLog(
@@ -143,7 +153,7 @@ const capture = async ({ origin, org, name, out }) => {
     switch (written.kind) {
       case "written":
         if (leftover !== "") process.stderr.write(`capture-replay: wrote ${out}${leftover}\n`);
-        return result.capture;
+        return result;
       case "exists":
         throw new CaptureFailure(`${out} already exists; choose a new file${leftover}`);
       case "failed":
@@ -159,9 +169,10 @@ const capture = async ({ origin, org, name, out }) => {
 
 try {
   const options = parseOptions(process.argv.slice(2));
-  const captured = await capture(options);
+  const { capture: captured, redacted } = await capture(options);
+  const redactions = redacted === 0 ? "" : ` (${redacted} secret-shaped values redacted)`;
   process.stderr.write(
-    `captured ${captured.head} events of ${options.org}/${options.name} from ${options.origin} into ${options.out}\n`,
+    `captured ${captured.head} events of ${options.org}/${options.name} from ${options.origin} into ${options.out}${redactions}\n`,
   );
 } catch (error) {
   // Only this script's own sentences are printed: a library error can quote what the backend sent.

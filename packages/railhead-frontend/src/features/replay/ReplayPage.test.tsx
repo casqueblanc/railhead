@@ -230,6 +230,7 @@ describe("ReplayPage", () => {
       version: CAPTURE_VERSION,
       source: captured.source,
       repo: captured.repo,
+      history: captured.history,
       head: 3,
       events: captured.events.slice(0, 3),
     };

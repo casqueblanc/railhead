@@ -34,29 +34,57 @@ const SOURCE: Extract<CaptureSource, { kind: "captured" }> = {
 
 const SECRET = "rh_session_d0n0tl3ak";
 
+/** The history the fake board serves its log under. */
+const HISTORY = "0123456789abcdef0123456789abcdef";
+
+/** A Railhead session token's shape: the fixed header, claims and a MAC, each base64url. */
+const SESSION_TOKEN =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZ2VudCI6ImFndF94In0.bWFjLWJ5dGVzLWZvci10ZXN0";
+
 /** A deadline that never passes. */
 const NO_DEADLINE = new AbortController().signal;
 
-/** A board log behind `readEvents`, serving at most `pageSize` events per page. */
+/**
+ * A board log behind `readEvents`, serving at most `pageSize` events per page. `reset` replaces the
+ * log and its history after the first page, as an owner's reset does. Unless `ignoreHistory` is set,
+ * a read naming another history fails with `cursor_ahead`, as the backend's does.
+ */
 const fakeReader = (
-  events: readonly unknown[],
-  options: { pageSize?: number; head?: number; repo?: string } = {},
+  initial: readonly unknown[],
+  options: {
+    pageSize?: number;
+    head?: number;
+    repo?: string;
+    reset?: { events: readonly unknown[]; history: string };
+    ignoreHistory?: boolean;
+  } = {},
 ) => {
   const calls: number[] = [];
+  const histories: (string | undefined)[] = [];
+  let events = initial;
+  let history = HISTORY;
   const reader: CaptureReader = {
-    readEvents: async (cursor, limit) => {
+    readEvents: async (cursor, limit, asked) => {
       calls.push(cursor);
+      histories.push(asked);
+      if (options.ignoreHistory !== true && asked !== undefined && asked !== history) {
+        return { ok: false, code: "cursor_ahead" };
+      }
       const size = Math.min(limit, options.pageSize ?? limit);
       const page: CapturePage = {
         repo: options.repo ?? SYNTH_REPO,
         events: events.slice(cursor, cursor + size),
         cursor,
         head: options.head ?? events.length,
+        history,
       };
+      if (options.reset !== undefined && calls.length === 1) {
+        ({ events, history } = options.reset);
+      }
       return { ok: true, value: page };
     },
   };
-  return { reader, calls };
+  return { reader, calls, histories };
 };
 
 type IssueEvent = Extract<RailheadEvent, { type: "issue.filed" }>;
@@ -80,6 +108,7 @@ const fileOf = (fields: Record<string, unknown>): string =>
     version: CAPTURE_VERSION,
     source: SOURCE,
     repo: SYNTH_REPO,
+    history: HISTORY,
     head: 3,
     events: issues(3),
     ...fields,
@@ -93,7 +122,7 @@ const parsedError = (text: string) => {
 
 describe("captureLog", () => {
   it("reads every page up to the head and copies each event exactly", async () => {
-    const { reader, calls } = fakeReader(decisionReversal.events, { pageSize: 7 });
+    const { reader, calls, histories } = fakeReader(decisionReversal.events, { pageSize: 7 });
     const result = await captureLog(reader, SOURCE, NO_DEADLINE);
     if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
     expect(result.capture).toEqual({
@@ -101,12 +130,77 @@ describe("captureLog", () => {
       version: CAPTURE_VERSION,
       source: SOURCE,
       repo: SYNTH_REPO,
+      history: HISTORY,
       head: decisionReversal.events.length,
       events: decisionReversal.events,
     });
-    expect(calls).toEqual(
-      Array.from({ length: Math.ceil(decisionReversal.events.length / 7) }, (_, page) => page * 7),
+    expect(result.redacted).toBe(0);
+    const pages = Math.ceil(decisionReversal.events.length / 7);
+    expect(calls).toEqual(Array.from({ length: pages }, (_, page) => page * 7));
+    expect(histories).toEqual([undefined, ...Array.from({ length: pages - 1 }, () => HISTORY)]);
+  });
+
+  // The new history's log is longer, so without the history check the second page would be a
+  // gapless suffix of it whose events pass validation and fold: a file describing neither run.
+  const RESET = { events: issues(12), history: "fedcba9876543210fedcba9876543210" };
+
+  it("refuses a capture when the repository is reset between pages", async () => {
+    const { reader, histories } = fakeReader(issues(6), { pageSize: 3, reset: RESET });
+    const result = await captureLog(reader, SOURCE, NO_DEADLINE);
+    expect(result).toEqual({ ok: false, error: { kind: "history_changed" } });
+    expect(histories).toEqual([undefined, HISTORY]);
+    if (result.ok) throw new Error("captured");
+    expect(captureErrorText(result.error)).toBe(
+      "The repository was reset while the capture read it; capture it again.",
     );
+  });
+
+  it("refuses a later page from another history even when the backend serves it", async () => {
+    const { reader } = fakeReader(issues(6), {
+      pageSize: 3,
+      reset: RESET,
+      ignoreHistory: true,
+    });
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
+      ok: false,
+      error: { kind: "history_changed" },
+    });
+  });
+
+  it("reports cursor_ahead on the first page as a refusal, not a reset", async () => {
+    const reader: CaptureReader = {
+      readEvents: async () => ({ ok: false, code: "cursor_ahead" }),
+    };
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
+      ok: false,
+      error: { kind: "read_failed", code: "cursor_ahead" },
+    });
+  });
+
+  it.each([
+    ["an empty history", ""],
+    ["an overlong history", "h".repeat(257)],
+    ["a history that is not a string", 7],
+  ])("refuses a first page with %s", async (_label, history) => {
+    const reader: CaptureReader = {
+      readEvents: async (cursor) => ({
+        ok: true,
+        // Through JSON, as the wire delivers it: the page's type does not hold for a hostile backend.
+        value: JSON.parse(
+          JSON.stringify({
+            repo: SYNTH_REPO,
+            events: issues(2).slice(cursor),
+            cursor,
+            head: 2,
+            history,
+          }),
+        ),
+      }),
+    };
+    expect(await captureLog(reader, SOURCE, NO_DEADLINE)).toEqual({
+      ok: false,
+      error: { kind: "malformed", path: "history" },
+    });
   });
 
   it("leaves out every field the event schema does not define", async () => {
@@ -124,7 +218,7 @@ describe("captureLog", () => {
     if (!serialized.ok) throw new Error("serialize failed");
     expect(serialized.text).not.toContain(SECRET);
     expect(Object.keys(JSON.parse(serialized.text)).toSorted()).toEqual(
-      ["events", "format", "head", "repo", "source", "version"].toSorted(),
+      ["events", "format", "head", "history", "repo", "source", "version"].toSorted(),
     );
   });
 
@@ -181,6 +275,7 @@ describe("captureLog", () => {
           events: issues(4).slice(cursor, cursor + 2),
           cursor,
           head: 4,
+          history: HISTORY,
         },
       }),
     };
@@ -233,6 +328,7 @@ describe("captureLog", () => {
                     events: log.slice(cursor, cursor + 1),
                     cursor,
                     head: log.length,
+                    history: HISTORY,
                   },
                 }),
               1_000,
@@ -286,6 +382,100 @@ describe("captureLog", () => {
   });
 });
 
+const capturedEvents = async (events: readonly RailheadEvent[]) => {
+  const result = await captureLog(fakeReader(events).reader, SOURCE, NO_DEADLINE);
+  if (!result.ok) throw new Error(`capture failed: ${result.error.kind}`);
+  return result;
+};
+
+const withBody = (body: string): IssueEvent => ({
+  ...issue(1),
+  data: { ...issue(1).data, body },
+});
+
+describe("captureLog redaction", () => {
+  it.each([
+    ["a session token", `rh login gave ${SESSION_TOKEN} to me`, "rh login gave [redacted] to me"],
+    [
+      "an Artifacts token",
+      "remote token art_v1_0123456789abcdef0123456789abcdef?expires=1760000000 here",
+      "remote token [redacted] here",
+    ],
+    ["a Bearer credential", "sent Bearer abcdefgh12345678 then", "sent [redacted] then"],
+    ["a Basic credential", "basic dXNlcjpwYXNzd29yZA==", "[redacted]"],
+    ["an Authorization value", 'Authorization: "s3cr3tvalue99"', 'Authorization: "[redacted]"'],
+    [
+      "a password in a remote URL",
+      "git push https://agt_x:hunter2hunter2@railhead.example/demo.git",
+      "git push https://[redacted]@railhead.example/demo.git",
+    ],
+  ])("redacts %s in an issue body", async (_label, body, expected) => {
+    const result = await capturedEvents([withBody(body)]);
+    expect(result.capture.events).toEqual([withBody(expected)]);
+    expect(result.redacted).toBe(1);
+  });
+
+  it("redacts every free-text field an event defines", async () => {
+    const leak = `see ${SESSION_TOKEN}`;
+    const asked: RailheadEvent = {
+      v: 1,
+      seq: 2,
+      at: SYNTH_START_MS + 2,
+      repo: SYNTH_REPO,
+      actor: { kind: "agent", id: "agt_synthatlas" },
+      type: "question.asked",
+      data: {
+        questionId: "qst_synthsize",
+        claimId: "clm_synthatlas",
+        decisionId: "dec_synthsize",
+        text: leak,
+        options: [
+          { key: "a", label: leak },
+          { key: "b", label: "Keep it" },
+        ],
+      },
+    };
+    const acked: RailheadEvent = {
+      v: 1,
+      seq: 3,
+      at: SYNTH_START_MS + 3,
+      repo: SYNTH_REPO,
+      actor: { kind: "agent", id: "agt_synthatlas" },
+      type: "inbox.acked",
+      data: { agentId: "agt_synthatlas", claimId: "clm_synthatlas", item: 1, plan: leak },
+    };
+    const filed: RailheadEvent = {
+      ...issue(1),
+      data: { ...issue(1).data, title: leak, body: leak },
+    };
+    const read = await capturedEvents([filed, asked, acked]);
+    expect(read.redacted).toBe(5);
+    expect(JSON.stringify(read.capture)).not.toContain("eyJ");
+    expect(read.capture.events[1]).toMatchObject({
+      data: {
+        text: "see [redacted]",
+        options: [{ label: "see [redacted]" }, { label: "Keep it" }],
+      },
+    });
+  });
+
+  it.each([
+    ["prose that mentions a bearer", "the bearer of the token is the agent"],
+    ["a short Bearer value", "Bearer abc"],
+    ["a URL without a password", "https://railhead.example/demo/upload-app"],
+    ["a JWT-like string too short to be a token", "eyJabc.def.ghi"],
+  ])("copies %s unchanged", async (_label, body) => {
+    const result = await capturedEvents([withBody(body)]);
+    expect(result.capture.events).toEqual([withBody(body)]);
+    expect(result.redacted).toBe(0);
+  });
+
+  it("never lengthens text: the shortest match is as long as the replacement", async () => {
+    const result = await capturedEvents([withBody("Bearer 12345678")]);
+    expect(result.capture.events).toEqual([withBody("[redacted]")]);
+  });
+});
+
 describe("parseCapture", () => {
   it.each([decisionReversal, checkBeforeLand, optionResults])(
     "reads back what serializeCapture wrote: $description",
@@ -316,9 +506,17 @@ describe("parseCapture", () => {
     expect(result.ok && result.capture.events).toEqual([...issues(3), reopened]);
   });
 
-  it("reads a captured source", () => {
+  it("reads a captured source and its history", () => {
     const result = parseCapture(fileOf({}));
     expect(result.ok && result.capture.source).toEqual(SOURCE);
+    expect(result.ok && result.capture.history).toBe(HISTORY);
+  });
+
+  it("keeps secret-shaped text a file holds: opening a file redacts nothing", () => {
+    const events = issues(3);
+    events[0] = { ...issue(1), data: { ...issue(1).data, body: SESSION_TOKEN } };
+    const result = parseCapture(fileOf({ events }));
+    expect(result.ok && result.capture.events[0]).toEqual(events[0]);
   });
 
   it.each([
@@ -343,6 +541,8 @@ describe("parseCapture", () => {
       fileOf({ source: { kind: "synthetic", description: "x".repeat(257) } }),
       { kind: "malformed", path: "source.description" },
     ],
+    ["a missing history", fileOf({ history: undefined }), { kind: "malformed", path: "history" }],
+    ["an empty history", fileOf({ history: "" }), { kind: "malformed", path: "history" }],
     [
       "a missing capture time",
       fileOf({ source: { ...SOURCE, capturedAt: undefined } }),

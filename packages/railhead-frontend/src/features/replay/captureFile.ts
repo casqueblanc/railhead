@@ -7,6 +7,18 @@
 // secret by contract (`@railhead/shared/events`), and the capture reads the public board log, so
 // the script needs no credential and the file records none.
 //
+// Free text in events (agent names, issue titles and bodies, question text and option labels,
+// acknowledgement plans) is written by people and agents, and one may paste a credential into it.
+// `captureLog` replaces the shapes Railhead issues or carries with `[redacted]`: session tokens and
+// other JWTs, Artifacts tokens, `Bearer` and `Basic` credentials, `Authorization` values and
+// passwords in URLs. Any other free text is copied as is, so a capture file is as sensitive as the
+// board log it was read from. Opening a file redacts nothing: it holds what its author chose.
+//
+// A capture is one history of the log. Resetting a repository starts a new history whose `seq`
+// numbers restart at 1 under the same repository, so `captureLog` reads every page after the first
+// under the first page's history and refuses the capture when it changes; the file records that one
+// history.
+//
 // Opening a file is the trust boundary: its text is untrusted. `parseCapture` establishes every
 // shape with the same field-by-field copy, then refuses anything a replay could misrepresent: an
 // unknown format or version, a log that does not start at 1, a gap or reordering, an event from
@@ -78,6 +90,8 @@ export interface Capture {
   source: CaptureSource;
   /** The repository whose log this is. */
   repo: RepoId;
+  /** The `EventPage.history` every event was read under; `synthetic` for a synthetic log. */
+  history: string;
   /** The `seq` of the last event; the events run from 1 to `head` without a gap. */
   head: number;
   events: RailheadEvent[];
@@ -107,11 +121,18 @@ export type CaptureError =
   | { kind: "head_mismatch"; head: number; last: number }
   /** The backend refused a page while capturing. `code` is `null` when it is not a known code. */
   | { kind: "read_failed"; code: BoardErrorCode | null }
+  /** The repository was reset while capturing, so the pages came from different histories. */
+  | { kind: "history_changed" }
   /** The capture's deadline passed before the whole log was read. */
   | { kind: "timed_out" };
 
 /** A capture, or why there is none. */
 export type CaptureResult = { ok: true; capture: Capture } | { ok: false; error: CaptureError };
+
+/** A capture read from a backend and how many secret-shaped values it redacted, or why there is none. */
+export type CaptureLogResult =
+  | { ok: true; capture: Capture; redacted: number }
+  | { ok: false; error: CaptureError };
 
 /** A page of the board log, after `EventPage`. */
 export interface CapturePage {
@@ -119,6 +140,7 @@ export interface CapturePage {
   events: unknown[];
   cursor: number;
   head: number;
+  history: string;
 }
 
 /** The part of the board API a capture reads, after `BoardApi.readEvents`. */
@@ -126,6 +148,7 @@ export interface CaptureReader {
   readEvents(
     cursor: number,
     limit: number,
+    history?: string,
   ): PromiseLike<{ ok: true; value: CapturePage } | { ok: false; code: unknown }>;
 }
 
@@ -158,8 +181,11 @@ function isBoardErrorCode(code: string): code is BoardErrorCode {
 /**
  * Reads the whole log through `reader` and builds a captured capture. The log is read up to the
  * head the first page reports, so events appended while capturing are left out rather than mixing
- * two moments. Every event is copied field by field and validated; any page that breaks the gapless
- * log, names another repository or makes no progress fails the capture.
+ * two moments. Every later page is read under the first page's history, and a page from another
+ * history, or a `cursor_ahead` refusal, fails the capture with `history_changed`: a reset mid-capture
+ * must not splice two logs into one. Every event is copied field by field, redacted (see the module
+ * comment) and validated; any page that breaks the gapless log, names another repository or makes
+ * no progress fails the capture.
  *
  * `deadline` bounds the whole read, however slowly the backend pages: once it aborts, the pending
  * page is abandoned and the capture fails with `timed_out`. The caller cancels that page's call by
@@ -169,26 +195,50 @@ export const captureLog = async (
   reader: CaptureReader,
   source: Extract<CaptureSource, { kind: "captured" }>,
   deadline: AbortSignal,
-): Promise<CaptureResult> => {
+): Promise<CaptureLogResult> => {
   const sourceError = checkCapturedSource(source);
   if (sourceError !== null) return { ok: false, error: sourceError };
   const events: RailheadEvent[] = [];
   let repo: RepoId | null = null;
   let head: number | null = null;
+  let history: string | null = null;
+  let redacted = 0;
+  const redact = (text: string): string =>
+    SECRET_SHAPES.reduce(
+      (current, [shape, replacement]) =>
+        current.replace(shape, (...match: string[]) => {
+          redacted += 1;
+          return replacement(match);
+        }),
+      text,
+    );
   // Each successful page advances by at least one event, so the loop ends within `head` pages.
   while (head === null || events.length < head) {
     if (deadline.aborted) return { ok: false, error: { kind: "timed_out" } };
-    const read = await untilAborted(reader.readEvents(events.length, CAPTURE_PAGE_SIZE), deadline);
+    const pending: ReturnType<CaptureReader["readEvents"]> =
+      history === null
+        ? reader.readEvents(events.length, CAPTURE_PAGE_SIZE)
+        : reader.readEvents(events.length, CAPTURE_PAGE_SIZE, history);
+    const read = await untilAborted(pending, deadline);
     if (read === ABORTED) return { ok: false, error: { kind: "timed_out" } };
     if (!read.ok) {
-      return { ok: false, error: { kind: "read_failed", code: readBoardErrorCode(read.code) } };
+      const code = readBoardErrorCode(read.code);
+      if (history !== null && code === "cursor_ahead") {
+        return { ok: false, error: { kind: "history_changed" } };
+      }
+      return { ok: false, error: { kind: "read_failed", code } };
     }
-    const page = read.value;
-    if (head === null) {
+    const page: CapturePage = read.value;
+    if (history === null) {
       if (page.head > MAX_CAPTURE_EVENTS) return { ok: false, error: { kind: "too_large" } };
       head = page.head;
       repo = page.repo;
+      history = page.history;
+      const historyError = checkHistory(history);
+      if (historyError !== null) return { ok: false, error: historyError };
       if (head === 0) return { ok: false, error: { kind: "empty" } };
+    } else if (page.history !== history) {
+      return { ok: false, error: { kind: "history_changed" } };
     } else if (page.repo !== repo) {
       return { ok: false, error: { kind: "foreign_repo", seq: events.length + 1 } };
     }
@@ -199,18 +249,92 @@ export const captureLog = async (
       if (events.length === head) break;
       const copied = readEvent(value, `events[${events.length}]`);
       if (!copied.ok) return copied;
-      events.push(copied.event);
+      events.push(redactEvent(copied.event, redact));
     }
   }
-  if (repo === null || head === null) return { ok: false, error: { kind: "empty" } };
-  return checkCapture({
+  if (repo === null || head === null || history === null) {
+    return { ok: false, error: { kind: "empty" } };
+  }
+  const checked = checkCapture({
     format: CAPTURE_FORMAT,
     version: CAPTURE_VERSION,
     source: { ...source },
     repo,
+    history,
     head,
     events,
   });
+  return checked.ok ? { ...checked, redacted } : checked;
+};
+
+/**
+ * The secret shapes `captureLog` redacts, each with its replacement. Every pattern matches at least
+ * as many characters as its replacement has, so redacting never lengthens text past an event's
+ * bounds.
+ */
+const SECRET_SHAPES: readonly (readonly [RegExp, (match: string[]) => string])[] = [
+  // Railhead session tokens are JWTs: `<header>.<claims>.<mac>`, the header always `{"alg":...`.
+  [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, () => REDACTED],
+  // Artifacts repository tokens, which a write remote carries.
+  [/art_v1_[A-Za-z0-9]{16,}(?:\?expires=\d+)?/g, () => REDACTED],
+  [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, () => REDACTED],
+  // The header name stays readable; a value of ten or more characters keeps the length bound.
+  [
+    /\b(Authorization\s*[:=]\s*"?)[A-Za-z0-9._~+/=-]{10,}/gi,
+    ([, name]) => `${name ?? ""}${REDACTED}`,
+  ],
+  // `https://<user>:<password>@host`, as a Git remote with a session token or write token is.
+  [/\b(https?:\/\/)[^\s/@:]+:[^\s/@[\]]{8,}@/gi, ([, scheme]) => `${scheme ?? ""}${REDACTED}@`],
+];
+
+const REDACTED = "[redacted]";
+
+/** `event` with `redact` applied to each free-text field. */
+const redactEvent = (event: RailheadEvent, redact: (text: string) => string): RailheadEvent => {
+  switch (event.type) {
+    case "agent.invited":
+      return { ...event, data: { ...event.data, name: redact(event.data.name) } };
+    case "agent.joined":
+      return { ...event, data: { ...event.data, name: redact(event.data.name) } };
+    case "issue.filed":
+      return {
+        ...event,
+        data: { ...event.data, title: redact(event.data.title), body: redact(event.data.body) },
+      };
+    case "question.asked":
+      return {
+        ...event,
+        data: {
+          ...event.data,
+          text: redact(event.data.text),
+          options: event.data.options.map((option) => ({
+            ...option,
+            label: redact(option.label),
+          })),
+        },
+      };
+    case "inbox.acked":
+      return { ...event, data: { ...event.data, plan: redact(event.data.plan) } };
+    case "agent.confirmed":
+    case "agent.revoked":
+    case "claim.opened":
+    case "claim.pushed":
+    case "claim.ready":
+    case "claim.refused":
+    case "claim.reopened":
+    case "claim.expired":
+    case "claim.reassigned":
+    case "decision.recorded":
+    case "inbox.queued":
+    case "inbox.delivered":
+    case "train.check":
+    case "train.conflict":
+    case "train.intent":
+    case "train.main":
+      return event;
+    default:
+      return unreachable(event);
+  }
 };
 
 const ABORTED = Symbol("aborted");
@@ -284,6 +408,7 @@ export const parseCapture = (text: string): CaptureResult => {
       version: CAPTURE_VERSION,
       source: readSource(value.source),
       repo: string(value, "repo", ""),
+      history: string(value, "history", ""),
       head: integer(value, "head", ""),
       events,
     });
@@ -319,6 +444,8 @@ export const captureErrorText = (error: CaptureError): string => {
       return `The capture says it ends at event ${error.head}, but its last event is ${error.last}.`;
     case "read_failed":
       return `The backend refused to read the log (${error.code ?? "unknown error"}).`;
+    case "history_changed":
+      return "The repository was reset while the capture read it; capture it again.";
     case "timed_out":
       return "The backend did not serve the whole log before the capture's deadline.";
     default:
@@ -354,6 +481,8 @@ const checkCapture = (capture: Capture): CaptureResult => {
   if (head !== events.length) {
     return { ok: false, error: { kind: "head_mismatch", head, last: events.length } };
   }
+  const historyError = checkHistory(capture.history);
+  if (historyError !== null) return { ok: false, error: historyError };
   const sourceError = checkSource(capture.source);
   if (sourceError !== null) return { ok: false, error: sourceError };
   return { ok: true, capture };
@@ -369,6 +498,12 @@ const checkSource = (source: CaptureSource): CaptureError | null => {
       return unreachable(source);
   }
 };
+
+/** A backend's history is untrusted until checked; `typeof` holds even when the type says string. */
+const checkHistory = (history: unknown): CaptureError | null =>
+  typeof history === "string"
+    ? checkSourceText(history, "history")
+    : { kind: "malformed", path: "history" };
 
 const checkSourceText = (text: string, path: string): CaptureError | null =>
   text === "" || text.length > MAX_SOURCE_TEXT_LENGTH ? { kind: "malformed", path } : null;

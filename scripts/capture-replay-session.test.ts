@@ -83,28 +83,46 @@ const transportOf = (socket: WebSocket): RpcTransport => {
   };
 };
 
+/** The history the endpoint serves its log under. */
+const HISTORY = "0123456789abcdef0123456789abcdef";
+
 /**
  * Serves `log` as repository demo/upload-app, as the backend's `openBoard` and `readEvents` do.
  * `refuseOpenWith` and `refuseReadWith` make every `openBoard` or `readEvents` call fail with that
- * code, as a hostile endpoint might.
+ * code, as a hostile endpoint might. `resetTo` replaces the log with a new history after the first
+ * page, as an owner's reset does; like the backend, a read that names the old history then fails
+ * with `cursor_ahead`.
  */
 const startBoard = async (
   repo: string,
-  log: readonly unknown[],
-  options: { refuseOpenWith?: unknown; refuseReadWith?: unknown } = {},
+  initial: readonly unknown[],
+  options: {
+    refuseOpenWith?: unknown;
+    refuseReadWith?: unknown;
+    resetTo?: readonly unknown[];
+  } = {},
 ) => {
   const pages: number[] = [];
+  const histories: (string | undefined)[] = [];
+  let log = initial;
+  let history = HISTORY;
   class Board extends RpcTarget {
-    readEvents(cursor: number, limit: number) {
+    readEvents(cursor: number, limit: number, asked?: string) {
+      histories.push(asked);
       if (options.refuseReadWith !== undefined) {
         return { ok: false, code: options.refuseReadWith, message: HOSTILE };
       }
+      if (asked !== undefined && asked !== history) {
+        return { ok: false, code: "cursor_ahead", message: HOSTILE };
+      }
       const events = log.slice(cursor, cursor + Math.min(limit, SERVED_PAGE));
       pages.push(cursor);
-      return {
-        ok: true,
-        value: { repo, events, cursor: cursor + events.length, head: log.length },
-      };
+      const value = { repo, events, cursor: cursor + events.length, head: log.length, history };
+      if (options.resetTo !== undefined && pages.length === 1) {
+        log = options.resetTo;
+        history = "fedcba9876543210fedcba9876543210";
+      }
+      return { ok: true, value };
     }
   }
   class Api extends RpcTarget {
@@ -128,6 +146,7 @@ const startBoard = async (
   return {
     port: address.port,
     pages,
+    histories,
     close: () => {
       for (const client of server.clients) client.terminate();
       return new Promise<void>((resolve) => server.close(() => resolve()));
@@ -179,6 +198,10 @@ test("captures a served log into a file the replay page opens to the same board"
     );
     assert.equal(result.code, 0);
     assert.equal(board.pages.length, Math.ceil(events.length / SERVED_PAGE));
+    assert.deepEqual(board.histories, [
+      undefined,
+      ...Array.from({ length: board.pages.length - 1 }, () => HISTORY),
+    ]);
     assert.deepEqual(readdirSync(dir), ["run.json"]);
 
     const text = readFileSync(out, "utf8");
@@ -192,6 +215,7 @@ test("captures a served log into a file the replay page opens to the same board"
       version: 1,
       source: { kind: "captured", origin, org: "demo", name: "upload-app", capturedAt },
       repo,
+      history: HISTORY,
       head: events.length,
       events,
     });
@@ -282,4 +306,93 @@ for (const [label, refusal, expected] of [
       await board.close();
     }
   });
+}
+
+test("refuses a capture when the repository is reset between pages, and writes nothing", async () => {
+  const { issues } = await syntheticIssues();
+  // The new history's log is longer than the old one, so a capture that ignored the history would
+  // read a gapless suffix of it after the old log's first page.
+  const board = await startBoard("rep_synthrepo", issues(SERVED_PAGE + 3), {
+    resetTo: issues(SERVED_PAGE * 3),
+  });
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const result = await runScript([
+      "--origin",
+      `http://127.0.0.1:${board.port}`,
+      "--repo",
+      "demo/upload-app",
+      "--out",
+      out,
+    ]);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      "capture-replay: The repository was reset while the capture read it; capture it again.\n",
+    );
+    assert.deepEqual(board.histories, [undefined, HISTORY]);
+    assert.deepEqual(readdirSync(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+test("redacts a session token pasted into an issue body and says how many it redacted", async () => {
+  const { issues } = await syntheticIssues();
+  const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZ3RfeCJ9.c2lnbmF0dXJlLWJ5dGVz";
+  const [first, second] = issues(2);
+  assert.ok(isRecord(first) && isRecord(first.data) && second !== undefined);
+  const leaked = { ...first, data: { ...first.data, body: `rh push failed with ${token}` } };
+  const board = await startBoard("rep_synthrepo", [leaked, second]);
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const result = await runScript([
+      "--origin",
+      `http://127.0.0.1:${board.port}`,
+      "--repo",
+      "demo/upload-app",
+      "--out",
+      out,
+    ]);
+    assert.equal(result.code, 0);
+    assert.equal(
+      result.stderr,
+      `captured 2 events of demo/upload-app from http://127.0.0.1:${board.port} into ${out} (1 secret-shaped values redacted)\n`,
+    );
+    const text = readFileSync(out, "utf8");
+    assert.doesNotMatch(text, /eyJ/);
+    const file: unknown = JSON.parse(text);
+    assert.ok(isRecord(file) && Array.isArray(file.events) && isRecord(file.events[0]));
+    assert.deepEqual(file.events[0].data, {
+      ...first.data,
+      body: "rh push failed with [redacted]",
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+/** `issue.filed` events 1 to `count` of repository `rep_synthrepo`, from the board fixtures. */
+async function syntheticIssues() {
+  const { SYNTH_OWNER, SYNTH_START_MS } = await load("fixtures/board/syntheticLog.ts");
+  return {
+    issues: (count: number): unknown[] =>
+      Array.from({ length: count }, (_, index) => ({
+        v: 1,
+        seq: index + 1,
+        at: Number(SYNTH_START_MS) + index + 1,
+        repo: "rep_synthrepo",
+        actor: SYNTH_OWNER,
+        type: "issue.filed",
+        data: {
+          issueId: `iss_synth${(index + 1).toString().padStart(6, "0")}`,
+          title: "Synthetic",
+          body: "",
+        },
+      })),
+  };
 }

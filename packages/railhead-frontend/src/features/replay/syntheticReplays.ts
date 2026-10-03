@@ -17,6 +17,7 @@ export const syntheticCapture = (log: SyntheticLog): Capture => {
     version: CAPTURE_VERSION,
     source: { kind: "synthetic", description: log.description },
     repo: first.repo,
+    history: "synthetic",
     head: log.events.length,
     events: [...log.events],
   };
