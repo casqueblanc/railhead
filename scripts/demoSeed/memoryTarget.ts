@@ -17,6 +17,8 @@ export type TargetMethod = Exclude<keyof SeedTarget, "read">;
 
 interface StoredRepo {
   main: string | null;
+  /** Whether the repository is visible to `read`; a seed sets it last, after importing main. */
+  initialized: boolean;
   issues: BoardIssue[];
 }
 
@@ -27,6 +29,8 @@ export class MemoryTarget implements SeedTarget, BoardIssues {
   #lostAfterWrite: TargetMethod | null = null;
   /** A method that throws before writing anything. */
   #failing: TargetMethod | null = null;
+  /** Whether the next seed imports main and then throws before initializing the repository. */
+  #failingAfterImport = false;
 
   /** Makes the next call of `method` write and then throw, once. */
   loseResponseOf(method: TargetMethod): void {
@@ -38,25 +42,36 @@ export class MemoryTarget implements SeedTarget, BoardIssues {
     this.#failing = method;
   }
 
-  /** Every repository name held, sorted. */
+  /**
+   * Makes the next seed import main and then throw before initializing the repository, once, as a
+   * backend seed whose token sweep or initialization failed: main stays while `read` sees nothing.
+   */
+  failAfterImport(): void {
+    this.#failingAfterImport = true;
+  }
+
+  /** Every repository name held, initialized or not, sorted. */
   names(): string[] {
     return [...this.#repos.keys()].toSorted();
   }
 
   async read(ref: RepoRef): Promise<RepoState | null> {
     const repo = this.#repos.get(key(ref));
-    return repo === undefined ? null : { main: repo.main };
+    return repo === undefined || !repo.initialized ? null : { main: repo.main };
   }
 
   async issues(ref: RepoRef): Promise<readonly BoardIssue[]> {
-    return (this.#repos.get(key(ref))?.issues ?? []).map((issue) => ({ ...issue }));
+    const repo = this.#repos.get(key(ref));
+    return repo === undefined || !repo.initialized
+      ? []
+      : repo.issues.map((issue) => ({ ...issue }));
   }
 
   /**
-   * Creates the repository and imports main from the bundle's own header in one step, as the
-   * backend does: a bundle that is not main alone at the approved head is refused, a repeat with
-   * the same head succeeds, and a main at another head or a repository without a main is
-   * `ActionStale`.
+   * Imports main from the bundle's own header, then initializes the repository, as the backend
+   * does: a bundle that is not main alone at the approved head is refused, a repeat with the same
+   * head succeeds and initializes a repository a failed seed left hidden, and a main at another
+   * head, hidden or not, or an initialized repository without a main is `ActionStale`.
    */
   async seed(ref: RepoRef, bundle: MainBundle): Promise<void> {
     this.#before("seed");
@@ -64,15 +79,21 @@ export class MemoryTarget implements SeedTarget, BoardIssues {
     if (head === null || head !== bundle.head) {
       throw new Error(`The bundle is not main alone at ${bundle.head}`);
     }
-    const repo = this.#repos.get(key(ref));
-    if (repo === undefined) {
-      this.#repos.set(key(ref), { main: head, issues: [] });
-    } else if (repo.main !== head) {
+    const repo = this.#repos.get(key(ref)) ?? { main: null, initialized: false, issues: [] };
+    if (repo.main !== head && (repo.main !== null || repo.initialized)) {
       throw new ActionStale(`${key(ref)} has main at ${repo.main ?? "nothing"}, not ${head}`);
     }
+    repo.main = head;
+    this.#repos.set(key(ref), repo);
+    if (this.#failingAfterImport) {
+      this.#failingAfterImport = false;
+      throw new Error("seed failed after importing main");
+    }
+    repo.initialized = true;
     this.#after("seed");
   }
 
+  /** Deletes the repository whether or not it was initialized, as the backend deletes by name. */
   async reset(ref: RepoRef): Promise<boolean> {
     this.#before("reset");
     const deleted = this.#repos.delete(key(ref));
@@ -82,13 +103,13 @@ export class MemoryTarget implements SeedTarget, BoardIssues {
 
   /** Leaves `ref` existing without a main, as a reset that did not finish would; not part of the port. */
   leaveWithoutMain(ref: RepoRef): void {
-    this.#repos.set(key(ref), { main: null, issues: [] });
+    this.#repos.set(key(ref), { main: null, initialized: true, issues: [] });
   }
 
   /** Files an issue as the owner does on the board; not part of the port. */
   fileAsOwner(ref: RepoRef, issue: BoardIssue): void {
     const repo = this.#repos.get(key(ref));
-    if (repo === undefined) throw new Error(`${key(ref)} does not exist`);
+    if (repo?.initialized !== true) throw new Error(`${key(ref)} does not exist`);
     repo.issues.push({ title: issue.title, body: issue.body });
   }
 

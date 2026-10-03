@@ -87,7 +87,7 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
 test("reset --dry-run names only the demo repository", async () => {
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", source]), [
     "todo delete repository demo/upload-app",
-    "note planned against an instance holding only demo/upload-app: no live target exists yet",
+    "note no live target exists yet",
   ]);
 });
 

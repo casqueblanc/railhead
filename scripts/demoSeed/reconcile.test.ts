@@ -4,7 +4,7 @@ import { test } from "node:test";
 import type { MainBundle } from "./history.ts";
 import { loadManifest, SeedRefusal, type SeedManifest } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
-import { ActionStale, describePlan, planSeed, reset, seed } from "./reconcile.ts";
+import { ActionStale, describePlan, planReset, planSeed, reset, seed } from "./reconcile.ts";
 
 const manifest = loadManifest(
   join(import.meta.dirname, "..", "..", "fixtures", "demo", "seed.json"),
@@ -40,7 +40,7 @@ test("a seed creates the repository with main in one action, and leaves the issu
 
   assert.deepEqual(
     plan.map((planned) => planned.status),
-    ["missing", "missing", "missing", "missing"],
+    ["done", "missing", "missing", "missing"],
   );
   assert.deepEqual(await target.read(demo), { main: history.head });
   assert.deepEqual(await target.issues(demo), []);
@@ -197,9 +197,8 @@ test("reset deletes the demo repository and keeps every other one", async () => 
   }
   await seed(manifest, history, target, target);
 
-  const plan = await reset(manifest, target);
+  assert.equal(await reset(manifest, target), true);
 
-  assert.deepEqual(describePlan(plan), ["todo delete repository demo/upload-app"]);
   assert.equal(await target.read(demo), null);
   assert.deepEqual(target.names(), ["acme/upload-app", "demo/other", "demo/upload-app-2"]);
   assert.deepEqual(await target.issues({ org: "acme", repo: "upload-app" }), [
@@ -207,22 +206,55 @@ test("reset deletes the demo repository and keeps every other one", async () => 
   ]);
 });
 
-test("reset of an absent repository writes nothing, and seed after reset rebuilds the same state", async () => {
+test("reset of an absent repository reports nothing deleted, and seed after reset rebuilds the same state", async () => {
   const target = new MemoryTarget();
-  target.fail("reset");
 
-  const plan = await reset(manifest, target);
-  assert.deepEqual(describePlan(plan), ["ok   delete repository demo/upload-app"]);
+  assert.equal(await reset(manifest, target), false);
+  assert.deepEqual(target.names(), []);
 
   await seed(manifest, history, target, target);
   const first = await target.read(demo);
-  // The armed failure is still pending, so the reset of the existing repository fails first.
+  target.fail("reset");
   await assert.rejects(reset(manifest, target), /reset failed/);
   assert.deepEqual(await target.read(demo), first);
 
-  await reset(manifest, target);
+  assert.equal(await reset(manifest, target), true);
   await seed(manifest, history, target, target);
   assert.deepEqual(await target.read(demo), first);
+});
+
+test("reset always calls the target, so a main left by a failed seed at another head is cleared", async () => {
+  const target = new MemoryTarget();
+  target.failAfterImport();
+  await assert.rejects(seed(manifest, history, target, target), /seed failed after importing main/);
+  // Main is imported but the repository was never initialized: `read` reports nothing.
+  assert.equal(await target.read(demo), null);
+  assert.deepEqual(target.names(), ["demo/upload-app"]);
+
+  // A seed at another head plans a seed and the target refuses it as stale.
+  const other = bundleOf("b".repeat(40));
+  await assert.rejects(seed(manifest, other, target, target), ActionStale);
+  await assert.rejects(seed(manifest, other, target, target), /has main at a{40}, not b{40}/);
+
+  assert.deepEqual(describePlan(planReset(manifest)), ["todo delete repository demo/upload-app"]);
+  assert.equal(await reset(manifest, target), true);
+  assert.deepEqual(target.names(), []);
+
+  const plan = await seed(manifest, other, target, target);
+  assert.equal(plan[0]?.status, "done");
+  assert.deepEqual(await target.read(demo), { main: other.head });
+});
+
+test("a seed at the same head completes a repository a failed seed left hidden", async () => {
+  const target = new MemoryTarget();
+  target.failAfterImport();
+  await assert.rejects(seed(manifest, history, target, target), /seed failed after importing main/);
+  assert.equal(await target.read(demo), null);
+  assert.deepEqual(await target.issues(demo), []);
+
+  await seed(manifest, history, target, target);
+  assert.deepEqual(await target.read(demo), { main: history.head });
+  assert.deepEqual(target.names(), ["demo/upload-app"]);
 });
 
 test("a manifest pointed at another repository is refused before the target is read", async () => {

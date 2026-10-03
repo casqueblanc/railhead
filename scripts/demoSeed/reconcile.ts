@@ -15,7 +15,9 @@
 // issue and whether the board already shows it; the owner files the missing ones.
 //
 // Reset deletes the demo repository by name and nothing else. It never lists the target to choose
-// what to delete, so another repository cannot be swept up with it.
+// what to delete, so another repository cannot be swept up with it. It always calls the target,
+// even when `read` finds nothing: a seed that failed after importing main leaves that main in
+// place behind a repository `read` does not report, and only the target's reset clears it.
 //
 // The live target does not exist yet; until it does the commands only plan, and
 // `docs/demo-seed.md` gives the owner's steps.
@@ -37,16 +39,24 @@ export interface RepoState {
 
 /** Where the seed writes, as `DemoSeedApi` (#149). Each method touches only the repository given. */
 export interface SeedTarget {
-  /** The repository's state, or `null` when it does not exist. */
+  /**
+   * The repository's state, or `null` when it is not initialized. A seed initializes it last, so
+   * `null` does not mean the target holds nothing: a main imported by a failed seed may remain.
+   */
   read(ref: RepoRef): Promise<RepoState | null>;
   /**
    * Creates the repository if it is missing and imports `bundle` as its main, as `demo.seed`. Main
    * is only ever created, never moved: when it is already `bundle.head` this succeeds without
    * writing, and when it holds another head, or the repository exists without a main, it throws
-   * `ActionStale`. Nothing is visible until main is in place, so a failure leaves no repository.
+   * `ActionStale`. The repository is initialized only after main is in place, so a failure can
+   * leave main imported while `read` still returns `null`; a repeat at the same head completes it,
+   * and a seed at another head is `ActionStale` until a reset.
    */
   seed(ref: RepoRef, bundle: MainBundle): Promise<void>;
-  /** Deletes the repository and everything in it, as `demo.reset`; `false` when it was absent. */
+  /**
+   * Deletes the repository and everything in it, including a main `read` does not report, as
+   * `demo.reset`; `false` when nothing was there.
+   */
   reset(ref: RepoRef): Promise<boolean>;
 }
 
@@ -128,7 +138,8 @@ export async function planSeed(
 
 /**
  * Seeds the repository with main from `bundle`, the bytes the target receives, when a fresh plan
- * finds it missing, and returns the plan. Missing issues stay missing: the owner files them.
+ * finds it missing, and returns the plan with the steps it applied marked done. Missing issues
+ * stay missing: the owner files them.
  */
 export async function seed(
   manifest: SeedManifest,
@@ -138,14 +149,21 @@ export async function seed(
 ): Promise<PlannedStep[]> {
   const ref = demoRef(manifest);
   const plan = await planSeed(manifest, bundle, target, board);
-  for (const { step, status } of plan) {
-    if (status === "done") continue;
+  const applied: PlannedStep[] = [];
+  for (const planned of plan) {
+    const { step, status } = planned;
+    if (status === "done") {
+      applied.push(planned);
+      continue;
+    }
     switch (step.action) {
       case "repo.seed":
         await target.seed(ref, bundle);
+        applied.push({ step, status: "done" });
         break;
       case "issue.file":
         // The owner's step; the seed holds no authority to file an issue.
+        applied.push(planned);
         break;
       case "repo.delete":
         throw new SeedRefusal("A seed plan never deletes.");
@@ -153,30 +171,21 @@ export async function seed(
         return unreachable(step);
     }
   }
-  return plan;
+  return applied;
 }
 
-/** Plans a reset: one deletion of the demo repository, done when it is already absent. */
-export async function planReset(
-  manifest: SeedManifest,
-  target: SeedTarget,
-): Promise<PlannedStep[]> {
+/**
+ * Plans a reset: one deletion of the demo repository, always to do. `read` cannot see a main left
+ * by a failed seed, so no read can show the deletion already done.
+ */
+export function planReset(manifest: SeedManifest): PlannedStep[] {
   const ref = demoRef(manifest);
-  const state = await target.read(ref);
-  return [
-    {
-      step: { action: "repo.delete", target: `${ref.org}/${ref.repo}` },
-      status: state === null ? "done" : "missing",
-    },
-  ];
+  return [{ step: { action: "repo.delete", target: `${ref.org}/${ref.repo}` }, status: "missing" }];
 }
 
-/** Deletes the demo repository if it exists, and returns the plan it applied. */
-export async function reset(manifest: SeedManifest, target: SeedTarget): Promise<PlannedStep[]> {
-  const ref = demoRef(manifest);
-  const plan = await planReset(manifest, target);
-  if (plan.some((planned) => planned.status === "missing")) await target.reset(ref);
-  return plan;
+/** Deletes the demo repository; `false` when the target held nothing to delete. */
+export async function reset(manifest: SeedManifest, target: SeedTarget): Promise<boolean> {
+  return target.reset(demoRef(manifest));
 }
 
 /** One line per step, naming its target, for a dry run. */

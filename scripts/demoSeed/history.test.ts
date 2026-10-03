@@ -296,6 +296,29 @@ test("the overlay adds, replaces and removes files from the tip commit in one la
   assert.deepEqual(planHistory(request(source, "HEAD", overlay)), history);
 });
 
+test("the overlay commit is dated by its inputs, so an unrelated commit keeps the head", () => {
+  const source = sourceRepo("overlay-stable");
+  commit(source, { "tooling/package.json": "{}\n" }, "chore: add tooling");
+  const overlay: OverlayEntry[] = [{ path: "package.json", from: "tooling/package.json" }];
+  const inputs = git(source, ["log", "-1", "--format=%ad", "--date=raw"]);
+  const before = planHistory(request(source, "HEAD", overlay));
+
+  commit(source, { "other/y.ts": "y\n" }, "chore: unrelated after");
+  assert.deepEqual(planHistory(request(source, "HEAD", overlay)), before);
+  const bundle = join(scratch, "overlay-stable.bundle");
+  writeHistoryBundle(request(source, "HEAD", overlay), bundle);
+  assert.equal(
+    git(cloneOf(bundle, "overlay-stable-clone"), ["log", "-1", "--format=%ad", "--date=raw"]),
+    inputs,
+  );
+
+  // A change to an overlay source is an input: it moves the head.
+  commit(source, { "tooling/package.json": '{ "name": "demo" }\n' }, "chore: name the package");
+  const moved = planHistory(request(source, "HEAD", overlay));
+  assert.notEqual(moved.head, before.head);
+  assert.equal(moved.commits, before.commits);
+});
+
 test("an overlay whose source or removed file is missing is refused", () => {
   const source = sourceRepo("overlay-missing");
 

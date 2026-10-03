@@ -197,7 +197,11 @@ function rewrite(request: ImportRequest, scratch: string): ImportedHistory {
   }
   if (request.overlay.length > 0) {
     const tree = overlayTree(request, scratch, previousTree);
-    const { authorDate, committerDate } = metadataOf(sourceRoot, tip);
+    // Dated by the newest commit that changed one of its inputs, not by the tip, so a commit
+    // elsewhere in the monorepo does not move the head.
+    const froms = request.overlay.flatMap(({ from }) => (from === null ? [] : [from]));
+    const dated = git(sourceRoot, ["rev-list", "-1", tip, "--", directory, ...froms]).trim();
+    const { authorDate, committerDate } = metadataOf(sourceRoot, dated);
     head = commitTree(scratch, tree, head, {
       subject: request.overlaySubject,
       authorDate,

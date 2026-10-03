@@ -79,13 +79,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     }
     case "reset": {
       requireDryRun(values["dry-run"], "reset");
-      // Planned against an instance holding the demo repository, so the deletion is listed.
-      const target = new MemoryTarget();
-      target.leaveWithoutMain({ org: manifest.org, repo: manifest.repo });
-      return [
-        ...describePlan(await planReset(manifest, target)),
-        `note planned against an instance holding only ${manifest.org}/${manifest.repo}: no live target exists yet`,
-      ];
+      return [...describePlan(planReset(manifest)), "note no live target exists yet"];
     }
     case "bundle": {
       if (values.out === undefined) throw new SeedRefusal("bundle needs --out FILE.");
