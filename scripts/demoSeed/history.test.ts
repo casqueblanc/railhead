@@ -8,6 +8,7 @@ import {
   buildMainBundle,
   bundleHead,
   DEMO_AUTHOR,
+  hasPathAt,
   planHistory,
   readFileAt,
   resolveCommit,
@@ -348,6 +349,20 @@ test("a file is read from the commit, not from the working tree", () => {
   );
   assert.throws(() => readFileAt(source, head, "apps/demo/none.ts"), /has no file/);
   assert.throws(() => readFileAt(source, head, "apps/demo"), /has no file/);
+});
+
+test("a path is found as a file or directory of the commit, never the working tree", () => {
+  const source = sourceRepo("has-path");
+  const head = resolveCommit(source, "HEAD");
+  writeFileSync(join(source, "apps", "demo", "dirty.ts"), "dirty\n");
+
+  assert.equal(hasPathAt(source, head, "apps/demo/index.ts"), true);
+  assert.equal(hasPathAt(source, head, "apps/demo"), true);
+  assert.equal(hasPathAt(source, head, "apps/demo/dirty.ts"), false);
+  // A prefix or a pattern is not the path.
+  assert.equal(hasPathAt(source, head, "apps/demo/ind"), false);
+  assert.equal(hasPathAt(source, head, "apps/demo/*.ts"), false);
+  assert.throws(() => hasPathAt(source, "f".repeat(40), "apps/demo"));
 });
 
 test("a failed directory lookup fails the import instead of skipping that commit", () => {

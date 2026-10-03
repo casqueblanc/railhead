@@ -30,7 +30,7 @@ node scripts/demoSeed/cli.ts bundle --out main.bundle
 
 Two agents on separate issues reach the same open decision. That is what the demo exists to show: the warning and the large-upload support both depend on the answer, so one answer must reach both agents through their inboxes, and changing it later (`a` to `b`) must reach both again, superseding what each built on the old version. The third issue is independent, so one agent keeps working while the other two wait on the decision.
 
-The manifest check enforces this shape: exactly three issues, exactly two touching the decision's scope, and a decision whose key and options match the tagged suites in the app's `acceptance/checks.json` one for one, which the train runs for the option in force. The decision must also pass the agent wire's `ask` rules, lowercase option keys included, since an agent opens it by asking; `manifest.test.ts` checks the restated rules against `@railhead/shared` and the `ask` wire fixture.
+The manifest check enforces this shape: exactly three issues, exactly two touching the decision's scope, and a decision whose key and options match the tagged suites in the app's `acceptance/checks.json` one for one, which the train runs for the option in force. Every path in the decision's scope and in each issue's `touches` must exist in the app at the selected commit, so a renamed file refuses the seed instead of leaving a collision that only the manifest shows. The decision must also pass the agent wire's `ask` rules, lowercase option keys included, since an agent opens it by asking; `manifest.test.ts` checks the restated rules against `@railhead/shared` and the `ask` wire fixture.
 
 ## Repeatable seed, safe reset
 

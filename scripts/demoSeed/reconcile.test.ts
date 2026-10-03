@@ -308,10 +308,16 @@ test("reset always calls the target, so a main left by a failed seed at another 
   assert.equal(await target.read(demo), null);
   assert.deepEqual(target.names(), ["demo/upload-app"]);
 
-  // A seed at another head plans a seed and the target refuses it as stale.
+  // A seed at another head plans a seed; the target's stale answer reaches the owner as a refusal.
   const other = bundleOf("b".repeat(40));
-  await assert.rejects(seed(manifest, other, target, target), ActionStale);
-  await assert.rejects(seed(manifest, other, target, target), /has main at a{40}, not b{40}/);
+  await assert.rejects(seed(manifest, other, target, target), (error) => {
+    assert.ok(error instanceof SeedRefusal);
+    assert.equal(error.message, "demo/upload-app@main holds another main. Reset it first.");
+    assert.ok(error.cause instanceof ActionStale);
+    assert.match(error.cause.message, /has main at a{40}, not b{40}/);
+    return true;
+  });
+  assert.equal(await target.read(demo), null);
 
   assert.deepEqual(describePlan(planReset(manifest)), ["todo delete repository demo/upload-app"]);
   assert.equal(await reset(manifest, target), true);
@@ -375,6 +381,19 @@ test("the issue payloads print verbatim for every issue the owner still has to f
   assert.equal(body.join("\n"), second.body);
   assert.ok(body.includes(""));
   assert.ok(body.every((line) => !line.includes("\\n") && !line.startsWith('"')));
+});
+
+test("a filed issue reads as filed, not as an owner step", async () => {
+  const target = new MemoryTarget();
+  await seed(manifest, history, target, target);
+  fileSeededIssues(target, [manifest.issues[0]?.title ?? ""]);
+
+  assert.deepEqual(describePlan(await planSeed(manifest, history, target, target)), [
+    `ok   seed repository demo/upload-app@main = ${history.head}`,
+    'ok   issue demo/upload-app#seed-1 is filed: "Warn before uploading a file above the size limit"',
+    'todo owner files issue demo/upload-app#seed-2: "Let people upload files larger than 10 MB"',
+    'todo owner files issue demo/upload-app#seed-3: "Let people delete an upload"',
+  ]);
 });
 
 test("no payload prints once every issue is filed as seeded", async () => {

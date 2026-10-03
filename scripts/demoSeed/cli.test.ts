@@ -257,6 +257,38 @@ test("the manifest is read from the selected commit, never the working tree", as
   ]);
 });
 
+test("a decision scope or issue path the app lacks at the selected commit is refused", async () => {
+  const repo = sourceRepo("paths");
+  // Both the decision's scope and two issues name src/limits.ts, so the manifest alone still
+  // shows the collision after the rename.
+  git(repo, ["mv", "demo/upload-app/src/limits.ts", "demo/upload-app/src/limit.ts"]);
+  git(repo, ["commit", "--quiet", "-m", "refactor: rename the limits"]);
+  const out = join(scratch, "paths.bundle");
+  const renamed =
+    /[0-9a-f]{40}:demo\/upload-app has no decision\.scope src\/limits\.ts, issues\[0\]\.touches src\/limits\.ts, issues\[1\]\.touches src\/limits\.ts\.$/;
+
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), renamed);
+  await assert.rejects(run(["bundle", "--out", out, "--source-root", repo]), renamed);
+  assert.equal(existsSync(out), false);
+  // The commit before the rename still plans and bundles.
+  const lines = await run(["seed", "--dry-run", "--revision", "HEAD~1", "--source-root", repo]);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
+
+  // A path only one issue touches counts too.
+  git(repo, ["mv", "demo/upload-app/src/limit.ts", "demo/upload-app/src/limits.ts"]);
+  git(repo, ["rm", "--quiet", "demo/upload-app/__tests__/app.test.ts"]);
+  git(repo, ["commit", "--quiet", "-m", "test: drop the app test"]);
+  await assert.rejects(
+    run(["seed", "--dry-run", "--source-root", repo]),
+    /has no issues\[2\]\.touches __tests__\/app\.test\.ts\.$/,
+  );
+  // Reset reads no manifest, so a missing path does not block it.
+  assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
+    "todo delete repository demo/upload-app",
+    "note no live target exists yet",
+  ]);
+});
+
 test("reset still plans when the committed checks or the source do not match the manifest", async () => {
   const repo = sourceRepo("reset-checks");
   writeFileSync(join(repo, CHECKS), otherDecision());

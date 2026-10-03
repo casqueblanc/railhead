@@ -177,7 +177,15 @@ export async function seed(
     }
     switch (step.action) {
       case "repo.seed":
-        await target.seed(ref, bundle);
+        try {
+          await target.seed(ref, bundle);
+        } catch (error) {
+          // A main the read could not see, such as one a failed seed imported at another head.
+          if (!(error instanceof ActionStale)) throw error;
+          throw new SeedRefusal(`${step.target} holds another main. Reset it first.`, {
+            cause: error,
+          });
+        }
         applied.push({ step, status: "done" });
         break;
       case "issue.file":
@@ -252,6 +260,7 @@ function issueStatus(copies: readonly BoardIssue[], seeded: string): StepStatus 
 function issueAction(status: StepStatus, target: string, filed = 0): string {
   switch (status) {
     case "done":
+      return `issue ${target} is filed`;
     case "missing":
       return `owner files issue ${target}`;
     case "differs":

@@ -100,6 +100,12 @@ export function readFileAt(sourceRoot: string, commit: string, path: string): st
   return git(sourceRoot, ["cat-file", "blob", entry.object]);
 }
 
+/** Whether `commit` has a file or directory at `path`. */
+export function hasPathAt(sourceRoot: string, commit: string, path: string): boolean {
+  const type = entryAt(sourceRoot, commit, path)?.type;
+  return type === "blob" || type === "tree";
+}
+
 /** Computes the rewritten history without writing a bundle, for a dry run. */
 export function planHistory(request: ImportRequest): ImportedHistory {
   return withScratch(request.sourceRoot, (scratch) => rewrite(request, scratch));
