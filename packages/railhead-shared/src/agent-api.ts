@@ -28,8 +28,10 @@
 // another secret, apart from the session token the session route exists to return.
 
 import {
+  MAX_LIST_LENGTH,
   MAX_OPTION_LABEL_LENGTH,
   MAX_OPTIONS,
+  MAX_PATH_LENGTH,
   MAX_PLAN_LENGTH,
   MAX_QUESTION_LENGTH,
   MIN_OPTIONS,
@@ -75,6 +77,13 @@ export const AGENT_REQUEST_TIMEOUT_MS = 30_000;
 
 /** Longest a question long-poll holds a request open, in milliseconds. */
 export const MAX_LONG_POLL_MS = 25_000;
+
+/**
+ * Most UTF-8 bytes a question's scope may take as a JSON array. The scope is copied into the
+ * answer's inbox item, so this keeps that item far below the inbox's size limit; half the request
+ * body limit leaves room for the question and its options.
+ */
+export const MAX_SCOPE_BYTES = MAX_AGENT_REQUEST_BYTES / 2;
 
 /** How long a login challenge stays valid after it is issued, in milliseconds. */
 export const CHALLENGE_TTL_MS = 60_000;
@@ -750,6 +759,12 @@ export interface AskRequest {
   text: string;
   /** The answers offered, between `MIN_OPTIONS` and `MAX_OPTIONS`, with unique keys. */
   options: QuestionOption[];
+  /**
+   * The repository paths the answer applies to: 1 to `MAX_LIST_LENGTH` relative paths, none blank,
+   * with an empty, `.` or `..` segment, or with a control character, and at most
+   * `MAX_SCOPE_BYTES` together. The decision the answer records carries them as its scope.
+   */
+  scope: string[];
 }
 
 /** Where a question stands. */
@@ -864,6 +879,7 @@ export function validateAgentRequest(request: AgentRequestPair): void {
       }
       requireText(request.body.text, MAX_QUESTION_LENGTH, "text");
       requireOptions(request.body.options);
+      requireScope(request.body.scope);
       return;
     case "work":
     case "status":
@@ -942,6 +958,44 @@ function requireOptions(options: QuestionOption[]): void {
     }
     requireText(option.label, MAX_OPTION_LABEL_LENGTH, `options[${index}].label`);
   });
+}
+
+function requireScope(scope: string[]): void {
+  if (scope.length === 0 || scope.length > MAX_LIST_LENGTH) {
+    throw new Error(`scope must have between 1 and ${MAX_LIST_LENGTH} entries`);
+  }
+  scope.forEach((path, index) => {
+    if (!isScopePath(path)) throw new Error(`scope[${index}] is not a repository path`);
+  });
+  if (scopeBytes(scope) > MAX_SCOPE_BYTES) {
+    throw new Error(`scope is larger than ${MAX_SCOPE_BYTES} bytes`);
+  }
+}
+
+// C0, DEL and C1 controls, which JSON escapes to as many as six bytes, and lone surrogates, which
+// are not text.
+const UNPRINTABLE = /[\p{Cc}\p{Cs}]/u;
+
+/**
+ * True when `path` can be a question's scope entry: a relative repository path, not blank, with no
+ * empty, `.` or `..` segment and no control character. Blank paths are refused because the inbox
+ * refuses blank scope text, so an answer naming one could never be delivered.
+ */
+export function isScopePath(path: string): boolean {
+  if (path.trim() === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
+  if (UNPRINTABLE.test(path)) return false;
+  return path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+/** The UTF-8 bytes of `scope` as a JSON array, the size `MAX_SCOPE_BYTES` bounds. */
+export function scopeBytes(scope: readonly string[]): number {
+  let bytes = 0;
+  // JSON.stringify escapes lone surrogates, so every code point here is a whole one.
+  for (const char of JSON.stringify(scope)) {
+    const point = char.codePointAt(0) ?? 0;
+    bytes += point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+  }
+  return bytes;
 }
 
 function requireId(kind: IdKind, value: string, field: string): void {

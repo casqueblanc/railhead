@@ -1,4 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { useLiveBoardPorts } from "../features/board/liveConnection";
 import { HomePage } from "../pages/home/HomePage";
 
-export const Route = createFileRoute("/")({ component: HomePage });
+const BoardRoute = () => <HomePage ports={useLiveBoardPorts()} />;
+
+export const Route = createFileRoute("/")({ component: BoardRoute });

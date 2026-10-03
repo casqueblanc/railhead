@@ -306,15 +306,7 @@ impl DecisionRecorded {
             "supersedes",
             "the previous version, or null for the first",
         )?;
-        require_list(&self.scope, "scope")?;
-        require(
-            !self.scope.is_empty(),
-            "scope",
-            "a list of at least one path",
-        )?;
-        self.scope
-            .iter()
-            .try_for_each(|path| require_path(path, "scope"))
+        require_scope(&self.scope)
     }
 }
 
@@ -532,6 +524,15 @@ fn require_decision_refs(refs: &[DecisionRef]) -> Result<()> {
 fn require_decision_ref(decision: &DecisionRef) -> Result<()> {
     require_id(IdKind::Decision, &decision.decision_id, "decisionId")?;
     require_positive(decision.version, "version")
+}
+
+/// One to [`MAX_LIST_LENGTH`](crate::rules::MAX_LIST_LENGTH) repository paths.
+pub(crate) fn require_scope(scope: &[String]) -> Result<()> {
+    require_list(scope, "scope")?;
+    require(!scope.is_empty(), "scope", "a list of at least one path")?;
+    scope
+        .iter()
+        .try_for_each(|path| require_path(path, "scope"))
 }
 
 /// Between [`MIN_OPTIONS`] and [`MAX_OPTIONS`] options with unique, valid keys and labels.
