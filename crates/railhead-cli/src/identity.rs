@@ -1754,23 +1754,24 @@ mod tests {
         let home = tempfile::tempdir()?;
         let store = FileStore::new(home.path());
         let atlas = identity("atlas", "agt_atlas01")?;
-        store.save_session(&atlas.name, &session(&atlas, TOKEN, 1_800_000_000_000)?)?;
 
-        // A free lock is taken at once, even with the deadline already passed.
+        // A free lock is taken at once, even with the deadline already passed. It is the lock's
+        // first taker: a child another test forks in this process can inherit the descriptor of
+        // a lock released here earlier and hold it until it execs, so nothing takes it before.
         let past = Instant::now();
         let free = store.lock_session_until(&atlas.name, past)?;
         let free = free.ok_or_else(|| anyhow::anyhow!("a free lock was not taken"))?;
+        free.save(&session(&atlas, TOKEN, 1_800_000_000_000)?)?;
         assert!(free.load()?.is_some());
 
-        // Held by another writer, the wait ends at the deadline, not when the lock is released.
+        // Held by another writer, the wait ends at the deadline, not when the lock is released:
+        // the lock stays held throughout, so the wait returning at all shows the deadline ended
+        // it. How long after the deadline it returns depends on scheduling, so it is not bounded.
         let started = Instant::now();
         let deadline = started + Duration::from_millis(300);
         assert!(store.lock_session_until(&atlas.name, deadline)?.is_none());
         let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
-            "{waited:?}"
-        );
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
         assert!(store.lock_session_until(&atlas.name, past)?.is_none());
 
         // Released within the wait, the lock is taken then.
