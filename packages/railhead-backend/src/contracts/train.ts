@@ -231,7 +231,7 @@ export interface TrainPort {
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
   /**
    * Whether the queue holds an entry, in any state, for the claim at `generation`, or `null` when the
-   * module is missing. Call it only inside the caller's transaction. The claims module reads it when
+   * module is missing; `null` is a refusal. Call it only inside the caller's transaction. The claims module reads it when
    * a ready claim is marked ready again, to queue a pin that never reached the train.
    */
   hasEntry(claimId: ClaimId, generation: number): boolean | null;
