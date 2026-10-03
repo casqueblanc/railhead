@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::commands::claim::{render_claim, session};
 use crate::http::Endpoint;
-use crate::output::{Output, Render, inert};
+use crate::output::{Output, Render, inert, quoted};
 use crate::{Agent, Error, Result};
 
 /// Arguments of `rh status`.
@@ -68,12 +68,12 @@ impl Render for Status {
         writeln!(
             out,
             "agent {} ({}), {state}",
-            inert(&self.agent.name),
-            inert(&self.agent.agent_id)
+            quoted(&self.agent.name),
+            quoted(&self.agent.agent_id)
         )?;
         match &self.claim {
             Some(claim) => {
-                writeln!(out, "claim {}", inert(&claim.claim_id))?;
+                writeln!(out, "claim {}", quoted(&claim.claim_id))?;
                 render_claim(out, claim)?;
             }
             None => writeln!(out, "no claim")?,
@@ -83,22 +83,108 @@ impl Render for Status {
         }
         for item in &self.items {
             let what = match &item.entry {
-                InboxEntry::Decision { decision } => {
-                    format!("decision {} v{}", decision.decision_id, decision.version)
-                }
-                InboxEntry::Rework { decision } => {
-                    format!(
-                        "rework for decision {} v{}",
-                        decision.decision_id, decision.version
-                    )
-                }
+                InboxEntry::Decision { decision } => format!(
+                    "decision {} v{}",
+                    quoted(&decision.decision_id),
+                    decision.version
+                ),
+                InboxEntry::Rework { decision } => format!(
+                    "rework for decision {} v{}",
+                    quoted(&decision.decision_id),
+                    decision.version
+                ),
                 InboxEntry::Conflict {
                     other_claim_id,
                     path,
-                } => format!("conflict with {other_claim_id} on {path}"),
+                } => format!(
+                    "conflict with {} on {}",
+                    quoted(other_claim_id),
+                    quoted(path)
+                ),
             };
-            writeln!(out, "inbox item {}: {}", item.item, inert(&what))?;
+            writeln!(out, "inbox item {}: {what}", item.item)?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn status(agent_name: &str, items: &[Value]) -> anyhow::Result<Status> {
+        Ok(Status {
+            agent: serde_json::from_value(
+                json!({"agentId": "agt_atlas01", "name": agent_name, "ownerId": "usr_lemarier", "state": "confirmed"}),
+            )?,
+            claim: None,
+            clone: None,
+            items: serde_json::from_value(Value::Array(items.to_vec()))?,
+        })
+    }
+
+    fn conflict(path: &str) -> Value {
+        json!({"item": 18, "claimId": "clm_42abcd", "queuedAt": 1,
+            "entry": {"kind": "conflict", "otherClaimId": "clm_43abcd", "path": path},
+            "decision": null})
+    }
+
+    fn rendered(status: &Status) -> anyhow::Result<String> {
+        let mut text = Vec::new();
+        status.render(&mut text)?;
+        Ok(String::from_utf8(text)?)
+    }
+
+    #[test]
+    fn inbox_items_print_quoted_backend_values() -> anyhow::Result<()> {
+        let rework = json!({"item": 17, "claimId": "clm_42abcd", "queuedAt": 1,
+            "entry": {"kind": "rework", "decision": {"decisionId": "dec_upload1", "version": 2}},
+            "decision": null});
+        let text = rendered(&status("atlas", &[rework, conflict("src/upload.ts")])?)?;
+        assert_eq!(
+            text,
+            "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\n\
+             inbox item 17: rework for decision \"dec_upload1\" v2\n\
+             inbox item 18: conflict with \"clm_43abcd\" on \"src/upload.ts\"\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_path_and_inbox_stay_visible() -> anyhow::Result<()> {
+        assert_eq!(
+            rendered(&status("atlas", &[conflict("")])?)?.lines().last(),
+            Some("inbox item 18: conflict with \"clm_43abcd\" on \"\"")
+        );
+        assert_eq!(
+            rendered(&status("atlas", &[])?)?,
+            "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_cannot_forge_a_line() -> anyhow::Result<()> {
+        let text = rendered(&status(
+            "atlas\nno claim",
+            &[conflict(
+                "a.ts\ninbox item 99: forged\u{2028}inbox item 98: forged\u{1b}[2J",
+            )],
+        )?)?;
+        assert_eq!(
+            text,
+            "agent \"atlas\\nno claim\" (\"agt_atlas01\"), confirmed\nno claim\n\
+             inbox item 18: conflict with \"clm_43abcd\" on \
+             \"a.ts\\ninbox item 99: forged\\u2028inbox item 98: forged\\u001b[2J\"\n"
+        );
+        assert!(
+            !text
+                .split(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
+                .any(|line| line.starts_with("inbox item 9")),
+            "{text}"
+        );
         Ok(())
     }
 }
