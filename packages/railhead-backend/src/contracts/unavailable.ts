@@ -1,7 +1,12 @@
-// The implementation of each port while its module is not installed. Every method refuses with
-// `unavailable` and does nothing else: it holds no state and receives no storage, so it cannot
-// record an effect. In particular the ready gate is never `clear` and no check ever passes by
-// default; a missing security module blocks the action it guards.
+// The implementation of each port while its module is not installed. Every asynchronous method
+// refuses with `unavailable`, and each synchronous fence reader returns `null`; neither does
+// anything else. Each port holds no state and receives no storage, so it cannot record an effect.
+// In particular the ready gate is never `clear` and no check ever passes by default; a missing
+// security module blocks the action it guards.
+//
+// The fence readers cannot return a `PortFailure`, so their `null` is what each contract defines
+// as unknown: no attempt, no current generation and no decision list, never an empty one. A
+// caller treats `null` as a refusal.
 
 import type { ArtifactsPort } from "./artifacts";
 import type { ClaimsPort } from "./claims";
@@ -41,6 +46,7 @@ export const unavailableClaims: ClaimsPort = {
   claim: refuse("claims"),
   ready: refuse("claims"),
   pin: refuse("claims"),
+  currentGeneration: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
 };
@@ -59,6 +65,7 @@ export const unavailableDecisions: DecisionsPort = {
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),
+  currentVersions: () => null,
 };
 
 /** Artifacts while its module is missing. */
@@ -76,13 +83,19 @@ export const unavailableMerge: MergePort = {
 
 /** Checks while their module is missing: nothing runs, so nothing passes. */
 export const unavailableChecks: CheckPort = {
+  definitions: refuse("checks"),
   start: refuse("checks"),
 };
 
-/** The train while its module is missing: no report is recorded. */
+/**
+ * The train while its module is missing: no report is recorded, no attempt is known and nothing is
+ * owed, so `resume` does nothing.
+ */
 export const unavailableTrain: TrainPort = {
   enqueue: refuse("train"),
   recordCheck: refuse("train"),
+  attemptOutcome: () => null,
+  resume: async () => {},
 };
 
 /** Authorization while its module is missing: no intent is authorized. */
@@ -99,6 +112,7 @@ export const unavailableMainRef: MainRefPort = {
 
 /** The main writer while its module is missing. */
 export const unavailableMainWriter: MainWriterPort = {
+  head: refuse("mainWriter"),
   publish: refuse("mainWriter"),
 };
 

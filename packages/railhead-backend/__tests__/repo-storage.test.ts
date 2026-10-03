@@ -1,7 +1,13 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { StorageError, atomically, migrate, type RepoStorage } from "../src/repo/storage";
+import {
+  StorageError,
+  atomically,
+  migrate,
+  wakeNoLaterThan,
+  type RepoStorage,
+} from "../src/repo/storage";
 
 /** Runs `body` against the storage of a Durable Object no other test touches. */
 function withStorage<R>(body: (storage: RepoStorage) => R): Promise<R> {
@@ -132,5 +138,37 @@ describe("atomically", () => {
       // @ts-expect-error -- a transaction commits when its body returns, so it cannot await.
       atomically(storage, async () => 1);
     });
+  });
+});
+
+describe("wakeNoLaterThan", () => {
+  it("sets an unset alarm, keeps an earlier one and moves a later one earlier", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    // An hour away and more, so no alarm fires during the test.
+    const base = Date.now() + 3_600_000;
+    const alarms = await runInDurableObject(stub, async (_instance, state) => {
+      const seen: (number | null)[] = [];
+      await wakeNoLaterThan(state.storage, base + 2_000);
+      seen.push(await state.storage.getAlarm());
+      await wakeNoLaterThan(state.storage, base + 5_000);
+      seen.push(await state.storage.getAlarm());
+      await wakeNoLaterThan(state.storage, base + 2_000);
+      seen.push(await state.storage.getAlarm());
+      await wakeNoLaterThan(state.storage, base + 1_000);
+      seen.push(await state.storage.getAlarm());
+      await state.storage.deleteAlarm();
+      return seen;
+    });
+    expect(alarms).toEqual([base + 2_000, base + 2_000, base + 2_000, base + 1_000]);
+  });
+
+  it("refuses a time the runtime cannot schedule and leaves the alarm unset", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const { error, alarm } = await runInDurableObject(stub, async (_instance, state) => {
+      const refused = await wakeNoLaterThan(state.storage, 0).catch((e: unknown) => e);
+      return { error: refused, alarm: await state.storage.getAlarm() };
+    });
+    expect(error).toBeInstanceOf(TypeError);
+    expect(alarm).toBeNull();
   });
 });

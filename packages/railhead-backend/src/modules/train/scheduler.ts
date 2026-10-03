@@ -7,10 +7,13 @@
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
 // again rather than inheriting any part of its result.
 //
-// Nothing schedules the train from a timer: each `enqueue` and `recordCheck` drives it until it
-// waits for a check report or a port, or the queue is empty. A train blocked on an unavailable port
-// moves again on the next call. A thrown drive error does not undo the call's committed write:
-// the call still returns its result, and the next call drives again.
+// Each `enqueue` and `recordCheck` drives the train until it waits for a check report or a port,
+// or the queue is empty. Accepting work also records, in the same transaction, that a drive is
+// owed. When a drive ends, the train settles that debt from storage: it clears it once nothing can
+// move, asks the Repo's alarm to drive again at once when work arrived too late for the drive, and
+// backs off when a port refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row. A
+// thrown drive error does not undo the call's committed write: the call still returns its result.
+// A restarted train asks for the wake it owes, so a lost alarm is set again.
 
 import {
   isCommitSha,
@@ -19,11 +22,13 @@ import {
   MAX_PATH_LENGTH,
   type Actor,
   type CommitSha,
+  type CheckRunId,
   type DecisionRef,
 } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
 import { fail, ok, type PortErrorCode, type PortResult } from "../../contracts/result";
 import type {
+  AttemptOutcome,
   CheckAttempt,
   CheckDefinition,
   CheckReport,
@@ -36,13 +41,16 @@ import {
   activeBatch,
   batchByAttempt,
   batchedEntries,
+  clearWake,
   countPending,
+  hasMovableWork,
   highestGeneration,
   insertBatch,
   insertEntry,
   markCheckStarted,
   migrateTrain,
   readEntry,
+  readWake,
   recentBatches,
   recentEntries,
   recordCandidate,
@@ -52,6 +60,7 @@ import {
   settleBatch,
   settleEntry,
   waitingEntries,
+  writeWake,
   type BatchFailure,
   type BatchRecord,
   type DropReason,
@@ -67,6 +76,19 @@ export const MAX_BATCH = 8;
 /** How many batches may fail for reasons outside a pin before the pin is dropped. */
 export const MAX_RETRIES = 3;
 
+/** The first delay after a drive stops on a port or throws. Each failure in a row doubles it. */
+export const WAKE_BASE_MS = 1_000;
+
+/** The longest delay between drives that fail. */
+export const WAKE_MAX_MS = 5 * 60_000;
+
+/**
+ * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
+ * all. After that the train stops asking and logs `train.wake_exhausted`; its work stays in storage
+ * and the next `enqueue` or `recordCheck` drives it again.
+ */
+export const MAX_WAKE_FAILURES = 24;
+
 /**
  * Most state transitions one call drives. Every transition that does not stop the drive settles or
  * consumes queue state: a batch costs at most four (form, compose, start or land, and a drop of
@@ -80,17 +102,6 @@ export const MAX_STEPS = 4 * MAX_QUEUE * (MAX_RETRIES + 3);
 export const MAX_DIAGNOSTIC_ROWS = 64;
 
 const TRAIN_ACTOR: Actor = { kind: "system", id: "sys_train" };
-
-/**
- * What the train needs that no published port provides yet. #107 adds `MainWriterPort.head` and
- * `CheckPort.definitions`; until then production refuses both, so no batch starts.
- */
-export interface TrainDeps {
-  /** Main's current commit. */
-  mainHead(): Promise<PortResult<CommitSha>>;
-  /** The trusted check definitions read from `main`. */
-  checkDefinitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
-}
 
 /** Why the train stopped short of a check or a landing. */
 export type BlockReason =
@@ -121,14 +132,14 @@ export type DriveOutcome =
   | { kind: "idle" }
   /** The active batch waits for its runner's report. */
   | { kind: "checking"; batchId: number; attemptId: string }
-  /** The train cannot move until a port answers; the next call tries again. */
+  /** The train cannot move until a port answers; the alarm tries again after a delay. */
   | { kind: "blocked"; batchId: number | null; reason: BlockReason; code: PortErrorCode | null }
-  /** The drive used its step budget, which a correct queue never reaches; the next call continues. */
+  /** The drive used its step budget, which a correct queue never reaches; the alarm continues. */
   | { kind: "yielded" };
 
 /** The train port, with the scheduler's own reads. */
 export interface Train extends TrainPort {
-  /** Moves the train as far as it can go now. */
+  /** Moves the train as far as it can go now, then settles the drive it owes. */
   drive(): Promise<DriveOutcome>;
   /** Up to `limit` batches with their diagnostics, newest first. */
   batches(limit: number): BatchRecord[];
@@ -141,12 +152,16 @@ type Step = { kind: "continue" } | { kind: "stop"; outcome: DriveOutcome };
 const CONTINUE: Step = { kind: "continue" };
 
 /** Builds the train of one repository over its own tables. */
-export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: TrainDeps): Train {
+export function createTrain(context: RepoContext, ports: () => RepoPorts): Train {
   migrateTrain(context.storage);
   const { log, clock } = context;
   const sql = context.storage.sql;
   let running: Promise<DriveOutcome> | null = null;
   let again = false;
+
+  // A restarted train asks again for the wake it owes: the alarm may never have been set.
+  const owed = readWake(sql);
+  if (owed !== null) context.wake(owed.dueAt);
 
   function drive(): Promise<DriveOutcome> {
     if (running !== null) {
@@ -154,9 +169,10 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
       return running;
     }
     const current = (async () => {
+      let outcome: DriveOutcome | null = null;
       try {
-        let outcome: DriveOutcome;
         // A call that arrives while a drive runs asks for one more pass, never an unbounded chain.
+        // Work it leaves behind is found in storage by `settleWake`, which the alarm then drives.
         let passes = 0;
         do {
           again = false;
@@ -165,11 +181,56 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
         } while (again && passes < 2);
         return outcome;
       } finally {
+        // Nothing awaits between the last pass and here, so no call can commit work unseen.
         running = null;
+        settleWake(outcome);
       }
     })();
     running = current;
     return current;
+  }
+
+  /**
+   * Settles the drive the train owes after a drive ended with `outcome`, or threw (`null`). A
+   * failure in a row doubles the delay; a drive that ran clean clears the count.
+   */
+  function settleWake(outcome: DriveOutcome | null): void {
+    const now = clock();
+    const failed = outcome === null || outcome.kind === "blocked" || outcome.kind === "yielded";
+    const due = context.storage.transactionSync((): number | "exhausted" | null => {
+      if (failed) {
+        const failures = (readWake(sql)?.failures ?? 0) + 1;
+        if (failures > MAX_WAKE_FAILURES) {
+          clearWake(sql);
+          return "exhausted";
+        }
+        const dueAt = now + wakeDelay(failures);
+        writeWake(sql, { dueAt, failures });
+        return dueAt;
+      }
+      if (hasMovableWork(sql)) {
+        writeWake(sql, { dueAt: now, failures: 0 });
+        return now;
+      }
+      clearWake(sql);
+      return null;
+    });
+    if (due === "exhausted") {
+      console.error(
+        JSON.stringify({
+          event: "train.wake_exhausted",
+          repo: context.repoId,
+          failures: MAX_WAKE_FAILURES,
+        }),
+      );
+    } else if (due !== null) {
+      context.wake(due);
+    }
+  }
+
+  /** Records, inside the caller's transaction, that accepted work is owed a drive now. */
+  function oweDrive(now: number): void {
+    writeWake(sql, { dueAt: now, failures: readWake(sql)?.failures ?? 0 });
   }
 
   async function pass(): Promise<DriveOutcome> {
@@ -202,9 +263,9 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
       return CONTINUE;
     }
 
-    const main = await deps.mainHead();
+    const main = await ports().mainWriter.head();
     if (!main.ok) return blocked(null, "main_unavailable", main.code);
-    const definitions = await deps.checkDefinitions(main.value);
+    const definitions = await ports().checks.definitions(main.value);
     if (!definitions.ok) return blocked(null, "definitions_unavailable", definitions.code);
     const [definition, ...others] = definitions.value;
     if (definition === undefined || others.length > 0) {
@@ -405,8 +466,10 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
   }
 
   /**
-   * Parks a conflicting pair and asks a person: with no classifier installed, every conflict is
-   * treated as a disagreement. The batch's other pins go back to the front unchanged.
+   * Parks a conflicting pair and records `train.conflict`, which the board shows with both claims
+   * and the path. With no classifier installed, every conflict is treated as a disagreement and
+   * given `route: "question"`, but no question is created and nothing unparks the pair: no port
+   * lets the train ask yet (#118). The batch's other pins go back to the front unchanged.
    */
   function routeConflict(
     batch: BatchRecord,
@@ -462,11 +525,11 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
   }
 
   /**
-   * Drives after a call committed its write, so a port that rejects or a broken invariant cannot
-   * turn that committed result into a thrown error. The error is logged by name only, never with
-   * its message, which may carry a port's text.
+   * Drives without throwing, so a port that rejects or a broken invariant cannot turn a committed
+   * result into a thrown error; the drive has already asked for its retry. The error is logged by
+   * name only, never with its message, which may carry a port's text.
    */
-  async function driveAfterCommit(): Promise<void> {
+  async function driveLogged(): Promise<void> {
     try {
       await drive();
     } catch (error) {
@@ -475,6 +538,35 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
         JSON.stringify({ event: "train.drive_failed", repo: context.repoId, error: name }),
       );
     }
+  }
+
+  async function resume(): Promise<void> {
+    const owedNow = readWake(sql);
+    if (owedNow === null) return;
+    // Another module's alarm may fire first; ask again for this train's own time.
+    if (owedNow.dueAt > clock()) {
+      context.wake(owedNow.dueAt);
+      return;
+    }
+    await driveLogged();
+  }
+
+  function attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null {
+    const batch = batchByAttempt(sql, attemptId);
+    if (batch === null) return null;
+    const attempt = attemptOf(batch);
+    if (batch.checkResult === null) return { attempt, report: null };
+    if (batch.finishedAt === null) throw new Error("a recorded report has no finish time");
+    return {
+      attempt,
+      report: {
+        attemptId: attempt.attemptId,
+        candidate: attempt.candidate,
+        result: batch.checkResult,
+        logDigest: batch.logDigest,
+        finishedAt: batch.finishedAt,
+      },
+    };
   }
 
   async function enqueue(pin: ClaimPin): Promise<PortResult<{ queued: boolean }>> {
@@ -497,10 +589,11 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
         return fail("busy", "The train's queue is full.");
       }
       insertEntry(sql, pin, now);
+      oweDrive(now);
       return ok({ queued: true });
     });
     if (!result.ok) return result;
-    await driveAfterCommit();
+    await driveLogged();
     return result;
   }
 
@@ -523,7 +616,15 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
         return fail("check_mismatch", "This attempt is no longer waiting for a report.");
       }
       const now = clock();
-      recordCheckResult(sql, batch.batchId, report.result, report.logDigest, now);
+      recordCheckResult(
+        sql,
+        batch.batchId,
+        report.result,
+        report.logDigest,
+        report.finishedAt,
+        now,
+      );
+      oweDrive(now);
       if (report.result !== "pass") {
         failBatchIn(batch, report.result === "fail" ? "check_fail" : "check_error", now);
       }
@@ -541,17 +642,24 @@ export function createTrain(context: RepoContext, ports: () => RepoPorts, deps: 
     });
     const { value } = result;
     if (!value.ok) return value;
-    await driveAfterCommit();
+    await driveLogged();
     return value;
   }
 
   return {
     enqueue,
     recordCheck,
+    attemptOutcome,
+    resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
     entries: (limit) => recentEntries(sql, boundLimit(limit)),
   };
+}
+
+/** `WAKE_BASE_MS` doubled for each failure after the first, at most `WAKE_MAX_MS`. */
+function wakeDelay(failures: number): number {
+  return Math.min(WAKE_BASE_MS * 2 ** Math.min(failures - 1, 20), WAKE_MAX_MS);
 }
 
 function attemptOf(batch: BatchRecord): CheckAttempt {

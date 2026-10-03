@@ -8,6 +8,18 @@
 /** The part of a Durable Object's storage this module uses. A `Repo` passes `ctx.storage`. */
 export type RepoStorage = Pick<DurableObjectStorage, "sql" | "transactionSync">;
 
+/** The part of a Durable Object's storage that holds its one alarm. */
+export type AlarmStorage = Pick<DurableObjectStorage, "getAlarm" | "setAlarm">;
+
+/**
+ * Sets the object's one alarm to `at` unless it is already set earlier, so one module's wake
+ * never delays another's. A module woken before its own time asks again from its `resume`.
+ */
+export async function wakeNoLaterThan(storage: AlarmStorage, at: number): Promise<void> {
+  const current = await storage.getAlarm();
+  if (current === null || at < current) await storage.setAlarm(at);
+}
+
 /** Why a storage operation was refused. */
 export type StorageErrorCode =
   /** A migration owner's name is not a lowercase identifier. */

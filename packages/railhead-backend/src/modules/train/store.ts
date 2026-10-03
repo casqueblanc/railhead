@@ -3,6 +3,10 @@
 // At most one batch is active at a time. The `active` column holds 1 for the active batch and NULL
 // for every settled one, and its UNIQUE constraint refuses a second active row, so even a bug in
 // the scheduler cannot start two batches at once.
+//
+// `train_wake` holds at most one row: the drive the train owes and when it is due. A call that
+// accepts work writes it in the same transaction, so the debt survives a restart even when the
+// Repo's alarm was never set.
 
 import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
@@ -49,6 +53,12 @@ const MIGRATIONS: readonly string[] = [
     updated_at INTEGER NOT NULL,
     CHECK ((active IS NOT NULL) = (state IN ('composing', 'checking', 'passed')))
   ) STRICT`,
+  "ALTER TABLE train_batches ADD COLUMN finished_at INTEGER",
+  `CREATE TABLE train_wake (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    due_at INTEGER NOT NULL,
+    failures INTEGER NOT NULL CHECK (failures >= 0)
+  ) STRICT`,
 ];
 
 /** Creates or migrates the train's tables. */
@@ -66,7 +76,7 @@ export type EntryState =
   | "landed"
   /** Removed from the train; `reason` says why. */
   | "dropped"
-  /** Held with the claim it conflicts with until a person decides. */
+  /** Held with the claim it conflicts with. Nothing returns it to the queue yet (#118). */
   | "parked";
 
 /** Why a pin left the queue without landing. */
@@ -81,7 +91,7 @@ export type DropReason =
   | "compose_failed"
   /** The pin's batches failed for reasons outside it too many times. */
   | "retries_exhausted"
-  /** The pin conflicts with another claim; a person is asked. */
+  /** The pin conflicts with another claim in its batch. */
   | "conflict";
 
 /** One pin in the train's queue. */
@@ -103,7 +113,7 @@ export type BatchState = "composing" | "checking" | "passed" | "landed" | "faile
 
 /** Why a batch failed. */
 export type BatchFailure =
-  /** Two pins conflict; both are parked and the conflict is routed to a question. */
+  /** Two pins conflict; both are parked and `train.conflict` records the pair. */
   | "conflict"
   /** The merge named a commit that does not exist. */
   | "compose_missing_commit"
@@ -150,6 +160,8 @@ export interface BatchRecord {
   checkResult: CheckResult | null;
   /** SHA-256 of the check log, as reported. */
   logDigest: string | null;
+  /** When the reported run finished, as reported. */
+  finishedAt: number | null;
   /** The merge intent, once authorized. */
   intentId: string | null;
   /** Why it failed, or `null`. */
@@ -183,6 +195,7 @@ type BatchRow = {
   check_started: number;
   check_result: string | null;
   log_digest: string | null;
+  finished_at: number | null;
   intent_id: string | null;
   failure: string | null;
   created_at: number;
@@ -191,7 +204,7 @@ type BatchRow = {
 
 const QUEUE_COLUMNS = "claim_id, generation, commit_sha, state, isolate, retries, reason";
 const BATCH_COLUMNS =
-  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_result, log_digest, intent_id, failure, created_at, updated_at";
+  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
 /** The queue entry of `claimId` at `generation`, or `null`. */
 export function readEntry(sql: SqlStorage, claimId: string, generation: number): QueueEntry | null {
@@ -410,12 +423,15 @@ export function recordCheckResult(
   batchId: number,
   result: CheckResult,
   logDigest: string | null,
+  finishedAt: number,
   now: number,
 ): void {
   sql.exec(
-    `UPDATE train_batches SET check_result = ?, log_digest = ?, updated_at = ? WHERE batch_id = ?`,
+    `UPDATE train_batches SET check_result = ?, log_digest = ?, finished_at = ?, updated_at = ?
+       WHERE batch_id = ?`,
     result,
     logDigest,
+    finishedAt,
     now,
     batchId,
   );
@@ -458,6 +474,55 @@ export function settleBatch(
   );
 }
 
+/** A drive the train owes. */
+export interface PendingWake {
+  /** When it is due, in milliseconds since the Unix epoch. */
+  dueAt: number;
+  /** How many drives in a row stopped on a port or threw. */
+  failures: number;
+}
+
+/** The drive the train owes, or `null`. */
+export function readWake(sql: SqlStorage): PendingWake | null {
+  const row = sql
+    .exec<{ due_at: number; failures: number }>("SELECT due_at, failures FROM train_wake")
+    .toArray()[0];
+  return row === undefined ? null : { dueAt: row.due_at, failures: row.failures };
+}
+
+/** Records the drive the train owes. */
+export function writeWake(sql: SqlStorage, wake: PendingWake): void {
+  sql.exec(
+    `INSERT INTO train_wake (id, due_at, failures) VALUES (1, ?, ?)
+     ON CONFLICT (id) DO UPDATE SET due_at = excluded.due_at, failures = excluded.failures`,
+    wake.dueAt,
+    wake.failures,
+  );
+}
+
+/** Records that the train owes nothing. */
+export function clearWake(sql: SqlStorage): void {
+  sql.exec("DELETE FROM train_wake");
+}
+
+/**
+ * Whether storage holds work a drive could move now: an active batch that is not waiting for a
+ * runner's report, or a waiting pin with no batch active.
+ */
+export function hasMovableWork(sql: SqlStorage): boolean {
+  const row = sql
+    .exec<{ movable: number }>(
+      `SELECT CASE
+         WHEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
+           THEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1
+             AND (state IN ('composing', 'passed') OR (state = 'checking' AND check_started = 0)))
+         ELSE EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued')
+       END AS movable`,
+    )
+    .toArray()[0];
+  return row?.movable === 1;
+}
+
 function toEntry(row: QueueRow): QueueEntry {
   return {
     pin: { claimId: row.claim_id, generation: row.generation, commit: row.commit_sha },
@@ -486,6 +551,7 @@ function toBatch(row: BatchRow): BatchRecord {
     checkStarted: row.check_started === 1,
     checkResult: row.check_result === null ? null : parseCheckResult(row.check_result),
     logDigest: row.log_digest,
+    finishedAt: row.finished_at,
     intentId: row.intent_id,
     failure: row.failure === null ? null : parseBatchFailure(row.failure),
     createdAt: row.created_at,

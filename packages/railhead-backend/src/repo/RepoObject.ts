@@ -26,9 +26,9 @@ import { fail, ok, type PortResult } from "../contracts/result";
 import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
 import type { GitTarget } from "../modules/git/entry";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
-import { composeRepo, type RepoPorts } from "./composeRepo";
+import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
 import { EventLog, EventLogError } from "./eventLog";
-import { migrate } from "./storage";
+import { migrate, wakeNoLaterThan } from "./storage";
 
 /** A repository as it was recorded. */
 export interface RepoSummary {
@@ -68,6 +68,8 @@ interface Installed {
 /** One repository. */
 export class Repo extends DurableObject<Env> {
   #installed: Installed | null;
+  // Wakes reach storage one at a time, so each reads the alarm the previous one left.
+  #wakes: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -199,6 +201,24 @@ export class Repo extends DurableObject<Env> {
     return ports.git.serve(request, target, path);
   }
 
+  /** Resumes every module that owes work. Each module asks for its own next wake. */
+  async alarm(): Promise<void> {
+    const installed = this.#installed;
+    if (installed === null) return;
+    await resumeAll(installed.summary.repoId, resumables(installed.ports));
+    // Let the wakes the modules asked for reach storage before the handler returns.
+    await this.#wakes;
+  }
+
+  #wake(repoId: RepoId, at: number): void {
+    this.#wakes = this.#wakes
+      .then(() => wakeNoLaterThan(this.ctx.storage, at))
+      .catch((error: unknown) => {
+        const name = error instanceof Error ? error.name : "unknown";
+        console.error(JSON.stringify({ event: "repo.wake_failed", repo: repoId, error: name }));
+      });
+  }
+
   #ports(): RepoPorts | null {
     return this.#installed?.ports ?? null;
   }
@@ -228,6 +248,7 @@ export class Repo extends DurableObject<Env> {
       log,
       clock: Date.now,
       env: this.env,
+      wake: (at) => this.#wake(summary.repoId, at),
     });
     return { summary, log, ports };
   }
