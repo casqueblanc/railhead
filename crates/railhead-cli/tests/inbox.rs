@@ -6,14 +6,20 @@
 //! log, never inferred from the output.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Read, Write as _};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, OnceLock};
+#[cfg(debug_assertions)]
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
+#[cfg(debug_assertions)]
+use wiremock::Respond;
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -170,6 +176,412 @@ fn rh_in_clone(world: &World, args: &[&str]) -> anyhow::Result<Run> {
     finish(&command(world, world.clone.path(), None, args).output()?)
 }
 
+/// How long a loaded machine, or a first launch of a freshly built binary, may take to get `rh` to
+/// its `--wait`. Only a run that never gets there takes this long.
+const PATIENCE: Duration = Duration::from_secs(120);
+
+/// How long `rh` may run past its `--wait` once its gate opens before the test stops it. Longer
+/// than any bound a test asserts, so a run stopped here had already failed.
+const OVERRUN: Duration = Duration::from_secs(30);
+
+/// A child process, started as the leader of a process group of its own, killed with its
+/// descendants and reaped when the test lets go of it. A stalled `rh`, any Git it started, and any
+/// process left in its group after it exited fail the test instead of hanging the job.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // Drop cannot report a failure: a child that already exited is the outcome wanted, and the
+        // wait reaps it either way.
+        #[cfg(unix)]
+        kill_tree(self.0.id(), matches!(self.0.try_wait(), Ok(None)));
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Sends `signal` to the process `pid`.
+#[cfg(unix)]
+fn signal(signal: &str, pid: u32) {
+    // A process that exited in the meantime is the outcome wanted.
+    let _ = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills the process group `root` leads, `root` itself while `runs`, and every process descended
+/// from them. `subprocess::run` starts each Git in a process group of its own, so a group signal
+/// would miss it; the tree is walked by parent as well. A descendant orphaned by `root`'s exit is
+/// found through the group, which outlives its leader while a member runs; one that also left the
+/// group is out of reach once `root` has exited. Each process found is stopped first, so none
+/// starts another after the walk saw it.
+#[cfg(unix)]
+fn kill_tree(root: u32, runs: bool) {
+    let mut tree = Vec::new();
+    if runs {
+        signal("-STOP", root);
+        tree.push(root);
+    }
+    // Bounded: each round stops at least one new process or ends the walk.
+    for _ in 0..64 {
+        let Ok(table) = Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="])
+            .stderr(Stdio::null())
+            .output()
+        else {
+            break;
+        };
+        let found: Vec<u32> = String::from_utf8_lossy(&table.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace().map(str::parse::<u32>);
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some(Ok(pid)), Some(Ok(parent)), Some(Ok(group))) => {
+                        Some((pid, parent, group))
+                    }
+                    _ => None,
+                }
+            })
+            .filter(|(pid, parent, group)| {
+                (*group == root || tree.contains(parent)) && !tree.contains(pid)
+            })
+            .map(|(pid, _, _)| pid)
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        for pid in found {
+            signal("-STOP", pid);
+            tree.push(pid);
+        }
+    }
+    for pid in tree {
+        signal("-KILL", pid);
+    }
+}
+
+/// Reads `pipe` to its end on a thread of its own, so a full pipe cannot stall the child. The
+/// thread ends when every holder of the pipe's write end has exited.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
+            None => Ok(bytes),
+        };
+        // A receiver that gave up has already failed its test.
+        let _ = sender.send(read);
+    });
+    receiver
+}
+
+/// What `reader` read, or [`None`] when a descendant still held the pipe open at `until`.
+fn collected(
+    reader: &Receiver<io::Result<Vec<u8>>>,
+    until: Instant,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match reader.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(read) => Ok(Some(read?)),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+        Err(RecvTimeoutError::Disconnected) => anyhow::bail!("a pipe reader panicked"),
+    }
+}
+
+/// The debug-build gate `rh ask` holds its `--wait` at: `rh` writes `ready` in the directory and
+/// starts its deadline only once `go` exists there. A test times the wait from the moment it
+/// creates `go`, however long the process took to start.
+struct Gate {
+    dir: tempfile::TempDir,
+    go: Arc<OnceLock<Instant>>,
+}
+
+impl Gate {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            dir: tempfile::tempdir()?,
+            go: Arc::default(),
+        })
+    }
+
+    /// Runs `command`, whose `--wait` is `wait`, through the gate. Returns the run, when the test
+    /// opened the gate, and when `rh` exited.
+    #[cfg(debug_assertions)]
+    fn run(&self, command: Command, wait: Duration) -> anyhow::Result<(Run, Instant, Instant)> {
+        self.run_within(command, PATIENCE, wait + OVERRUN)
+    }
+
+    /// [`Gate::run`], stopping `rh` and failing when it has not reached its wait within `patience`,
+    /// or still runs `limit` after the gate opened. A descendant holding `rh`'s output open after
+    /// `rh` exited counts as `rh` still running.
+    fn run_within(
+        &self,
+        mut command: Command,
+        patience: Duration,
+        limit: Duration,
+    ) -> anyhow::Result<(Run, Instant, Instant)> {
+        command.env("RH_TEST_WAIT_GATE", self.dir.path());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = Reaped(command.spawn()?);
+        let stdout = drain(child.0.stdout.take());
+        let stderr = drain(child.0.stderr.take());
+        let ready = self.dir.path().join("ready");
+        let until = Instant::now() + patience;
+        while !ready.exists() {
+            if let Some(status) = child.0.try_wait()? {
+                let stderr = collected(&stderr, until)?.ok_or_else(|| {
+                    anyhow::anyhow!("rh exited before its wait, its output still open {patience:?} after it started")
+                })?;
+                anyhow::bail!(
+                    "rh exited before its wait: {status} {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            anyhow::ensure!(
+                Instant::now() < until,
+                "rh did not reach its wait within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let go = Instant::now();
+        self.go
+            .set(go)
+            .map_err(|_| anyhow::anyhow!("a gate opens once"))?;
+        fs::write(self.dir.path().join("go"), b"")?;
+        let until = go + limit;
+        let status = loop {
+            if let Some(status) = child.0.try_wait()? {
+                break status;
+            }
+            anyhow::ensure!(
+                Instant::now() < until,
+                "rh still ran {limit:?} after its gate opened"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let exited = Instant::now();
+        let still_open =
+            || anyhow::anyhow!("rh's output was still open {limit:?} after its gate opened");
+        let output = Output {
+            status,
+            stdout: collected(&stdout, until)?.ok_or_else(still_open)?,
+            stderr: collected(&stderr, until)?.ok_or_else(still_open)?,
+        };
+        Ok((finish(&output)?, go, exited))
+    }
+}
+
+/// A shell standing in for a stalled `rh`: it records its process id in `pid`, runs `script`, then
+/// sleeps for ten minutes.
+#[cfg(unix)]
+fn stalled(pid: &Path, script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            &format!("echo $$ > '{}'; {script} exec sleep 600", pid.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Whether the process `pid` names still runs.
+#[cfg(unix)]
+fn running(pid: &Path) -> anyhow::Result<bool> {
+    let pid = fs::read_to_string(pid)?;
+    let status = Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_that_never_reaches_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let started = Instant::now();
+    let error = gate
+        .run_within(stalled(&pid, ""), Duration::from_millis(300), PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh did not reach its wait within 300ms")
+    );
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    assert!(!running(&pid)?);
+    assert!(gate.go.get().is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_that_outlives_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let ready = format!("touch '{}';", gate.dir.path().join("ready").display());
+    let started = Instant::now();
+    let error = gate
+        .run_within(stalled(&pid, &ready), PATIENCE, Duration::from_millis(300))
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh still ran 300ms after its gate opened")
+    );
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    assert!(!running(&pid)?);
+    assert!(gate.dir.path().join("go").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_that_exits_before_its_wait_fails_with_its_stderr() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "echo refused >&2; exit 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let error = gate
+        .run_within(command, PATIENCE, PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh exited before its wait: exit status: 3 refused\n")
+    );
+    Ok(())
+}
+
+/// Whether the process `pid` names is gone within [`OVERRUN`]. A descendant orphaned by the kill
+/// is reaped by init, which may take a moment.
+#[cfg(unix)]
+fn gone(pid: &Path) -> anyhow::Result<bool> {
+    let until = Instant::now() + OVERRUN;
+    while running(pid)? {
+        if Instant::now() >= until {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stopped_run_takes_its_descendants_with_it() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let descendant = gate.dir.path().join("descendant");
+    // Like Git under `subprocess::run`, the descendant runs in a process group of its own (`set
+    // -m`). The gate opens only once it has recorded its process id.
+    let script = format!(
+        "set -m; sh -c 'echo $$ > \"$1\"; exec sleep 600' sh '{descendant}' & \
+         while [ ! -s '{descendant}' ]; do sleep 0.01; done; touch '{ready}';",
+        descendant = descendant.display(),
+        ready = gate.dir.path().join("ready").display(),
+    );
+    let error = gate
+        .run_within(stalled(&pid, &script), PATIENCE, Duration::from_millis(300))
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh still ran 300ms after its gate opened")
+    );
+    assert!(gone(&pid)?, "the stopped run still runs");
+    assert!(gone(&descendant)?, "its descendant outlived it");
+    Ok(())
+}
+
+/// A shell standing in for an `rh` that leaves a sleeping descendant behind: the descendant stays
+/// in its process group, records its process id in `descendant` and holds `held` (`1` for stdout,
+/// `2` for stderr) open; the shell then runs `script` and exits with status 3.
+#[cfg(unix)]
+fn orphaning(descendant: &Path, held: u8, script: &str) -> Command {
+    let other = if held == 1 { 2 } else { 1 };
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            &format!(
+                "sh -c 'echo $$ > \"$1\"; exec sleep 600' sh '{descendant}' {other}>/dev/null & \
+                 while [ ! -s '{descendant}' ]; do sleep 0.01; done; {script} exit 3",
+                descendant = descendant.display(),
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descendant_holding_stderr_before_the_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let descendant = gate.dir.path().join("descendant");
+    let patience = Duration::from_secs(5);
+    let started = Instant::now();
+    let error = gate
+        .run_within(orphaning(&descendant, 2, ""), patience, PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh exited before its wait, its output still open 5s after it started")
+    );
+    assert!(
+        started.elapsed() < patience + OVERRUN,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(gate.go.get().is_none());
+    assert!(gone(&descendant)?, "the descendant outlived the run");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descendant_holding_stdout_after_the_gate_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let descendant = gate.dir.path().join("descendant");
+    // The shell exits only once the gate is open, so it is seen reaching its wait.
+    let script = format!(
+        "touch '{ready}'; while [ ! -e '{go}' ]; do sleep 0.01; done;",
+        ready = gate.dir.path().join("ready").display(),
+        go = gate.dir.path().join("go").display(),
+    );
+    let error = gate
+        .run_within(
+            orphaning(&descendant, 1, &script),
+            PATIENCE,
+            Duration::from_millis(300),
+        )
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh's output was still open 300ms after its gate opened")
+    );
+    let go = gate
+        .go
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("the gate never opened"))?;
+    assert!(go.elapsed() < OVERRUN, "{:?}", go.elapsed());
+    assert!(gone(&descendant)?, "the descendant outlived the run");
+    Ok(())
+}
+
 /// The fixture exchange named `name`.
 fn exchange(file: &str, name: &str) -> anyhow::Result<Value> {
     let path = format!(
@@ -214,6 +626,71 @@ async fn answer(world: &World, verb: &str, route: &str, response: ResponseTempla
         .respond_with(response)
         .mount(&world.server)
         .await;
+}
+
+/// How long a held response is delayed: far beyond any `--wait` a test passes.
+#[cfg(debug_assertions)]
+const HOLD: Duration = Duration::from_secs(20);
+/// Room for process exit after a wait ends. A wait plus this stays well under [`HOLD`], so a CLI
+/// that waited for the held answer still fails.
+#[cfg(debug_assertions)]
+const EXIT_SLACK: Duration = Duration::from_secs(10);
+
+/// A response held for [`HOLD`], or until a set time after a [`Gate`] opens, that records when each
+/// request arrived, so a test bounds how long the CLI held it open.
+#[derive(Clone)]
+#[cfg(debug_assertions)]
+struct Held {
+    response: ResponseTemplate,
+    until: Option<(Arc<OnceLock<Instant>>, Duration)>,
+    arrivals: Arc<Mutex<Vec<Instant>>>,
+}
+
+#[cfg(debug_assertions)]
+impl Held {
+    fn new(response: ResponseTemplate) -> Self {
+        Self {
+            response,
+            until: None,
+            arrivals: Arc::default(),
+        }
+    }
+
+    /// A response held until `after` past the moment `gate` opens, or sent at once when a request
+    /// arrives later than that.
+    fn after_go(response: ResponseTemplate, gate: &Gate, after: Duration) -> Self {
+        Self {
+            until: Some((Arc::clone(&gate.go), after)),
+            ..Self::new(response)
+        }
+    }
+
+    /// How long the latest held request stayed open before `rh` exited at `exited`.
+    fn open_until(&self, exited: Instant) -> anyhow::Result<Duration> {
+        let arrivals = self.arrivals.lock().unwrap_or_else(PoisonError::into_inner);
+        let arrived = arrivals
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no request was held"))?;
+        Ok(exited.duration_since(*arrived))
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Respond for Held {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let now = Instant::now();
+        self.arrivals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(now);
+        // A request before the gate opens has no time to be held until, so it is held in full.
+        let delay = self
+            .until
+            .as_ref()
+            .and_then(|(go, after)| go.get().map(|go| *go + *after))
+            .map_or(HOLD, |until| until.saturating_duration_since(now));
+        self.response.clone().set_delay(delay)
+    }
 }
 
 /// The requests the server received on `route`.
@@ -995,6 +1472,35 @@ async fn ask_wait_stops_when_the_wait_runs_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs only against a release build, as `cargo test --release` makes, which must compile none of
+/// the debug-build wait gate.
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn a_release_build_ignores_the_wait_gate() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        fixture("question.json", "a long poll that times out is still open")?,
+    )
+    .await;
+    let gate = tempfile::tempdir()?;
+    let mut command = command(
+        &world,
+        world.outside.path(),
+        Some("atlas"),
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+    );
+    command.env("RH_TEST_WAIT_GATE", gate.path());
+    // The gate never opens, yet the wait runs and ends on its own.
+    let run = finish(&command.output()?)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.at("/data/timedOut")?, json!(true));
+    assert!(!gate.path().join("ready").exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn ask_wait_is_bounded_and_a_question_id_is_checked() -> anyhow::Result<()> {
     let world = world().await?;
@@ -1488,6 +1994,8 @@ async fn an_ask_interrupted_in_flight_has_already_named_its_key() -> anyhow::Res
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     let world = world().await?;
@@ -1499,26 +2007,29 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     )
     .await;
     // The backend holds every poll far beyond the wait, then answers.
-    answer(
-        &world,
-        "GET",
-        "/questions/qst_upload1",
-        fixture("question.json", "an answered question carries the decision")?
-            .set_delay(Duration::from_secs(20)),
-    )
-    .await;
+    let stall = Held::new(fixture(
+        "question.json",
+        "an answered question carries the decision",
+    )?);
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .respond_with(stall.clone())
+        .mount(&world.server)
+        .await;
 
-    // Asked and waited on: the wait ends with the question as asked.
+    // Asked and waited on: the wait ends with the question as asked, before the held answer.
     let mut args = ask_args(QUESTION, "src/upload.ts");
     args.extend(["--wait", "2"]);
-    let started = Instant::now();
-    let run = rh_in_clone(&world, &args)?;
-    let elapsed = started.elapsed();
+    let (run, go, exited) = Gate::new()?.run(
+        command(&world, world.clone.path(), None, &args),
+        Duration::from_secs(2),
+    )?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert!(
-        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
-        "{elapsed:?}"
-    );
+    let elapsed = exited.duration_since(go);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.at("/data/timedOut")?, json!(true));
     assert_eq!(run.at("/data/question/state")?, json!("open"));
     assert_eq!(run.at("/next")?, json!("rh ask"));
@@ -1529,16 +2040,23 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
         .and_then(|poll| poll.url.query_pairs().find(|(key, _)| key == "waitMs"))
         .and_then(|(_, value)| value.parse::<u64>().ok())
         .unwrap_or(u64::MAX);
-    assert!((1_000..=1_500).contains(&held), "{held}");
+    // Held for what was left of the wait less the margin for the answer to travel, never longer.
+    assert!((1..=1_500).contains(&held), "{held}");
 
     // Resumed: nothing of the question is known, so the timeout says how to wait again.
-    let started = Instant::now();
-    let run = rh(
-        &world,
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+    let (run, go, exited) = Gate::new()?.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+        ),
+        Duration::from_secs(1),
     )?;
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    let elapsed = exited.duration_since(go);
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(1) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/retryable")?, json!(true));
@@ -1555,6 +2073,8 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Result<()> {
     let world = world().await?;
@@ -1573,9 +2093,10 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
             "message": message}, "inbox": null, "next": null}),
     );
     // The first login's challenge is held far beyond the wait.
+    let stall = Held::new(challenge.clone());
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(challenge.clone().set_delay(Duration::from_secs(20)))
+        .respond_with(stall.clone())
         .up_to_n_times(1)
         .mount(&world.server)
         .await;
@@ -1605,10 +2126,15 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
         .await;
 
     let args = ["--json", "ask", "--question", "qst_upload1", "--wait", "2"];
-    let started = Instant::now();
-    let run = rh(&world, &args)?;
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    let gate = Gate::new()?;
+    let (run, go, exited) = gate.run(
+        command(&world, world.outside.path(), Some("atlas"), &args),
+        Duration::from_secs(2),
+    )?;
+    let elapsed = exited.duration_since(go);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    let open = stall.open_until(exited)?;
+    assert!(open < Duration::from_secs(2) + EXIT_SLACK, "{open:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
@@ -1628,6 +2154,7 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
 
 /// Lapses `atlas`'s stored session and gives it a key, so its next command logs in. Returns the
 /// lapsed record and the challenge response for that login.
+#[cfg(debug_assertions)]
 fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
     let origin = world.server.uri();
     let atlas = world.home.path().join("agents/atlas");
@@ -1647,54 +2174,64 @@ fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
     Ok((lapsed, challenge))
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> anyhow::Result<()> {
     let world = world().await?;
     let (lapsed, challenge) = lapse_session(&world)?;
-    // The challenge answers just before the deadline, and the session request then stalls: each
-    // fits one request timeout, but the two together do not fit the wait.
+    let wait = Duration::from_secs(6);
+    // The challenge answers two seconds before the deadline, timed from the moment the gate lets
+    // the wait start.
+    let gate = Gate::new()?;
+    let near = Duration::from_secs(4);
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(challenge.set_delay(Duration::from_millis(3_500)))
+        .respond_with(Held::after_go(challenge, &gate, near))
         .mount(&world.server)
         .await;
+    // The session request then stalls: it fits one request timeout, but not the time left.
+    let stall = Held::new(json_response(
+        200,
+        &json!({"ok": true, "data": {"token": FRESH, "expiresAt": 4_102_444_800_000_u64,
+            "agent": {"agentId": "agt_atlas01", "name": "atlas", "ownerId": "usr_lemarier",
+            "state": "confirmed"}, "repoId": "rep_demo0001"}, "inbox": null, "next": null}),
+    ));
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session")))
-        .respond_with(
-            json_response(
-                200,
-                &json!({"ok": true, "data": {"token": FRESH, "expiresAt": 4_102_444_800_000_u64,
-                    "agent": {"agentId": "agt_atlas01", "name": "atlas",
-                    "ownerId": "usr_lemarier", "state": "confirmed"}, "repoId": "rep_demo0001"},
-                    "inbox": null, "next": null}),
-            )
-            .set_delay(Duration::from_secs(20)),
-        )
+        .respond_with(stall)
         .mount(&world.server)
         .await;
 
-    let started = Instant::now();
-    let run = rh(
-        &world,
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
+    let (run, go, exited) = gate.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "6"],
+        ),
+        wait,
     )?;
-    let elapsed = started.elapsed();
-    // Without the deadline the session request alone would run to 7.5 s.
-    assert!(
-        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_millis(6_500),
-        "{elapsed:?}"
-    );
+    // A login that gave its session request the request timeout, which the poll set to what was
+    // left of the wait as it began, would end no sooner than `near + wait` after the gate opened,
+    // however the machine scheduled it. One bounded by the deadline ends a little after `wait`.
+    let elapsed = exited.duration_since(go);
+    assert!(elapsed >= wait, "{elapsed:?}");
+    assert!(elapsed < wait + Duration::from_secs(3), "{elapsed:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
-    // The login reached its session request, no poll was sent, and the lapsed session is kept.
-    assert_eq!(received(&world, "/session").await.len(), 1);
+    // The login sent its session request, unless a loaded machine delivered the challenge only
+    // once the deadline had passed. No poll was sent, and the lapsed session is kept.
+    assert!(received(&world, "/session").await.len() <= 1);
     assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
     let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
     assert_eq!(stored, lapsed);
     Ok(())
 }
 
+// Times its wait through the gate, which only a debug build of `rh` opens.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Result<()> {
     let world = world().await?;
@@ -1704,8 +2241,9 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
         .respond_with(challenge)
         .mount(&world.server)
         .await;
-    // Another process holds the session lock, as a login of its own would, well past the wait. It
-    // lets go after 10 s so that a wait the deadline does not end fails instead of hanging.
+    // Another process holds the session lock, as a login of its own would, until `rh` exits. It
+    // lets go after [`PATIENCE`] and [`HOLD`] regardless, so that a wait the deadline does not end
+    // fails instead of hanging.
     let lock = world.home.path().join("agents/atlas/.session.lock");
     let held = fs::OpenOptions::new()
         .read(true)
@@ -1714,21 +2252,31 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
         .truncate(false)
         .open(&lock)?;
     held.lock()?;
+    let (exit, exited_rx) = std::sync::mpsc::channel::<()>();
     let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(10));
+        // Either outcome lets go: `rh` exited, or the hold ran out.
+        let _ = exited_rx.recv_timeout(PATIENCE + HOLD);
         drop(held);
     });
 
-    let started = Instant::now();
-    let run = rh(
-        &world,
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
+    let (run, go, exited) = Gate::new()?.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
+        ),
+        Duration::from_secs(2),
     )?;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
-        "{elapsed:?}"
-    );
+    drop(exit);
+    release
+        .join()
+        .map_err(|_| anyhow::anyhow!("the lock holder panicked"))?;
+    // The lock is held from before the gate opens until `rh` exits, so the wait ends by the
+    // deadline counted from the gate, not when the lock is let go.
+    let elapsed = exited.duration_since(go);
+    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2) + EXIT_SLACK, "{elapsed:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
@@ -1736,9 +2284,6 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
     assert_eq!(requests(&world).await, 0);
     let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
     assert_eq!(stored, lapsed);
-    release
-        .join()
-        .map_err(|_| anyhow::anyhow!("the lock holder panicked"))?;
     Ok(())
 }
 
