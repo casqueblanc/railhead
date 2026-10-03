@@ -12,6 +12,7 @@ import {
 import { UPLOAD, decide, uploadPrelude } from "../../../../../fixtures/board/uploadSteps";
 import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
 import { DecisionsPanel } from "./DecisionsPanel";
+import type { AttemptControl } from "../enrollment/ownerActions";
 import type {
   DecisionActions,
   RecordDecisionOutcome,
@@ -49,6 +50,24 @@ const recorder = (outcome: () => Promise<RecordDecisionOutcome>) => {
     },
   };
   return { requests, actions };
+};
+
+/** A recorder whose one request waits until the test settles it, keeping the control it got. */
+const held = () => {
+  const calls: { control: AttemptControl; settle: (outcome: RecordDecisionOutcome) => void }[] = [];
+  const actions: DecisionActions = {
+    kind: "available",
+    onRecordDecision: (_request, control) =>
+      new Promise((resolve) => {
+        calls.push({ control, settle: resolve });
+      }),
+  };
+  const call = () => {
+    const found = calls[0];
+    if (found === undefined) throw new Error("nothing was requested");
+    return found;
+  };
+  return { actions, calls, call };
 };
 
 describe("DecisionsPanel", () => {
@@ -190,6 +209,58 @@ describe("DecisionsPanel", () => {
     expect(text()).toContain("Answering is blocked while the board catches up");
     await submit("Replace answer");
     expect(requests).toEqual([]);
+  });
+
+  describe("when the action is withdrawn mid-request", () => {
+    it("aborts an answer not yet sent and drops its late outcome", async () => {
+      const { actions, call } = held();
+      await render(answered(), actions);
+      await choose("Upload them in chunks");
+      await submit("Replace answer");
+      expect(text()).toContain("Recording…");
+
+      await render(answered(), { kind: "unavailable", reason: "offline" });
+
+      expect(call().control.signal.aborted).toBe(true);
+      expect(text()).toContain("before the answer was sent. Nothing was recorded.");
+      await act(async () => call().settle({ ok: true, version: 9 }));
+      expect(text()).not.toContain("Recorded as version 9");
+      expect(text()).toContain("Nothing was recorded.");
+    });
+
+    it("says an answer already sent may have been recorded, and drops its late outcome", async () => {
+      const { actions, call } = held();
+      await render(answered(), actions);
+      await choose("Upload them in chunks");
+      await submit("Replace answer");
+      call().control.onSent();
+
+      const lost = seqWhere(decisionReversal, (event) => event.type === "inbox.acked");
+      await render(fold(withLostEvents(decisionReversal, [lost])), actions);
+
+      expect(call().control.signal.aborted).toBe(true);
+      expect(text()).toContain("after the answer was sent. Check the decision's history");
+      await act(async () => call().settle({ ok: false, message: "late refusal" }));
+      expect(text()).not.toContain("late refusal");
+    });
+
+    it("drops a replaced session's outcome and answers through the new one", async () => {
+      const first = held();
+      await render(answered(), first.actions);
+      await choose("Upload them in chunks");
+      await submit("Replace answer");
+      first.call().control.onSent();
+
+      const second = recorder(async () => ({ ok: true, version: 3 }));
+      await render(answered(), second.actions);
+      await act(async () => first.call().settle({ ok: true, version: 2 }));
+
+      expect(first.call().control.signal.aborted).toBe(true);
+      expect(text()).not.toContain("Recorded as version 2");
+      await submit("Replace answer");
+      expect(second.requests).toHaveLength(1);
+      expect(text()).toContain("Recorded as version 3.");
+    });
   });
 
   it("renders question and option text inertly", async () => {
