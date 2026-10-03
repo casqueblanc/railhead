@@ -9,6 +9,9 @@
 // Readers fetch the log in bounded pages from a cursor (the last sequence number they hold), so a
 // reader that was disconnected, or a `Repo` that was evicted, resumes from storage rather than
 // from anything held in memory.
+//
+// Observers registered with `observe` hear the new head after each commit that appended events. An
+// observation is only a wake-up: it carries no events, and an observer reads them from storage.
 
 import {
   EVENT_SCHEMA_VERSION,
@@ -105,6 +108,13 @@ export interface ReplayPage {
   head: number;
 }
 
+/** Hears the head after a commit that appended events. It must not throw or start a transaction. */
+export type CommitObserver = (head: number) => void;
+
+// Keyed by storage rather than by log, so a commit through any `EventLog` opened on a repository's
+// storage wakes every observer of that repository.
+const observers = new WeakMap<RepoStorage, Set<CommitObserver>>();
+
 /** One repository's event log. Open it with `EventLog.open`. */
 export class EventLog {
   readonly #storage: RepoStorage;
@@ -141,6 +151,24 @@ export class EventLog {
   }
 
   /**
+   * Calls `observer` with the new head after every later commit that appended events, never inside
+   * the transaction and never for a rollback. Returns the function that stops the observation.
+   */
+  observe(observer: CommitObserver): () => void {
+    let set = observers.get(this.#storage);
+    if (set === undefined) {
+      set = new Set();
+      observers.set(this.#storage, set);
+    }
+    // A fresh wrapper per call, so observing twice with one function is two observations.
+    const entry: CommitObserver = (head) => observer(head);
+    set.add(entry);
+    return () => {
+      set.delete(entry);
+    };
+  }
+
+  /**
    * Runs `body` as one transaction in which it may change state and append events. If `body`
    * throws, its state changes and events are rolled back and the error is rethrown. `body` must not
    * await, and must not keep its `EventTransaction` beyond its return.
@@ -166,13 +194,16 @@ export class EventLog {
       },
     };
     this.#inTransaction = true;
+    let value: Synchronous<T>;
     try {
-      const value = atomically(this.#storage, () => body(tx));
-      return { value, events };
+      value = atomically(this.#storage, () => body(tx));
     } finally {
       open = false;
       this.#inTransaction = false;
     }
+    const last = events.at(-1);
+    if (last !== undefined) this.#notify(last.seq);
+    return { value, events };
   }
 
   /**
@@ -232,6 +263,18 @@ export class EventLog {
       }
       return { events, head };
     });
+  }
+
+  // The transaction has committed, so an observer's failure must not reach the caller as if it
+  // had not: it is reported by name only and the remaining observers still run.
+  #notify(head: number): void {
+    for (const observer of observers.get(this.#storage) ?? []) {
+      try {
+        observer(head);
+      } catch (error) {
+        console.error("event log observer failed", error instanceof Error ? error.name : "unknown");
+      }
+    }
   }
 
   #append(seq: number, actor: Actor, payload: EventPayload): RailheadEvent {
