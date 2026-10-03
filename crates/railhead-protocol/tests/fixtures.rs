@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use railhead_protocol::{
     AckRequest, AckResult, AgentResponse, AgentRoute, AskRequest, ChallengeRequest,
     ChallengeResult, ClaimRequest, ClaimResult, Error, InboxResult, JoinRequest, JoinResult,
-    MAX_SAFE_INTEGER, Method, QuestionResult, ReadyRequest, ReadyResult, SessionRequest,
+    MAX_SAFE_INTEGER, Method, PinResult, QuestionResult, ReadyRequest, ReadyResult, SessionRequest,
     SessionResult, StatusResult, decode_event,
 };
 use serde::Serialize;
@@ -17,7 +17,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const EVENTS: &str = include_str!("../../../fixtures/protocol/wire/events.json");
 
-const ROUTES: [(AgentRoute, &str); 11] = [
+const ROUTES: [(AgentRoute, &str); 12] = [
     (
         AgentRoute::Join,
         include_str!("../../../fixtures/protocol/wire/agent/join.json"),
@@ -45,6 +45,10 @@ const ROUTES: [(AgentRoute, &str); 11] = [
     (
         AgentRoute::Ready,
         include_str!("../../../fixtures/protocol/wire/agent/ready.json"),
+    ),
+    (
+        AgentRoute::Pin,
+        include_str!("../../../fixtures/protocol/wire/agent/pin.json"),
     ),
     (
         AgentRoute::Inbox,
@@ -196,7 +200,11 @@ fn decode_request(route: AgentRoute, body: &Value) -> Result<Value, Box<dyn std:
         AgentRoute::Ready => request(body, ReadyRequest::validate),
         AgentRoute::Ack => request(body, AckRequest::validate),
         AgentRoute::Ask => request(body, AskRequest::validate),
-        AgentRoute::Status | AgentRoute::Work | AgentRoute::Inbox | AgentRoute::Question => {
+        AgentRoute::Status
+        | AgentRoute::Work
+        | AgentRoute::Pin
+        | AgentRoute::Inbox
+        | AgentRoute::Question => {
             if body.is_null() {
                 Ok(Value::Null)
             } else {
@@ -223,6 +231,7 @@ fn decode_response(route: AgentRoute, body: &Value) -> Result<Value, Box<dyn std
         AgentRoute::Status => response::<StatusResult>(body),
         AgentRoute::Work | AgentRoute::Claim => response::<ClaimResult>(body),
         AgentRoute::Ready => response::<ReadyResult>(body),
+        AgentRoute::Pin => response::<PinResult>(body),
         AgentRoute::Inbox => response::<InboxResult>(body),
         AgentRoute::Ack => response::<AckResult>(body),
         AgentRoute::Ask | AgentRoute::Question => response::<QuestionResult>(body),

@@ -27,6 +27,7 @@ import { AdvertisedRefsReader, type AdvertisedRefs } from "../src/git/refAdverti
 import { artifactsRemotes } from "../src/git/remotes";
 import { PushReportReader } from "../src/git/reportStatus";
 import type { GitPort, GitTarget } from "../src/modules/git/entry";
+import { createClaims } from "../src/modules/claims/module";
 import { EventLog, EventLogError } from "../src/repo/eventLog";
 
 // Request and response bodies recorded from stock Git 2.50.1 against `git http-backend`: a
@@ -452,7 +453,8 @@ function unrecorded(
     | "record_failed"
     | "outcome_unknown"
     | "reconcile_failed"
-    | "unreadable_record",
+    | "unreadable_record"
+    | "unfenced",
   unproven?: "unobserved" | "later_push",
 ): string {
   return JSON.stringify({
@@ -2852,6 +2854,202 @@ describe("a push left pending", () => {
           error: "Error",
         }),
       ]);
+    });
+  });
+});
+
+// The released schema steps that ran before pushes and claims were fenced to an episode, copied
+// rather than imported so a later edit to either module cannot change the schema this test upgrades.
+const CLAIMS_BEFORE_EPISODES = [
+  `CREATE TABLE claims_issues (
+    issue_id TEXT PRIMARY KEY,
+    filed_seq INTEGER NOT NULL UNIQUE,
+    grant_id TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL
+  ) STRICT`,
+  `CREATE TABLE claims_claims (
+    claim_id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL UNIQUE REFERENCES claims_issues (issue_id),
+    agent_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    state TEXT NOT NULL
+      CHECK (state IN ('allocating', 'working', 'ready', 'merged', 'expired')),
+    fork_base TEXT,
+    base TEXT,
+    ready_commit TEXT,
+    CHECK ((state = 'allocating') = (base IS NULL))
+  ) STRICT`,
+  `CREATE UNIQUE INDEX claims_one_active_per_agent ON claims_claims (agent_id)
+    WHERE state IN ('allocating', 'working', 'ready')`,
+  `CREATE INDEX claims_active_by_owner ON claims_claims (owner_id)
+    WHERE state IN ('allocating', 'working', 'ready')`,
+  "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
+];
+const GATEWAY_BEFORE_EPISODES = [
+  `CREATE TABLE git_pending_push (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    updates TEXT NOT NULL,
+    due_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL
+  ) STRICT`,
+  "CREATE INDEX git_pending_push_due ON git_pending_push (due_at)",
+  "CREATE TABLE git_fork_release (repo TEXT PRIMARY KEY, released INTEGER NOT NULL) STRICT",
+  "ALTER TABLE git_pending_push ADD COLUMN release INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE git_pending_push ADD COLUMN prior TEXT",
+];
+
+/**
+ * Stores, under the old schemas, a working claim at generation 3 that may have been pinned and
+ * reopened since, and its push pending with a fork read that proves the push moved the fork. Then
+ * upgrades both modules over that storage and runs `body` with the claims port, the gateway, the
+ * event log, how many fork reads the gateway sent, and a way to write to the storage.
+ */
+async function upgradedWithLegacyPush(
+  body: (
+    claims: ClaimsPort,
+    gateway: GitPort,
+    events: () => RailheadEvent[],
+    readCount: () => number,
+    exec: (query: string, ...bindings: SqlStorageValue[]) => void,
+  ) => Promise<void>,
+): Promise<void> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  await runInDurableObject(stub, async (_instance, state) => {
+    const { storage } = state;
+    const fake = new FakeArtifacts();
+    fake.seed(await mainRepoName(REPO), [ROOT, HEAD]);
+    const artifacts = createArtifactsAdapter(
+      { repoId: REPO, storage, clock: fake.clock, namespace: fake },
+      { ...ARTIFACTS_LIMITS, callTimeoutMs: 100 },
+    );
+    const forked = await artifacts.forkForClaim(CLAIM, HEAD);
+    if (!forked.ok) throw new Error(`fork failed: ${forked.code}`);
+    const forkName = await forkRepoName(REPO, CLAIM);
+
+    storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS railhead_migrations (owner TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT",
+    );
+    for (const step of [...CLAIMS_BEFORE_EPISODES, ...GATEWAY_BEFORE_EPISODES]) {
+      storage.sql.exec(step);
+    }
+    storage.sql.exec(
+      "INSERT INTO railhead_migrations (owner, version) VALUES ('claims', ?), ('git_gateway', ?)",
+      CLAIMS_BEFORE_EPISODES.length,
+      GATEWAY_BEFORE_EPISODES.length,
+    );
+    storage.sql.exec(
+      `INSERT INTO claims_issues (issue_id, filed_seq, grant_id, title, body)
+       VALUES ('iss_gitissue0001', 1, 'grt_gitgrant0001', 'title', 'body')`,
+    );
+    storage.sql.exec(
+      `INSERT INTO claims_claims
+         (claim_id, issue_id, agent_id, owner_id, generation, state, fork_base, base)
+       VALUES (?, 'iss_gitissue0001', ?, ?, 3, 'working', ?, ?)`,
+      CLAIM,
+      AGENT.agentId,
+      AGENT.ownerId,
+      HEAD,
+      HEAD,
+    );
+    storage.sql.exec("INSERT INTO git_fork_release (repo, released) VALUES (?, 1)", forkName);
+    storage.sql.exec(
+      `INSERT INTO git_pending_push
+         (claim_id, generation, agent_id, repo, updates, due_at, attempts, release, prior)
+       VALUES (?, 3, ?, ?, ?, 0, 0, 1, ?)`,
+      CLAIM,
+      AGENT.agentId,
+      forkName,
+      JSON.stringify([{ ref: "refs/heads/feature", from: null, to: PUSHED }]),
+      JSON.stringify({ "refs/heads/feature": null }),
+    );
+
+    const log = EventLog.open(storage, REPO, fake.clock);
+    const claims = createClaims(
+      { repoId: REPO, storage, log, clock: fake.clock, env, wake: async () => true },
+      () => {
+        throw new Error("the claims port reads no other port here");
+      },
+    );
+    let reads = 0;
+    const gateway = createGitGateway(
+      {
+        log,
+        storage,
+        clock: () => Date.now(),
+        wake: async () => true,
+        ports: () => ({ sessions, claims, artifacts }),
+        remote: async (repo) => ok(`https://fake.artifacts.invalid/${repo}.git`),
+        // The fork shows the push applied, so only its row's mark keeps it from being recorded.
+        upstream: async () => {
+          reads += 1;
+          return advertisement([
+            [HEAD, "refs/heads/main"],
+            [PUSHED, "refs/heads/feature"],
+          ]);
+        },
+      },
+      FAST,
+    );
+    await body(
+      claims,
+      gateway,
+      () => log.replay(0, 100).events,
+      () => reads,
+      (query, ...bindings) => {
+        storage.sql.exec(query, ...bindings);
+      },
+    );
+  });
+}
+
+describe("a push left pending before pushes were fenced to an episode", () => {
+  it("is dropped and logged after the upgrade without recording `claim.pushed`", async () => {
+    await upgradedWithLegacyPush(async (claims, gateway, events, reads) => {
+      // The upgraded claim's fence is the one an unmarked row would have defaulted to.
+      expect(claims.workingGeneration(CLAIM)).toBe(3);
+      expect(claims.workingEpisode(CLAIM)).toBe(1);
+      await gateway.resume();
+      expect(events().filter((event) => event.type === "claim.pushed")).toEqual([]);
+      expect(reads()).toBe(0);
+      expect(logged).toEqual([unrecorded("unfenced")]);
+    });
+  });
+
+  it("leaves a push saved after the upgrade, under the same fence, to be recorded", async () => {
+    await upgradedWithLegacyPush(async (_claims, gateway, events, reads, exec) => {
+      await gateway.resume();
+      // The same push saved again by upgraded code, which marks nothing.
+      exec(
+        `INSERT INTO git_pending_push
+           (claim_id, generation, episode, agent_id, repo, updates, due_at, attempts, release, prior)
+         SELECT ?, 3, 1, ?, repo, ?, 0, 0, 1, ? FROM git_fork_release`,
+        CLAIM,
+        AGENT.agentId,
+        JSON.stringify([{ ref: "refs/heads/feature", from: null, to: PUSHED }]),
+        JSON.stringify({ "refs/heads/feature": null }),
+      );
+      await gateway.resume();
+      expect(events()).toMatchObject([
+        {
+          type: "claim.pushed",
+          data: {
+            claimId: CLAIM,
+            generation: 3,
+            ref: "refs/heads/feature",
+            from: null,
+            to: PUSHED,
+          },
+        },
+      ]);
+      expect(reads()).toBe(1);
+      expect(logged).toEqual([unrecorded("unfenced"), reconciled(1, 0)]);
     });
   });
 });

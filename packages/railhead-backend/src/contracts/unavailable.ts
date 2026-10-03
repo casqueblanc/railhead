@@ -127,6 +127,7 @@ export const unavailableTrain: TrainPort = {
   answered: () => {
     throw new UnavailableError("train");
   },
+  pinView: refuse("train"),
   armWake: async () => false,
   resume: async () => {},
 };

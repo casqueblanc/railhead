@@ -47,7 +47,8 @@
 // generation. Otherwise it records nothing and logs the outcome as unknown. This assumes the
 // gateway is the fork's only writer once its claim is working. A pending push whose claim moved on
 // is dropped and logged as `git_push_unrecorded`; that a claim can move on after its push's last
-// bytes were sent is #159.
+// bytes were sent is #159. So is a push saved before pushes were fenced to an episode: its claim
+// may have been pinned and reopened at the same generation since, which its row cannot show.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -197,6 +198,11 @@ const MIGRATIONS: readonly string[] = [
   // The claim's working episode the push was granted in. A row saved before this step has none and
   // is fenced to the first episode.
   "ALTER TABLE git_pending_push ADD COLUMN episode INTEGER NOT NULL DEFAULT 1",
+  // That first episode is also the episode of a claim that was pinned and reopened at the same
+  // generation before the claims module counted episodes, so it cannot stand for a row saved before
+  // the episode step. Every row present now is marked unfenced and dropped without being recorded.
+  "ALTER TABLE git_pending_push ADD COLUMN unfenced INTEGER NOT NULL DEFAULT 0",
+  "UPDATE git_pending_push SET unfenced = 1",
 ];
 /** How many pending pushes one alarm reconciles; the alarm is asked for again for the rest. */
 const RECONCILE_BATCH = 8;
@@ -494,7 +500,7 @@ class GitGateway implements GitPort {
       const due = this.#context.storage.sql
         .exec<PendingRow>(
           `SELECT id, claim_id, generation, episode, agent_id, repo, updates, attempts, release,
-             prior
+             prior, unfenced
            FROM git_pending_push WHERE due_at <= ? ORDER BY due_at, id LIMIT ?`,
           this.#context.clock(),
           RECONCILE_BATCH,
@@ -520,7 +526,7 @@ class GitGateway implements GitPort {
    * push released to the fork since. Finding a ref at the new id alone proves nothing, since a stale
    * push that was refused can find the fork already there. Without that before-read, or once another
    * push was released after this one, nothing is recorded and the outcome is logged as unknown. A
-   * push whose claim moved on is dropped.
+   * push whose claim moved on is dropped, and so is one saved before pushes were fenced to an episode.
    */
   async #reconcile(row: PendingRow): Promise<void> {
     const fence = pendingFence(row);
@@ -529,6 +535,11 @@ class GitGateway implements GitPort {
     if (updates === null || prior === undefined) {
       this.#drop(row.id, fence);
       logUnrecorded(fence, "unreadable_record");
+      return;
+    }
+    if (row.unfenced !== 0) {
+      this.#drop(row.id, fence);
+      logUnrecorded(fence, "unfenced");
       return;
     }
     if (!this.#working(fence)) {
@@ -1026,6 +1037,8 @@ interface PendingRow extends Record<string, SqlStorageValue> {
   attempts: number;
   release: number;
   prior: string | null;
+  /** Non-zero for a row saved before pushes were fenced to an episode. */
+  unfenced: number;
 }
 
 /** The branches a push names as read from its fork before the push was released. */
@@ -1380,7 +1393,8 @@ function logUnrecorded(
     | "record_failed"
     | "outcome_unknown"
     | "reconcile_failed"
-    | "unreadable_record",
+    | "unreadable_record"
+    | "unfenced",
   unproven?: Unproven,
 ): void {
   logPush("git_push_unrecorded", fence, unproven === undefined ? { reason } : { reason, unproven });
