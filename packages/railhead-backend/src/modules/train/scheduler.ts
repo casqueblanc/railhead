@@ -5,7 +5,10 @@
 // resumes from storage: a batch left composing is composed again from the same main and pins, and
 // an attempt the check port never acknowledged is started again under the same id. Nothing here
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
-// again rather than inheriting any part of its result.
+// again rather than inheriting any part of its result. A batch is formed only while each pin's
+// generation and decision versions are still the ones it was read under, so a decision recorded
+// while the train reads main never schedules a pin that decision superseded. While a pin's current
+// versions cannot be read, no batch is formed and the drive stops blocked, for the alarm to retry.
 //
 // A pin is queued only inside the transaction that records `ready`, or that repeats it for a pin
 // with no entry, and the Repo's alarm drives the train once it commits; each `recordCheck` drives
@@ -98,6 +101,7 @@ import type {
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import type { EventTransaction } from "../../repo/eventLog";
 import { checkFence, type FenceReaders } from "../../train/authorize";
+import { sameVersions } from "../claims/module";
 import {
   activeBatch,
   batchByAttempt,
@@ -219,7 +223,7 @@ export type BlockReason =
   | "definition_invalid"
   /** The claims module did not answer for a pin. */
   | "pin_unavailable"
-  /** The decisions module did not answer for a claim. */
+  /** The decisions module did not answer for a claim, or could not read its current versions. */
   | "requirements_unavailable"
   /** The merge port did not answer. */
   | "merge_unavailable"
@@ -524,6 +528,28 @@ export function createTrain(
     if (first === undefined) return stop({ kind: "idle" });
     const members = first.isolate ? [first] : takeWhile(waiting, (entry) => !entry.isolate);
 
+    // Each claim's requirements are read before its pin. A pin that answers was recorded under the
+    // versions current when it was read; the fenced insert below finds those versions still current
+    // and equal to the requirements read earlier, and versions only move forward, so the batch is
+    // scheduled under exactly the versions its pins were recorded under.
+    const required = new Map<string, DecisionRef[]>();
+    const refused: QueueEntry[] = [];
+    for (const entry of members) {
+      const result = await bounded(generation, "decisions", () =>
+        ports().decisions.requirements(entry.pin.claimId),
+      );
+      if (!result.ok) {
+        if (isTransient(result.code)) return blocked(null, "requirements_unavailable", result.code);
+        refused.push(entry);
+      } else {
+        required.set(entry.pin.claimId, result.value);
+      }
+    }
+    if (refused.length > 0) {
+      dropEntries(generation, refused, "requirements_refused");
+      return CONTINUE;
+    }
+
     const stale: QueueEntry[] = [];
     for (const entry of members) {
       const current = await bounded(generation, "claims", () =>
@@ -555,39 +581,43 @@ export function createTrain(
       return blocked(null, "definition_invalid", null);
     }
 
-    const required: DecisionRef[] = [];
-    const refused: QueueEntry[] = [];
-    for (const entry of members) {
-      const result = await bounded(generation, "decisions", () =>
-        ports().decisions.requirements(entry.pin.claimId),
-      );
-      if (!result.ok) {
-        if (isTransient(result.code)) return blocked(null, "requirements_unavailable", result.code);
-        refused.push(entry);
-      } else {
-        required.push(...result.value);
-      }
-    }
-    if (refused.length > 0) {
-      dropEntries(generation, refused, "requirements_refused");
-      return CONTINUE;
-    }
-
     const pins = members.map((entry) => entry.pin);
     const now = clock();
-    const decisions = uniqueDecisions(required);
-    fenced(generation, () => {
-      // A pin queued during the reads above may have changed an entry; form again from storage.
-      const unchanged = members.every((entry) => stillObserved(entry));
-      if (!unchanged || activeBatch(sql) !== null) return;
-      // A decision recorded during those reads may have superseded a pin. Each claim must still be
-      // ready at its entry's episode with a clear inbox gate, under exactly `decisions`; otherwise
-      // the next form reads its pin again, which reopens a superseded claim and drops its entry.
-      if (!members.every((entry) => stillReady(entry))) return;
-      if (!checkFence(fenceReaders, pins, decisions, null).ok) return;
+    const formed = fenced(generation, (): "formed" | "moved" | "unknown" => {
+      // A pin queued during the reads above may have settled an entry or queued a newer episode of
+      // it, and a decision recorded during them may have superseded a pin; form again from storage,
+      // where the next read of a superseded pin reopens its claim and drops it. Versions that cannot
+      // be read are not a move: another pass would read the same entries again and learn nothing.
+      let unknown = false;
+      for (const entry of members) {
+        const { claimId, generation: pinned } = entry.pin;
+        if (!stillObserved(entry) || ports().claims.currentGeneration(claimId) !== pinned) {
+          return "moved";
+        }
+        const versions = ports().decisions.currentVersions(claimId);
+        const pinnedUnder = required.get(claimId);
+        if (versions === null) unknown = true;
+        else if (pinnedUnder === undefined || !sameVersions(versions, pinnedUnder)) return "moved";
+      }
+      if (unknown) return "unknown";
+      if (activeBatch(sql) !== null) return "moved";
+      const decisions = uniqueDecisions([...required.values()].flat());
+      // Each claim must also still be ready at its entry's episode with a clear inbox gate, its pin
+      // recorded under exactly `decisions`.
+      if (!members.every((entry) => stillReady(entry))) return "moved";
+      if (!checkFence(fenceReaders, pins, decisions, null).ok) return "moved";
       insertBatch(sql, { expectedMain: main.value, pins, decisions, definition }, now);
+      return "formed";
     });
-    return CONTINUE;
+    switch (formed) {
+      case "formed":
+      case "moved":
+        return CONTINUE;
+      case "unknown":
+        return blocked(null, "requirements_unavailable", "unavailable");
+      default:
+        return unreachable(formed);
+    }
   }
 
   async function advance(generation: number, batch: BatchRecord): Promise<Step> {

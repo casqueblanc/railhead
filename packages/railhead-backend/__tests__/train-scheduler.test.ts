@@ -88,6 +88,10 @@ class Fakes {
   readonly pins = new Map<string, ClaimPin>();
   /** Requirements returned per claim. */
   readonly requirements = new Map<string, DecisionRef[]>();
+  /** When true, the decisions fence reader reports every claim's versions unknown. */
+  unknownVersions = false;
+  /** How many times the decisions fence reader was read. */
+  versionReads = 0;
   composeCalls: { main: CommitSha; pins: ClaimPin[] }[] = [];
   /** The merge attempt of each compose, in order. */
   composeAttempts: string[] = [];
@@ -127,8 +131,12 @@ class Fakes {
     for (const p of pins) this.pins.set(p.claimId, p);
   }
 
+  /** Every port call the train made, in order. */
+  readonly reached: PortCall[] = [];
+
   /** Never settles while `call` is the hung one. */
   async answer(call: PortCall): Promise<void> {
+    this.reached.push(call);
     if (this.hang === call) await new Promise<never>(() => {});
     await this.holds.get(call);
   }
@@ -176,7 +184,12 @@ class Fakes {
           await this.answer("decisions.requirements");
           return ok(this.requirements.get(claimId) ?? []);
         },
-        currentVersions: (claimId) => this.requirements.get(claimId) ?? [],
+        currentVersions: (claimId) => {
+          this.versionReads += 1;
+          return this.pins.has(claimId) && !this.unknownVersions
+            ? (this.requirements.get(claimId) ?? [])
+            : null;
+        },
       },
       merge: {
         compose: async (main, pins, attempt) => {
@@ -1852,6 +1865,92 @@ describe("train ready episodes", () => {
       expect(events()).toMatchObject([{ type: "train.conflict" }]);
       expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "parked" });
       expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+    }, fakes);
+  });
+});
+
+describe("train batch fence", () => {
+  it("forms no batch when a pin's decision versions move while main is read, and schedules its re-ready", async () => {
+    const fakes = new Fakes();
+    const v1: DecisionRef = { decisionId: "dec_upload001", version: 1 };
+    const v2: DecisionRef = { decisionId: "dec_upload001", version: 2 };
+    fakes.requirements.set(pin(1).claimId, [v1]);
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      // Version 2 supersedes the pin; the claims module reopens the claim, so it has no pin.
+      fakes.requirements.set(pin(1).claimId, [v2]);
+      fakes.pins.delete(pin(1).claimId);
+      release();
+      await enqueued;
+
+      expect(train.batches(8)).toEqual([]);
+      expect(fakes.composeCalls).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "dropped", reason: "pin_changed" });
+
+      // The holder marks adapted work ready under version 2, and that pin is scheduled.
+      const adapted = pin(1, 1, sha("f"));
+      fakes.ready(adapted);
+      expect(await train.enqueue(adapted)).toEqual(ok({ queued: true }));
+      expect(lastStarted(fakes)).toMatchObject({ pins: [adapted], decisions: [v2] });
+    }, fakes);
+  });
+
+  it("forms no batch when a claim changes owner while main is read, and drops the old pin", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      fakes.ready(pin(1, 2));
+      release();
+      await enqueued;
+
+      expect(train.batches(8)).toEqual([]);
+      expect(fakes.composeCalls).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "dropped", reason: "pin_changed" });
+    }, fakes);
+  });
+
+  it("stops blocked after one read while the decision versions are unknown, and forms the batch once they are known", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(pin(1));
+      const release = fakes.hold("mainWriter.head");
+      const enqueued = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      // The fence reader reports the claim unknown while the async reads still answer.
+      fakes.unknownVersions = true;
+      const reads = fakes.versionReads;
+      release();
+      await enqueued;
+
+      // One pass read the versions once and stopped; it did not read the queue again.
+      expect(fakes.versionReads - reads).toBe(1);
+      const count = (call: PortCall) => fakes.reached.filter((c) => c === call).length;
+      expect(count("decisions.requirements")).toBe(1);
+      expect(count("claims.pin")).toBe(1);
+      expect(count("mainWriter.head")).toBe(1);
+      expect(train.batches(8)).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "queued" });
+      expect(sql.exec("SELECT COUNT(*) AS n FROM train_batches").one().n).toBe(0);
+      expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
+      expect(await train.drive()).toEqual({
+        kind: "blocked",
+        batchId: null,
+        reason: "requirements_unavailable",
+        code: "unavailable",
+      });
+
+      // Once the reader answers again, the alarm's next drive forms the batch and starts its check.
+      fakes.unknownVersions = false;
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      expect(lastStarted(fakes)).toMatchObject({ pins: [pin(1)], decisions: [] });
+      expect(train.entries(1)[0]).toMatchObject({ state: "batched" });
     }, fakes);
   });
 });

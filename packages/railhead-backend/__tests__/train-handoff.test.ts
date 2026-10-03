@@ -79,6 +79,8 @@ interface Setup {
    * is called. `reached` resolves once the read has answered.
    */
   holdNextPin(): { reached: Promise<void>; release(): void };
+  /** Makes reads of main wait until the returned function releases them. */
+  holdMain(): { reached: Promise<void>; release: () => void };
   /** The Artifacts fake behind the adapter. */
   fake: FakeArtifacts;
   /** The commit main is at. */
@@ -155,6 +157,7 @@ function withHandoff<T>(
         return realAlarm ? alarm.request(at) : true;
       },
     };
+    let mainGate: { reached: () => void; released: Promise<void> } | null = null;
     const composed: ClaimPin[][] = [];
     const started: CheckAttempt[] = [];
     const published: string[] = [];
@@ -217,7 +220,13 @@ function withHandoff<T>(
       train: install(train),
       authorization,
       mainWriter: {
-        head: () => mainRef.read(),
+        head: async () => {
+          if (mainGate !== null) {
+            mainGate.reached();
+            await mainGate.released;
+          }
+          return mainRef.read();
+        },
         publish: async (intentId) => {
           published.push(intentId);
           return writer.publish(intentId);
@@ -330,6 +339,18 @@ function withHandoff<T>(
         held = { reach: reached.resolve, released: released.promise };
         return { reached: reached.promise, release: released.resolve };
       },
+      holdMain() {
+        const reached = signal();
+        const released = signal();
+        mainGate = { reached: reached.resolve, released: released.promise };
+        return {
+          reached: reached.promise,
+          release: () => {
+            mainGate = null;
+            released.resolve();
+          },
+        };
+      },
       main: () => mainAt,
       mainUp: true,
       advance: (ms) => fake.advance(ms),
@@ -346,13 +367,13 @@ function withHandoff<T>(
   });
 }
 
-/** A promise and the call that resolves it. */
-function signal(): { promise: Promise<void>; resolve(): void } {
-  let resolve: (() => void) | undefined;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
+/** A promise and the function that settles it. */
+function signal(): { promise: Promise<void>; resolve: () => void } {
+  let settle: (() => void) | null = null;
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
   });
-  return { promise, resolve: () => resolve?.() };
+  return { promise, resolve: () => settle?.() };
 }
 
 function claimState(sql: SqlStorage, claimId: string): string {
@@ -949,6 +970,58 @@ describe("a re-ready after a superseded decision", () => {
       expect(setup.started.at(-1)?.attemptId).not.toBe(old.attemptId);
       expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
       expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+    });
+  });
+});
+
+describe("a decision recorded while the train forms a batch", () => {
+  it("forms no batch for the superseded pin, and the train drops it", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const main = setup.holdMain();
+      const driving = setup.train.resume();
+      await main.reached;
+
+      // The pin and its requirements were read under version 1; version 2 lands before main does.
+      await setup.decide(claim.claimId, first.decisionId);
+      main.release();
+      await driving;
+
+      expect(setup.train.batches(8)).toEqual([]);
+      expect(setup.composed).toEqual([]);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+    });
+  });
+
+  it("refuses to authorize a batch whose decision was superseded after it formed", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await setup.train.resume();
+      const attempt = setup.started[0];
+      if (attempt === undefined) throw new Error("no check was started");
+      expect(attempt.decisions).toEqual([first]);
+
+      await setup.decide(claim.claimId, first.decisionId);
+      const recorded = await setup.train.recordCheck({
+        attemptId: attempt.attemptId,
+        candidate: attempt.candidate,
+        result: "pass",
+        logDigest: null,
+        finishedAt: attempt.createdAt,
+      });
+
+      expect(recorded.ok).toBe(true);
+      expect(setup.train.batches(8)).toMatchObject([
+        { state: "failed", failure: "authorization_refused", intentId: null },
+      ]);
+      expect(setup.sql.exec("SELECT COUNT(*) AS n FROM merge_intents").one().n).toBe(0);
+      expect(setup.log.replay(0, 256).events.map((event) => event.type)).not.toContain(
+        "train.intent",
+      );
+      // The retried pin was superseded, so the train's read reopened the claim and dropped it.
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
     });
   });
 });
