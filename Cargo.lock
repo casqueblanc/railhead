@@ -1411,6 +1411,7 @@ dependencies = [
  "dirs",
  "railhead-protocol",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

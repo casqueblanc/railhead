@@ -11,15 +11,20 @@ import type { AgentState, BoardState } from "../board/boardState";
 const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
 const CONFIRMATION_CODE = /^[0-9]{6}$/;
 
-/** An invite no agent has used yet. */
-export interface OpenInvite {
+/** An invite no agent has used. */
+export interface UnusedInvite {
   inviteId: InviteId;
   name: string;
+  /** When it stops being usable, in milliseconds since the Unix epoch. */
+  expiresAt: number;
 }
 
 /** The section's rows, each list ordered by name and then id so it does not reshuffle. */
 export interface Roster {
-  invites: readonly OpenInvite[];
+  /** Unused invites an agent can still join with. */
+  invites: readonly UnusedInvite[];
+  /** Unused invites the backend no longer accepts and has freed. */
+  expired: readonly UnusedInvite[];
   awaiting: readonly AgentState[];
   confirmed: readonly AgentState[];
   revoked: readonly AgentState[];
@@ -30,19 +35,32 @@ const byName =
   (a: T, b: T) =>
     a.name.localeCompare(b.name) || key(a).localeCompare(key(b));
 
-/** Splits the board's invites and agents into the section's rows. */
-export const roster = (state: BoardState): Roster => {
+/**
+ * Splits the board's invites and agents into the section's rows. An unused invite is expired from
+ * `expiresAt` on, as the backend treats it; `now` is this browser's clock, in milliseconds since
+ * the Unix epoch, so a skewed clock moves when an invite shows as expired.
+ */
+export const roster = (state: BoardState, now: number): Roster => {
   const agents = Object.values(state.agents).toSorted(byName((agent) => agent.agentId));
+  const unused = Object.values(state.invites)
+    .filter((invite) => invite.agentId === null)
+    .map(({ inviteId, name, expiresAt }) => ({ inviteId, name, expiresAt }))
+    .toSorted(byName((invite) => invite.inviteId));
   return {
-    invites: Object.values(state.invites)
-      .filter((invite) => invite.agentId === null)
-      .map(({ inviteId, name }) => ({ inviteId, name }))
-      .toSorted(byName((invite) => invite.inviteId)),
+    invites: unused.filter((invite) => now < invite.expiresAt),
+    expired: unused.filter((invite) => invite.expiresAt <= now),
     awaiting: agents.filter((agent) => agent.status === "awaiting_confirmation"),
     confirmed: agents.filter((agent) => agent.status === "confirmed"),
     revoked: agents.filter((agent) => agent.status === "revoked"),
   };
 };
+
+/** When the next of these invites expires, or `null` when none is left to expire. */
+export const nextExpiry = (invites: readonly UnusedInvite[]): number | null =>
+  invites.reduce<number | null>(
+    (next, invite) => (next === null || invite.expiresAt < next ? invite.expiresAt : next),
+    null,
+  );
 
 /** Why an invite name is refused, or `null` when the backend may accept it. */
 export const inviteNameProblem = (name: string): string | null => {
