@@ -128,7 +128,7 @@ export function mergeCommand(main: string, pins: readonly string[], seconds: num
  * Finds which earlier commit `pin` conflicts with: each of `partners` in order, from a clean
  * checkout, merged with `pin` without committing. Prints `partner <index>` for the first that
  * conflicts, followed by `git ls-files -u -z`, or `partner none` when every merge is clean. Exits
- * 2 when a step fails in any other way.
+ * 2 when a step fails in any other way, including a merge that stops with no unmerged entry.
  */
 export function partnerCommand(pin: string, partners: readonly string[], seconds: number): string {
   const tries = partners.map(
@@ -141,7 +141,11 @@ export function partnerCommand(pin: string, partners: readonly string[], seconds
     '  step git merge -q --no-ff --no-commit "$3" >/dev/null 2>&1',
     "  r=$?",
     '  if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi',
-    '  if [ "$r" -ne 0 ]; then echo "partner $1"; git ls-files -u -z || exit 2; exit 0; fi',
+    // A merge that stopped with no unmerged entry failed for another reason, not a conflict.
+    '  if [ "$r" -ne 0 ]; then',
+    '    [ -n "$(git ls-files -u)" ] || exit 2',
+    '    echo "partner $1"; git ls-files -u -z || exit 2; exit 0',
+    "  fi",
     "}",
     ...tries,
     "echo 'partner none'",

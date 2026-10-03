@@ -261,6 +261,8 @@ class Run {
     if (step.exec.truncated) return failure("unsupported");
     const found = parsePartner(step.exec.stdout);
     if (found === null) return failure("infrastructure");
+    // A partner whose merge left no unmerged entry did not conflict.
+    if (found.kind === "partner" && found.entries.length === 0) return failure("infrastructure");
     // No single earlier pin conflicts with it, or it conflicts with main itself: neither is a pair
     // of pins the train can route.
     if (found.kind === "none" || found.index === 0) return failure("unsupported");

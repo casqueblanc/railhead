@@ -273,6 +273,18 @@ describe("compose", () => {
     });
   });
 
+  it("reports a partner merge that left no unmerged entry as infrastructure", async () => {
+    await withMerge(async (harness) => {
+      harness.fake.replies.merge = [{ exitCode: 42 }];
+      harness.fake.replies.partner = [{ exitCode: 0, stdout: "partner 1\n" }];
+
+      expect(await harness.merge.compose(MAIN, [PIN_A, PIN_B])).toEqual(
+        ok({ kind: "error", reason: "infrastructure" }),
+      );
+      expect(harness.fake.steps()).not.toContain("binary");
+    });
+  });
+
   it("reports a binary conflict as unsupported", async () => {
     await withMerge(async (harness) => {
       harness.fake.replies.merge = [{ exitCode: 42 }];
