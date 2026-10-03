@@ -951,7 +951,14 @@ async function withRepoOwner(
   await runInDurableObject(repo, async (_instance, state) => {
     const clock = { now: Date.now() };
     const log = EventLog.open(state.storage, repoId);
-    const context = { repoId, storage: state.storage, log, clock: () => clock.now, env };
+    const context = {
+      repoId,
+      storage: state.storage,
+      log,
+      clock: () => clock.now,
+      env,
+      wake: () => {},
+    };
     const grants: Dispatch[] = [];
     const ports = recordingPorts(
       composeRepo(context),
@@ -1540,6 +1547,7 @@ describe("owner actions", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
+        wake: () => {},
       };
       const owner = createOwner(context, () => composeRepo(context), {
         instance: env.OWNER.getByName(unique("owner-")),

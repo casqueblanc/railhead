@@ -26,9 +26,9 @@ import { fail, ok, type PortResult } from "../contracts/result";
 import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
 import type { GitTarget } from "../modules/git/entry";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
-import { composeRepo, type RepoPorts } from "./composeRepo";
+import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
 import { EventLog, EventLogError } from "./eventLog";
-import { migrate } from "./storage";
+import { EarliestAlarm, migrate } from "./storage";
 
 /** A repository as it was recorded. */
 export interface RepoSummary {
@@ -67,12 +67,22 @@ interface Installed {
 
 /** One repository. */
 export class Repo extends DurableObject<Env> {
-  #installed: Installed | null;
+  #installed: Installed | null = null;
+  readonly #alarm: EarliestAlarm;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const summary = this.#readSummary();
-    this.#installed = summary === null ? null : this.#install(summary);
+    this.#alarm = new EarliestAlarm(ctx.storage, (error) => {
+      const name = error instanceof Error ? error.name : "unknown";
+      const repo = this.#installed?.summary.repoId ?? null;
+      console.error(JSON.stringify({ event: "repo.wake_failed", repo, error: name }));
+    });
+    // Modules ask for wakes while they are built, so the alarm is read first.
+    void ctx.blockConcurrencyWhile(async () => {
+      await this.#alarm.load();
+      const summary = this.#readSummary();
+      this.#installed = summary === null ? null : this.#install(summary);
+    });
   }
 
   /** The repository, or `null` when it was never initialized. */
@@ -199,6 +209,18 @@ export class Repo extends DurableObject<Env> {
     return ports.git.serve(request, target, path);
   }
 
+  /**
+   * Resumes every module that owes work. Each module asks for its own next wake. If one of those
+   * wakes failed to reach storage, the handler throws so the runtime retries the alarm.
+   */
+  async alarm(): Promise<void> {
+    this.#alarm.fired();
+    const installed = this.#installed;
+    if (installed === null) return;
+    await resumeAll(installed.summary.repoId, resumables(installed.ports));
+    await this.#alarm.settle();
+  }
+
   #ports(): RepoPorts | null {
     return this.#installed?.ports ?? null;
   }
@@ -228,6 +250,7 @@ export class Repo extends DurableObject<Env> {
       log,
       clock: Date.now,
       env: this.env,
+      wake: (at) => this.#alarm.request(at),
     });
     return { summary, log, ports };
   }

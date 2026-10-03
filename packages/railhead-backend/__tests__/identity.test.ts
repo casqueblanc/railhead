@@ -189,7 +189,14 @@ async function withIdentity(
   await runInDurableObject(stub, async (_instance, state) => {
     const clock = { now: Date.now() };
     const log = EventLog.open(state.storage, repoId, () => clock.now);
-    const context = { repoId, storage: state.storage, log, clock: () => clock.now, env };
+    const context = {
+      repoId,
+      storage: state.storage,
+      log,
+      clock: () => clock.now,
+      env,
+      wake: () => {},
+    };
     const build = () =>
       createIdentity(context, {
         origin: "origin" in options ? options.origin : ORIGIN,
@@ -346,7 +353,7 @@ describe("joins", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const log = EventLog.open(state.storage, repoId);
       const identity = createIdentity(
-        { repoId, storage: state.storage, log, clock: Date.now, env },
+        { repoId, storage: state.storage, log, clock: Date.now, env, wake: () => {} },
         { origin: auth.join.fields.origin, refusalsPerWindow: 10 },
       );
       const secret = "s".repeat(43);
