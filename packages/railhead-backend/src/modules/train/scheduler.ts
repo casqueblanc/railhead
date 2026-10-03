@@ -338,10 +338,14 @@ export function createTrain(
   };
   let discarding: Promise<void> | null = null;
 
-  // A restarted train asks again for the wake it owes: the alarm may never have been set. Whether
-  // an exhausted wake is still owed needs the authorization port, which `resume` reads.
+  // A restarted train asks again for the wake it owes: the alarm may never have been set.
   const owed = readWake(sql);
-  if (owed !== null) context.wake(owed.dueAt);
+  if (owed !== null && !isExhausted(owed)) context.wake(owed.dueAt);
+  else if (owed !== null) {
+    // An exhausted wake is owed only while a write to main may have landed unheard, which needs
+    // the authorization port. Ports exist once the composition building this train has returned.
+    queueMicrotask(() => wakeForSettlement(owed));
+  }
   wakeForDiscards();
 
   /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
@@ -1091,6 +1095,21 @@ export function createTrain(
       }
     } finally {
       context.storage.transactionSync(() => wakeForDiscards());
+    }
+  }
+
+  /**
+   * Asks the Repo's alarm for the exhausted wake `exhausted` if the train still owes a settlement,
+   * so an alarm for nothing is never set. A failed read is logged by name and asks for nothing.
+   */
+  function wakeForSettlement(exhausted: PendingWake): void {
+    try {
+      if (owesSettlement()) context.wake(exhausted.dueAt);
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "unknown";
+      console.error(
+        JSON.stringify({ event: "train.settle_wake_failed", repo: context.repoId, error: name }),
+      );
     }
   }
 

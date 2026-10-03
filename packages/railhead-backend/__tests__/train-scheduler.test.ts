@@ -1968,11 +1968,12 @@ describe("train settle wake", () => {
       expect(owed(sql)).toEqual({ dueAt: now(), failures: EXHAUSTED_FAILURES });
       const authorizations = fakes.authorized.length;
 
-      // The restarted train asks for the wake it holds, but its alarm drives nothing, since no
-      // intent was authorized, and asks for nothing more.
-      const again = restart();
-      expect(wakes.at(-1)).toBe(now());
+      // No intent was authorized, so the restarted train asks for no alarm, and an alarm another
+      // module asked for drives nothing and asks for nothing more.
       const asked = wakes.length;
+      const again = restart();
+      await Promise.resolve();
+      expect(wakes).toHaveLength(asked);
       advance(SETTLE_WAKE_MS);
       await again.resume();
       expect(fakes.authorized).toHaveLength(authorizations);
@@ -2077,6 +2078,44 @@ describe("train module", () => {
     expect(wake).toBeNull();
     await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
   });
+  it("sets no Repo alarm after eviction for an exhausted wake that owes no settlement", async () => {
+    const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const stub = env.REPO.getByName(repoObjectName("acme", name));
+    const summary = await stub.initialize("acme", name);
+    if (!summary.ok) throw new Error(summary.code);
+
+    // What retries that ran out before any intent was authorized leave: work stored under an
+    // exhausted wake whose time has passed, and no alarm.
+    await runInDurableObject(stub, async (_instance, state) => {
+      migrateTrain(state.storage);
+      const now = Date.now();
+      insertEntry(state.storage.sql, pin(1), 1, now - 60_000);
+      writeWake(state.storage.sql, { dueAt: now - 1_000, failures: EXHAUSTED_FAILURES });
+      await state.storage.deleteAlarm();
+    });
+    await evictDurableObject(stub);
+
+    // The cold-started Repo builds its train and asks for no alarm. A past alarm would fire at once
+    // and be set again by every cold start; none is set after either start, and the stored work
+    // waits for a call.
+    expect(await stub.describe()).toEqual(summary.value);
+    await scheduler.wait(50);
+    expect(
+      await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm()),
+    ).toBeNull();
+    expect(await runDurableObjectAlarm(stub)).toBe(false);
+    await evictDurableObject(stub);
+    expect(await runDurableObjectAlarm(stub)).toBe(false);
+    const stored = await runInDurableObject(stub, (_instance, state) => ({
+      wake: readWake(state.storage.sql),
+      entries: state.storage.sql.exec("SELECT state FROM train_queue").toArray(),
+    }));
+    expect(stored).toEqual({
+      wake: { dueAt: expect.any(Number), failures: EXHAUSTED_FAILURES },
+      entries: [{ state: "queued" }],
+    });
+  });
+
   it("persists the lease alarm with an accepted pin, so the alarm drives it after the object stops mid-drive", async () => {
     const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
     const stub = env.REPO.getByName(repoObjectName("acme", name));

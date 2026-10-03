@@ -650,6 +650,9 @@ describe("the train's settle wake", () => {
       const asked = h.wakes.length;
 
       const restarted = h.restart();
+      // The restarted train asks once the composition building it has returned.
+      expect(h.wakes.slice(asked)).toEqual([]);
+      await Promise.resolve();
       expect(h.wakes.slice(asked)).toEqual([owed?.dueAt]);
 
       ref.down = false;
