@@ -240,7 +240,7 @@ describe("supersession", () => {
           claimId: CLAIM,
           decision: { decisionId, version: 2 },
           kind: "decision",
-          item: 2,
+          delivery: { agentId: ATLAS, item: 2 },
           recordedAt: NOW,
         },
       ]);
@@ -394,8 +394,16 @@ describe("authorization across a change", () => {
         entry("rework", decisionId, 2),
       ]);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 1 }, kind: "decision", item: 1 },
-        { decision: { decisionId, version: 2 }, kind: "rework", item: 2 },
+        {
+          decision: { decisionId, version: 1 },
+          kind: "decision",
+          delivery: { agentId: ATLAS, item: 1 },
+        },
+        {
+          decision: { decisionId, version: 2 },
+          kind: "rework",
+          delivery: { agentId: ATLAS, item: 2 },
+        },
       ]);
     });
   });
@@ -411,8 +419,12 @@ describe("authorization across a change", () => {
       expect(types(h.events()).slice(-1)).toEqual(["decision.recorded"]);
       expect(await h.entries(ATLAS)).toHaveLength(1);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 1 }, kind: "decision", item: 1 },
-        { decision: { decisionId, version: 2 }, kind: "rework", item: null },
+        {
+          decision: { decisionId, version: 1 },
+          kind: "decision",
+          delivery: { agentId: ATLAS, item: 1 },
+        },
+        { decision: { decisionId, version: 2 }, kind: "rework", delivery: null },
       ]);
     });
   });
@@ -462,7 +474,7 @@ describe("relied", () => {
       // Generation 1 holds the claim, but the landed work names generation 2.
       expect(h.relied([{ decisionId, version: 1 }], 2)).toEqual([]);
       expect(h.obligations()).toContainEqual(
-        expect.objectContaining({ kind: "rework", item: null }),
+        expect.objectContaining({ kind: "rework", delivery: null }),
       );
     });
   });
@@ -516,7 +528,7 @@ describe("transfer", () => {
       expect(await h.record(decisionId, "reject", 1)).toEqual(ok({ decisionId, version: 2 }));
       expect(await h.entries(ATLAS)).toHaveLength(1);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 2 }, kind: "decision", item: null },
+        { decision: { decisionId, version: 2 }, kind: "decision", delivery: null },
       ]);
 
       const events = h.transfer({ agentId: BOREAS, claimId: CLAIM, generation: 2 });
@@ -528,7 +540,11 @@ describe("transfer", () => {
       expect(await h.entries(BOREAS)).toMatchObject([{ item: 1, version: 2 }]);
       expect(await h.inbox.readyGate(CLAIM, 2)).toEqual(ok({ kind: "blocked", items: [1] }));
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 2 }, kind: "decision", item: 1 },
+        {
+          decision: { decisionId, version: 2 },
+          kind: "decision",
+          delivery: { agentId: BOREAS, item: 1 },
+        },
       ]);
       // A repeated takeover call queues nothing, and the next version reaches BOREAS directly.
       expect(h.transfer({ agentId: BOREAS, claimId: CLAIM, generation: 2 })).toEqual([]);
@@ -547,8 +563,16 @@ describe("transfer", () => {
         { agentId: BOREAS, entry: entry("decision", decisionId, 1) },
       ]);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 1 }, kind: "decision", item: 1 },
+        {
+          decision: { decisionId, version: 1 },
+          kind: "decision",
+          delivery: { agentId: BOREAS, item: 1 },
+        },
       ]);
+      // ATLAS's earlier delivery of version 1 is replaced here, and kept by the event log.
+      expect(
+        h.events().filter((event) => event.type === "inbox.queued" && event.data.agentId === ATLAS),
+      ).toHaveLength(1);
     });
   });
 
@@ -569,13 +593,14 @@ describe("transfer", () => {
       // Version 3 subsumes version 2's pending rework: both are delivered by BOREAS's one item.
       expect(
         h.storage.sql
-          .exec<{ version: number; item: number | null }>(
-            "SELECT version, item FROM decision_obligations WHERE kind = 'rework' ORDER BY version",
+          .exec<{ version: number; agent_id: string | null; item: number | null }>(
+            `SELECT version, agent_id, item FROM decision_obligations
+             WHERE kind = 'rework' ORDER BY version`,
           )
           .toArray(),
       ).toEqual([
-        { version: 2, item: 1 },
-        { version: 3, item: 1 },
+        { version: 2, agent_id: BOREAS, item: 1 },
+        { version: 3, agent_id: BOREAS, item: 1 },
       ]);
       expect(await h.entries(ATLAS)).toHaveLength(1);
     });
@@ -604,7 +629,7 @@ describe("transfer", () => {
         DecisionsWriteError,
       );
       expect(h.log.head()).toBe(head);
-      expect(h.obligations()).toMatchObject([{ item: null }]);
+      expect(h.obligations()).toMatchObject([{ delivery: null }]);
     });
   });
 
@@ -652,8 +677,12 @@ describe("obligations", () => {
     await withDecisions(async (h) => {
       h.generation(null);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 1 }, kind: "decision", item: 1 },
-        { decision: { decisionId, version: 2 }, kind: "rework", item: null },
+        {
+          decision: { decisionId, version: 1 },
+          kind: "decision",
+          delivery: { agentId: ATLAS, item: 1 },
+        },
+        { decision: { decisionId, version: 2 }, kind: "rework", delivery: null },
       ]);
       // The person's lost response is retried after the restart.
       expect(await h.record(decisionId, "reject", 1, "chl_change0001")).toEqual(
@@ -669,8 +698,16 @@ describe("obligations", () => {
       expect(h.transfer({ agentId: BOREAS, claimId: CLAIM, generation: 2 })).toEqual([]);
       expect(h.count("decision_obligations")).toBe(2);
       expect(h.obligations()).toMatchObject([
-        { decision: { decisionId, version: 1 }, kind: "decision", item: 1 },
-        { decision: { decisionId, version: 2 }, kind: "rework", item: 1 },
+        {
+          decision: { decisionId, version: 1 },
+          kind: "decision",
+          delivery: { agentId: ATLAS, item: 1 },
+        },
+        {
+          decision: { decisionId, version: 2 },
+          kind: "rework",
+          delivery: { agentId: BOREAS, item: 1 },
+        },
       ]);
       expect(await h.entries(BOREAS)).toMatchObject([
         { item: 1, entry: entry("rework", decisionId, 2) },

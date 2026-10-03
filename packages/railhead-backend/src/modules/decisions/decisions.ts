@@ -106,15 +106,17 @@ const MIGRATIONS: readonly string[] = [
   "CREATE INDEX decision_claims_claim ON decision_claims (claim_id)",
   // The newest version the claim's authorized or merged work relied on, or `NULL` before any.
   "ALTER TABLE decision_claims ADD COLUMN relied INTEGER CHECK (relied IS NULL OR relied > 0)",
-  // What each version asks of each dependent claim. `item` is the inbox item it was delivered as,
-  // or `NULL` while no current holder could receive it.
+  // What each version asks of each dependent claim. `agent_id` and `item` name its latest delivery,
+  // since item numbers are per agent, or are both `NULL` while no current holder could receive it.
   `CREATE TABLE decision_obligations (
     claim_id TEXT NOT NULL,
     decision_id TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version > 0),
     kind TEXT NOT NULL CHECK (kind IN ('decision', 'rework')),
+    agent_id TEXT,
     item INTEGER CHECK (item IS NULL OR item > 0),
     recorded_at INTEGER NOT NULL,
+    CHECK ((agent_id IS NULL) = (item IS NULL)),
     PRIMARY KEY (claim_id, decision_id, version, kind)
   ) STRICT`,
 ];
@@ -176,6 +178,7 @@ interface ObligationRow extends Record<string, SqlStorageValue> {
   decision_id: string;
   version: number;
   kind: string;
+  agent_id: string | null;
   item: number | null;
   recorded_at: number;
 }
@@ -378,12 +381,14 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         )
       : null;
     tx.sql.exec(
-      `INSERT INTO decision_obligations (claim_id, decision_id, version, kind, item, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO decision_obligations
+         (claim_id, decision_id, version, kind, agent_id, item, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       dependency.claim_id,
       ref.decisionId,
       ref.version,
       kind,
+      item === null ? null : dependency.agent_id,
       item,
       clock(),
     );
@@ -660,20 +665,25 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         });
         // The current version subsumes every older one still waiting for a holder.
         tx.sql.exec(
-          `UPDATE decision_obligations SET item = ?
+          `UPDATE decision_obligations SET agent_id = ?, item = ?
            WHERE claim_id = ? AND decision_id = ? AND item IS NULL`,
+          agentId,
           item,
           claimId,
           row.decision_id,
         );
         tx.sql.exec(
-          `INSERT INTO decision_obligations (claim_id, decision_id, version, kind, item, recorded_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT (claim_id, decision_id, version, kind) DO UPDATE SET item = excluded.item`,
+          // The holder's delivery replaces the former holder's, whose item the event log keeps.
+          `INSERT INTO decision_obligations
+             (claim_id, decision_id, version, kind, agent_id, item, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (claim_id, decision_id, version, kind)
+           DO UPDATE SET agent_id = excluded.agent_id, item = excluded.item`,
           claimId,
           row.decision_id,
           current,
           kind,
+          agentId,
           item,
           clock(),
         );
@@ -722,7 +732,7 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       if (!isId("claim", claimId)) return null;
       return sql
         .exec<ObligationRow>(
-          `SELECT claim_id, decision_id, version, kind, item, recorded_at
+          `SELECT claim_id, decision_id, version, kind, agent_id, item, recorded_at
            FROM decision_obligations o
            WHERE claim_id = ? AND version = (
              SELECT MAX(version) FROM decision_obligations l
@@ -735,7 +745,10 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
           claimId: row.claim_id,
           decision: { decisionId: row.decision_id, version: row.version },
           kind: obligationKind(row.kind),
-          item: row.item,
+          delivery:
+            row.agent_id === null || row.item === null
+              ? null
+              : { agentId: row.agent_id, item: row.item },
           recordedAt: row.recorded_at,
         }));
     },

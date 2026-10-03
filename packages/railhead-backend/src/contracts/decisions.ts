@@ -1,7 +1,13 @@
 // Questions and versioned decisions.
 
 import type { AskRequest, QuestionResult } from "@railhead/shared/agent-api";
-import type { ClaimId, DecisionId, DecisionRef, QuestionId } from "@railhead/shared/events";
+import type {
+  AgentId,
+  ClaimId,
+  DecisionId,
+  DecisionRef,
+  QuestionId,
+} from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
 import type { InboxTarget } from "./inbox";
 import type { AgentPrincipal, GrantFor } from "./principals";
@@ -22,10 +28,12 @@ export interface DecisionObligation {
    */
   kind: "decision" | "rework";
   /**
-   * The inbox item it was delivered as, or `null` while no holder could receive it: the claim was
-   * merged, expired, unknown, or held by an owner its dependency has not been transferred to.
+   * Its latest delivery: the agent and that agent's inbox item, since item numbers are per agent.
+   * `null` while no holder could receive it: the claim was merged, expired, unknown, or held by an
+   * owner its dependency has not been transferred to. `transfer` replaces a former holder's
+   * delivery with the new holder's; the event log keeps the former one.
    */
-  item: number | null;
+  delivery: { agentId: AgentId; item: number } | null;
   /** When it was recorded. */
   recordedAt: number;
 }
