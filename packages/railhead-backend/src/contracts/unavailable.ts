@@ -62,6 +62,7 @@ export const unavailableInbox: InboxPort = {
     throw new UnavailableError("inbox");
   },
   readyGate: refuse("inbox"),
+  readyGateNow: () => null,
 };
 
 /** Decisions while its module is missing: no requirement list, so nothing is authorized. */

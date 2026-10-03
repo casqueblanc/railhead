@@ -45,6 +45,7 @@ const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
   ["decisions.currentVersions", null],
   ["inbox.queue", "throws"],
+  ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
 ]);
 

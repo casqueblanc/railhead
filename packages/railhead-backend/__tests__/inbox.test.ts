@@ -616,6 +616,24 @@ describe("ready gate", () => {
         ok: true,
         value: { kind: "clear" },
       });
+      // The fence reader answers the same, and inside a transaction it sees an item queued by it.
+      expect(h.inbox.readyGateNow(CLAIM, 2)).toEqual({ kind: "blocked", items: [1] });
+      expect(h.inbox.readyGateNow(CLAIM, 1)).toEqual({ kind: "clear" });
+      const seen = h.log.transaction((tx) => {
+        h.inbox.queue(tx, { agentId: "agt_atlas01", claimId: CLAIM, generation: 1 }, CONFLICT);
+        return h.inbox.readyGateNow(CLAIM, 1);
+      }).value;
+      expect(seen).toEqual({ kind: "blocked", items: [2] });
+    });
+  });
+
+  it("clears the fence reader once the item is acknowledged", async () => {
+    await withInbox(async (h) => {
+      h.queue();
+      await h.inbox.pending(h.agent(), 1);
+      expect(h.inbox.readyGateNow(CLAIM, 1)).toEqual({ kind: "blocked", items: [1] });
+      await h.inbox.ack(h.agent(), 1, "Chunk uploads.");
+      expect(h.inbox.readyGateNow(CLAIM, 1)).toEqual({ kind: "clear" });
     });
   });
 
@@ -641,6 +659,8 @@ describe("ready gate", () => {
           ok: false,
           code: "invalid_request",
         });
+        // Unknown, never clear.
+        expect(h.inbox.readyGateNow(claimId, generation)).toBeNull();
       }
     });
   });
@@ -658,6 +678,7 @@ describe("unavailable inbox", () => {
       ]) {
         expect(result).toMatchObject({ ok: false, code: "unavailable" });
       }
+      expect(unavailableInbox.readyGateNow(CLAIM, 1)).toBeNull();
       expect(() =>
         h.log.transaction((tx) => {
           tx.append(
