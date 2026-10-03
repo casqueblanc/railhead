@@ -82,6 +82,8 @@ export interface SeedTargetLimits extends TokenSweepLimits {
    * settled. How late a call can take effect is not measured.
    */
   readonly orphanSettleMs: number;
+  /** How long a read of main answers every later read, so unauthenticated reads stay bounded. */
+  readonly readCacheMs: number;
 }
 
 /** The lifetime of the token minted for a push into an existing, empty main repository. */
@@ -96,6 +98,7 @@ export const SEED_TARGET_LIMITS: SeedTargetLimits = {
   // The adapter's rule for a mint a previous incarnation never saw answered: its requested lifetime
   // and the clock skew.
   orphanSettleMs: PUSH_TOKEN_TTL_SECONDS * 1000 + MINT_CLOCK_SKEW_MS,
+  readCacheMs: 5_000,
 };
 
 /** The demo repository's seed and reset. */
@@ -136,6 +139,9 @@ export function createSeedTarget(
   // Records whose call has not answered yet, timed out or not.
   const unanswered = new Set<number>();
   let running = false;
+  // The last read of main and when it started. Anyone may read, so reads within `readCacheMs` of
+  // it share its answer instead of calling Artifacts again; a seed or reset drops it.
+  let lastRead: { at: number; result: Promise<PortResult<DemoSeedState | null>> } | null = null;
 
   /** Runs `work` unless another seed or reset is running. */
   async function exclusive<T>(work: () => Promise<PortResult<T>>): Promise<PortResult<T>> {
@@ -145,7 +151,15 @@ export function createSeedTarget(
       return await work();
     } finally {
       running = false;
+      lastRead = null;
     }
+  }
+
+  /** The repository as Artifacts holds it now. */
+  async function readState(artifacts: SeedArtifacts): Promise<PortResult<DemoSeedState | null>> {
+    const main = await readMain(artifacts, await mainRepoName(context.repoId));
+    if (!main.ok) return main;
+    return ok({ repo: context.repoId, main: main.value === "missing" ? null : main.value });
   }
 
   /** Bounds one binding call that changes nothing; a late answer is dropped. */
@@ -335,13 +349,15 @@ export function createSeedTarget(
   }
 
   return {
-    async read() {
-      if (!context.initialized()) return ok(null);
+    read() {
+      if (!context.initialized()) return Promise.resolve(ok(null));
       const { artifacts } = context;
-      if (artifacts === undefined) return noArtifacts();
-      const main = await readMain(artifacts, await mainRepoName(context.repoId));
-      if (!main.ok) return main;
-      return ok({ repo: context.repoId, main: main.value === "missing" ? null : main.value });
+      if (artifacts === undefined) return Promise.resolve(noArtifacts());
+      const now = context.clock();
+      if (lastRead === null || now < lastRead.at || now - lastRead.at >= limits.readCacheMs) {
+        lastRead = { at: now, result: readState(artifacts) };
+      }
+      return lastRead.result;
     },
 
     seed(head, pack) {

@@ -89,6 +89,8 @@ export class FakeArtifacts implements ArtifactsNamespace {
   createTokenCalls = 0;
   /** How many tokens were minted with `createToken`. */
   tokensMinted = 0;
+  /** How many `listTokens` calls reached the fake. */
+  listTokensCalls = 0;
   #now: number;
   #nextId = 1;
   #forkFaults: ForkFault[] = [];
@@ -268,6 +270,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
       },
       listTokens: async () => {
         live();
+        this.listTokensCalls += 1;
         await this.#hold("listTokens");
         const tokens = repo.tokens.map((token) => ({
           id: token.id,

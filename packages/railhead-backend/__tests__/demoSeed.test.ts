@@ -156,7 +156,11 @@ class SeedFake implements SeedArtifacts {
     return { remote: remote(name), token: token.plaintext };
   }
 
+  /** How many repositories were opened. */
+  gets = 0;
+
   async get(name: string): Promise<SeedArtifactsRepo> {
+    this.gets += 1;
     const handle = await this.fake.get(name);
     return {
       ...handle,
@@ -366,6 +370,48 @@ describe("seed target", () => {
       expect(seed.fake.liveTokens(main)).toEqual([]);
       expect(host.initialized).toBe(true);
       expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+    }));
+
+  it("answers repeated reads from one Artifacts read for a few seconds", () =>
+    withTarget(async ({ seed, target, clock }) => {
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      const before = seed.gets;
+      const reads = await Promise.all(Array.from({ length: 20 }, () => target.read()));
+      expect(reads).toEqual(Array.from({ length: 20 }, () => ok({ repo: REPO_ID, main: HEAD })));
+      clock.now += SEED_TARGET_LIMITS.readCacheMs - 1;
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+      expect(seed.gets).toBe(before + 1);
+
+      // Past the interval the next read asks Artifacts again.
+      clock.now += 1;
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+      expect(seed.gets).toBe(before + 2);
+    }));
+
+  it("drops the cached read after a seed or reset, even one that fails", () =>
+    withTarget(async ({ seed, target, main }) => {
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+      seed.fake.repos.get(main)?.commits.splice(0, 1, OTHER_HEAD);
+      // Within the interval the cached answer stands.
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({
+        ok: false,
+        code: "action_stale",
+      });
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: OTHER_HEAD }));
+
+      seed.fake.repos.get(main)?.commits.splice(0, 1, HEAD);
+      seed.failDeleteOf = main;
+      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+    }));
+
+  it("reads nothing from Artifacts before the Repo is initialized", () =>
+    withTarget(async ({ seed, target }) => {
+      expect(await target.read()).toEqual(ok(null));
+      expect(seed.gets).toBe(0);
     }));
 
   it("succeeds again without pushing for the same head, and refuses another head", () =>
@@ -988,6 +1034,29 @@ describe("seed control", () => {
         ok({ kind: "demo.reset", deleted: true }),
       );
       expect(calls.resets).toBe(1);
+    }));
+
+  it("refuses a proof whose signature counter did not advance, and spends it", () =>
+    withControl(async ({ control, calls, sign }) => {
+      // Signed first with counter 1, used after an assertion with counter 2 was recorded: what a
+      // cloned or replaying authenticator presents.
+      const earlier = await sign({ kind: "demo.reset" });
+      const later = await sign({ kind: "demo.seed", head: HEAD });
+      expect(await control.perform(later.challengeId, later.assertion, MAIN_BUNDLE)).toMatchObject({
+        ok: true,
+      });
+
+      expect(await control.perform(earlier.challengeId, earlier.assertion, null)).toMatchObject({
+        ok: false,
+        code: "proof_invalid",
+      });
+      expect(calls.resets).toBe(0);
+      expect(calls.seed).toHaveLength(1);
+      expect(await control.perform(earlier.challengeId, earlier.assertion, null)).toMatchObject({
+        ok: false,
+        code: "proof_expired",
+      });
+      expect(calls.resets).toBe(0);
     }));
 
   it("refuses an assertion for another challenge, a forged seal and an expired challenge", () =>
