@@ -12,7 +12,9 @@
 // awaits Artifacts; then one transaction checks that the agent still holds the claim at the
 // generation it sent, that the inbox gate is clear and that the decision versions are known, and
 // records the pin with those versions. Only then are the fork's tokens revoked. A repeat of the
-// same pin returns it, so a lost response is answered by retrying. From the pin on, `authorizeGit`
+// same pin returns it, so a lost response is answered by retrying. `pin`, the train's read, answers
+// only while those versions are still the current ones and the inbox gate is still clear, so a
+// decision superseded after ready never lets the train take the pin. From the pin on, `authorizeGit`
 // refuses every push to the fork; a push already granted may still move the fork's branch, but
 // never the pin, which names a commit rather than a ref.
 //
@@ -25,6 +27,7 @@ import {
   isId,
   type Actor,
   type ClaimId,
+  type DecisionRef,
   type IssueId,
   type RefusalReason,
 } from "@railhead/shared/events";
@@ -272,7 +275,7 @@ export function createClaims(
         if (decisions === null) {
           return fail("unavailable", "The claim's decision versions are unknown.");
         }
-        if (!pinReady(tx.sql, claimId, generation, commit)) {
+        if (!pinReady(tx.sql, claimId, generation, commit, decisions)) {
           throw new Error("a working claim read in this transaction could not be pinned");
         }
         tx.append(
@@ -294,9 +297,22 @@ export function createClaims(
 
     async pin(claimId) {
       if (!isId("claim", claimId)) return fail("invalid_request", "The claim id is malformed.");
+      // Every read below is synchronous, so they see one state of the Repo.
       const row = claimById(context.storage.sql, claimId);
       if (row === null || row.state !== "ready" || row.readyCommit === null) {
         return fail("claim_closed", "The claim is not ready, so it has no pin.");
+      }
+      const gate = ports().inbox.readyGateNow(claimId, row.generation);
+      if (gate === null) return fail("unavailable", "The inbox cannot confirm acknowledgements.");
+      if (gate.kind === "blocked") {
+        return fail("unacked_decision", "An inbox item affecting the claim is not acknowledged.");
+      }
+      const decisions = ports().decisions.currentVersions(claimId);
+      if (decisions === null) {
+        return fail("unavailable", "The claim's decision versions are unknown.");
+      }
+      if (row.readyDecisions === null || !sameVersions(row.readyDecisions, decisions)) {
+        return fail("decision_superseded", "A decision changed after the claim was marked ready.");
       }
       const pin: ClaimPin = { claimId, generation: row.generation, commit: row.readyCommit };
       return ok(pin);
@@ -444,6 +460,16 @@ function pushGrant(row: ClaimRow, principal: AgentPrincipal, repo: string): Port
     default:
       return row.state satisfies never;
   }
+}
+
+/** True when both lists name the same version of the same decisions, in any order. */
+function sameVersions(left: readonly DecisionRef[], right: readonly DecisionRef[]): boolean {
+  if (left.length !== right.length) return false;
+  const versions = new Map(left.map((ref) => [ref.decisionId, ref.version]));
+  return (
+    versions.size === left.length &&
+    right.every((ref) => versions.get(ref.decisionId) === ref.version)
+  );
 }
 
 function lost(): PortResult<never> {

@@ -97,13 +97,19 @@ function withReady<T>(
           { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
         )
       : base.artifacts;
-    const { versions } = world;
+    // The fakes read `world` on every call, so a test can change their answers after ready.
     const decisions =
-      versions === "real"
+      world.versions === "real"
         ? createDecisions(context, () => ports)
-        : { ...base.decisions, currentVersions: () => versions };
-    const inbox: InboxPort =
-      world.gateUnknown === true ? { ...base.inbox, readyGateNow: () => null } : base.inbox;
+        : {
+            ...base.decisions,
+            currentVersions: () => (world.versions === "real" ? null : world.versions),
+          };
+    const inbox: InboxPort = {
+      ...base.inbox,
+      readyGateNow: (claimId, generation) =>
+        world.gateUnknown === true ? null : base.inbox.readyGateNow(claimId, generation),
+    };
     const port: ClaimsPort = createClaims(context, () => ports);
     const ports: RepoPorts = {
       ...base,
@@ -548,6 +554,54 @@ describe("ready races", () => {
   });
 });
 
+/** Asks a question on the claim and records `option` as the owner's decision. */
+async function decide(
+  setup: Setup,
+  claimId: string,
+  expectedVersion: number | null,
+  existing?: DecisionRef["decisionId"],
+): Promise<DecisionRef> {
+  let decisionId = existing;
+  if (decisionId === undefined) {
+    const asked = await setup.decisions.ask(agent(1), claimId, {
+      generation: 1,
+      requestId: "req_upload0000000001",
+      text: "Should uploads above 10 MB be rejected or chunked?",
+      options: [
+        { key: "reject", label: "Reject them" },
+        { key: "chunk", label: "Upload them in chunks" },
+      ],
+      scope: ["src/upload.ts"],
+    });
+    if (!asked.ok) throw new Error(`ask refused: ${asked.code}`);
+    decisionId = asked.value.decisionId;
+  }
+  const recorded = await setup.decisions.record({
+    kind: "human",
+    userId: "usr_owner0001",
+    repoId: REPO,
+    grantId: crypto.randomUUID(),
+    action: {
+      kind: "decision.record",
+      decisionId,
+      option: expectedVersion === null ? "chunk" : "reject",
+      expectedVersion,
+    },
+  });
+  if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
+  return recorded.value;
+}
+
+/** Acknowledges every item delivered to agent 1. */
+async function ackAll(setup: Setup): Promise<void> {
+  const delivered = await setup.inbox.pending(agent(1), 16);
+  if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
+  for (const { item } of delivered.value.items) {
+    const acked = await setup.inbox.ack(agent(1), item, "Follow the decision.");
+    if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
+  }
+}
+
 describe("pin", () => {
   it("refuses a working claim, an unknown one and a malformed id", async () => {
     await withReady(async (setup) => {
@@ -555,6 +609,93 @@ describe("pin", () => {
       expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
       expectFailure(await setup.port.pin("clm_unknownclm1"), "claim_closed");
       expectFailure(await setup.port.pin("iss_issue0001"), "invalid_request");
+    });
+  });
+
+  it("refuses a pin whose decision was superseded after ready, even once the new version is acknowledged", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const first = await decide(setup, claim.claimId, null);
+      await ackAll(setup);
+      const readied = await setup.port.ready(agent(1), claim.claimId, request(WORK));
+      expect(readied).toMatchObject({ ok: true, value: { repeated: false } });
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
+      );
+
+      const second = await decide(setup, claim.claimId, 1, first.decisionId);
+      expect(second).toEqual({ decisionId: first.decisionId, version: 2 });
+
+      // The new version's item blocks the pin until it is acknowledged ...
+      expectFailure(await setup.port.pin(claim.claimId), "unacked_decision");
+      await ackAll(setup);
+      // ... and acknowledging it does not make work pinned under version 1 mergeable.
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+    });
+  });
+
+  it("answers while the versions match in any order and refuses one more decision", async () => {
+    const a: DecisionRef = { decisionId: "dec_decisiona1", version: 1 };
+    const b: DecisionRef = { decisionId: "dec_decisionb1", version: 3 };
+    const world: World = { fake: new FakeArtifacts(), versions: [a, b], artifacts: true };
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      const pinned = ok({ claimId: claim.claimId, generation: 1, commit: WORK });
+
+      world.versions = [b, a];
+      expect(await setup.port.pin(claim.claimId)).toEqual(pinned);
+
+      world.versions = [a, b, { decisionId: "dec_decisionc1", version: 1 }];
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      world.versions = [a];
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      world.versions = [];
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+    }, world);
+  });
+
+  it("refuses while the decision versions or the inbox gate are unknown, never treating them as clear", async () => {
+    const world: World = { fake: new FakeArtifacts(), versions: [], artifacts: true };
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+
+      world.versions = null;
+      expectFailure(await setup.port.pin(claim.claimId), "unavailable");
+      world.versions = [];
+      world.gateUnknown = true;
+      expectFailure(await setup.port.pin(claim.claimId), "unavailable");
+      world.gateUnknown = false;
+      expect((await setup.port.pin(claim.claimId)).ok).toBe(true);
+    }, world);
+  });
+
+  it("refuses a pin whose stored versions are missing or unreadable", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      const [stored] = setup.sql
+        .exec<{ ready_decisions: string | null }>(
+          "SELECT ready_decisions FROM claims_claims WHERE claim_id = ?",
+          claim.claimId,
+        )
+        .toArray();
+      expect(stored?.ready_decisions).toBe("[]");
+
+      for (const value of [null, "{", "[{}]", '[{"decisionId":"dec_decisiona1","version":0}]']) {
+        setup.sql.exec(
+          "UPDATE claims_claims SET ready_decisions = ? WHERE claim_id = ?",
+          value,
+          claim.claimId,
+        );
+        expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      }
     });
   });
 });
