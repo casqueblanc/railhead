@@ -1,8 +1,8 @@
 //! A claim's clone on disk.
 //!
-//! A new clone is built in a staging directory beside its target and renamed into place only once
-//! its fork is fetched and checked out, so a failed fetch leaves nothing behind and the next
-//! `rh work` or `rh claim` starts clean. An existing clone of the same claim and agent is reused:
+//! A new clone is built in a staging directory that this run creates beside its target and alone
+//! owns, and is renamed into place only once its fork is fetched and checked out, so a failed
+//! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. An existing clone of the same claim and agent is reused:
 //! its Railhead settings are refreshed and its working tree, index and refs are never touched.
 //!
 //! Every remote is checked against the agent's own origin and repository before Git sees it, so
@@ -253,33 +253,20 @@ fn create(dir: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes)
         .ok_or_else(|| conflict(dir, "is not a directory a clone can be created in"))?;
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|error| io_error("creating", parent, &error))?;
-    let mut staging_name = OsStr::new(".").to_os_string();
-    staging_name.push(name);
-    staging_name.push(".rh-partial");
-    let staging = parent.join(staging_name);
-    // A staging directory is left only when a run was killed mid-fetch; it holds nothing an agent
-    // wrote, but it is removed only when it is provably a staging clone of this same claim.
-    match occupant(&staging)? {
-        Occupant::Nothing => {}
-        Occupant::Clone(binding)
-            if binding.identity == identity.agent_id && binding.claim_id == claim.claim_id =>
-        {
-            fs::remove_dir_all(&staging).map_err(|error| io_error("removing", &staging, &error))?;
-        }
-        Occupant::Clone(_) | Occupant::Other => {
-            return Err(conflict(&staging, "is in the way of the clone"));
-        }
-    }
+    let staging = stage(parent, name)?;
 
     let built = build(&staging, identity, claim, remotes);
     let placed = built.and_then(|()| {
-        // An empty target directory is replaced by the finished clone.
+        // An empty target directory is replaced by the finished clone. Renaming a directory onto
+        // a non-empty one fails, so when two runs race for the same target the first one to
+        // publish keeps it and the other fails without touching it.
         if dir.exists() {
             fs::remove_dir(dir).map_err(|error| io_error("replacing", dir, &error))?;
         }
         fs::rename(&staging, dir).map_err(|error| io_error("moving the clone to", dir, &error))
     });
     if let Err(error) = placed {
+        // Only this run's own staging directory is removed; it never held anything an agent wrote.
         if staging.exists() {
             fs::remove_dir_all(&staging)
                 .map_err(|cleanup| io_error("removing", &staging, &cleanup))?;
@@ -287,6 +274,34 @@ fn create(dir: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes)
         return Err(error);
     }
     Ok(())
+}
+
+/// How many staging names `stage` tries before giving up.
+const STAGING_ATTEMPTS: u32 = 64;
+
+/// Creates a staging directory beside the target that belongs to this run alone.
+///
+/// The directory is created with `create_dir`, which fails when the name is taken, so this run
+/// owns exactly what it created and never adopts or deletes anything already there. A directory
+/// left by a killed run is kept for a person to inspect: its name says what it is, but nothing
+/// proves no other run is still using it.
+fn stage(parent: &Path, name: &OsStr) -> Result<PathBuf> {
+    let pid = std::process::id();
+    for attempt in 0..STAGING_ATTEMPTS {
+        let mut staging_name = OsStr::new(".").to_os_string();
+        staging_name.push(name);
+        staging_name.push(format!(".rh-partial-{pid}-{attempt}"));
+        let staging = parent.join(staging_name);
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error("creating", &staging, &error)),
+        }
+    }
+    Err(conflict(
+        parent,
+        "has no free name for a staging directory; remove old .rh-partial directories",
+    ))
 }
 
 fn build(staging: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes) -> Result<()> {
@@ -558,6 +573,76 @@ mod tests {
             default_dir(cwd, Some(&binding), &identity, "clm_old001"),
             Path::new("/work/demo-clm_old001")
         );
+        Ok(())
+    }
+
+    fn staging_path(parent: &Path, attempt: u32) -> PathBuf {
+        parent.join(format!(".demo.rh-partial-{}-{attempt}", std::process::id()))
+    }
+
+    #[test]
+    fn staging_creates_a_new_empty_directory_of_its_own() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let first = stage(parent.path(), OsStr::new("demo"))?;
+        assert_eq!(first, staging_path(parent.path(), 0));
+        assert_eq!(fs::read_dir(&first)?.count(), 0);
+        let second = stage(parent.path(), OsStr::new("demo"))?;
+        assert_eq!(second, staging_path(parent.path(), 1));
+        Ok(())
+    }
+
+    #[test]
+    fn staging_never_adopts_or_empties_a_taken_name() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let taken = staging_path(parent.path(), 0);
+        fs::create_dir(&taken)?;
+        fs::write(taken.join("work.txt"), "unpublished\n")?;
+        let staging = stage(parent.path(), OsStr::new("demo"))?;
+        assert_eq!(staging, staging_path(parent.path(), 1));
+        assert_eq!(fs::read_to_string(taken.join("work.txt"))?, "unpublished\n");
+        Ok(())
+    }
+
+    #[test]
+    fn staging_gives_up_when_every_name_is_taken() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        for attempt in 0..STAGING_ATTEMPTS {
+            fs::create_dir(staging_path(parent.path(), attempt))?;
+        }
+        let error = stage(parent.path(), OsStr::new("demo")).err();
+        assert!(
+            matches!(
+                error,
+                Some(Error::Local {
+                    code: LocalCode::WorkspaceConflict,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read_dir(parent.path())?.count(),
+            usize::try_from(STAGING_ATTEMPTS)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_reports_a_parent_it_cannot_write_in() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let missing = parent.path().join("missing");
+        let error = stage(&missing, OsStr::new("demo")).err();
+        assert!(
+            matches!(
+                error,
+                Some(Error::Local {
+                    code: LocalCode::WorkspaceConflict,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(!missing.exists());
         Ok(())
     }
 

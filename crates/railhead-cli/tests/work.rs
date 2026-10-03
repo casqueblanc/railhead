@@ -496,6 +496,82 @@ async fn a_failed_clone_leaves_nothing_and_the_next_run_recovers() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn a_new_clone_never_removes_a_clone_or_staging_directory_beside_it() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/claims",
+        fixture(&world, "claim.json", "claims the named issue")?,
+    )
+    .await;
+    // A real clone of the same claim, at the name older builds used for staging.
+    let named = ".demo-clm_42abcd.rh-partial";
+    let first = rh(
+        &world,
+        &world.outside(),
+        Some("atlas"),
+        &["claim", "iss_upload1", "--dir", named],
+    )?;
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    let kept = world.outside().join(named);
+    fs::write(kept.join("notes.txt"), "draft\n")?;
+    git_in(&world, &kept, &["add", "notes.txt"])?;
+    git_in(&world, &kept, &["commit", "--quiet", "-m", "wip"])?;
+    let kept_head = git_in(&world, &kept, &["rev-parse", "HEAD"])?;
+    fs::write(kept.join("scratch.txt"), "untracked\n")?;
+    // Another run's staging directory, still in use.
+    let other = world
+        .outside()
+        .join(".demo-clm_42abcd.rh-partial-999999999-0");
+    fs::create_dir(&other)?;
+    fs::write(other.join("fetching"), "in progress\n")?;
+    let unchanged = |world: &World| -> anyhow::Result<()> {
+        assert_eq!(git_in(world, &kept, &["rev-parse", "HEAD"])?, kept_head);
+        assert_eq!(fs::read_to_string(kept.join("notes.txt"))?, "draft\n");
+        assert_eq!(fs::read_to_string(kept.join("scratch.txt"))?, "untracked\n");
+        assert_eq!(fs::read_to_string(other.join("fetching"))?, "in progress\n");
+        Ok(())
+    };
+
+    world.server.reset().await;
+    let resumed = ResponseTemplate::new(200).set_body_raw(
+        resumed_claim_body(&world, "claim.json")?,
+        "application/json",
+    );
+    answer(&world, "POST", "/claims", resumed).await;
+    let args = ["--json", "claim", "iss_upload1", "--dir", "demo-clm_42abcd"];
+
+    // A failed fetch removes only the run's own staging directory.
+    point_fork_at(&world, &world.work.path().join("missing.git"))?;
+    let failed = rh(&world, &world.outside(), Some("atlas"), &args)?;
+    assert_eq!(failed.error_code()?, json!("git"), "{}", failed.stdout);
+    unchanged(&world)?;
+    assert!(!world.clone_dir().exists());
+
+    point_fork_at(&world, &world.fork)?;
+    let created = rh(&world, &world.outside(), Some("atlas"), &args)?;
+    assert_eq!(created.code, Some(0), "{}", created.stdout);
+    assert_eq!(
+        created.json()?.pointer("/data/clone/state"),
+        Some(&json!("created"))
+    );
+    assert_eq!(
+        git_in(&world, &world.clone_dir(), &["rev-parse", "HEAD"])?,
+        world.fork_head
+    );
+    unchanged(&world)?;
+    let mut partial: Vec<String> = fs::read_dir(world.work.path())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("rh-partial"))
+        .collect();
+    partial.sort();
+    assert_eq!(partial, [named, ".demo-clm_42abcd.rh-partial-999999999-0"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_mismatched_agent_or_directory_sends_nothing() -> anyhow::Result<()> {
     let world = world().await?;
     answer(
