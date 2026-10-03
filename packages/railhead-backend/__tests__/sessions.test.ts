@@ -780,10 +780,10 @@ describe("the agent routes", () => {
       error: { code: "challenge_invalid" },
     });
 
-    // Authenticated, the call reaches the claims module, which is not installed yet.
+    // Authenticated, status answers for the session's agent, which holds no claim yet.
     expect(await status(session.data.token)).toMatchObject({
-      ok: false,
-      error: { code: "unavailable" },
+      ok: true,
+      data: { agent: { agentId, state: "confirmed" }, claim: null },
     });
     expect(await status(flipAt(session.data.token, -2))).toMatchObject({
       ok: false,
