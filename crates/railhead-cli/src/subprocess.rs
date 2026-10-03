@@ -2,10 +2,14 @@
 //!
 //! On Unix the child leads its own process group, so a child that outlives its deadline is
 //! stopped together with everything it started: a Git hook, filter, transport or upload pack.
+//!
+//! On Unix, `SIGTERM` or `SIGINT` sent to `rh` while a child runs stops that child's process group
+//! the same way, so a Git clone cannot outlive `rh` and keep writing into a directory the caller is
+//! removing. The caller then reads [`interrupted`] and ends `rh` with [`exit_on`].
 
 use std::io::{self, Read as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,6 +39,9 @@ pub enum RunError {
     /// It was still running at its deadline and was stopped.
     #[error("was still running after {} seconds and was stopped", .0.as_secs())]
     TimedOut(Duration),
+    /// `rh` received this signal while it ran, and it was stopped.
+    #[error("was stopped because rh received signal {0}")]
+    Interrupted(i32),
 }
 
 /// Runs `command` and waits at most `limit` for it, counted from before it is started, capturing
@@ -46,7 +53,8 @@ pub enum RunError {
 /// # Errors
 ///
 /// [`RunError::Io`] when the child cannot be started or waited for, [`RunError::TimedOut`] when it
-/// or its stdout outlived `limit`.
+/// or its stdout outlived `limit`, [`RunError::Interrupted`] when `rh` received `SIGTERM` or
+/// `SIGINT` before or while it ran.
 pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Finished, RunError> {
     let deadline = Instant::now().checked_add(limit).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "the deadline is too far away")
@@ -69,6 +77,8 @@ fn run_until(
     });
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
+    signals::watch()?;
+    let _running = signals::Running::enter().map_err(RunError::Interrupted)?;
     let mut child = command.spawn()?;
     let deadline = match deadline() {
         Ok(deadline) => deadline,
@@ -100,26 +110,39 @@ fn run_until(
     // still be stopped with the group.
     let stdout = match stdout {
         None => Vec::new(),
-        Some(receiver) => {
+        Some(receiver) => loop {
+            if let Some(signal) = interrupted() {
+                stop(&mut child)?;
+                return Err(RunError::Interrupted(signal));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match receiver.recv_timeout(remaining) {
-                Ok(Ok(bytes)) => bytes,
+            match receiver.recv_timeout(remaining.min(MAX_POLL)) {
+                Ok(Ok(bytes)) => break bytes,
                 Ok(Err(error)) => {
                     stop(&mut child)?;
                     return Err(error.into());
                 }
-                Err(_) => {
+                Err(RecvTimeoutError::Timeout) if remaining > MAX_POLL => {}
+                Err(RecvTimeoutError::Timeout) => {
                     stop(&mut child)?;
                     return Err(RunError::TimedOut(limit));
                 }
+                Err(RecvTimeoutError::Disconnected) => {
+                    stop(&mut child)?;
+                    return Err(io::Error::other("the stdout reader stopped").into());
+                }
             }
-        }
+        },
     };
     let status = match wait_until(&mut child, deadline) {
-        Ok(Some(status)) => status,
-        Ok(None) => {
+        Ok(Waited::Exited(status)) => status,
+        Ok(Waited::TimedOut) => {
             stop(&mut child)?;
             return Err(RunError::TimedOut(limit));
+        }
+        Ok(Waited::Interrupted(signal)) => {
+            stop(&mut child)?;
+            return Err(RunError::Interrupted(signal));
         }
         Err(error) => {
             stop(&mut child)?;
@@ -129,16 +152,29 @@ fn run_until(
     Ok(Finished { status, stdout })
 }
 
-/// Waits for `child` until `deadline`; `None` when it is still running then.
-fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+/// How waiting for a child ended.
+enum Waited {
+    /// It exited.
+    Exited(ExitStatus),
+    /// It was still running at the deadline.
+    TimedOut,
+    /// `rh` received this signal while it was running.
+    Interrupted(i32),
+}
+
+/// Waits for `child` until `deadline`, or until `rh` receives `SIGTERM` or `SIGINT`.
+fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Waited> {
     let mut pause = Duration::from_millis(5);
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            return Ok(Waited::Exited(status));
+        }
+        if let Some(signal) = interrupted() {
+            return Ok(Waited::Interrupted(signal));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(None);
+            return Ok(Waited::TimedOut);
         }
         thread::sleep(pause.min(remaining));
         pause = pause.saturating_mul(2).min(MAX_POLL);
@@ -174,6 +210,139 @@ fn stop(child: &mut Child) -> io::Result<()> {
     let _ = child.kill();
     child.wait()?;
     Ok(())
+}
+
+/// The signal `rh` received, `SIGTERM` or `SIGINT`, once a child has been run; `None` before then
+/// and on platforms other than Unix.
+pub fn interrupted() -> Option<i32> {
+    signals::received()
+}
+
+/// Ends `rh` as `signal` would have, after the child it interrupted was stopped and cleaned up
+/// after.
+#[cfg(unix)]
+pub fn exit_on(signal: i32) -> ! {
+    signals::exit_on(signal)
+}
+
+/// Ends `rh` as `signal` would have. No signal is ever received here, so nothing calls it.
+#[cfg(not(unix))]
+pub fn exit_on(signal: i32) -> ! {
+    std::process::exit(128_i32.saturating_add(signal))
+}
+
+/// `SIGTERM` and `SIGINT`, watched from the first child on.
+///
+/// A watcher thread records the signal. When no child is running it ends `rh` at once, as the
+/// default action would. Otherwise the thread running the child sees the signal within
+/// [`MAX_POLL`], stops the child's process group and returns [`RunError::Interrupted`], so its
+/// caller can clean up before calling [`exit_on`]; the watcher ends `rh` anyway after
+/// [`INTERRUPT_GRACE`](signals::INTERRUPT_GRACE).
+#[cfg(unix)]
+mod signals {
+    use std::io;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    /// How long `rh` may keep running after a signal that arrived while a child ran: long enough
+    /// to stop the child's group and remove what the interrupted step had written.
+    pub const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+    /// The signal received, or 0 before any.
+    static RECEIVED: AtomicI32 = AtomicI32::new(0);
+    /// How many children are running.
+    static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    /// Whether the watcher started, or why it could not.
+    static WATCHER: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
+
+    /// Starts the watcher, once.
+    pub fn watch() -> io::Result<()> {
+        WATCHER
+            .get_or_init(|| start().map_err(|error| (error.kind(), error.to_string())))
+            .clone()
+            .map_err(|(kind, message)| io::Error::new(kind, message))
+    }
+
+    fn start() -> io::Result<()> {
+        let mut signals = Signals::new([SIGTERM, SIGINT])?;
+        thread::Builder::new()
+            .name("rh-signals".to_owned())
+            .spawn(move || {
+                // The first signal ends `rh`, so the iterator is never resumed.
+                if let Some(signal) = signals.forever().next() {
+                    // Stored before `RUNNING` is read, as `Running::enter` does the reverse, so
+                    // either a child about to start sees the signal or this sees the child.
+                    RECEIVED.store(signal, Ordering::SeqCst);
+                    if RUNNING.load(Ordering::SeqCst) > 0 {
+                        thread::sleep(INTERRUPT_GRACE);
+                    }
+                    exit_on(signal);
+                }
+            })?;
+        Ok(())
+    }
+
+    pub fn received() -> Option<i32> {
+        match RECEIVED.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    pub fn exit_on(signal: i32) -> ! {
+        // Restores the default action and raises the signal, so the parent sees `rh` ended by it.
+        // Should that fail, the exit status a shell reports for the signal is used instead.
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+        std::process::exit(128_i32.saturating_add(signal))
+    }
+
+    /// A running child, counted until dropped.
+    pub struct Running(());
+
+    impl Running {
+        /// Counts a child about to start, or returns the signal already received instead.
+        pub fn enter() -> Result<Self, i32> {
+            RUNNING.fetch_add(1, Ordering::SeqCst);
+            let running = Self(());
+            match received() {
+                None => Ok(running),
+                Some(signal) => Err(signal),
+            }
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            RUNNING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// No signal is watched on platforms other than Unix.
+#[cfg(not(unix))]
+mod signals {
+    use std::io;
+
+    pub fn watch() -> io::Result<()> {
+        Ok(())
+    }
+
+    pub fn received() -> Option<i32> {
+        None
+    }
+
+    pub struct Running(());
+
+    impl Running {
+        pub fn enter() -> Result<Self, i32> {
+            Ok(Self(()))
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

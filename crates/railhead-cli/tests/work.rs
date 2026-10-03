@@ -664,6 +664,116 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
     Ok(())
 }
 
+/// `rh work` whose fetch never ends, ended with `signal`: its Git process group is gone and its
+/// partial clone removed by the time `rh` exits, and `rh` ends as the signal would have ended it.
+#[cfg(unix)]
+async fn signal_during_fetch(signal: rustix::process::Signal) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::time::{Duration, Instant};
+
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    // The fork's upload pack records its own process and its parent, which Git started, and never
+    // answers. It ignores SIGTERM, so only killing the process group ends it.
+    let pid_file = world.work.path().join("upload-pack.pid");
+    let hang = world.work.path().join("hang.sh");
+    fs::write(
+        &hang,
+        format!(
+            "#!/bin/sh\necho $$ $PPID > '{0}.tmp'\nmv '{0}.tmp' '{0}'\ntrap '' TERM\n\
+             while :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    )?;
+    fs::set_permissions(&hang, fs::Permissions::from_mode(0o755))?;
+    point_fork_at(&world, &world.fork)?;
+    let pointed = fs::read_to_string(&world.git_config)?;
+    fs::write(
+        &world.git_config,
+        format!(
+            "{pointed}[remote \"origin\"]\n\tuploadpack = {}\n",
+            hang.display()
+        ),
+    )?;
+
+    // The Git deadline is far away, so only the signal stops the fetch.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rh"));
+    command
+        .args(["--json", "work"])
+        .current_dir(world.outside())
+        .env("RAILHEAD_HOME", world.home.path())
+        .env("RAILHEAD_AGENT", "atlas")
+        .env("RAILHEAD_GIT_TIMEOUT", "3600")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    git_env(&mut command, &world.git_config);
+    let mut rh = command.spawn()?;
+    let ready = Instant::now() + Duration::from_secs(60);
+    while !pid_file.exists() {
+        if Instant::now() > ready || rh.try_wait()?.is_some() {
+            rh.kill()?;
+            rh.wait()?;
+            anyhow::bail!("the fetch never started");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let recorded = fs::read_to_string(&pid_file)?;
+    let pids: Vec<i32> = recorded
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(pids.len(), 2, "{recorded}");
+
+    let pid = rustix::process::Pid::from_child(&rh);
+    let started = Instant::now();
+    rustix::process::kill_process(pid, signal)?;
+    let output = rh.wait_with_output()?;
+    // Stopped by the signal, not by the hour-long deadline.
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(output.status.signal(), Some(signal.as_raw()), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+
+    // Checked once, right after `rh` exited: a process killed then may only wait to be reaped.
+    for pid in pids {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()?;
+        let state = String::from_utf8(state.stdout)?;
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "process {pid} outlived rh: {state}"
+        );
+    }
+    assert!(!world.clone_dir().exists());
+    let partial: Vec<_> = fs::read_dir(world.work.path())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("rh-partial"))
+        .collect();
+    assert!(partial.is_empty(), "{partial:?}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_during_a_fetch_stops_git_before_rh_exits() -> anyhow::Result<()> {
+    signal_during_fetch(rustix::process::Signal::TERM).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigint_during_a_fetch_stops_git_before_rh_exits() -> anyhow::Result<()> {
+    signal_during_fetch(rustix::process::Signal::INT).await
+}
+
 /// Makes the fork's upload pack run `interloper` once, before the first fetch is answered, so it
 /// fills the target while that run is still building its clone.
 #[cfg(unix)]

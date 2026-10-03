@@ -530,6 +530,13 @@ fn run_git(action: &str, command: &mut Command, capture: bool) -> Result<Vec<u8>
             true,
             None,
         )),
+        // Never printed: `rh` ends on the signal once this step has cleaned up.
+        Err(error @ RunError::Interrupted(_)) => Err(local(
+            LocalCode::Git,
+            format!("{action}: git {error}"),
+            true,
+            None,
+        )),
     }
 }
 
