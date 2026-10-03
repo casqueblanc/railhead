@@ -1,7 +1,8 @@
 // `node scripts/demoSeed/cli.ts <seed|reset|bundle> ...`: the demo seed and reset commands.
 //
 //   seed --dry-run      plan the seed of demo/upload-app, name every target and print each issue's
-//                       exact title and body for the owner to file
+//                       exact title and body for the owner to file; it builds the bundle in
+//                       scratch, so it refuses whatever bundle refuses, and writes nothing
 //   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else
 //   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
 //                       refuses --dry-run, since seed --dry-run is the preview
@@ -86,7 +87,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
     overlay: STANDALONE_OVERLAY,
     overlaySubject: STANDALONE_SUBJECT,
   };
-  assertMatchesChecks(
+  const suites = assertMatchesChecks(
     manifest,
     readJsonAt(
       sourceRoot,
@@ -95,7 +96,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
       "acceptance checks",
     ),
   );
-  assertPathsInApp(sourceRoot, commit, manifest);
+  assertPathsInApp(sourceRoot, commit, manifest, suites);
 
   switch (command) {
     case "seed": {
@@ -136,16 +137,23 @@ function readJsonAt(sourceRoot: string, commit: string, path: string, what: stri
 }
 
 /**
- * Refuses a decision scope or issue path the app does not have at `commit`. The manifest's
- * collision check compares only its own strings, so a renamed or misspelt file would leave two
- * issues colliding on paper over code neither of them changes.
+ * Refuses a decision scope, issue path or acceptance suite the app does not have at `commit`. The
+ * manifest's collision check compares only its own strings, so a renamed or misspelt file would
+ * leave two issues colliding on paper over code neither of them changes; a missing suite would
+ * leave its option with no check to run once the decision chooses it.
  */
-function assertPathsInApp(sourceRoot: string, commit: string, manifest: SeedManifest): void {
+function assertPathsInApp(
+  sourceRoot: string,
+  commit: string,
+  manifest: SeedManifest,
+  suites: readonly string[],
+): void {
   const named = [
     ...manifest.decision.scope.map((path) => ({ field: "decision.scope", path })),
     ...manifest.issues.flatMap((issue, index) =>
       issue.touches.map((path) => ({ field: `issues[${index}].touches`, path })),
     ),
+    ...suites.map((path) => ({ field: "checks.json suite", path })),
   ];
   const missing = named
     .filter(({ path }) => !hasPathAt(sourceRoot, commit, `${manifest.source}/${path}`))

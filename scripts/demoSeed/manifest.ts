@@ -230,9 +230,11 @@ export function assertAskable(ask: Ask): void {
 /**
  * Checks the decision against the app's `acceptance/checks.json`: checks the app's own parser
  * accepts, the same decision key, a suite for every option and an option for every suite, so the
- * check the train runs can follow any answer and the current one can start.
+ * check the train runs can follow any answer and the current one can start. Returns each suite's
+ * file, relative to the app's root: the parser checks only their spelling, so the caller checks
+ * that the app has them.
  */
-export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): void {
+export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): readonly string[] {
   if (record(checks, "checks.json")["decision"] !== manifest.decision.key) {
     throw new SeedRefusal("checks.json names a different decision than the manifest.");
   }
@@ -255,12 +257,19 @@ export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): vo
       throw new SeedRefusal(`The decision offers ${option}, which no checks.json suite tags.`);
     }
   }
+  return definitions.suites.map((suite) => suite.file);
 }
 
-/** True when a path in `touches` is in `scope`, or below a scope directory. */
+/**
+ * True when a path in `touches` is in `scope`, below a scope directory, or a directory holding a
+ * scope path: a task that may change `src` may change `src/limits.ts`.
+ */
 export function overlaps(touches: readonly string[], scope: readonly string[]): boolean {
   return touches.some((touched) =>
-    scope.some((scoped) => touched === scoped || touched.startsWith(`${scoped}/`)),
+    scope.some(
+      (scoped) =>
+        touched === scoped || touched.startsWith(`${scoped}/`) || scoped.startsWith(`${touched}/`),
+    ),
   );
 }
 

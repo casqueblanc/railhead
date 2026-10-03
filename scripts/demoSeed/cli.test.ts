@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -15,6 +16,7 @@ import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { run } from "./cli.ts";
+import { MAX_BUNDLE_BYTES } from "./history.ts";
 import { loadManifest, SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
@@ -320,6 +322,44 @@ test("a decision scope or issue path the app lacks at the selected commit is ref
     "todo delete repository demo/upload-app",
     "note no live target exists yet",
   ]);
+});
+
+test("an acceptance suite the app lacks at the selected commit is refused", async () => {
+  const repo = sourceRepo("suites");
+  // Option b's suite is not in force, so the app's own checks would still pass without it.
+  git(repo, ["rm", "--quiet", "demo/upload-app/acceptance/option-b.test.ts"]);
+  git(repo, ["commit", "--quiet", "-m", "test: drop option b's suite"]);
+  const out = join(scratch, "suites.bundle");
+  const missing =
+    /[0-9a-f]{40}:demo\/upload-app has no checks\.json suite acceptance\/option-b\.test\.ts\.$/;
+
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), missing);
+  await assert.rejects(run(["bundle", "--out", out, "--source-root", repo]), missing);
+  assert.equal(existsSync(out), false);
+  // The commit before still plans and bundles.
+  const lines = await run(["bundle", "--out", out, "--revision", "HEAD~1", "--source-root", repo]);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
+  assert.equal(existsSync(out), true);
+});
+
+test("a revision whose bundle is above 8 MiB is refused by the dry run and the bundle", async () => {
+  const repo = sourceRepo("oversized");
+  // Random bytes do not compress, so the bundle carries all of them.
+  writeFileSync(
+    join(repo, "demo/upload-app/src/fixture.bin"),
+    randomBytes(MAX_BUNDLE_BYTES + 1024 * 1024),
+  );
+  git(repo, ["add", "--all"]);
+  git(repo, ["commit", "--quiet", "-m", "test: add a large fixture"]);
+  const out = join(scratch, "oversized.bundle");
+  const oversized = /The bundle is \d+ bytes; the seed accepts at most 8388608\.$/;
+
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), oversized);
+  await assert.rejects(run(["bundle", "--out", out, "--source-root", repo]), oversized);
+  assert.equal(existsSync(out), false);
+  // The commit before is within the limit and still plans.
+  const lines = await run(["seed", "--dry-run", "--revision", "HEAD~1", "--source-root", repo]);
+  assert.match(lines[0] ?? "", /^main [0-9a-f]{40} \(2 commits, full history\)$/);
 });
 
 test("reset still plans when the committed checks or the source do not match the manifest", async () => {

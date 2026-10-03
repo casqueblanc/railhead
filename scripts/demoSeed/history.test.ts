@@ -168,6 +168,20 @@ test("a bundle above the size limit is refused, and one at the limit is not", ()
   );
 });
 
+test("a dry run refuses a revision whose bundle is above the size limit", () => {
+  const source = sourceRepo("plan-limit");
+  const { head, commits, bytes } = buildMainBundle(request(source, "HEAD"));
+
+  assert.deepEqual(planHistory(request(source, "HEAD"), bytes.length), { head, commits });
+  assert.throws(
+    () => planHistory(request(source, "HEAD"), bytes.length - 1),
+    (error) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        `The bundle is ${bytes.length} bytes; the seed accepts at most ${bytes.length - 1}.`,
+  );
+});
+
 function header(text: string): Uint8Array {
   return new TextEncoder().encode(text);
 }

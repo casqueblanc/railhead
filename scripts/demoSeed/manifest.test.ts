@@ -85,7 +85,11 @@ test("the manifest's decision matches the app's tagged acceptance suites", () =>
   );
   const both = [suite("a", 1), suite("b", 2)];
 
-  assert.doesNotThrow(() => assertMatchesChecks(manifest, checks));
+  // Every suite's file, the one not in force included, for the caller to find in the app.
+  assert.deepEqual(assertMatchesChecks(manifest, checks), [
+    "acceptance/option-a.test.ts",
+    "acceptance/option-b.test.ts",
+  ]);
   assert.throws(
     () => assertMatchesChecks(manifest, { decision: "other", current: suite("a", 1), suites: [] }),
     /different decision/,
@@ -444,6 +448,28 @@ test("a scope directory covers the paths below it and nothing beside it", () => 
   assert.equal(overlaps(["src/upload/limits.ts"], ["src/upload"]), true);
   assert.equal(overlaps(["src/uploads.ts"], ["src/upload"]), false);
   assert.equal(overlaps([], ["src"]), false);
+});
+
+test("a touched directory covers the scope paths below it and nothing beside it", () => {
+  assert.equal(overlaps(["src"], ["src/limits.ts"]), true);
+  assert.equal(overlaps(["src/upload"], ["src/upload/limits.ts"]), true);
+  // A sibling sharing a prefix, and a scope path above the touched one's directory.
+  assert.equal(overlaps(["src/upload"], ["src/uploads.ts"]), false);
+  assert.equal(overlaps(["src/up"], ["src/upload/limits.ts"]), false);
+  assert.equal(overlaps(["src/limits"], ["src/limits.ts"]), false);
+});
+
+test("a third task touching a directory that holds the scope is a third collision", () => {
+  const base = fixture();
+  const [first, second, third] = issues(base);
+  assert.ok(first !== undefined && second !== undefined && third !== undefined);
+
+  assert.throws(
+    () => parseManifest({ ...base, issues: [first, second, { ...third, touches: ["src"] }] }),
+    /Exactly two issues must touch the decision's scope; 3 do\./,
+  );
+  // The fixture's third task touches files beside the scope and stays independent.
+  assert.equal(parseManifest(base).issues.length, 3);
 });
 
 test("an unreadable or unparsable manifest is refused", () => {

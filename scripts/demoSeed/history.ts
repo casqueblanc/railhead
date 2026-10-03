@@ -106,9 +106,16 @@ export function hasPathAt(sourceRoot: string, commit: string, path: string): boo
   return type === "blob" || type === "tree";
 }
 
-/** Computes the rewritten history without writing a bundle, for a dry run. */
-export function planHistory(request: ImportRequest): ImportedHistory {
-  return withScratch(request.sourceRoot, (scratch) => rewrite(request, scratch));
+/**
+ * The history `writeHistoryBundle` would write, for a dry run. It builds the same bundle in scratch
+ * and discards it, so a revision whose bundle is above `maxBytes` is refused here too.
+ */
+export function planHistory(
+  request: ImportRequest,
+  maxBytes: number = MAX_BUNDLE_BYTES,
+): ImportedHistory {
+  const { head, commits } = buildMainBundle(request, maxBytes);
+  return { head, commits };
 }
 
 /**
