@@ -3,16 +3,18 @@
 //
 // The container starts with the internet off and HTTPS intercepted. Every HTTP and HTTPS request it
 // makes goes to an outbound handler running in this Worker, outside the container: before a policy
-// is set that handler refuses everything, and afterwards it is the Git gateway for that policy. No
-// token is ever placed in the container; the gateway adds one to each request it forwards.
+// is set that handler refuses everything, and afterwards it is the Git gateway for that policy until
+// the sandbox's deadline. No token is ever placed in the container; the gateway adds one to each
+// request it forwards. Each object serves one incarnation behind a `SandboxFence` (see `fence.ts`).
 //
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
 
 import { ContainerProxy, Sandbox, getSandbox } from "@cloudflare/sandbox";
-import type { SandboxDriver } from "./entry";
+import type { SandboxCommand, SandboxDriver } from "./entry";
+import { SandboxFence } from "./fence";
 import { serveGitGateway } from "./gateway";
-import { parseSandboxPolicy, type SandboxPolicy } from "./policy";
+import { grantedPolicy, type SandboxPolicy } from "./policy";
 
 export { ContainerProxy };
 
@@ -22,6 +24,12 @@ const TOKEN_TTL_SECONDS = 60;
 /** The SDK's idle stop: longer than `MAX_SANDBOX_LIFETIME_MS`, so it never ends a live attempt. */
 const IDLE_BACKSTOP = "45m";
 
+/**
+ * The SDK's session token for a command that shares no shell state with the others: what
+ * `getSandbox(..., { enableDefaultSession: false })` sends for each `exec` in SDK 0.12.1.
+ */
+const SESSIONLESS = "__DISABLE_SESSION__";
+
 /** The outbound handler a sandbox's policy selects. */
 const GIT_GATEWAY = "gitGateway";
 
@@ -29,6 +37,46 @@ const GIT_GATEWAY = "gitGateway";
 export class RailheadSandbox extends Sandbox<Env> {
   override enableInternet = false;
   override interceptHttps = true;
+
+  readonly #fence = new SandboxFence(
+    this.ctx.storage,
+    {
+      route: (grant) => this.setOutboundHandler(GIT_GATEWAY, grant),
+      exec: (command, options) =>
+        this.execWithSessionToken(command, SESSIONLESS, {
+          timeout: options.timeoutMs,
+          ...(options.env === undefined ? {} : { env: options.env }),
+          ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        }),
+      destroy: () => this.destroy(),
+      scheduleExpiry: async (deadline) => {
+        await this.schedule(new Date(deadline), "railheadExpire");
+      },
+    },
+    Date.now,
+  );
+
+  /** Starts this sandbox's one incarnation under `policy` until `deadline`. */
+  async railheadStart(policy: SandboxPolicy, deadline: number): Promise<void> {
+    await this.#fence.start(policy, deadline);
+  }
+
+  /** Runs one command in the incarnation, cut to its remaining lifetime. */
+  async railheadExec(
+    command: SandboxCommand,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    return this.#fence.exec(command);
+  }
+
+  /** Retires the incarnation for good and destroys its container. */
+  async railheadRetire(): Promise<void> {
+    await this.#fence.retire();
+  }
+
+  /** Runs at the deadline `railheadStart` scheduled. */
+  async railheadExpire(): Promise<void> {
+    await this.#fence.expire();
+  }
 }
 
 // Until a policy selects the gateway, every request is refused.
@@ -37,7 +85,7 @@ RailheadSandbox.outbound = () =>
 
 RailheadSandbox.outboundHandlers = {
   [GIT_GATEWAY]: (request: Request, env: Env, ctx: { params?: unknown }) =>
-    serveGitGateway(request, parseSandboxPolicy(ctx.params), {
+    serveGitGateway(request, grantedPolicy(ctx.params, Date.now()), {
       mint: async (repo, scope) => {
         using handle = await env.ARTIFACTS.get(repo);
         const token = await handle.createToken(scope, TOKEN_TTL_SECONDS);
@@ -47,29 +95,27 @@ RailheadSandbox.outboundHandlers = {
     }),
 };
 
+/**
+ * Opens the named sandbox. The SDK refuses a name it cannot use, such as one over 63 characters,
+ * before any request is sent.
+ */
+export function openSandbox(env: Env, name: string): RailheadSandbox {
+  // The sandbox module destroys every sandbox itself, and each one retires at its deadline. The
+  // idle stop is only a backstop, past the longest lifetime, for a sandbox whose teardown never ran.
+  return getSandbox(env.SANDBOX, name, { sleepAfter: IDLE_BACKSTOP, enableDefaultSession: false });
+}
+
 /** The driver over the Sandbox SDK, with each sandbox a `RailheadSandbox` named by its slot. */
 export function sdkDriver(env: Env): SandboxDriver {
-  const open = (name: string) =>
-    // The sandbox module destroys every sandbox itself. The idle stop is only a backstop, past the
-    // longest lifetime, for a sandbox whose teardown never ran.
-    getSandbox(env.SANDBOX, name, { sleepAfter: IDLE_BACKSTOP, enableDefaultSession: false });
   return {
-    async start(name: string, policy: SandboxPolicy) {
-      const box = open(name);
-      await box.setOutboundHandler(GIT_GATEWAY, policy);
-      const probe = await box.exec("git --version");
-      if (probe.exitCode !== 0) throw new Error("sandbox did not answer its first command");
+    async start(name, policy, deadline) {
+      await openSandbox(env, name).railheadStart(policy, deadline);
     },
     async exec(name, command) {
-      const result = await open(name).exec(command.command, {
-        timeout: command.timeoutMs,
-        ...(command.env === undefined ? {} : { env: command.env }),
-        ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
-      });
-      return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+      return openSandbox(env, name).railheadExec(command);
     },
     async destroy(name) {
-      await open(name).destroy();
+      await openSandbox(env, name).railheadRetire();
     },
   };
 }

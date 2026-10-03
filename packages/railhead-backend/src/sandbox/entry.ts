@@ -2,10 +2,12 @@
 // No adapter calls it directly; the merge and checks modules reach it through `ports().sandbox`.
 //
 // An attempt asks for a sandbox with `admit`, runs commands with `exec` and ends it with `release`.
-// Admission is bounded per repository (see `admission.ts`); a sandbox past its lifetime is torn
-// down by the next `admit` or `exec`, never left to the platform's inactivity timeout. Command
-// output comes from code the sandbox ran and is untrusted: callers never log it or give it
-// authority.
+// Admission is bounded per repository (see `admission.ts`). A sandbox's lifetime runs from its
+// admission and is enforced twice: its own object retires it at the deadline through a durable alarm
+// and its Git grant lapses then (see `fence.ts`), whether or not anything else happens, and the next
+// `admit` or `exec` here tears down every slot past its deadline and frees it once the teardown is
+// confirmed. Command output comes from code the sandbox ran and is untrusted: callers never log it
+// or give it authority.
 
 import { fail, ok, type PortResult } from "../contracts/result";
 import type { ModuleFactory } from "../repo/composeRepo";
@@ -28,8 +30,11 @@ export const START_TIMEOUT_MS = 90_000;
 /** How long a teardown may take before the slot is recorded as uncertain. */
 export const DESTROY_TIMEOUT_MS = 30_000;
 
-/** The longest one command may run. */
+/** The longest one command may run. A command is also cut to its sandbox's remaining lifetime. */
 export const MAX_COMMAND_TIMEOUT_MS = 10 * 60_000;
+
+/** How much longer than its own timeout a command's answer may take to arrive. */
+export const EXEC_GRACE_MS = 15_000;
 
 /** The most bytes of each output stream returned from one command; the rest is cut. */
 export const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -70,7 +75,10 @@ export interface SandboxPort {
     policy: SandboxPolicy,
     lifetimeMs: number,
   ): Promise<PortResult<Admission>>;
-  /** Runs one command in the attempt's running sandbox. A timeout leaves the slot `uncertain`. */
+  /**
+   * Runs one command in the attempt's running sandbox, cut to its remaining lifetime. A timeout
+   * leaves the slot `uncertain`; a result that arrives after the slot ended is refused.
+   */
   exec(attemptId: SandboxAttemptId, command: SandboxCommand): Promise<PortResult<SandboxExec>>;
   /**
    * Destroys the attempt's sandbox and frees its slot, or leaves the slot `uncertain` when the
@@ -82,16 +90,26 @@ export interface SandboxPort {
   slots(): Promise<PortResult<SlotRecord[]>>;
 }
 
-/** The container runtime behind the port. Production uses `sdkDriver`; tests supply their own. */
+/**
+ * The container runtime behind the port. Production uses `sdkDriver`; tests supply their own. Each
+ * sandbox name is used for one admission only.
+ */
 export interface SandboxDriver {
-  /** Starts the named sandbox under `policy` and confirms it answers. */
-  start(sandbox: string, policy: SandboxPolicy): Promise<void>;
-  /** Runs one command and returns its exit code and full output. */
+  /**
+   * Starts the named sandbox under `policy`, arranges its own teardown at `deadline` and confirms
+   * it answers. Refused once the sandbox was destroyed.
+   */
+  start(sandbox: string, policy: SandboxPolicy, deadline: number): Promise<void>;
+  /** Runs one command and returns its exit code and full output. Refused once destroyed. */
   exec(
     sandbox: string,
     command: SandboxCommand,
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
-  /** Destroys the named sandbox. Destroying one that is not running succeeds. */
+  /**
+   * Destroys the named sandbox for good: no later start or command runs in it. Resolves once no
+   * start or command already under way can leave it running. Destroying one that never ran, or
+   * was already destroyed, succeeds.
+   */
   destroy(sandbox: string): Promise<void>;
 }
 
@@ -99,34 +117,38 @@ export interface SandboxDriver {
 export interface SandboxDeps {
   driver: SandboxDriver;
   clock: () => number;
-  /** How long a start and a teardown may take; `START_TIMEOUT_MS` and `DESTROY_TIMEOUT_MS`. */
-  timeouts?: { startMs: number; destroyMs: number };
+  /**
+   * How long a start and a teardown may take, and how late a command's answer may be:
+   * `START_TIMEOUT_MS`, `DESTROY_TIMEOUT_MS` and `EXEC_GRACE_MS`.
+   */
+  timeouts?: { startMs: number; destroyMs: number; execGraceMs: number };
 }
 
 /** Builds the sandbox access of one repository over `driver`. */
 export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxPort {
   const { driver, clock } = deps;
-  const { startMs, destroyMs } = deps.timeouts ?? {
+  const { startMs, destroyMs, execGraceMs } = deps.timeouts ?? {
     startMs: START_TIMEOUT_MS,
     destroyMs: DESTROY_TIMEOUT_MS,
+    execGraceMs: EXEC_GRACE_MS,
   };
 
   async function teardown(slot: SlotRecord): Promise<PortResult<SlotRecord | null>> {
     const outcome = await settle(driver.destroy(slot.sandbox), destroyMs);
-    if (outcome.kind !== "done") return uncertain(slot.attemptId, "destroy_failed");
-    slots.released(slot.attemptId);
+    if (outcome.kind !== "done") return uncertain(slot, "destroy_failed");
+    slots.released(slot);
     return ok(null);
   }
 
   async function sweep(): Promise<void> {
     for (const slot of slots.expired(clock())) {
-      const releasing = slots.beginRelease(slot.attemptId);
+      const releasing = slots.beginRelease(slot.attemptId, slot.sandbox);
       if (releasing !== null) await teardown(releasing);
     }
   }
 
-  function uncertain(attemptId: string, reason: UncertainReason): PortResult<never> {
-    slots.uncertain(attemptId, reason);
+  function uncertain(slot: SlotRecord, reason: UncertainReason): PortResult<never> {
+    slots.uncertain(slot, reason);
     return fail("unavailable", "The sandbox did not confirm; its slot is held until released.");
   }
 
@@ -136,9 +158,10 @@ export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxP
       const admission = slots.admit(attemptId, policy, lifetimeMs, clock());
       if (!admission.ok || admission.value.kind !== "admitted") return admission;
       const { slot } = admission.value;
-      const outcome = await settle(driver.start(slot.sandbox, slot.policy), startMs);
-      if (outcome.kind !== "done") return uncertain(attemptId, "start_failed");
-      const running = slots.started(attemptId, clock());
+      if (slot.deadline === null) throw new Error("admitted slot has no deadline");
+      const outcome = await settle(driver.start(slot.sandbox, slot.policy, slot.deadline), startMs);
+      if (outcome.kind !== "done") return uncertain(slot, "start_failed");
+      const running = slots.started(slot);
       if (running === null) return fail("busy", "The sandbox was released while it started.");
       return ok({ kind: "admitted", slot: running });
     },
@@ -156,11 +179,24 @@ export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxP
       }
       await sweep();
       const slot = slots.get(attemptId);
-      if (slot === null || slot.state !== "running") {
+      if (slot === null || slot.state !== "running" || slot.deadline === null) {
         return fail("not_found", "This attempt has no running sandbox.");
       }
-      const outcome = await settle(driver.exec(slot.sandbox, command), command.timeoutMs);
-      if (outcome.kind !== "done") return uncertain(attemptId, "command_timeout");
+      const { deadline } = slot;
+      const limit = Math.min(command.timeoutMs, deadline - clock());
+      const outcome = await settle(driver.exec(slot.sandbox, command), limit + execGraceMs);
+      // The slot may have been released, replaced or passed its deadline while the command ran.
+      const current = slots.get(attemptId);
+      if (
+        current === null ||
+        current.sandbox !== slot.sandbox ||
+        current.state !== "running" ||
+        clock() >= deadline
+      ) {
+        await sweep();
+        return fail("not_found", "This attempt's sandbox ended while the command ran.");
+      }
+      if (outcome.kind !== "done") return uncertain(slot, "command_timeout");
       const stdout = cut(outcome.value.stdout);
       const stderr = cut(outcome.value.stderr);
       return ok({
@@ -185,7 +221,7 @@ export function createSandboxPort(slots: SlotTable, deps: SandboxDeps): SandboxP
 
 /** Builds the sandbox access of one repository. */
 export const sandbox: ModuleFactory<SandboxPort> = (context) =>
-  createSandboxPort(new SlotTable(context.storage, context.repoId), {
+  createSandboxPort(new SlotTable(context.storage), {
     driver: sdkDriver(context.env),
     clock: context.clock,
   });

@@ -49,6 +49,28 @@ export function parseSandboxPolicy(value: unknown): SandboxPolicy | null {
   return { host, namespace, read: repos, write: { repo, refPrefix } };
 }
 
+/**
+ * What one sandbox's outbound handler receives: its policy and the moment it lapses, in milliseconds
+ * since the Unix epoch. The gateway refuses everything once `expiresAt` has passed, so a container
+ * that outlives its deadline holds no Git authority.
+ */
+export interface SandboxGrant {
+  /** What the sandbox may reach. */
+  policy: SandboxPolicy;
+  /** When the grant lapses: the sandbox's deadline. */
+  expiresAt: number;
+}
+
+/** The policy `value` grants at `now`, or `null` when it is not a valid grant or has lapsed. */
+export function grantedPolicy(value: unknown, now: number): SandboxPolicy | null {
+  if (!isRecord(value)) return null;
+  const { expiresAt } = value;
+  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || now >= expiresAt) {
+    return null;
+  }
+  return parseSandboxPolicy(value["policy"]);
+}
+
 function isCandidatePrefix(prefix: string): boolean {
   if (!prefix.startsWith(CANDIDATE_REF_PREFIX) || !prefix.endsWith("/")) return false;
   return REF_SEGMENT.test(prefix.slice(CANDIDATE_REF_PREFIX.length, -1));

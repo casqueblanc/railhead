@@ -7,7 +7,10 @@
 // still counts against the bound, so an unconfirmed sandbox is never forgotten while it may run.
 //
 // Slot changes are written before the I/O they describe, so a request interleaved at an `await`
-// sees the slot already taken.
+// sees the slot already taken. Each admission gets a fresh sandbox name, used for no other slot, and
+// every later change names that sandbox as well as the attempt: a start, command or teardown that
+// completes after its slot was released, or replaced by a new admission of the same attempt, finds
+// no slot to change.
 
 import { fail, ok, type PortResult } from "../contracts/result";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
@@ -56,7 +59,7 @@ export type UncertainReason = "start_failed" | "command_timeout" | "destroy_fail
 export interface SlotRecord {
   /** The attempt. */
   attemptId: SandboxAttemptId;
-  /** The sandbox's Durable Object name. */
+  /** The sandbox's Durable Object name: fresh for each admission, so it names this incarnation. */
   sandbox: string;
   /** Where it stands. */
   state: SlotState;
@@ -64,11 +67,11 @@ export interface SlotRecord {
   reason: UncertainReason | null;
   /** The network policy its sandbox runs under. */
   policy: SandboxPolicy;
-  /** How long its sandbox may live once running. */
+  /** How long its sandbox may live from admission. */
   lifetimeMs: number;
   /** When it was requested. */
   requestedAt: number;
-  /** When its sandbox must be gone, or `null` while it is queued. */
+  /** When its sandbox must be gone, counted from admission, or `null` while it is queued. */
   deadline: number | null;
 }
 
@@ -113,12 +116,10 @@ interface SlotRow extends Record<string, SqlStorageValue> {
 /** The slots of one repository, in its storage. */
 export class SlotTable {
   readonly #storage: RepoStorage;
-  readonly #repoId: string;
 
-  constructor(storage: RepoStorage, repoId: string) {
+  constructor(storage: RepoStorage) {
     migrate(storage, OWNER, MIGRATIONS);
     this.#storage = storage;
-    this.#repoId = repoId;
   }
 
   /** Every slot, oldest request first. */
@@ -197,7 +198,7 @@ export class SlotTable {
            (attempt_id, sandbox, state, reason, policy, lifetime_ms, requested_at, seq, seen_at, deadline)
          VALUES (?, ?, 'queued', NULL, ?, ?, ?, ?, ?, NULL)`,
         attemptId,
-        `${this.#repoId}.${attemptId}`.toLowerCase(),
+        sandboxName(),
         JSON.stringify(policy),
         lifetimeMs,
         now,
@@ -210,44 +211,52 @@ export class SlotTable {
     });
   }
 
-  /** Marks a starting sandbox running until its deadline. */
-  started(attemptId: string, now: number): SlotRecord | null {
-    return this.#move(attemptId, ["starting"], "running", null, (slot) => now + slot.lifetimeMs);
+  /** Marks `slot`'s starting sandbox running until its deadline, if the slot still holds it. */
+  started(slot: SlotRecord): SlotRecord | null {
+    return this.#move(slot, ["starting"], "running");
   }
 
-  /** Marks a sandbox whose start, command or teardown did not confirm. Its slot stays held. */
-  uncertain(attemptId: string, reason: UncertainReason): SlotRecord | null {
-    return this.#move(attemptId, ["starting", "running", "releasing"], "uncertain", reason);
+  /**
+   * Marks `slot`'s sandbox, whose start, command or teardown did not confirm, as uncertain if the
+   * slot still holds it. The slot stays held.
+   */
+  uncertain(slot: SlotRecord, reason: UncertainReason): SlotRecord | null {
+    return this.#move(slot, ["starting", "running", "releasing"], "uncertain", reason);
   }
 
   /**
    * Begins a teardown: a queued attempt is removed at once (it holds no sandbox) and `null` is
    * returned; any other slot moves to `releasing` and is returned for its sandbox to be destroyed.
+   * With `sandbox`, only a slot still holding that sandbox is touched.
    */
-  beginRelease(attemptId: string): SlotRecord | null {
+  beginRelease(attemptId: string, sandbox?: string): SlotRecord | null {
     return atomically(this.#storage, () => {
       const slot = this.get(attemptId);
-      if (slot === null) return null;
+      if (slot === null || (sandbox !== undefined && slot.sandbox !== sandbox)) return null;
       if (slot.state === "queued") {
         this.#storage.sql.exec("DELETE FROM sandbox_slots WHERE attempt_id = ?", attemptId);
         return null;
       }
-      return this.#move(attemptId, ["starting", "running", "releasing", "uncertain"], "releasing");
+      return this.#move(slot, ["starting", "running", "releasing", "uncertain"], "releasing");
     });
   }
 
-  /** Frees a slot once its sandbox is confirmed destroyed. */
-  released(attemptId: string): void {
+  /** Frees `slot` once its sandbox is confirmed retired, if the slot still holds that sandbox. */
+  released(slot: SlotRecord): void {
     this.#storage.sql.exec(
-      "DELETE FROM sandbox_slots WHERE attempt_id = ? AND state = 'releasing'",
-      attemptId,
+      "DELETE FROM sandbox_slots WHERE attempt_id = ? AND sandbox = ? AND state = 'releasing'",
+      slot.attemptId,
+      slot.sandbox,
     );
   }
 
-  /** Running sandboxes past their deadline, which must be torn down. */
+  /**
+   * Admitted slots past their deadline, whatever their state, which must be torn down. A starting,
+   * uncertain or interrupted releasing slot is included: its sandbox may be running.
+   */
   expired(now: number): SlotRecord[] {
     return this.#rows(
-      "SELECT * FROM sandbox_slots WHERE state = 'running' AND deadline <= ? ORDER BY seq",
+      "SELECT * FROM sandbox_slots WHERE state != 'queued' AND deadline <= ? ORDER BY seq",
       now,
     );
   }
@@ -262,34 +271,31 @@ export class SlotTable {
     if (ahead > 0 || active >= MAX_ACTIVE_SANDBOXES) {
       return ok({ kind: "queued", position: ahead + 1 });
     }
-    const admitted = this.#move(
-      slot.attemptId,
-      ["queued"],
-      "starting",
-      null,
-      () => now + slot.lifetimeMs,
-    );
+    const admitted = this.#move(slot, ["queued"], "starting", null, now + slot.lifetimeMs);
     if (admitted === null) throw new Error("queued slot vanished during admission");
     return ok({ kind: "admitted", slot: admitted });
   }
 
+  // Moves the slot holding `target`'s sandbox from one of `from` to `to`. A slot that was freed, or
+  // now holds another sandbox, is left alone and `null` returned.
   #move(
-    attemptId: string,
+    target: SlotRecord,
     from: readonly SlotState[],
     to: SlotState,
     reason: UncertainReason | null = null,
-    deadline?: (slot: SlotRecord) => number,
+    deadline?: number,
   ): SlotRecord | null {
-    const slot = this.get(attemptId);
-    if (slot === null || !from.includes(slot.state)) return null;
+    const slot = this.get(target.attemptId);
+    if (slot === null || slot.sandbox !== target.sandbox || !from.includes(slot.state)) return null;
     this.#storage.sql.exec(
-      "UPDATE sandbox_slots SET state = ?, reason = ?, deadline = ? WHERE attempt_id = ?",
+      "UPDATE sandbox_slots SET state = ?, reason = ?, deadline = ? WHERE attempt_id = ? AND sandbox = ?",
       to,
       reason,
-      deadline === undefined ? slot.deadline : deadline(slot),
-      attemptId,
+      deadline ?? slot.deadline,
+      slot.attemptId,
+      slot.sandbox,
     );
-    return this.get(attemptId);
+    return this.get(slot.attemptId);
   }
 
   #count(where: string): number {
@@ -312,6 +318,16 @@ export class SlotTable {
       .toArray()
       .map(toRecord);
   }
+}
+
+/**
+ * A fresh sandbox name: 128 random bits as lowercase hex. It carries no repository or attempt text,
+ * so it fits the SDK's 63-character limit for every accepted identifier, and attempts differing
+ * only in case never share a sandbox.
+ */
+export function sandboxName(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `sbx-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function toRecord(row: SlotRow): SlotRecord {

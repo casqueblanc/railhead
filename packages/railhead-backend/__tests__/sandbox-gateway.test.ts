@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import {
   CANDIDATE_REF_PREFIX,
+  grantedPolicy,
   parseSandboxPolicy,
   type SandboxPolicy,
 } from "../src/sandbox/policy";
@@ -39,6 +40,10 @@ function push(...commands: string[]): string {
 
 function url(repo: string, op: string, host = HOST): string {
   return `https://${host}/git/railhead/${repo}.git/${op}`;
+}
+
+function fetchRefs(repo = "main-repo"): Request {
+  return new Request(`${url(repo, "info/refs")}?service=git-upload-pack`);
 }
 
 /** Gateway dependencies that record what was minted and forwarded. */
@@ -298,6 +303,8 @@ describe("RailheadSandbox outbound handlers", () => {
     expect(await refusal(response)).toBe("policy");
   });
 
+  const grant = { policy: POLICY, expiresAt: Date.now() + 60_000 };
+
   it("refuses another host, an invalid policy and a main push before reaching Artifacts", async () => {
     const gateway = RailheadSandbox.outboundHandlers?.["gitGateway"];
     if (gateway === undefined) throw new Error("no git gateway handler");
@@ -309,17 +316,54 @@ describe("RailheadSandbox outbound handlers", () => {
     // `remoteBindings: false` leaves ARTIFACTS unusable here, so a forwarded request would throw.
     expect(
       await refusal(
-        await gateway(new Request("https://example.com/"), env, { ...context, params: POLICY }),
+        await gateway(new Request("https://example.com/"), env, { ...context, params: grant }),
       ),
     ).toBe("host");
     expect(
       await refusal(
         await gateway(new Request("https://example.com/"), env, {
           ...context,
-          params: { host: 1 },
+          params: { ...grant, policy: { host: 1 } },
         }),
       ),
     ).toBe("policy");
-    expect(await refusal(await gateway(mainPush, env, { ...context, params: POLICY }))).toBe("ref");
+    expect(await refusal(await gateway(mainPush, env, { ...context, params: grant }))).toBe("ref");
+  });
+
+  it("refuses everything once the grant has lapsed, even a request the policy allows", async () => {
+    const gateway = RailheadSandbox.outboundHandlers?.["gitGateway"];
+    if (gateway === undefined) throw new Error("no git gateway handler");
+    // A live grant is applied: a repository outside it is refused for that reason, not the grant.
+    expect(
+      await refusal(await gateway(fetchRefs("elsewhere"), env, { ...context, params: grant })),
+    ).toBe("repository");
+    for (const expiresAt of [Date.now() - 1, Date.now() - 60_000]) {
+      const lapsed = { policy: POLICY, expiresAt };
+      expect(await refusal(await gateway(fetchRefs(), env, { ...context, params: lapsed }))).toBe(
+        "policy",
+      );
+    }
+    // A bare policy, without a deadline, grants nothing.
+    expect(await refusal(await gateway(fetchRefs(), env, { ...context, params: POLICY }))).toBe(
+      "policy",
+    );
+  });
+});
+
+describe("grantedPolicy", () => {
+  it("grants the policy until expiresAt and nothing from then on", () => {
+    const grant = { policy: POLICY, expiresAt: 5_000 };
+    expect(grantedPolicy(grant, 4_999)).toEqual(POLICY);
+    expect(grantedPolicy(grant, 5_000)).toBeNull();
+  });
+
+  it.each([
+    ["no deadline", { policy: POLICY }],
+    ["a fractional deadline", { policy: POLICY, expiresAt: 5_000.5 }],
+    ["a string deadline", { policy: POLICY, expiresAt: "9999999999999" }],
+    ["an invalid policy", { policy: { ...POLICY, host: "" }, expiresAt: 5_000 }],
+    ["null", null],
+  ])("refuses a grant with %s", (_name, value) => {
+    expect(grantedPolicy(value, 1_000)).toBeNull();
   });
 });
