@@ -281,27 +281,31 @@ async fn sync_prints_each_item_in_the_fixed_format_and_acknowledges_nothing() ->
         .mount(&world.server)
         .await;
 
+    // The whole page, so a stray line such as the inbox footer, which would send the agent back
+    // to rh sync under the items it was just shown, fails the test.
     let text = rh(&world, &["sync", "--limit", "16"])?;
     assert_eq!(text.code, Some(0), "{}", text.stderr);
-    for line in [
-        "[17] rework for claim \"clm_42abcd\"\n",
-        "     decision: \"dec_upload1\" v2, supersedes v1, recorded by \"usr_lemarier\" through Railhead\n",
-        &format!("     question: \"{QUESTION}\"\n"),
-        "     chosen: \"chunk\" \"Upload them in chunks\"\n",
-        "     was: \"reject\" \"Reject them\"\n",
-        "     scope: \"src/upload.ts\"\n",
-        "     action: rework required; redo work that relied on the earlier version\n",
-        "     acknowledge: rh ack 17 --plan <plan>\n",
-        "[18] conflict for claim \"clm_42abcd\"\n",
-        "     acknowledge: rh ack 18 --plan <plan>\n",
-        "next: rh ack\n",
-    ] {
-        assert!(
-            text.stdout.contains(line),
-            "missing {line:?} in\n{}",
-            text.stdout
-        );
-    }
+    assert_eq!(
+        text.stdout,
+        format!(
+            "2 unacknowledged items, oldest first\n\
+             \n\
+             [17] rework for claim \"clm_42abcd\"\n\
+             \x20    decision: \"dec_upload1\" v2, supersedes v1, recorded by \"usr_lemarier\" through Railhead\n\
+             \x20    question: \"{QUESTION}\"\n\
+             \x20    chosen: \"chunk\" \"Upload them in chunks\"\n\
+             \x20    was: \"reject\" \"Reject them\"\n\
+             \x20    scope: \"src/upload.ts\"\n\
+             \x20    action: rework required; redo work that relied on the earlier version\n\
+             \x20    acknowledge: rh ack 17 --plan <plan>\n\
+             \n\
+             [18] conflict for claim \"clm_42abcd\"\n\
+             \x20    overlaps: claim \"clm_43abcd\" on \"src/upload.ts\"\n\
+             \x20    action: redo the change on the new base\n\
+             \x20    acknowledge: rh ack 18 --plan <plan>\n\
+             next: rh ack\n"
+        )
+    );
 
     let json = rh(&world, &["--json", "sync", "--limit", "16"])?;
     assert_eq!(json.at("/ok")?, json!(true));
@@ -430,16 +434,18 @@ async fn sync_shows_how_many_items_wait_beyond_the_page() -> anyhow::Result<()> 
     answer(&world, "GET", "/inbox", page(&[inbox_item(18)], 5)).await;
     let run = rh(&world, &["sync", "--limit", "1"])?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert!(
-        run.stdout
-            .contains("4 more pending; acknowledge these, then run rh sync again\n"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("inbox: 5 unacknowledged"),
-        "{}",
-        run.stdout
+    // The count beyond the page is the last word before next; no inbox footer repeats it.
+    assert_eq!(
+        run.stdout,
+        "1 unacknowledged item, oldest first\n\
+         \n\
+         [18] conflict for claim \"clm_42abcd\"\n\
+         \x20    overlaps: claim \"clm_43abcd\" on \"src/upload.ts\"\n\
+         \x20    action: redo the change on the new base\n\
+         \x20    acknowledge: rh ack 18 --plan <plan>\n\
+         \n\
+         4 more pending; acknowledge these, then run rh sync again\n\
+         next: rh ack\n"
     );
     Ok(())
 }
@@ -1067,6 +1073,96 @@ async fn ask_reports_a_refused_or_inconsistent_question() -> anyhow::Result<()> 
     assert_eq!(inconsistent.at("/error/code")?, json!("malformed_response"));
     // Each failure ended the wait at its first poll.
     assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 3);
+    Ok(())
+}
+
+/// A refusal with `code`, sent with the status the protocol fixes for it.
+fn refusal(status: u16, code: &str, retry_after_ms: Option<u64>) -> ResponseTemplate {
+    json_response(
+        status,
+        &json!({"ok": false, "error": {"code": code, "message": "Try again later.",
+            "retryable": true, "retryAfterMs": retry_after_ms, "next": null}}),
+    )
+}
+
+#[tokio::test]
+async fn ask_wait_polls_again_after_a_busy_refusal_once_the_advised_delay_has_passed()
+-> anyhow::Result<()> {
+    let world = world().await?;
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/questions/qst_upload1")))
+        .respond_with(refusal(503, "busy", Some(1_500)))
+        .up_to_n_times(1)
+        .mount(&world.server)
+        .await;
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        fixture("question.json", "an answered question carries the decision")?,
+    )
+    .await;
+
+    let started = Instant::now();
+    let run = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "10"],
+    )?;
+    let elapsed = started.elapsed();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.at("/data/question/state")?, json!("answered"));
+    assert_eq!(run.at("/data/timedOut")?, json!(false));
+    assert!(
+        run.stderr.contains("polling again in 2 s"),
+        "{}",
+        run.stderr
+    );
+    assert!(!run.stderr.contains("Try again later."), "{}", run.stderr);
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
+    assert!(
+        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(10),
+        "{elapsed:?}"
+    );
+    assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ask_wait_ends_on_a_refusal_it_cannot_retry_within_the_wait() -> anyhow::Result<()> {
+    let world = world().await?;
+    // The advised delay outlasts the wait, so the refusal ends it at once.
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        refusal(429, "rate_limited", Some(5_000)),
+    )
+    .await;
+    let started = Instant::now();
+    let limited = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
+    )?;
+    assert_eq!(limited.code, Some(1), "{}", limited.stderr);
+    assert_eq!(limited.at("/error/code")?, json!("rate_limited"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 1);
+
+    // A retryable failure that does not ask to come back later is not polled again.
+    world.server.reset().await;
+    answer(
+        &world,
+        "GET",
+        "/questions/qst_upload1",
+        refusal(500, "internal", None),
+    )
+    .await;
+    let internal = rh(
+        &world,
+        &["--json", "ask", "--question", "qst_upload1", "--wait", "5"],
+    )?;
+    assert_eq!(internal.at("/error/code")?, json!("internal"));
+    assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 1);
     Ok(())
 }
 

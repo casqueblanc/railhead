@@ -48,8 +48,9 @@ pub fn run(agent: &Agent<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
     } else {
         Some(NextCommand::Ack)
     };
-    out.success(&synced, response.inbox.as_ref(), next)
-        .map_err(Error::Output)
+    // The piggybacked digest would end the page by telling the agent to run `rh sync` again;
+    // `Synced` already says how many items are pending.
+    out.success(&synced, None, next).map_err(Error::Output)
 }
 
 /// The result of `rh sync`.

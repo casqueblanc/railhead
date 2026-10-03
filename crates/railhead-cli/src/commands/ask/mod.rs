@@ -14,8 +14,8 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use railhead_protocol::{
-    AGENT_REQUEST_TIMEOUT_MS, AgentSuccess, AskRequest, IdKind, MAX_LONG_POLL_MS, NextCommand,
-    QuestionOption, QuestionResult, QuestionState, is_id,
+    AGENT_REQUEST_TIMEOUT_MS, AgentErrorCode, AgentSuccess, AskRequest, IdKind, MAX_LONG_POLL_MS,
+    NextCommand, QuestionOption, QuestionResult, QuestionState, is_id,
 };
 use serde::Serialize;
 use ssh_key::rand_core::{OsRng, RngCore};
@@ -314,9 +314,12 @@ fn resumable(error: Error, question_id: &str, request_id: &str, seconds: u64) ->
 /// timeout, plus any wait for another process's login on the session lock; bounding that login
 /// by the deadline is casqueblanc/railhead#153.
 ///
+/// A `busy` or `rate_limited` refusal is polled again after [`retry_delay`] when that pause ends
+/// before the deadline; any other failure ends the wait.
+///
 /// # Errors
 ///
-/// When a poll fails as [`read`] does, and [`LocalCode::Timeout`] when the wait ran out before
+/// When a poll fails as [`read`] does and is not retried, and [`LocalCode::Timeout`] when the wait ran out before
 /// any state of the question was known.
 fn wait_for(
     agent: &Agent<'_>,
@@ -333,14 +336,28 @@ fn wait_for(
     let deadline = Instant::now() + wait;
     loop {
         let started = Instant::now();
-        let Some(current) = poll(agent, question_id, deadline)? else {
-            break;
+        let early = match poll(agent, question_id, deadline) {
+            Ok(None) => break,
+            Ok(Some(current)) => {
+                if current.data.state == QuestionState::Answered {
+                    return Ok((current, false));
+                }
+                last = Some(current);
+                MIN_POLL_INTERVAL.saturating_sub(started.elapsed())
+            }
+            Err(error) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let Some(delay) = retry_delay(&error).filter(|delay| *delay < left) else {
+                    return Err(error);
+                };
+                out.notice(&format!(
+                    "{error}; polling again in {} s",
+                    delay.as_secs_f64().ceil()
+                ))
+                .map_err(Error::Output)?;
+                delay
+            }
         };
-        if current.data.state == QuestionState::Answered {
-            return Ok((current, false));
-        }
-        last = Some(current);
-        let early = MIN_POLL_INTERVAL.saturating_sub(started.elapsed());
         let pause = early.min(deadline.saturating_duration_since(Instant::now()));
         if !pause.is_zero() {
             // The timer must be created inside the runtime.
@@ -358,6 +375,27 @@ fn wait_for(
         retryable: true,
         next: Some(NextCommand::Ask),
     })
+}
+
+/// How long to pause before polling again after `error`, or `None` when the poll must not be
+/// repeated. Only a refusal that asks to come back later is retried: `busy` and `rate_limited`,
+/// after the backend's `retryAfterMs` and never sooner than [`MIN_POLL_INTERVAL`].
+fn retry_delay(error: &Error) -> Option<Duration> {
+    let Error::Http(http::Error::Rejected { error, .. }) = error else {
+        return None;
+    };
+    if !error.retryable
+        || !matches!(
+            error.code,
+            AgentErrorCode::Busy | AgentErrorCode::RateLimited
+        )
+    {
+        return None;
+    }
+    let advised = error
+        .retry_after_ms
+        .map_or(Duration::ZERO, |ms| Duration::from_millis(u64::from(ms)));
+    Some(advised.max(MIN_POLL_INTERVAL))
 }
 
 /// One poll that ends by `deadline`: the backend holds it for the time left less
