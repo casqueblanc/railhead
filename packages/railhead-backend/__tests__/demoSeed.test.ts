@@ -21,6 +21,7 @@ import {
   createSeedTarget,
   SEED_TARGET_LIMITS,
   type SeedArtifacts,
+  type SeedTargetLimits,
   type SeedArtifactsRepo,
   type SeedTarget,
 } from "../src/modules/demoSeed/target";
@@ -111,10 +112,39 @@ class SeedFake implements SeedArtifacts {
   pushFault: "none" | "lose-response" | "drop" | "reject" = "none";
   failNextDelete = false;
 
+  /** Holds the next `create` before it creates anything, as a request whose effect is delayed. */
+  holdNextCreate(): { reached: Promise<void>; release: () => void } {
+    let reach: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const reached = new Promise<void>((resolve) => {
+      reach = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#createGate = async () => {
+      reach?.();
+      await held;
+    };
+    return { reached, release: () => release?.() };
+  }
+
+  #createGate: (() => Promise<void>) | null = null;
+
+  /** Makes the next `create` take effect and never answer, as when its object was evicted. */
+  hangAfterNextCreate = false;
+
   async create(name: string): Promise<unknown> {
+    const gate = this.#createGate;
+    this.#createGate = null;
+    if (gate !== null) await gate();
     if (this.fake.repos.has(name)) throw new FakeArtifactsError("ALREADY_EXISTS");
     this.fake.seed(name, []);
     const token = this.fake.mintFor(name, "write", 86_400);
+    if (this.hangAfterNextCreate) {
+      this.hangAfterNextCreate = false;
+      return new Promise(() => {});
+    }
     return { remote: remote(name), token: token.plaintext };
   }
 
@@ -257,38 +287,61 @@ interface TargetSetup {
   storage: RepoStorage;
   host: { initialized: boolean; initializeCalls: number; wipes: number };
   main: string;
+  clock: { now: number };
+  /** A new target on the same storage, as after the object restarted. */
+  restart: () => SeedTarget;
 }
+
+const SHORT_CALLS: SeedTargetLimits = { ...SEED_TARGET_LIMITS, callTimeoutMs: 50 };
 
 function withTarget(
   body: (setup: TargetSetup) => Promise<void>,
-  options: { artifacts?: boolean } = {},
+  options: { artifacts?: boolean; limits?: SeedTargetLimits } = {},
 ): Promise<void> {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
     const seed = new SeedFake();
     const host = { initialized: false, initializeCalls: 0, wipes: 0 };
-    const target = createSeedTarget(
-      {
-        repoId: REPO_ID,
-        storage: state.storage,
-        artifacts: options.artifacts === false ? undefined : seed,
-        fetch: seed.fetch,
-        initialized: () => host.initialized,
-        initialize: () => {
-          host.initializeCalls += 1;
-          host.initialized = true;
-          return ok(undefined);
+    const clock = { now: 1_000_000 };
+    const restart = () =>
+      createSeedTarget(
+        {
+          repoId: REPO_ID,
+          storage: state.storage,
+          artifacts: options.artifacts === false ? undefined : seed,
+          fetch: seed.fetch,
+          clock: () => clock.now,
+          initialized: () => host.initialized,
+          initialize: () => {
+            host.initializeCalls += 1;
+            host.initialized = true;
+            return ok(undefined);
+          },
+          wipe: async () => {
+            host.wipes += 1;
+            host.initialized = false;
+          },
         },
-        wipe: async () => {
-          host.wipes += 1;
-          host.initialized = false;
-        },
-      },
-      { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000 },
-    );
-    await body({ seed, target, storage: state.storage, host, main: await mainRepoName(REPO_ID) });
+        options.limits ?? { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000 },
+      );
+    const target = restart();
+    const main = await mainRepoName(REPO_ID);
+    await body({ seed, target, storage: state.storage, host, main, clock, restart });
     expect(seed.fake.openHandles).toBe(0);
   });
+}
+
+/** Retries `attempt` until it succeeds, for calls refused while an earlier one settles. */
+async function eventually<T>(
+  attempt: () => Promise<PortResult<T>>,
+  ms = 5_000,
+): Promise<PortResult<T>> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const result = await attempt();
+    if (result.ok || Date.now() > deadline) return result;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 describe("seed target", () => {
@@ -363,6 +416,121 @@ describe("seed target", () => {
       expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
       paused.release();
       expect(await first).toMatchObject({ ok: true });
+    }));
+
+  it("refuses to reset until a create that timed out answers, then deletes what it made", () =>
+    withTarget(
+      async ({ seed, target, host, main }) => {
+        const create = seed.holdNextCreate();
+        const first = target.seed(HEAD, fakePack());
+        await create.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+        // The lock is free, but the create may still land: neither a seed nor a reset may run.
+        expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        expect(host.wipes).toBe(0);
+        expect(seed.deleted).toEqual([]);
+
+        create.release();
+        expect(await eventually(() => target.reset())).toEqual(
+          ok({ kind: "demo.reset", deleted: true }),
+        );
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(1);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("refuses to seed until a token mint that timed out answers, and revokes that token", () =>
+    withTarget(
+      async ({ seed, target, host, main }) => {
+        seed.fake.seed(main, []);
+        const mint = seed.fake.pauseNext("createTokenBeforeMint");
+        const first = target.seed(HEAD, fakePack());
+        await mint.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        expect(seed.pushes).toEqual([]);
+
+        // The mint lands after its caller gave up; nothing may report success while it is live.
+        mint.release();
+        expect(await eventually(() => target.seed(HEAD, fakePack()))).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.tokensMinted).toBe(2);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(host.initialized).toBe(true);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, waits out a create the previous object never saw answered", () =>
+    withTarget(
+      async ({ seed, target, host, main, clock, restart }) => {
+        seed.hangAfterNextCreate = true;
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({
+          ok: false,
+          code: "internal",
+        });
+
+        // The new object cannot see the old call answer, so it waits out the call's window.
+        const restarted = restart();
+        expect(await restarted.reset()).toMatchObject({ ok: false, code: "internal" });
+        expect(await restarted.seed(HEAD, fakePack())).toMatchObject({
+          ok: false,
+          code: "internal",
+        });
+        clock.now += SEED_TARGET_LIMITS.orphanSettleMs - 1;
+        expect(await restarted.reset()).toMatchObject({ ok: false, code: "internal" });
+        expect(seed.fake.repos.has(main)).toBe(true);
+
+        clock.now += 1;
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(1);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("revokes the push token on a same-head retry after its revocation failed", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      seed.fake.failRevocations(100);
+      expect(await target.seed(HEAD, fakePack())).toEqual({
+        ok: false,
+        code: "internal",
+        message: "Main was imported but its push token was not revoked; try again.",
+      });
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(seed.fake.liveTokens(main)).not.toEqual([]);
+      expect(host.initialized).toBe(false);
+
+      // Main already holds the head, so nothing is pushed, but the owed sweep still runs.
+      seed.fake.failRevocations(0);
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.pushes).toHaveLength(1);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initialized).toBe(true);
+    }));
+
+  it("after a restart between push and revocation, revokes the token before initializing", () =>
+    withTarget(async ({ seed, target, host, main, restart }) => {
+      seed.fake.failRevocations(100);
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+      expect(seed.fake.liveTokens(main)).not.toEqual([]);
+
+      seed.fake.failRevocations(0);
+      const restarted = restart();
+      expect(await restarted.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initialized).toBe(true);
+      // Once main is clean nothing is owed: a later seed on an operating main sweeps nothing.
+      const holder = seed.fake.mintFor(main, "read", 300);
+      expect(await restarted.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(seed.fake.liveTokens(main)).toEqual([holder]);
     }));
 
   it("resets by deleting main and the recorded forks by name, and nothing else", () =>

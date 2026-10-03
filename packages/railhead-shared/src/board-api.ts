@@ -109,7 +109,10 @@ export type SubscriptionEnd =
   | "slow"
   /** The backend is restarting or hibernating. */
   | "restart"
-  /** The session lost access to the repository. Do not resubscribe. */
+  /**
+   * The session lost access to the repository, or the owner reset it and its history is gone. Do
+   * not resubscribe from the old cursor.
+   */
   | "revoked";
 
 /** A pending join the owner may confirm: the code the agent's terminal shows. */

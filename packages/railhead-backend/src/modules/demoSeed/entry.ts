@@ -99,6 +99,7 @@ export function demoSeedTarget(host: DemoSeedHost, env: Env): SeedTarget {
     storage: host.storage,
     artifacts: artifactsBinding(env),
     fetch: (input, init) => fetch(input, init),
+    clock: Date.now,
     initialized: () => host.initialized(),
     initialize: () => host.initialize(),
     wipe: () => host.wipe(),

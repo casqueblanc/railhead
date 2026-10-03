@@ -282,8 +282,13 @@ export class Repo extends DurableObject<Env> {
         initialized: () => this.#installed !== null,
         initialize: () => this.initialize(DEMO_ORG, DEMO_REPO),
         wipe: async () => {
-          await this.ctx.storage.deleteAll();
+          // Subscribers follow the history being deleted: they end, and a board that subscribes
+          // again starts from the new history.
+          this.#installed?.ports.stream.endAll("revoked");
           this.#installed = null;
+          await this.ctx.storage.deleteAll();
+          // Whether the wipe removed the alarm or not, the next wake request must see storage.
+          await this.#alarm.load();
         },
       },
       this.env,
