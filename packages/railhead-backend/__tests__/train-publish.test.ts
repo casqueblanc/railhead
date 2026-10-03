@@ -861,7 +861,7 @@ describe("the train's settle wake", () => {
       async (h) => {
         // The rebuilt train asks for the settle wake once its composition returns, and storage
         // holds it.
-        expect(await h.train.startup).toBe(true);
+        expect(await h.train.startup()).toBe(true);
         expect(owed).toBeDefined();
         expect(await h.storedAlarm()).toBe(owed);
 
@@ -908,7 +908,7 @@ describe("the train's settle wake", () => {
         [pin(1)],
         async (h) => {
           // The first attempt failed; a later one stored the alarm.
-          expect(await h.train.startup).toBe(true);
+          expect(await h.train.startup()).toBe(true);
           expect(owed).toBeDefined();
           expect(await h.storedAlarm()).toBe(owed);
 
@@ -936,13 +936,49 @@ describe("the train's settle wake", () => {
       ref,
       [pin(1)],
       async (h) => {
-        expect(await h.train.startup).toBe(false);
+        expect(await h.train.startup()).toBe(false);
         expect(await h.storedAlarm()).toBeNull();
         // The wake row still owes the settlement, so a ready's `armWake` asks again.
         expect(readWake(h.sql)?.failures).toBe(EXHAUSTED_FAILURES);
         expect(await h.train.armWake()).toBe(true);
         expect(owed).toBeDefined();
         expect(await h.storedAlarm()).toBe(owed);
+      },
+      { stub, realAlarm: true, failedAlarmWrites: STARTUP_WAKE_ATTEMPTS },
+    );
+    await runInDurableObject(stub, (_instance, state) => state.storage.deleteAlarm());
+  });
+
+  it("settles the intent through the train a reset Repo rebuilds after every settle wake write failed", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const ref = new FakeMain(MAIN, ["drop"]);
+    const { intentId, candidate, owed } = await owedAcrossRestart({ stub, realAlarm: true }, ref);
+
+    ref.down = false;
+    await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        // Every startup write failed: the Repo resets on this, so no alarm and no call remains.
+        expect(await h.train.startup()).toBe(false);
+        expect(await h.storedAlarm()).toBeNull();
+        expect(batchStates(h.train)).toEqual([["passed", null]]);
+
+        // The next request builds the train again, which stores the wake from its row, and the
+        // alarm alone settles the intent.
+        const rebuilt = h.restart();
+        expect(await rebuilt.startup()).toBe(true);
+        expect(owed).toBeDefined();
+        expect(await h.storedAlarm()).toBe(owed);
+        await h.fireAlarm();
+        expect(ref.main).toBe(candidate);
+        expect(h.authorization.record(intentId)).toMatchObject({
+          status: "updated",
+          main: candidate,
+        });
+        expect(batchStates(h.train)).toEqual([["landed", null]]);
+        expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+        expect(readWake(h.sql)).toBeNull();
       },
       { stub, realAlarm: true, failedAlarmWrites: STARTUP_WAKE_ATTEMPTS },
     );
@@ -967,7 +1003,7 @@ describe("the train's settle wake", () => {
       [pin(1)],
       async (h) => {
         const asked = h.wakes.length;
-        expect(await h.train.startup).toBe(true);
+        expect(await h.train.startup()).toBe(true);
         expect(h.wakes).toHaveLength(asked);
         expect(await h.storedAlarm()).toBeNull();
       },
