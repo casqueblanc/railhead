@@ -9,6 +9,13 @@
 //!
 //! One join enrolls a name at a time: it holds the name's enrollment lock from reading the stored
 //! identity to storing the session, and a second join for the name stops before sending anything.
+//! Before its first request a join also stores the enrollment's scope, the origin, repository,
+//! invite and key, and removes it only once it logs in or the backend refuses the join. Until then
+//! a join with any other invite under the name stops before sending anything, so a response lost
+//! to a crash or a dropped connection leaves an enrollment the same invite resumes.
+//!
+//! Every command that acts as an agent gets its session from [`session`], which logs in again with
+//! the agent's key when the stored session is missing or about to expire.
 
 pub mod invite;
 pub mod key;
@@ -27,11 +34,11 @@ use tokio::time::Instant;
 
 use crate::http::{self, Endpoint};
 use crate::identity::{
-    self, AgentId, AgentName, AgentSelector, FileStore, Identity, LockKind, SecretKind,
-    SecretStore as _, Session, SessionToken,
+    self, AgentId, AgentName, AgentSelector, FileStore, Identity, LockKind, PendingEnrollment,
+    SecretKind, SecretStore as _, Session, SessionToken,
 };
 use crate::output::{LocalCode, Output, Render, inert};
-use crate::{Error, Invocation, Result};
+use crate::{Agent, Error, Invocation, Result};
 
 use invite::{INVITE_ENV, Invite, InviteArg};
 use key::{KeyOrigin, SigningKey};
@@ -72,24 +79,11 @@ fn parse_name(value: &str) -> std::result::Result<AgentName, String> {
 ///
 /// # Errors
 ///
-/// When the invite is malformed, the name is taken by another enrollment or another join is
-/// enrolling it, the store fails, the backend refuses or answers for another key, the owner does
+/// When the invite is malformed, the name is taken by another identity or an unfinished enrollment
+/// of another invite, or another join is enrolling it, the store fails, the backend refuses or answers for another key, the owner does
 /// not confirm within `--wait`, or the login fails.
 pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Result<()> {
-    let arg = match &args.invite {
-        Some(arg) => arg.clone(),
-        None => std::env::var(INVITE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(InviteArg::new)
-            .ok_or_else(|| Error::Local {
-                code: LocalCode::InvalidInput,
-                message: format!("name the invite URL, or set {INVITE_ENV}"),
-                retryable: false,
-                next: None,
-            })?,
-    };
-    let invite = Invite::parse(&arg)?;
+    let invite = Invite::parse(&invite_arg(args)?)?;
     let name = match &args.name {
         Some(name) => name.clone(),
         None => default_name(&invite.id)?,
@@ -106,10 +100,12 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
             retryable: true,
             next: Some(NextCommand::Join),
         })?;
+    let started = unfinished(store, &name, &invite)?;
     let existing = existing_identity(store, &name, &invite)?;
     let client = http::Client::new(&invite.origin, &invite.repo)?;
     let (key, made) = SigningKey::load_or_create(store, &name)?;
     let public_key = key.public_key()?;
+    reserve(store, &name, &invite, started.as_ref(), &public_key, made)?;
     let message = key::join_message(&invite.origin, &invite.repo, &invite.id, &public_key);
     let request = JoinRequest {
         invite_id: invite.id.clone(),
@@ -133,9 +129,13 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
         {
             Ok(success) => success,
             Err(error) => {
-                // A refused join registered nothing, so a key made for it is not anyone's yet.
-                if made == KeyOrigin::Created && is_refusal(&error) {
-                    store.remove(&name, SecretKind::SigningKey)?;
+                // A refused join registered nothing: the enrollment is over, and a key made for it
+                // is not anyone's yet. Any other failure may have registered it, so both stay.
+                if is_refusal(&error) {
+                    store.remove_enrollment(&name)?;
+                    if made == KeyOrigin::Created {
+                        store.remove(&name, SecretKind::SigningKey)?;
+                    }
                 }
                 return Err(error.into());
             }
@@ -167,6 +167,7 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
         }
         let login = login(&client, &identity, &key).await?;
         store.save_session(&name, &login.session)?;
+        store.remove_enrollment(&name)?;
         let joined = Joined {
             name: name.to_string(),
             agent_id: identity.agent_id.to_string(),
@@ -184,6 +185,23 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
     })
 }
 
+/// The invite URL on the command line, or else in `RAILHEAD_INVITE`.
+fn invite_arg(args: &Args) -> Result<InviteArg> {
+    match &args.invite {
+        Some(arg) => Ok(arg.clone()),
+        None => std::env::var(INVITE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(InviteArg::new)
+            .ok_or_else(|| Error::Local {
+                code: LocalCode::InvalidInput,
+                message: format!("name the invite URL, or set {INVITE_ENV}"),
+                retryable: false,
+                next: None,
+            }),
+    }
+}
+
 /// A login's session, with the pending inbox and next command its response carried.
 #[derive(Debug)]
 pub struct Login {
@@ -193,6 +211,102 @@ pub struct Login {
     pub inbox: Option<InboxDigest>,
     /// The command the backend asks the agent to run next.
     pub next: Option<NextCommand>,
+}
+
+/// A session to act as an agent with, and the login that made it when there was one.
+#[derive(Debug)]
+pub enum Authenticated {
+    /// The stored session, still current.
+    Stored(SessionToken),
+    /// A new session from a login with the agent's key, already stored.
+    LoggedIn(Box<Login>),
+}
+
+impl Authenticated {
+    /// The session token.
+    #[must_use]
+    pub fn into_token(self) -> SessionToken {
+        match self {
+            Self::Stored(token) => token,
+            Self::LoggedIn(login) => login.session.token,
+        }
+    }
+}
+
+/// A session for `agent`: the stored one while it is current, otherwise a new one from a login
+/// with the agent's key, stored for the next command. The lapsed token is never sent.
+///
+/// The login runs under the session lock, and the stored session is read again once the lock is
+/// held, so processes that find it lapsed together log in once. The agent has no session, and
+/// nothing is sent, when its stored session was issued to another identity, its enrollment is
+/// unfinished or it has no key. When the backend reports it unconfirmed or revoked, the one login
+/// attempt stops with no session too.
+///
+/// # Errors
+///
+/// [`LocalCode::NoSession`] in those cases; otherwise when the store fails or the login fails.
+pub fn session(agent: &Agent<'_>) -> Result<Authenticated> {
+    if let Some(token) = agent.stored_session()? {
+        return Ok(Authenticated::Stored(token));
+    }
+    let identity = &agent.identity;
+    let store = agent.invocation.context.store();
+    let lock = store.lock_session(&identity.name)?;
+    match lock.load()? {
+        Some(stored) if !stored.issued_to(identity) => {
+            return Err(no_session(
+                identity,
+                "its stored session was issued to another agent; run rh join to replace it",
+            ));
+        }
+        Some(stored) if stored.usable_for(identity, identity::now_ms()) => {
+            return Ok(Authenticated::Stored(stored.token));
+        }
+        Some(_) | None => {}
+    }
+    if store.load_enrollment(&identity.name)?.is_some() {
+        return Err(no_session(
+            identity,
+            "its enrollment is not finished; run rh join to finish it",
+        ));
+    }
+    let key = SigningKey::load(store, &identity.name)?
+        .ok_or_else(|| no_session(identity, "it has no key to log in with"))?;
+    let client = agent.client()?;
+    let login = agent
+        .invocation
+        .runtime
+        .block_on(login(&client, identity, &key))
+        .map_err(|error| match error {
+            Error::Http(http::Error::Rejected { error, .. })
+                if error.code == AgentErrorCode::IdentityPending =>
+            {
+                no_session(
+                    identity,
+                    "the owner has not confirmed it yet; run rh join to wait",
+                )
+            }
+            Error::Http(http::Error::Rejected { error, .. })
+                if error.code == AgentErrorCode::IdentityRevoked =>
+            {
+                no_session(
+                    identity,
+                    "the owner revoked it; join again with a new invite",
+                )
+            }
+            other => other,
+        })?;
+    lock.save(&login.session)?;
+    Ok(Authenticated::LoggedIn(Box::new(login)))
+}
+
+fn no_session(identity: &Identity, why: &str) -> Error {
+    Error::Local {
+        code: LocalCode::NoSession,
+        message: format!("{} has no session: {why}", identity.name),
+        retryable: false,
+        next: Some(NextCommand::Join),
+    }
 }
 
 /// Logs in as `identity`: asks for a challenge, signs it when it is exactly the message `rh`
@@ -282,6 +396,70 @@ fn default_name(invite_id: &str) -> Result<AgentName> {
         let _ = write!(name, "{byte:02x}");
     }
     Ok(AgentName::new(&name)?)
+}
+
+/// The unfinished enrollment stored under `name`, which must be the invite's own: an enrollment of
+/// another invite stops the join before anything is made or sent.
+fn unfinished(
+    store: &FileStore,
+    name: &AgentName,
+    invite: &Invite,
+) -> Result<Option<PendingEnrollment>> {
+    let started = store.load_enrollment(name)?;
+    match &started {
+        Some(started) if !started.is_for(&invite.origin, &invite.repo, &invite.id) => {
+            Err(Error::Local {
+                code: LocalCode::InvalidInput,
+                message: format!(
+                    "{name} is still enrolling with invite {} for {} on {}; finish that join, or join under another --name",
+                    started.invite_id,
+                    started.repo,
+                    started.origin.as_str()
+                ),
+                retryable: false,
+                next: None,
+            })
+        }
+        Some(_) | None => Ok(started),
+    }
+}
+
+/// Stores the enrollment's scope before its first request, so a lost answer still leaves it to
+/// resume. A resumed enrollment must still hold the key it registered.
+fn reserve(
+    store: &FileStore,
+    name: &AgentName,
+    invite: &Invite,
+    started: Option<&PendingEnrollment>,
+    public_key: &str,
+    made: KeyOrigin,
+) -> Result<()> {
+    match started {
+        Some(started) if started.public_key != public_key => {
+            // The key the enrollment registered is gone, and a new one cannot resume it.
+            if made == KeyOrigin::Created {
+                store.remove(name, SecretKind::SigningKey)?;
+            }
+            Err(Error::Local {
+                code: LocalCode::Store,
+                message: format!(
+                    "{name}'s unfinished enrollment registered a key that is no longer stored; join under another --name"
+                ),
+                retryable: false,
+                next: None,
+            })
+        }
+        Some(_) => Ok(()),
+        None => Ok(store.save_enrollment(
+            name,
+            &PendingEnrollment {
+                origin: invite.origin.clone(),
+                repo: invite.repo.clone(),
+                invite_id: invite.id.clone(),
+                public_key: public_key.to_owned(),
+            },
+        )?),
+    }
 }
 
 /// The identity already stored under `name`, which must belong to the invite's repository.

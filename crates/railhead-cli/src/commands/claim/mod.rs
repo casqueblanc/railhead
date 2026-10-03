@@ -8,14 +8,13 @@ pub mod workspace;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use railhead_protocol::{
-    AgentSuccess, ClaimRequest, ClaimResult, ClaimView, IdKind, NextCommand, is_id,
-};
+use railhead_protocol::{AgentSuccess, ClaimRequest, ClaimResult, ClaimView, IdKind, is_id};
 use serde::Serialize;
 
+use crate::commands::join;
 use crate::http::Endpoint;
 use crate::identity::SessionToken;
-use crate::output::{LocalCode, Output, Render, inert};
+use crate::output::{Output, Render, inert};
 use crate::{Agent, Error, Result};
 
 use workspace::{CloneState, Remotes};
@@ -98,21 +97,14 @@ impl Target {
     }
 }
 
-/// The agent's session token.
+/// The agent's session token, from a login with its key when the stored one lapsed. The request
+/// that follows reports the inbox, so a login's notices are not shown here.
 ///
 /// # Errors
 ///
-/// [`LocalCode::NoSession`] when it has none.
+/// As [`join::session`].
 pub fn session(agent: &Agent<'_>) -> Result<SessionToken> {
-    agent.stored_session()?.ok_or_else(|| Error::Local {
-        code: LocalCode::NoSession,
-        message: format!(
-            "{} has no session; log in with rh join",
-            agent.identity.name
-        ),
-        retryable: false,
-        next: Some(NextCommand::Join),
-    })
+    join::session(agent).map(join::Authenticated::into_token)
 }
 
 /// Opens the clone of a claimed issue and prints the claim, its task and the inbox.

@@ -142,6 +142,8 @@ struct Join {
     poll_after_ms: u64,
     /// How long every answer after the first takes.
     slow: Option<Duration>,
+    /// How long the first answer takes, to play an answer lost on the way.
+    lost: Option<Duration>,
 }
 
 impl Join {
@@ -153,6 +155,7 @@ impl Join {
             code: None,
             poll_after_ms: 0,
             slow: None,
+            lost: None,
         }
     }
 }
@@ -201,8 +204,9 @@ impl Respond for Join {
                 "ownerId": "usr_lemarier", "state": state}, "code": code,
                 "pollAfterMs": self.poll_after_ms}, "inbox": null, "next": next}),
         );
-        match self.slow {
-            Some(delay) if answered > 0 => answer.set_delay(delay),
+        match (self.lost, self.slow) {
+            (Some(delay), _) if answered == 0 => answer.set_delay(delay),
+            (_, Some(delay)) if answered > 0 => answer.set_delay(delay),
             _ => answer,
         }
     }
@@ -817,6 +821,100 @@ async fn a_refused_join_keeps_nothing() -> anyhow::Result<()> {
     );
     let dir = world.agent_dir("inv-abc123");
     assert!(!dir.join("key").exists() && !dir.join("identity.json").exists());
+    assert!(!dir.join("enrollment.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_first_answer_leaves_an_enrollment_only_its_invite_resumes() -> anyhow::Result<()> {
+    let world = world().await?;
+    let mut first = Join::new(&world, 0);
+    first.lost = Some(Duration::from_secs(30));
+    world.mount_join(first).await;
+    world.mount_login(None).await;
+    let other = elsewhere(&world).await?;
+    other.mount(0, None, None).await;
+
+    // The backend registers the key, and the join dies before its answer arrives.
+    let mut lost = spawn_join(&world, "atlas")?;
+    let started = Instant::now();
+    while world.backend.keys().is_empty() {
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(5),
+            "no join arrived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    lost.kill()?;
+    lost.wait()?;
+    let dir = world.agent_dir("atlas");
+    assert!(!dir.join("identity.json").exists());
+    let registered = world.backend.keys();
+    let path = dir.join("enrollment.json");
+    let scope = json!({"origin": world.origin(), "repo": "casqueblanc/demo", "inviteId": INVITE,
+        "publicKey": registered.first()});
+    let record: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    assert_eq!(record, scope);
+    #[cfg(unix)]
+    assert_eq!(mode(&path)?, 0o600);
+
+    // Another invite under the name stops before sending anything.
+    let elsewhere = join(&other, &["--name", "atlas"])?;
+    let envelope = elsewhere.json()?;
+    assert_eq!(
+        envelope.pointer("/error/code"),
+        Some(&json!("invalid_input"))
+    );
+    let message = envelope
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(message.contains(INVITE), "{message}");
+    assert_eq!(
+        other
+            .server
+            .received_requests()
+            .await
+            .map_or(0, |r| r.len()),
+        0
+    );
+
+    // Without the key it registered, the enrollment cannot resume, and no other key is sent.
+    let key = dir.join("key");
+    let saved = fs::read(&key)?;
+    fs::remove_file(&key)?;
+    let keyless = join(&world, &["--name", "atlas"])?;
+    assert_eq!(
+        keyless.json()?.pointer("/error/code"),
+        Some(&json!("store"))
+    );
+    assert!(!key.exists(), "a key made for the refused resume was kept");
+    assert_eq!(world.requests("/join").await, 1);
+    fs::write(&key, &saved)?;
+    #[cfg(unix)]
+    fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+
+    // The same invite resumes the enrollment with the key it registered, and finishes it.
+    let resumed = join(&world, &["--name", "atlas"])?;
+    assert_eq!(resumed.code, Some(0), "{}", resumed.stderr);
+    let keys = world.backend.keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        keys.first(),
+        keys.last(),
+        "the resumed join sent another key"
+    );
+    assert!(dir.join("identity.json").exists());
+    assert!(!path.exists(), "the finished enrollment was kept");
+    assert_eq!(stored(&world, "atlas")?.get("token"), Some(&json!(TOKEN)));
+
+    // Once it is finished, the name still belongs to the first origin.
+    let after = join(&other, &["--name", "atlas"])?;
+    assert_eq!(
+        after.json()?.pointer("/error/code"),
+        Some(&json!("invalid_input"))
+    );
+    assert_eq!(other.requests("/join").await, 0);
     Ok(())
 }
 
@@ -1135,14 +1233,196 @@ async fn an_erase_racing_a_login_keeps_the_new_session() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Answers `status` for the agent and records the `Authorization` header of every request.
+struct Status {
+    authorized: Arc<Mutex<Vec<String>>>,
+}
+
+impl Respond for Status {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let header = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        self.authorized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(header.to_owned());
+        json_response(
+            200,
+            &json!({"ok": true, "data": {"agent": {"agentId": AGENT, "name": "atlas",
+                "ownerId": "usr_lemarier", "state": "confirmed"}, "claim": null},
+                "inbox": null, "next": null}),
+        )
+    }
+}
+
+/// Runs `rh --json status` as the joined agent, outside any clone.
+fn status(world: &World) -> anyhow::Result<Run> {
+    let output = command(world, world.outside.path(), &["--json", "status"])
+        .env("RAILHEAD_AGENT", "inv-abc123")
+        .stdin(Stdio::null())
+        .output()?;
+    finish(world, &output)
+}
+
+/// Rewrites the stored session's expiry to `expires_at`.
+fn expire(world: &World, expires_at: u64) -> anyhow::Result<Value> {
+    let mut record = stored(world, "inv-abc123")?;
+    if let Some(slot) = record.get_mut("expiresAt") {
+        *slot = json!(expires_at);
+    }
+    store_session(world, "inv-abc123", &record)?;
+    Ok(record)
+}
+
 #[tokio::test]
-async fn commands_refuse_an_expired_or_foreign_session_without_a_request() -> anyhow::Result<()> {
+async fn a_command_logs_in_again_once_its_session_lapses() -> anyhow::Result<()> {
+    let world = joined().await?;
+    let authorized = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/status")))
+        .respond_with(Status {
+            authorized: Arc::clone(&authorized),
+        })
+        .mount(&world.server)
+        .await;
+    let logins = world.requests("/session").await;
+
+    // Lapsed, then about to lapse: each time the command logs in first and sends only the new
+    // session, and the stored session is current again for the next command.
+    for expires_at in [now_ms() - 1, now_ms() + 1000] {
+        expire(&world, expires_at)?;
+        let run = status(&world)?;
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert_eq!(
+            run.json()?.pointer("/data/agent/agentId"),
+            Some(&json!(AGENT))
+        );
+        let renewed = stored(&world, "inv-abc123")?;
+        assert_eq!(renewed.get("token"), Some(&json!(FRESH)));
+        let expires = renewed
+            .get("expiresAt")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        assert!(expires > now_ms() + 60_000, "{renewed}");
+    }
+    assert_eq!(world.requests("/session/challenge").await, logins + 2);
+    assert_eq!(world.requests("/session").await, logins + 2);
+
+    // A current session is sent as it is, without a login.
+    let run = status(&world)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(world.requests("/session").await, logins + 2);
+    let sent = authorized
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let bearer = format!("Bearer {FRESH}");
+    assert_eq!(sent, vec![bearer.clone(), bearer.clone(), bearer]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_command_waits_for_a_login_in_progress_and_uses_its_session() -> anyhow::Result<()> {
+    let world = joined().await?;
+    let authorized = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path(format!("{PREFIX}/status")))
+        .respond_with(Status {
+            authorized: Arc::clone(&authorized),
+        })
+        .mount(&world.server)
+        .await;
+    let lapsed = expire(&world, now_ms() - 1)?;
+    let logins = world.requests("/session/challenge").await;
+
+    // Another process holds the session lock while it logs in; the command waits for it.
+    let lock = fs::File::open(world.agent_dir("inv-abc123").join(".session.lock"))?;
+    lock.lock()?;
+    let waiting = command(&world, world.outside.path(), &["--json", "status"])
+        .env("RAILHEAD_AGENT", "inv-abc123")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(Duration::from_millis(300));
+    let mut fresh = lapsed;
+    for (field, value) in [
+        ("token", json!(FRESH)),
+        ("expiresAt", json!(now_ms() + SESSION_TTL_MS)),
+    ] {
+        if let Some(slot) = fresh.get_mut(field) {
+            *slot = value;
+        }
+    }
+    store_session(&world, "inv-abc123", &fresh)?;
+    lock.unlock()?;
+
+    let run = finish(&world, &waiting.wait_with_output()?)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    // It read the session the other login stored instead of logging in again.
+    assert_eq!(world.requests("/session/challenge").await, logins);
+    let sent = authorized
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(sent, vec![format!("Bearer {FRESH}")]);
+    assert_eq!(stored(&world, "inv-abc123")?, fresh);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_revoked_unconfirmed_or_failed_login_sends_no_request() -> anyhow::Result<()> {
+    for (status_code, code, expected) in [
+        (403, "identity_revoked", "no_session"),
+        (403, "identity_pending", "no_session"),
+        (401, "challenge_invalid", "challenge_invalid"),
+    ] {
+        let world = joined().await?;
+        Mock::given(method("POST"))
+            .and(path(format!("{PREFIX}/session/challenge")))
+            .respond_with(failure(status_code, code, "No."))
+            .with_priority(1)
+            .mount(&world.server)
+            .await;
+        let lapsed = expire(&world, now_ms() - 1)?;
+        let challenges = world.requests("/session/challenge").await;
+        let logins = world.requests("/session").await;
+
+        let run = status(&world)?;
+        assert_eq!(run.code, Some(1), "{code}");
+        let envelope = run.json()?;
+        assert_eq!(
+            envelope.pointer("/error/code"),
+            Some(&json!(expected)),
+            "{code}"
+        );
+        if expected == "no_session" {
+            assert_eq!(
+                envelope.pointer("/error/next"),
+                Some(&json!("rh join")),
+                "{code}"
+            );
+        }
+        // One login attempt, nothing signed, the lapsed session kept and never sent.
+        assert_eq!(
+            world.requests("/session/challenge").await,
+            challenges + 1,
+            "{code}"
+        );
+        assert_eq!(world.requests("/session").await, logins, "{code}");
+        assert_eq!(world.requests("/status").await, 0, "{code}");
+        assert_eq!(stored(&world, "inv-abc123")?, lapsed, "{code}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn commands_refuse_a_foreign_session_without_a_request() -> anyhow::Result<()> {
     let world = joined().await?;
     let current = stored(&world, "inv-abc123")?;
-    let mut expired = current.clone();
-    if let Some(slot) = expired.get_mut("expiresAt") {
-        *slot = json!(now_ms() - 1);
-    }
     let mut foreign = current.clone();
     if let Some(slot) = foreign.get_mut("agentId") {
         *slot = json!("agt_boreas01");
@@ -1151,7 +1431,12 @@ async fn commands_refuse_an_expired_or_foreign_session_without_a_request() -> an
     if let Some(slot) = elsewhere.get_mut("origin") {
         *slot = json!("https://railhead.dev");
     }
-    for record in [expired, foreign, elsewhere] {
+    let before = world
+        .server
+        .received_requests()
+        .await
+        .map_or(0, |r| r.len());
+    for record in [foreign, elsewhere] {
         store_session(&world, "inv-abc123", &record)?;
         for args in [&["--json", "status"][..], &["--json", "work"]] {
             let output = command(&world, world.outside.path(), args)
@@ -1165,10 +1450,16 @@ async fn commands_refuse_an_expired_or_foreign_session_without_a_request() -> an
                 "{args:?} {record}"
             );
         }
+        // The record is neither sent nor replaced by a login.
+        assert_eq!(stored(&world, "inv-abc123")?, record);
     }
     assert_eq!(
-        world.requests("/status").await + world.requests("/work").await,
-        0
+        world
+            .server
+            .received_requests()
+            .await
+            .map_or(0, |r| r.len()),
+        before
     );
     Ok(())
 }

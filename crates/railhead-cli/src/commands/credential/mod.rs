@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use serde::Serialize;
 
-use crate::commands::join::{self, key::SigningKey};
+use crate::commands::join::{self, Authenticated};
 use crate::context::CloneBinding;
 use crate::identity::{Identity, SessionToken};
 use crate::output::{LocalCode, Output, Render};
@@ -120,25 +120,13 @@ fn clone_of<'a>(agent: &'a Agent<'_>) -> Result<&'a CloneBinding> {
         })
 }
 
-/// The agent's stored session while it is current, or a new one from a login with its key, stored
-/// for the next request. A login's pending inbox and next command go to stderr, never stdout.
+/// The agent's session from [`join::session`]. A login's pending inbox and next command go to
+/// stderr, never stdout.
 fn session(agent: &Agent<'_>, out: &mut Output<'_>) -> Result<SessionToken> {
-    if let Some(token) = agent.stored_session()? {
-        return Ok(token);
-    }
-    let store = agent.invocation.context.store();
-    let key = SigningKey::load(store, &agent.identity.name)?.ok_or_else(|| Error::Local {
-        code: LocalCode::NoSession,
-        message: format!("{} has no key to log in with", agent.identity.name),
-        retryable: false,
-        next: Some(railhead_protocol::NextCommand::Join),
-    })?;
-    let client = agent.client()?;
-    let login = agent
-        .invocation
-        .runtime
-        .block_on(join::login(&client, &agent.identity, &key))?;
-    store.save_session(&agent.identity.name, &login.session)?;
+    let login = match join::session(agent)? {
+        Authenticated::Stored(token) => return Ok(token),
+        Authenticated::LoggedIn(login) => login,
+    };
     let pending = login
         .inbox
         .as_ref()
