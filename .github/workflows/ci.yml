@@ -139,6 +139,24 @@ jobs:
         if: steps.changes.outputs.run != 'false'
         run: pnpm build
 
+      # The deploy workflow's `wrangler deploy` with placeholder secrets: proves the Worker bundle,
+      # its config and the sandbox image build from the board Build just produced. Uploads nothing.
+      - name: Dry-run the Worker deploy
+        if: steps.changes.outputs.run != 'false'
+        working-directory: packages/railhead-backend
+        env:
+          CLOUDFLARE_ACCOUNT_ID: placeholder
+          SESSION_SIGNING_SECRET: placeholder-session-signing-secret-000000
+          OWNER_BOOTSTRAP_TOKEN: placeholder-owner-bootstrap-token-0000000
+        run: |
+          secrets_file="$RUNNER_TEMP/worker-secrets.json"
+          node ../../scripts/write-worker-secrets.mjs --config wrangler.jsonc --out "$secrets_file"
+          pnpm exec wrangler deploy --dry-run --secrets-file "$secrets_file"
+
+      - name: Remove placeholder secrets file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/worker-secrets.json"
+
       - name: Test
         if: steps.changes.outputs.run != 'false'
         run: pnpm test

@@ -190,6 +190,7 @@ function withHandoff<T>(
           composed.push(pins);
           return ok({ kind: "clean", candidate: candidateOf(pins) });
         },
+        discard: async () => ok({ removed: 1 }),
       },
     };
     const push = async (claimId: string, commit: string) => {
