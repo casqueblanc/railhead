@@ -174,6 +174,7 @@ async function withSessions(body: (harness: Harness) => Promise<void>): Promise<
       log,
       clock: () => clock.now,
       env,
+      wake: () => {},
     };
     const ports = composeRepo(context);
     const { sessions, identity } = ports;
@@ -771,6 +772,7 @@ describe("the agent routes", () => {
         log,
         clock: Date.now,
         env,
+        wake: () => {},
       });
       const created = value(
         await identity.createInvite(grant(repoId, { kind: "invite.create", name: "atlas" })),
@@ -829,6 +831,7 @@ describe("the agent routes", () => {
         log,
         clock: Date.now,
         env,
+        wake: () => {},
       });
       value(await identity.revoke(grant(repoId, { kind: "agent.revoke", agentId })));
     });
