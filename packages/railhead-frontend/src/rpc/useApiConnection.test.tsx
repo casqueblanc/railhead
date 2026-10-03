@@ -1,43 +1,19 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ApiSession } from "./apiSession";
+import { FakeApi } from "./fakeApi";
 import { useApiConnection } from "./useApiConnection";
 
 // React flushes effects and state updates inside act() only when the environment opts in.
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-/** A backend session whose probe and break are driven by the test. */
-class FakeSession implements ApiSession {
-  disposed = false;
-  answer: () => void = () => {};
-  refuse: () => void = () => {};
-  break: () => void = () => {};
-  readonly #probe = new Promise<void>((resolve, reject) => {
-    this.answer = resolve;
-    this.refuse = () => reject(new Error("probe refused"));
-  });
-
-  ping(): Promise<void> {
-    return this.#probe;
-  }
-
-  onRpcBroken(callback: (error: unknown) => void): void {
-    this.break = () => callback(new Error("session broken"));
-  }
-
-  [Symbol.dispose](): void {
-    this.disposed = true;
-  }
-}
-
 describe("useApiConnection", () => {
   let root: Root;
-  let sessions: FakeSession[];
+  let sessions: FakeApi[];
   let connection: ReturnType<typeof useApiConnection>;
 
   const connect = () => {
-    const session = new FakeSession();
+    const session = new FakeApi("unavailable");
     sessions.push(session);
     return session;
   };
@@ -46,7 +22,7 @@ describe("useApiConnection", () => {
     return null;
   };
   /** The session opened by the given attempt, failing the test when it was never opened. */
-  const session = (attempt: number): FakeSession => {
+  const session = (attempt: number): FakeApi => {
     const opened = sessions[attempt];
     if (!opened) throw new Error(`attempt ${attempt} opened no session`);
     return opened;
@@ -68,6 +44,11 @@ describe("useApiConnection", () => {
     await act(async () => session(0).answer());
 
     expect(connection.status).toBe("connected");
+  });
+
+  it("exposes the session it opened, before the backend answers", () => {
+    expect(sessions).toHaveLength(1);
+    expect(connection.session?.api).toBe(session(0));
   });
 
   it("is lost when the first probe fails", async () => {
@@ -92,6 +73,7 @@ describe("useApiConnection", () => {
     expect(sessions).toHaveLength(2);
     expect(session(0).disposed).toBe(true);
     expect(connection.status).toBe("connecting");
+    expect(connection.session?.api).toBe(session(1));
 
     await act(async () => session(0).break());
     expect(connection.status).toBe("connecting");
@@ -111,6 +93,7 @@ describe("useApiConnection", () => {
 
   it("disposes its session when the component unmounts", async () => {
     await act(async () => root.unmount());
+    root = createRoot(document.createElement("div"));
 
     expect(session(0).disposed).toBe(true);
   });
