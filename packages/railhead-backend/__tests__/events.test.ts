@@ -245,12 +245,21 @@ describe("validateEvent", () => {
       expect(() => validateEvent(event("decision.recorded", SYSTEM))).toThrow(/by a person/);
     });
 
-    it.each(["train.check", "train.main", "claim.reassigned", "inbox.queued"] as const)(
-      "refuses %s asserted by an agent",
-      (type) => {
-        expect(() => validateEvent(event(type, AGENT))).toThrow(/must be recorded by the system/);
-      },
-    );
+    it.each([
+      "train.check",
+      "train.main",
+      "claim.reassigned",
+      "claim.reopened",
+      "inbox.queued",
+    ] as const)("refuses %s asserted by an agent", (type) => {
+      expect(() => validateEvent(event(type, AGENT))).toThrow(/must be recorded by the system/);
+    });
+
+    it("refuses a reopened claim asserted by a person", () => {
+      expect(() => validateEvent(event("claim.reopened", HUMAN))).toThrow(
+        /must be recorded by the system/,
+      );
+    });
   });
 
   describe("agent self-reference", () => {

@@ -204,8 +204,8 @@ export function openClaim(
 
 /**
  * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
- * makes the claim ready. Returns `false`, and writes nothing, when the claim is no longer working
- * at that generation.
+ * makes the claim ready, and forgets its last refusal. Returns `false`, and writes nothing, when the
+ * claim is no longer working at that generation.
  */
 export function pinReady(
   sql: SqlStorage,
@@ -216,7 +216,8 @@ export function pinReady(
 ): boolean {
   const updated = sql
     .exec(
-      `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?
+      `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
+         last_refusal = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,
@@ -229,13 +230,14 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working and clears its pin. Returns `false`, and writes
- * nothing, when the claim is no longer ready at that generation.
+ * Returns a ready claim at `generation` to working, clears its pin and forgets its last refusal.
+ * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
  */
 export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
   const updated = sql
     .exec(
-      `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL
+      `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
+         last_refusal = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
       claimId,

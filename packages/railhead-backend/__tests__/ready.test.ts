@@ -875,6 +875,38 @@ describe("recorded refusals", () => {
       expect(refusals()).toBe(4);
     });
   });
+
+  it("records a refusal again after the claim was pinned and reopened", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const first = await decide(setup, claim.claimId, null);
+      const refusals = () =>
+        setup.events().filter((event) => event.type === "claim.refused").length;
+
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      expect(refusals()).toBe(1);
+      await ackAll(setup);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      await decide(setup, claim.claimId, 1, first.decisionId);
+      const head = setup.log.head();
+
+      // The claim reopens to working with no pin, the same state as the first refusal.
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      expect(types(setup.log.replay(head, 16).events)).toEqual(["claim.reopened", "claim.refused"]);
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      expect(refusals()).toBe(2);
+    });
+  });
 });
 
 describe("authorizeGit", () => {

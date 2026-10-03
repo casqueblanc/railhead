@@ -413,6 +413,7 @@ function refused(failure: PortFailure): Standing {
 /**
  * The failure of a refused standing, after recording `claim.refused` for the claim's agent unless
  * the claim's last recorded refusal had the same reason at the same generation, state and pin.
+ * Pinning or reopening the claim forgets that refusal, so a refusal in a new episode is recorded.
  */
 function refuse(
   tx: EventTransaction,
