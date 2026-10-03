@@ -20,7 +20,13 @@ import {
   MAIN_UPDATE_EXPIRY_MS,
   MAX_WRITE_ATTEMPTS,
 } from "../src/modules/mainWriter/mainWriter";
-import { createTrain, type Train } from "../src/modules/train/scheduler";
+import {
+  createTrain,
+  EXHAUSTED_FAILURES,
+  MAX_WAKE_FAILURES,
+  SETTLE_WAKE_MS,
+  type Train,
+} from "../src/modules/train/scheduler";
 import { readEntry, readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
@@ -69,6 +75,8 @@ class FakeMain implements MainRefPort {
   fallback: Step = "honest";
   /** Runs once while the next read is in flight: after it observes main, before it answers. */
   duringRead: (() => void) | null = null;
+  /** While true, Git answers neither reads nor updates. */
+  down = false;
 
   constructor(
     public main: CommitSha,
@@ -76,6 +84,7 @@ class FakeMain implements MainRefPort {
   ) {}
 
   async read(): Promise<PortResult<CommitSha>> {
+    if (this.down) return fail("unavailable", "Git is down.");
     const seen = this.main;
     const during = this.duringRead;
     this.duringRead = null;
@@ -84,6 +93,7 @@ class FakeMain implements MainRefPort {
   }
 
   async update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>> {
+    if (this.down) return fail("unavailable", "Git is down.");
     this.updates.push({ expected, next });
     const step = this.steps.shift() ?? this.fallback;
     switch (step) {
@@ -129,6 +139,10 @@ interface Harness {
   now(): number;
   /** Moves the Repo's clock forward to `at`. */
   advance(at: number): void;
+  /** Every time the Repo's alarm was asked for, oldest first. */
+  wakes: number[];
+  /** Builds another train over the same storage, as a restarted `Repo` does, and uses it. */
+  restart(): QueueingTrain;
 }
 
 /**
@@ -151,8 +165,9 @@ function withRepo<R>(
       log,
       clock: () => (now += 1),
       env,
-      wake: () => undefined,
+      wake: (at) => wakes.push(at),
     };
+    const wakes: number[] = [];
     const current = new Map(pins.map((p) => [p.claimId, p]));
     const currentGeneration = (claimId: string): number | null =>
       current.get(claimId)?.generation ?? null;
@@ -211,12 +226,11 @@ function withRepo<R>(
       authorization,
       mainWriter,
     };
-    const train = queueing(
-      createTrain(context, () => ports),
-      log,
-    );
+    let train = queueing(createTrain(context, () => ports), log);
     return body({
-      train,
+      get train() {
+        return train;
+      },
       ref,
       authorization,
       claims: current,
@@ -232,6 +246,11 @@ function withRepo<R>(
       now: () => now,
       advance: (at) => {
         now = Math.max(now, at);
+      },
+      wakes,
+      restart: () => {
+        train = queueing(createTrain(context, () => ports), log);
+        return train;
       },
     });
   });
@@ -484,3 +503,74 @@ describe("the train publishes through the real main writer", () => {
 function unreachable(value: never): never {
   throw new Error(`unhandled step: ${String(value)}`);
 }
+
+/** Drives the alarm until the train's retries run out; fails the test if they never do. */
+async function exhaust(h: Harness): Promise<void> {
+  for (let drive = 0; drive <= MAX_WAKE_FAILURES; drive += 1) {
+    if (readWake(h.sql)?.failures === EXHAUSTED_FAILURES) return;
+    await h.alarm();
+  }
+  throw new Error("the wake was never exhausted");
+}
+
+describe("the train's settle wake", () => {
+  it("settles an intent whose write may have landed once Git recovers, with no further call", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      ref.down = true;
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized", attempts: 1 });
+
+      await exhaust(h);
+
+      // The retries ran out, but the intent may have moved main, so a slow wake stays armed.
+      const exhausted = readWake(h.sql);
+      expect(exhausted).toEqual({ dueAt: h.now() + SETTLE_WAKE_MS, failures: EXHAUSTED_FAILURES });
+      expect(h.wakes.at(-1)).toBe(exhausted?.dueAt);
+
+      // An alarm another module asked for asks again for the settle wake and drives nothing.
+      const asked = h.wakes.length;
+      await h.train.resume();
+      expect(h.wakes.slice(asked)).toEqual([exhausted?.dueAt]);
+
+      // The settle drive finds Git still down: the row stays exhausted, an hour out again.
+      await h.alarm();
+      expect(readWake(h.sql)).toEqual({
+        dueAt: h.now() + SETTLE_WAKE_MS,
+        failures: EXHAUSTED_FAILURES,
+      });
+      expect(batchStates(h.train)).toEqual([["passed", null]]);
+
+      // Git recovers and nothing else calls the train: the next settle drive lands the batch.
+      ref.down = false;
+      await h.alarm();
+      expect(ref.main).toBe(first.candidate);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "updated" });
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(readWake(h.sql)).toBeNull();
+    });
+  });
+
+  it("asks again for an exhausted settle wake when the Repo restarts", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      ref.down = true;
+      const first = await pass(h);
+      await exhaust(h);
+      const owed = readWake(h.sql);
+      const asked = h.wakes.length;
+
+      const restarted = h.restart();
+      expect(h.wakes.slice(asked)).toEqual([owed?.dueAt]);
+
+      ref.down = false;
+      await h.alarm();
+      expect(restarted.batches(1)).toMatchObject([{ state: "landed" }]);
+      expect(ref.main).toBe(first.candidate);
+    });
+  });
+});
