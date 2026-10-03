@@ -17,10 +17,13 @@ const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 export type PushReport =
   /** The pack was unpacked and these refs were updated. */
   | { readonly kind: "reported"; readonly updated: ReadonlySet<string> }
-  /** The report was missing, refused the pack or could not be read: nothing is known to be updated. */
+  /** The report was complete and said the pack was not unpacked: nothing was updated. */
+  | { readonly kind: "refused" }
+  /** The report was missing or could not be read: what the push updated is not known. */
   | { readonly kind: "unknown" };
 
 const UNKNOWN: PushReport = { kind: "unknown" };
+const REFUSED: PushReport = { kind: "refused" };
 
 /** How the report is framed, from the capabilities the client sent. */
 export type ReportFraming = "side-band" | "plain" | "none";
@@ -110,7 +113,8 @@ export class PushReportReader {
       return UNKNOWN;
     }
     const [unpack, ...rest] = this.#lines;
-    if (unpack !== "unpack ok") return UNKNOWN;
+    if (unpack === undefined || !unpack.startsWith("unpack ")) return UNKNOWN;
+    if (unpack !== "unpack ok") return REFUSED;
     const updated = new Set<string>();
     // report-status-v2 follows an `ok` line with `option` lines when the server changed what the
     // client asked for; such a ref's outcome is not the one requested, so it counts as unknown.

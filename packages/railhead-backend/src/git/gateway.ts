@@ -26,7 +26,10 @@
 // that stops reading or goes away after its push was applied does not lose the record. A refused,
 // failed, cut-off or unreadable push records nothing, nor does one that outlived its claim. A push
 // the upstream applied but that was left unrecorded, because its claim changed or the record failed,
-// is logged as `git_push_unrecorded` with its claim and generation, for reconciliation.
+// is logged as `git_push_unrecorded` with its claim and generation, for reconciliation. So is a push
+// whose last bytes were sent but whose outcome is unknown: the upstream failed or answered with no
+// Git result, its response was cut off, or its report could not be read. Only a refusal the
+// upstream reported in a complete report is known to have moved nothing.
 //
 // Nothing here logs a token, a credential, a repository name or a body.
 
@@ -267,6 +270,9 @@ class GitGateway implements GitPort {
       record: (updated) => {
         this.#recordPush(principal, fence, head, updated);
       },
+      unknown: () => {
+        logUnrecorded(fence, "outcome_unknown");
+      },
     });
   }
 
@@ -413,6 +419,14 @@ class GitGateway implements GitPort {
     };
     const sent =
       body === null ? null : limited(body, maxBody, deadline, push?.current ?? null, awaitHeaders);
+    // Once a push's last bytes are sent, the upstream may have applied it: an exchange that then
+    // ends without a readable report leaves the fork to reconciliation.
+    let settled = false;
+    const outcomeUnknown = (): void => {
+      if (settled || push === null || sent?.released !== true) return;
+      settled = true;
+      push.unknown();
+    };
     if (sent === null) awaitHeaders();
     const headers = new Headers();
     for (const name of FORWARDED_REQUEST_HEADERS) {
@@ -440,6 +454,7 @@ class GitGateway implements GitPort {
       if (sent?.withheld === true && push !== null) return claimChanged(push.head);
       const outcome = deadline.expired ? "timeout" : "unreachable";
       logFailure(route, outcome);
+      outcomeUnknown();
       return outcome === "timeout"
         ? text(504, "railhead: the repository store did not answer in time")
         : text(502, "railhead: the repository store could not be reached");
@@ -457,10 +472,12 @@ class GitGateway implements GitPort {
       deadline.abort();
       await response.body?.cancel().catch(() => undefined);
       logFailure(route, `status_${response.status}`);
+      outcomeUnknown();
       return text(502, "railhead: the repository store refused the request");
     }
     if (response.body === null) {
       deadline.abort();
+      outcomeUnknown();
       return text(502, "railhead: the repository store sent no body");
     }
 
@@ -468,17 +485,29 @@ class GitGateway implements GitPort {
       push === null ? null : new PushReportReader(reportFraming(push.head.capabilities));
     const read = response.body.pipeThrough(
       inspected(this.#limits.maxResponseBytes, deadline, report, () => {
-        if (push !== null && report !== null) {
-          const outcome = report.end();
-          if (outcome.kind === "reported") push.record(outcome.updated);
+        if (push === null || report === null) return;
+        settled = true;
+        const outcome = report.end();
+        switch (outcome.kind) {
+          case "reported":
+            push.record(outcome.updated);
+            return;
+          case "refused":
+            return;
+          case "unknown":
+            push.unknown();
+            return;
+          default:
+            outcome satisfies never;
         }
       }),
     );
     // A push's response is read to its end by the gateway, not by the client's reads, so its report
-    // is recorded even when the client stops reading.
-    const passed = (push === null ? read : drained(read, PUSH_RESPONSE_BUFFER_BYTES)).pipeThrough(
-      masked(textEncoder.encode(token.value.value)),
-    );
+    // is recorded even when the client stops reading, and a response cut off by the deadline, the
+    // size bound or the upstream is seen too.
+    const passed = (
+      push === null ? read : drained(read, PUSH_RESPONSE_BUFFER_BYTES, outcomeUnknown)
+    ).pipeThrough(masked(textEncoder.encode(token.value.value)));
     return new Response(passed, {
       status: 200,
       headers: { "content-type": expectedType, "cache-control": "no-cache" },
@@ -490,10 +519,10 @@ class GitGateway implements GitPort {
    * Nothing is recorded unless the claim is still working at the push's generation when the record
    * is written: a claim that expired, changed hands or went ready while the push was in flight
    * keeps its own history. A record that fails is tried again up to `RECORD_ATTEMPTS` times in
-   * all, unless the event log refused it, which no retry changes. Whenever the refs the push moved
-   * stay in the fork without a `claim.pushed` event, the `git_push_unrecorded` warning names the
-   * claim and generation so the fork can be reconciled. The client's response is not cut short
-   * either way: the upstream has already applied the push.
+   * all, unless the event log refused it, which no retry changes. A record left unwritten either
+   * way is logged as `git_push_unrecorded` with the claim and generation, as is a push whose
+   * outcome is unknown, so the fork can be reconciled. The client's response is not cut short:
+   * the upstream has already applied the push.
    */
   #recordPush(
     principal: AgentPrincipal,
@@ -561,6 +590,8 @@ interface PendingPush {
   readonly current: () => boolean;
   /** Records the refs the upstream reported updated. */
   readonly record: (updated: ReadonlySet<string>) => void;
+  /** Leaves a push that may have been applied, though nothing says what it updated, to reconciliation. */
+  readonly unknown: () => void;
 }
 
 function routeOf(request: Request, path: string): Route | Response {
@@ -782,12 +813,13 @@ async function discarding(request: Request, response: Response): Promise<Respons
 }
 
 /**
- * Warns that a push moved refs in a claim's fork without a `claim.pushed` event. The claim id and
- * generation are Railhead's own; no ref, commit or other text from the push is logged.
+ * Warns that a push moved, or may have moved, refs in a claim's fork without a `claim.pushed` event.
+ * The claim id and generation are Railhead's own; no ref, commit or other text from the push is
+ * logged.
  */
 function logUnrecorded(
   fence: { claimId: string; generation: number },
-  reason: "claim_changed" | "record_failed",
+  reason: "claim_changed" | "record_failed" | "outcome_unknown",
 ): void {
   console.warn(
     JSON.stringify({
@@ -933,7 +965,7 @@ function cancelledOnAbort(
  * A request body that errors once more than `max` bytes pass or the deadline expires, and calls
  * `ended` once the whole body has passed. With `current`, the body's last `HELD_PUSH_BYTES` bytes
  * are held back until the client has sent everything, and passed on only if `current` still holds
- * then; otherwise the exchange is ended and the body is `withheld`.
+ * then, after which the body is `released`; otherwise the exchange is ended and it is `withheld`.
  */
 function limited(
   body: ReadableStream<Uint8Array>,
@@ -945,10 +977,12 @@ function limited(
   readonly stream: ReadableStream<Uint8Array>;
   readonly exceeded: boolean;
   readonly withheld: boolean;
+  readonly released: boolean;
 } {
   let seen = 0;
   let exceeded = false;
   let withheld = false;
+  let released = false;
   let held = new Uint8Array(0);
   const stream = body.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
@@ -989,6 +1023,7 @@ function limited(
             return;
           }
           if (held.length > 0) controller.enqueue(held);
+          released = true;
         }
         ended();
       },
@@ -1001,6 +1036,9 @@ function limited(
     },
     get withheld() {
       return withheld;
+    },
+    get released() {
+      return released;
     },
   };
 }
@@ -1043,9 +1081,14 @@ function inspected(
 /**
  * Reads `source` to its end whatever its own reader does, holding at most `buffer` unread bytes for
  * it. Past that, it waits for the reader to catch up, so a reader that stalls is still bounded by
- * whatever bounds `source`. Once the reader cancels, the rest of `source` is read and dropped.
+ * whatever bounds `source`. Once the reader cancels, the rest of `source` is read and dropped. If
+ * `source` errors, `failed` is called whether or not the reader is still there.
  */
-function drained(source: ReadableStream<Uint8Array>, buffer: number): ReadableStream<Uint8Array> {
+function drained(
+  source: ReadableStream<Uint8Array>,
+  buffer: number,
+  failed: () => void,
+): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let gone = false;
   let wake: (() => void) | null = null;
@@ -1076,6 +1119,7 @@ function drained(source: ReadableStream<Uint8Array>, buffer: number): ReadableSt
         // `source` errors only when the exchange is cut off, which records nothing; the reader, if
         // still there, sees the same error.
         pump().catch((error: unknown) => {
+          failed();
           if (!gone) controller.error(error);
         });
       },

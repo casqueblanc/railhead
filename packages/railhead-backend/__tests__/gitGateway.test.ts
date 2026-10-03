@@ -323,6 +323,18 @@ function sideBand(report: string): string {
   return `${pkt(`\u0001${report}`)}0000`;
 }
 
+/** `report` in band 1, split into packets of at most 60,000 bytes, then the outer flush. */
+function sideBands(report: string): string {
+  const packets: string[] = [];
+  for (let at = 0; at < report.length; at += 60_000) {
+    packets.push(pkt(`\u0001${report.slice(at, at + 60_000)}`));
+  }
+  return `${packets.join("")}0000`;
+}
+
+/** A refused ref and an option line that together pass the 64 KiB report bound. */
+const OVERSIZED_REFUSAL = `${pkt(`ng refs/heads/a ${"x".repeat(60_000)}\n`)}${pkt(`option refname ${"y".repeat(10_000)}\n`)}`;
+
 function bytesOf(response: Response): Promise<Uint8Array> {
   return response.arrayBuffer().then((buffer) => new Uint8Array(buffer));
 }
@@ -334,8 +346,16 @@ function pushedEvents(world: World): RailheadEvent[] {
 let logged: string[] = [];
 
 /** The warning for a push that moved the claim's fork without a `claim.pushed` event. */
-function unrecorded(reason: "claim_changed" | "record_failed"): string {
+function unrecorded(reason: "claim_changed" | "record_failed" | "outcome_unknown"): string {
   return JSON.stringify({ event: "git_push_unrecorded", claimId: CLAIM, generation: 3, reason });
+}
+
+/** The `outcome_unknown` warnings logged so far, after checking no line names a ref or commit. */
+function unknownOutcomes(): number {
+  for (const line of logged) {
+    for (const leaked of ["refs/heads/", PUSHED, ROOT, HEAD]) expect(line).not.toContain(leaked);
+  }
+  return logged.filter((line) => line === unrecorded("outcome_unknown")).length;
 }
 
 beforeEach(() => {
@@ -1384,11 +1404,13 @@ describe("bounds", () => {
       const text = await response.text();
       expect(pushedEvents(world)).toEqual([]);
       expect(logged.some((line) => line.includes("timeout"))).toBe(true);
+      // The upstream had read the whole push, so it may have applied it.
+      expect(unknownOutcomes()).toBe(1);
       expectNoTokenLeak(world, text);
     });
   });
 
-  it("errors a response that outlives the time limit, and records no push", async () => {
+  it("errors a response that outlives the time limit, and leaves the push to reconciliation", async () => {
     await withGateway(async (world) => {
       world.respond = () =>
         gitResponse(
@@ -1408,7 +1430,26 @@ describe("bounds", () => {
       expect(response.status).toBe(200);
       await expect(response.arrayBuffer()).rejects.toThrow();
       expect(pushedEvents(world)).toEqual([]);
+      expect(unknownOutcomes()).toBe(1);
     });
+  });
+
+  it("leaves a push whose response passes the size bound to reconciliation", async () => {
+    await withGateway(
+      async (world) => {
+        world.respond = () => gitResponse("git-receive-pack", "result", new Uint8Array(65));
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", PUSH_REQUEST),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status).toBe(200);
+        await expect(response.arrayBuffer()).rejects.toThrow();
+        expect(pushedEvents(world)).toEqual([]);
+        expect(unknownOutcomes()).toBe(1);
+      },
+      { ...FAST, maxResponseBytes: 64 },
+    );
   });
 });
 
@@ -1495,17 +1536,25 @@ describe("upstream responses", () => {
     });
   });
 
-  it("records nothing for a failed unpack, a fatal side band, a cut-off report or a refusal", async () => {
+  it("records nothing for a failed unpack, a fatal side band, a cut-off report or a refusal, and logs each unknown outcome", async () => {
     await withGateway(async (world) => {
       const update = pushBody([`${ROOT} ${HEAD} refs/heads/a`]);
-      for (const answer of [
-        sideBand(
-          `${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/a unpacker error\n")}0000`,
-        ),
-        `${pkt("\u0003fatal: out of space\n")}0000`,
-        `${pkt(`\u0001${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}`)}0000`,
-        pkt("\u0001garbage"),
-      ]) {
+      // Only the failed unpack and the refused ref are known to have moved nothing.
+      for (const [answer, unknown] of [
+        [
+          sideBand(
+            `${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/a unpacker error\n")}0000`,
+          ),
+          0,
+        ],
+        [sideBand(`${pkt("unpack ok\n")}${pkt("ng refs/heads/a non-fast-forward\n")}0000`), 0],
+        [`${pkt("\u0003fatal: out of space\n")}0000`, 1],
+        [`${pkt(`\u0001${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}`)}0000`, 1],
+        [pkt("\u0001garbage"), 1],
+        // A report that would read as a clean refusal, but is past the report bound.
+        [sideBands(`${pkt("unpack ok\n")}${OVERSIZED_REFUSAL}0000`), 1],
+      ] as const) {
+        logged = [];
         world.respond = () => gitResponse("git-receive-pack", "result", answer);
         const response = await world.gateway.serve(
           rpc("git-receive-pack", update),
@@ -1514,7 +1563,9 @@ describe("upstream responses", () => {
         );
         expect(response.status).toBe(200);
         await response.arrayBuffer();
+        expect(unknownOutcomes()).toBe(unknown);
       }
+      logged = [];
       world.respond = () => new Response("nope", { status: 500 });
       const failed = await world.gateway.serve(
         rpc("git-receive-pack", update),
@@ -1522,7 +1573,18 @@ describe("upstream responses", () => {
         "/git-receive-pack",
       );
       expect(failed.status).toBe(502);
-      expect(world.seen).toHaveLength(5);
+      expect(unknownOutcomes()).toBe(1);
+      logged = [];
+      world.respond = () =>
+        new Response(PUSH_RESULT, { headers: { "content-type": "application/octet-stream" } });
+      const mistyped = await world.gateway.serve(
+        rpc("git-receive-pack", update),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(mistyped.status).toBe(502);
+      expect(unknownOutcomes()).toBe(1);
+      expect(world.seen).toHaveLength(8);
       expect(pushedEvents(world)).toEqual([]);
     });
   });
@@ -1741,7 +1803,7 @@ describe("a client that stops reading a push's response", () => {
     });
   });
 
-  it("records nothing when the upstream is cut off after the client went away", async () => {
+  it("leaves the push to reconciliation when the upstream is cut off after the client went away", async () => {
     await withGateway(async (world) => {
       world.respond = () =>
         gitResponse(
@@ -1761,6 +1823,7 @@ describe("a client that stops reading a push's response", () => {
       await response.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 50));
       expect(pushedEvents(world)).toEqual([]);
+      expect(unknownOutcomes()).toBe(1);
     });
   });
 });
@@ -1907,6 +1970,20 @@ describe("push reports", () => {
       kind: "reported",
       updated: new Set(["refs/heads/x", "refs/heads/xy"]),
     });
+  });
+
+  it("tells a complete report of a failed unpack from one it cannot read", () => {
+    const refused = new PushReportReader("plain");
+    refused.push(
+      encoder.encode(`${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/a x\n")}0000`),
+    );
+    expect(refused.end()).toEqual({ kind: "refused" });
+    const unopened = new PushReportReader("plain");
+    unopened.push(encoder.encode(`${pkt("ok refs/heads/a\n")}0000`));
+    expect(unopened.end()).toEqual({ kind: "unknown" });
+    const cutOff = new PushReportReader("plain");
+    cutOff.push(encoder.encode(pkt("unpack index-pack failed\n")));
+    expect(cutOff.end()).toEqual({ kind: "unknown" });
   });
 
   it("knows nothing without a report, or with bytes after it", () => {
