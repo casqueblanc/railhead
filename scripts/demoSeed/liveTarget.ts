@@ -9,9 +9,14 @@
 // another action or head is refused there, never here.
 //
 // Every backend call is bounded by a timeout. A write whose answer times out or is lost is not
-// repeated here. The next seed reads the target first, so an uncertain seed is reconciled before
-// anything is written a second time; a reset reads nothing first, so the owner inspects the
-// instance before approving another.
+// repeated here: it fails with `WriteUncertain`. The next seed reads the target first, so an
+// uncertain seed is reconciled before anything is written a second time; a reset reads nothing
+// first, so the owner inspects the instance before approving another.
+//
+// The board has no issue query, so `issues` replays the log from its start. It keeps only the
+// issues whose titles the caller asks for and stops with an incomplete plan past
+// `MAX_EVENT_PAGES` pages or `LiveLimits.scanMs`, so a long log cannot hold an operator's run for
+// hours or fill its memory.
 //
 // The types come from `@railhead/shared` by relative path and type only: `@railhead/shared` already
 // depends on `@railhead/scripts`, and the workspace task graph refuses a cycle. The two runtime
@@ -47,12 +52,28 @@ export const API_PATH = "/api";
 /** The largest page `readEvents` returns; restates `@railhead/shared`'s `MAX_EVENT_PAGE`. */
 export const MAX_EVENT_PAGE = 256;
 
-/** How long one read may take before the run gives up. */
-const READ_TIMEOUT_MS = 30_000;
-/** How long one write may take, bundle upload included. */
-const WRITE_TIMEOUT_MS = 120_000;
-/** The most event pages an issue read pages through: about a quarter of a million events. */
-const MAX_EVENT_PAGES = 1024;
+/** The most event pages an issue read pages through: 16,384 events. */
+export const MAX_EVENT_PAGES = 64;
+
+/** How long the live target waits; tests shorten them. */
+export interface LiveLimits {
+  /** How long one read may take before the run gives up. */
+  readonly readMs: number;
+  /** How long one write may take, bundle upload included. */
+  readonly writeMs: number;
+  /** How long reading the whole board log may take. */
+  readonly scanMs: number;
+  /** The clock `scanMs` is measured on, in milliseconds. */
+  readonly now: () => number;
+}
+
+/** The limits a run uses. */
+export const LIVE_LIMITS: LiveLimits = {
+  readMs: 30_000,
+  writeMs: 120_000,
+  scanMs: 60_000,
+  now: Date.now,
+};
 
 /** The demo seed's capability, after `DemoSeedApi`. */
 export interface DemoSeedSession extends Disposable {
@@ -111,6 +132,21 @@ export class ApprovalNeeded extends Error {
  */
 export class BackendFailure extends Error {
   override readonly name = "BackendFailure";
+}
+
+/**
+ * A write was sent and its answer timed out or was lost, so it may have happened. It is never
+ * repeated here; what the owner does next depends on the action.
+ */
+export class WriteUncertain extends Error {
+  override readonly name = "WriteUncertain";
+  /** The action that may have happened. */
+  readonly action: DemoSeedAction;
+
+  constructor(action: DemoSeedAction, failure: BackendFailure) {
+    super(failure.message, { cause: failure });
+    this.action = action;
+  }
 }
 
 /**
@@ -181,17 +217,20 @@ export function parseSignedApproval(value: unknown): Approval {
 /** The demo repository on a live backend. It writes at most once, with the approval it holds. */
 export class LiveTarget implements SeedTarget, BoardIssues {
   readonly #session: LiveSession;
+  readonly #limits: LiveLimits;
   #approval: Approval | null;
 
-  constructor(session: LiveSession, approval: Approval) {
+  constructor(session: LiveSession, approval: Approval, limits: LiveLimits = LIVE_LIMITS) {
     this.#session = session;
     this.#approval = approval;
+    this.#limits = limits;
   }
 
   async read(ref: RepoRef): Promise<RepoState | null> {
     demoRef(ref);
-    using demo = await within(this.#session.demoSeed(), READ_TIMEOUT_MS, "demoSeed");
-    const state = valueOf(await within(demo.read(), READ_TIMEOUT_MS, "demoSeed.read"), "read");
+    const { readMs } = this.#limits;
+    using demo = await within(this.#session.demoSeed(), readMs, "demoSeed");
+    const state = valueOf(await within(demo.read(), readMs, "demoSeed.read"), "read");
     return state === null ? null : { main: state.main };
   }
 
@@ -212,25 +251,32 @@ export class LiveTarget implements SeedTarget, BoardIssues {
     return result.deleted;
   }
 
-  /** The repository's filed issues in log order, paging the log from its start. */
-  async issues(ref: RepoRef): Promise<readonly BoardIssue[]> {
+  /**
+   * The repository's filed issues titled one of `titles`, in log order, paging the log from its
+   * start. Other issues are dropped as each page arrives.
+   */
+  async issues(ref: RepoRef, titles: ReadonlySet<string>): Promise<readonly BoardIssue[]> {
     const { org, repo } = demoRef(ref);
-    const opened = await within(this.#session.openBoard(org, repo), READ_TIMEOUT_MS, "openBoard");
+    const { readMs, scanMs, now } = this.#limits;
+    const deadline = now() + scanMs;
+    const opened = await within(this.#session.openBoard(org, repo), readMs, "openBoard");
     if (!opened.ok && opened.code === "not_found") return [];
     using board = valueOf(opened, "openBoard");
     const filed: BoardIssue[] = [];
     let cursor = 0;
     let history: string | undefined;
     for (let pages = 0; pages < MAX_EVENT_PAGES; pages += 1) {
+      const left = deadline - now();
+      if (left <= 0) throw tooLong(`after ${scanMs} ms`);
       const read = board.readEvents(
         cursor,
         MAX_EVENT_PAGE,
         ...(history === undefined ? [] : [history]),
       );
-      const page = valueOf(await within(read, READ_TIMEOUT_MS, "readEvents"), "readEvents");
+      const page = valueOf(await within(read, Math.min(readMs, left), "readEvents"), "readEvents");
       history = page.history;
       for (const event of page.events) {
-        if (event.type === "issue.filed") {
+        if (event.type === "issue.filed" && titles.has(event.data.title)) {
           filed.push({ title: event.data.title, body: event.data.body });
         }
       }
@@ -240,7 +286,7 @@ export class LiveTarget implements SeedTarget, BoardIssues {
       }
       cursor = page.cursor;
     }
-    throw new Error(`The log is longer than ${MAX_EVENT_PAGES} pages.`);
+    throw tooLong(`past ${MAX_EVENT_PAGES * MAX_EVENT_PAGE} events`);
   }
 
   /** Performs `action` with the held approval, which is spent whether or not the call succeeds. */
@@ -250,16 +296,27 @@ export class LiveTarget implements SeedTarget, BoardIssues {
     if (approval === null) {
       throw new SeedRefusal(`${action.kind} needs another owner passkey assertion.`);
     }
-    using demo = await within(this.#session.demoSeed(), READ_TIMEOUT_MS, "demoSeed");
+    const { readMs, writeMs } = this.#limits;
+    using demo = await within(this.#session.demoSeed(), readMs, "demoSeed");
     switch (approval.kind) {
       case "prepare": {
-        const prepared = await within(demo.prepare(action), READ_TIMEOUT_MS, "demoSeed.prepare");
+        const prepared = await within(demo.prepare(action), readMs, "demoSeed.prepare");
         throw new ApprovalNeeded(action, valueOf(prepared, "prepare"));
       }
       case "signed": {
         const { challengeId, assertion } = approval;
-        const performed = demo.perform(challengeId, assertion, bundle);
-        return valueOf(await within(performed, WRITE_TIMEOUT_MS, "demoSeed.perform"), action.kind);
+        let performed: BoardResult<DemoSeedResult>;
+        try {
+          performed = await within(
+            demo.perform(challengeId, assertion, bundle),
+            writeMs,
+            "demoSeed.perform",
+          );
+        } catch (error) {
+          if (error instanceof BackendFailure) throw new WriteUncertain(action, error);
+          throw error;
+        }
+        return valueOf(performed, action.kind);
       }
       default:
         return unreachable(approval);
@@ -316,6 +373,13 @@ async function within<T>(promise: PromiseLike<T>, ms: number, call: string): Pro
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The refusal for a board log too long to read within the scan's budget. */
+function tooLong(limit: string): SeedRefusal {
+  return new SeedRefusal(
+    `The board log is too long: stopped reading it ${limit}, so the plan is incomplete.`,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

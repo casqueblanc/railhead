@@ -60,11 +60,14 @@ export class MemoryTarget implements SeedTarget, BoardIssues {
     return repo === undefined || !repo.initialized ? null : { main: repo.main };
   }
 
-  async issues(ref: RepoRef): Promise<readonly BoardIssue[]> {
+  /** The repository's issues titled one of `titles`, or every issue without `titles`. */
+  async issues(ref: RepoRef, titles?: ReadonlySet<string>): Promise<readonly BoardIssue[]> {
     const repo = this.#repos.get(key(ref));
     return repo === undefined || !repo.initialized
       ? []
-      : repo.issues.map((issue) => ({ ...issue }));
+      : repo.issues
+          .filter((issue) => titles === undefined || titles.has(issue.title))
+          .map((issue) => ({ ...issue }));
   }
 
   /**

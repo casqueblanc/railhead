@@ -15,10 +15,16 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
-import { run } from "./cli.ts";
+import { failureReport, run } from "./cli.ts";
 import { FakeBackend, sessionWith, signedFor } from "./fakeBackend.ts";
 import { MAX_BUNDLE_BYTES } from "./history.ts";
-import { ApprovalNeeded, type LiveSession } from "./liveTarget.ts";
+import {
+  ApprovalNeeded,
+  LIVE_LIMITS,
+  WriteUncertain,
+  type LiveLimits,
+  type LiveSession,
+} from "./liveTarget.ts";
 import { loadManifest, SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
@@ -496,4 +502,86 @@ test("the CLI refuses an assertion without a target or with a dry run, and a pla
     /https origin/,
   );
   assert.equal(backend.prepared.length, 0);
+});
+
+/** Runs `args` until it stops after prepare, and writes the owner's assertion for that challenge. */
+async function approve(
+  args: readonly string[],
+  open: () => LiveSession,
+  name: string,
+): Promise<string> {
+  const needed = await run(args, open).then(
+    () => assert.fail("the write should stop after prepare"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(needed instanceof ApprovalNeeded);
+  const file = join(scratch, name);
+  const { challengeId } = needed.challenge;
+  writeFileSync(file, JSON.stringify({ challengeId, assertion: signedFor(challengeId) }));
+  return file;
+}
+
+/** A write timeout short enough that a withheld answer fails the run at once. */
+const SHORT: LiveLimits = { ...LIVE_LIMITS, writeMs: 50 };
+
+test("a seed whose answer is lost exits 4, and the next run reads main in place and writes nothing", async () => {
+  const backend = new FakeBackend();
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["seed", "--source-root", source, "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "lost-seed.json");
+
+  backend.withholdNextAnswer = true;
+  const lost = await run([...args, "--assertion", file], open, SHORT).then(
+    () => assert.fail("the seed should fail without an answer"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(lost instanceof WriteUncertain);
+  const report = failureReport(lost);
+  assert.equal(report.exitCode, 4);
+  assert.deepEqual(report.stdout, []);
+  assert.equal(report.stderr[0], "demoSeed.perform did not answer within 50 ms.");
+  assert.match(
+    report.stderr[1] ?? "",
+    /^the seed of main [0-9a-f]{40} may have happened and was not repeated; run the same seed again: it reads the target first/,
+  );
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  const head = backend.main;
+  assert.ok(head !== null);
+
+  // The operator reruns the same command: it reads main in place and spends nothing.
+  const lines = await run([...args, "--assertion", file], open, SHORT);
+  assert.equal(lines[1], `ok   seed repository demo/upload-app@main = ${head}`);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  assert.equal(backend.received.length, 1);
+  assert.equal(backend.prepared.length, 1);
+});
+
+test("a reset whose answer is lost exits 4, tells the owner to inspect, and is never repeated", async () => {
+  const backend = new FakeBackend();
+  backend.exists = true;
+  backend.main = "a".repeat(40);
+  const open = (): LiveSession => sessionWith(backend);
+  const args = ["reset", "--target", "https://railhead.dev"];
+  const file = await approve(args, open, "lost-reset.json");
+
+  backend.withholdNextAnswer = true;
+  const lost = await run([...args, "--assertion", file], open, SHORT).then(
+    () => assert.fail("the reset should fail without an answer"),
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(lost instanceof WriteUncertain);
+  assert.deepEqual(failureReport(lost), {
+    stdout: [],
+    stderr: [
+      "demoSeed.perform did not answer within 50 ms.",
+      "the reset may have happened and was not repeated; inspect the instance with seed --dry-run --target ORIGIN or on the board before approving another reset",
+    ],
+    exitCode: 4,
+  });
+  assert.deepEqual(backend.performed, ["demo.reset"]);
+  assert.equal(backend.exists, false);
+
+  // Rerunning with the same assertion does not delete again: the challenge is spent.
+  await assert.rejects(run([...args, "--assertion", file], open, SHORT), /proof_expired/);
+  assert.deepEqual(backend.performed, ["demo.reset"]);
 });

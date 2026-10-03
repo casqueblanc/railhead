@@ -13,11 +13,15 @@ import {
   API_PATH,
   ApprovalNeeded,
   BackendFailure,
+  LIVE_LIMITS,
   LiveTarget,
   liveApiUrl,
   MAX_EVENT_PAGE,
+  MAX_EVENT_PAGES,
   parseSignedApproval,
+  WriteUncertain,
   type Approval,
+  type LiveLimits,
 } from "./liveTarget.ts";
 import { loadManifest, SeedRefusal } from "./manifest.ts";
 import { ActionStale, DEMO_REF, reset, seed } from "./reconcile.ts";
@@ -36,10 +40,22 @@ async function withTarget<T>(
   backend: FakeBackend,
   approval: Approval,
   body: (target: LiveTarget) => Promise<T>,
+  limits: LiveLimits = LIVE_LIMITS,
 ): Promise<T> {
   using session = sessionWith(backend);
-  return await body(new LiveTarget(session, approval));
+  return await body(new LiveTarget(session, approval, limits));
 }
+
+/** A backend holding the demo repository with `count` events, none of them issues. */
+function withLog(count: number): FakeBackend {
+  const backend = new FakeBackend();
+  backend.exists = true;
+  backend.main = HEAD;
+  backend.events = Array.from({ length: count }, (_, i) => otherEvent(i + 1));
+  return backend;
+}
+
+const WANTED = new Set(["First", "Last"]);
 
 /** The challenge a prepare-only seed of `head` stops with. */
 async function preparedSeed(backend: FakeBackend, head: string): Promise<ApprovalNeeded> {
@@ -226,28 +242,96 @@ test("a signed reset deletes the demo repository, and another repository is refu
   assert.equal(backend.prepared.length, 1);
 });
 
-test("issues are read from every page of the log, and a missing repository has none", async () => {
-  const backend = new FakeBackend();
-  assert.deepEqual(await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF)), []);
+test("issues are read from every page of the log, keeping only the titles asked for", async () => {
+  const empty = new FakeBackend();
+  assert.deepEqual(
+    await withTarget(empty, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    [],
+  );
 
-  backend.exists = true;
-  backend.main = HEAD;
-  // More than two pages, with the issues on the first and the last.
+  // More than two pages, with the wanted issues on the first and the last, and another between.
   const count = MAX_EVENT_PAGE * 2 + 3;
-  backend.events = Array.from({ length: count }, (_, i) => otherEvent(i + 1));
+  const backend = withLog(count);
   backend.events[0] = issueEvent(1, "First", "one");
+  backend.events[MAX_EVENT_PAGE] = issueEvent(MAX_EVENT_PAGE + 1, "Not seeded", "dropped");
   backend.events[count - 1] = issueEvent(count, "Last", "line\n\nline");
-  assert.deepEqual(await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF)), [
-    { title: "First", body: "one" },
-    { title: "Last", body: "line\n\nline" },
-  ]);
+  assert.deepEqual(
+    await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    [
+      { title: "First", body: "one" },
+      { title: "Last", body: "line\n\nline" },
+    ],
+  );
 
   // A log that stops advancing before its head is an error, not an empty board.
   backend.stall = true;
   await assert.rejects(
-    withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF)),
+    withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
     /stopped at 0 before its head/,
   );
+});
+
+test("a board log longer than the page cap stops the plan as incomplete", async () => {
+  const cap = MAX_EVENT_PAGES * MAX_EVENT_PAGE;
+  // Exactly the cap is read whole.
+  const full = withLog(cap);
+  full.events[cap - 1] = issueEvent(cap, "Last", "end");
+  assert.deepEqual(await withTarget(full, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)), [
+    { title: "Last", body: "end" },
+  ]);
+
+  // One event past it is refused, even though the wanted issue is within the first page.
+  const over = withLog(cap + 1);
+  over.events[0] = issueEvent(1, "First", "one");
+  await assert.rejects(
+    withTarget(over, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        "The board log is too long: stopped reading it past 16384 events, so the plan is incomplete.",
+  );
+  // So is the seed plan built on it, before anything is written.
+  await assert.rejects(
+    withTarget(over, { kind: "prepare" }, (t) => seed(manifest, bundleAt(HEAD), t, t)),
+    /board log is too long/,
+  );
+  assert.equal(over.prepared.length, 0);
+});
+
+test("a board log that takes longer than the scan budget stops the plan as incomplete", async () => {
+  const backend = withLog(MAX_EVENT_PAGE * 4);
+  // Each look at the clock is one second later; the budget is two and a half.
+  let clock = 0;
+  const limits: LiveLimits = { ...LIVE_LIMITS, scanMs: 2500, now: () => (clock += 1000) };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED), limits),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        "The board log is too long: stopped reading it after 2500 ms, so the plan is incomplete.",
+  );
+  // Within the budget the same log is read whole.
+  assert.deepEqual(
+    await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    [],
+  );
+});
+
+test("a write whose answer is lost fails as uncertain and is not repeated", async () => {
+  const limits: LiveLimits = { ...LIVE_LIMITS, writeMs: 50 };
+  const backend = new FakeBackend();
+  const needed = await preparedSeed(backend, HEAD);
+  backend.withholdNextAnswer = true;
+  await assert.rejects(
+    withTarget(backend, signed(needed), (t) => seed(manifest, bundleAt(HEAD), t, t), limits),
+    (error: unknown) =>
+      error instanceof WriteUncertain &&
+      error.action.kind === "demo.seed" &&
+      error.message === "demoSeed.perform did not answer within 50 ms.",
+  );
+  // The backend applied it once, and nothing sent it again.
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  assert.equal(backend.main, HEAD);
 });
 
 test("an unavailable backend is a failure with its sentence, not a refusal", async () => {

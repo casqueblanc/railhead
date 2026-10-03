@@ -69,8 +69,12 @@ export class FakeBackend {
   /** The bundles `perform` received, as bytes. */
   readonly received: Uint8Array[] = [];
   readonly prepared: DemoSeedAction[] = [];
+  /** The actions `perform` applied, in order. */
+  readonly performed: DemoSeedAction["kind"][] = [];
   /** A failure the next `perform` answers with, before doing anything. */
   failNextPerform: BoardErrorCode | null = null;
+  /** Whether the next `perform` applies its action and then never answers, as a lost response. */
+  withholdNextAnswer = false;
   /** Whether `readEvents` stops advancing its cursor. */
   stall = false;
   readonly #challenges = new Map<string, DemoSeedAction>();
@@ -112,12 +116,14 @@ export class FakeBackend {
         if (this.main !== null && this.main !== action.head) return fail("action_stale");
         this.main = action.head;
         this.exists = true;
+        this.performed.push(action.kind);
         return { ok: true, value: { kind: "demo.seed", repo: REPO_ID, head: action.head } };
       case "demo.reset": {
         const deleted = this.exists || this.main !== null;
         this.exists = false;
         this.main = null;
         this.events = [];
+        this.performed.push(action.kind);
         return { ok: true, value: { kind: "demo.reset", deleted } };
       }
       default:
@@ -157,8 +163,12 @@ class FakeDemoSeed extends RpcTarget {
     challengeId: string,
     assertion: PasskeyAssertion,
     bundle: Uint8Array | null,
-  ): BoardResult<DemoSeedResult> {
-    return this.#backend.perform(challengeId, assertion, bundle);
+  ): BoardResult<DemoSeedResult> | Promise<never> {
+    const backend = this.#backend;
+    const answer = backend.perform(challengeId, assertion, bundle);
+    if (!backend.withholdNextAnswer) return answer;
+    backend.withholdNextAnswer = false;
+    return new Promise<never>(() => {});
   }
 }
 

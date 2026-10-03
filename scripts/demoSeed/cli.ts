@@ -21,7 +21,9 @@
 // `prepare`, prints the challenge and exits 3, writing nothing; `--assertion FILE` performs it with
 // `{ challengeId, assertion }` the owner signed for that challenge. The owner's steps are in
 // `docs/demo-seed.md`. A refusal exits 2; a backend failure or timeout prints the backend's sentence
-// and exits 1. Nothing here creates a Cloudflare resource or reads a secret.
+// and exits 1. A write sent whose answer timed out or was lost exits 4 and says what to do next: run
+// a seed again, since it reads first; inspect the instance before approving another reset. Nothing
+// here creates a Cloudflare resource or reads a secret.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -47,11 +49,14 @@ import {
 import {
   ApprovalNeeded,
   BackendFailure,
+  LIVE_LIMITS,
   LiveTarget,
   liveApiUrl,
   openLiveSession,
   parseSignedApproval,
+  WriteUncertain,
   type Approval,
+  type LiveLimits,
   type LiveSession,
 } from "./liveTarget.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
@@ -76,12 +81,14 @@ const MANIFEST_PATH = "fixtures/demo/seed.json";
 export type OpenSession = (origin: string) => LiveSession;
 
 /**
- * Runs one command and returns the lines it prints. Throws `SeedRefusal` on a refused request and
- * `ApprovalNeeded` when a live write stopped after `prepare`.
+ * Runs one command and returns the lines it prints. Throws `SeedRefusal` on a refused request,
+ * `ApprovalNeeded` when a live write stopped after `prepare` and `WriteUncertain` when a write's
+ * answer was lost; `failureReport` turns each into output and an exit code.
  */
 export async function run(
   argv: readonly string[],
   openSession: OpenSession = openLiveSession,
+  limits: LiveLimits = LIVE_LIMITS,
 ): Promise<string[]> {
   const { positionals, values } = parseArgs({
     args: [...argv],
@@ -115,7 +122,7 @@ export async function run(
     }
     if (values["dry-run"]) return [...plan, `note planned for ${live.origin}`];
     using session = openSession(live.origin);
-    const deleted = await reset(ref, new LiveTarget(session, live.approval));
+    const deleted = await reset(ref, new LiveTarget(session, live.approval, limits));
     return [
       ...plan,
       deleted ? `deleted ${ref.org}/${ref.repo}` : `${ref.org}/${ref.repo} held nothing to delete`,
@@ -169,7 +176,7 @@ export async function run(
         ];
       }
       using session = openSession(live.origin);
-      const target = new LiveTarget(session, live.approval);
+      const target = new LiveTarget(session, live.approval, limits);
       if (values["dry-run"]) {
         const history = planHistory(request);
         const plan = await planSeed(manifest, history, target, target);
@@ -290,21 +297,49 @@ function decisionLines(key: string, options: readonly string[]): string[] {
   ];
 }
 
+/** What a failed run prints and its exit code. */
+export interface FailureReport {
+  readonly stdout: readonly string[];
+  readonly stderr: readonly string[];
+  readonly exitCode: 1 | 2 | 3 | 4;
+}
+
+/** The report for an error `run` throws on purpose; anything else is rethrown as a defect. */
+export function failureReport(error: unknown): FailureReport {
+  if (error instanceof ApprovalNeeded) {
+    return { stdout: describeApproval(error), stderr: [], exitCode: 3 };
+  }
+  if (error instanceof SeedRefusal) return { stdout: [], stderr: [error.message], exitCode: 2 };
+  if (error instanceof BackendFailure) return { stdout: [], stderr: [error.message], exitCode: 1 };
+  if (error instanceof WriteUncertain) {
+    return { stdout: [], stderr: [error.message, uncertainNext(error)], exitCode: 4 };
+  }
+  throw error;
+}
+
+/** What to do after a write whose answer was lost; it is never repeated automatically. */
+function uncertainNext(error: WriteUncertain): string {
+  switch (error.action.kind) {
+    case "demo.seed":
+      return `the seed of main ${error.action.head} may have happened and was not repeated; run the same seed again: it reads the target first and writes nothing if main is in place`;
+    case "demo.reset":
+      return "the reset may have happened and was not repeated; inspect the instance with seed --dry-run --target ORIGIN or on the board before approving another reset";
+    default:
+      return unreachable(error.action);
+  }
+}
+
+function unreachable(value: never): never {
+  throw new Error(`Unhandled ${JSON.stringify(value)}`);
+}
+
 if (import.meta.main) {
   try {
     for (const line of await run(process.argv.slice(2))) process.stdout.write(`${line}\n`);
   } catch (error) {
-    if (error instanceof ApprovalNeeded) {
-      for (const line of describeApproval(error)) process.stdout.write(`${line}\n`);
-      process.exitCode = 3;
-    } else if (error instanceof SeedRefusal) {
-      process.stderr.write(`${error.message}\n`);
-      process.exitCode = 2;
-    } else if (error instanceof BackendFailure) {
-      process.stderr.write(`${error.message}\n`);
-      process.exitCode = 1;
-    } else {
-      throw error;
-    }
+    const report = failureReport(error);
+    for (const line of report.stdout) process.stdout.write(`${line}\n`);
+    for (const line of report.stderr) process.stderr.write(`${line}\n`);
+    process.exitCode = report.exitCode;
   }
 }

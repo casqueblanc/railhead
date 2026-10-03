@@ -81,8 +81,11 @@ export interface BoardIssue {
 
 /** The board's issues for one repository: the read `DemoSeedApi` does not offer. */
 export interface BoardIssues {
-  /** The repository's open issues in filing order, empty when it does not exist. */
-  issues(ref: RepoRef): Promise<readonly BoardIssue[]>;
+  /**
+   * The repository's open issues titled one of `titles`, in filing order, empty when it does not
+   * exist.
+   */
+  issues(ref: RepoRef, titles: ReadonlySet<string>): Promise<readonly BoardIssue[]>;
 }
 
 /** The target refused a write because it holds something else, as the backend's `action_stale`. */
@@ -138,7 +141,8 @@ export async function planSeed(
       `${name} already has main at ${state.main}, not the import's ${history.head}. Reset it first.`,
     );
   }
-  const filed = Map.groupBy(await board.issues(ref), (issue) => issue.title);
+  const titles = new Set(manifest.issues.map((issue) => issue.title));
+  const filed = Map.groupBy(await board.issues(ref, titles), (issue) => issue.title);
 
   return [
     {
