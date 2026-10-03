@@ -489,7 +489,12 @@ class GitGateway implements GitPort {
     }
 
     const report =
-      push === null ? null : new PushReportReader(reportFraming(push.head.capabilities));
+      push === null
+        ? null
+        : new PushReportReader(
+            reportFraming(push.head.capabilities),
+            push.head.updates.map((update) => update.ref),
+          );
     const read = response.body.pipeThrough(
       inspected(this.#limits.maxResponseBytes, deadline, report, () => {
         if (push === null || report === null) return;
@@ -513,7 +518,12 @@ class GitGateway implements GitPort {
     // is recorded even when the client stops reading, and a response cut off by the deadline, the
     // size bound or the upstream is seen too.
     const passed = (
-      push === null ? read : drained(read, PUSH_RESPONSE_BUFFER_BYTES, outcomeUnknown)
+      push === null
+        ? read
+        : drained(read, PUSH_RESPONSE_BUFFER_BYTES, () => {
+            deadline.abort();
+            outcomeUnknown();
+          })
     ).pipeThrough(masked(textEncoder.encode(token.value.value)));
     return new Response(passed, {
       status: 200,
@@ -1089,7 +1099,8 @@ function inspected(
  * Reads `source` to its end whatever its own reader does, holding at most `buffer` unread bytes for
  * it. Past that, it waits for the reader to catch up, so a reader that stalls is still bounded by
  * whatever bounds `source`. Once the reader cancels, the rest of `source` is read and dropped. If
- * `source` errors, `failed` is called whether or not the reader is still there.
+ * `source` errors, `failed` is called once, whether the reader is still there, gone, or stalled
+ * with the buffer full, and the reader sees the same error.
  */
 function drained(
   source: ReadableStream<Uint8Array>,
@@ -1097,6 +1108,12 @@ function drained(
   failed: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
+  // Waiting for room alone would miss a `source` that errors meanwhile, such as at its deadline.
+  let ended = false;
+  const settled = reader.closed.then(() => {
+    ended = true;
+  });
+  settled.catch(() => undefined);
   let gone = false;
   let wake: (() => void) | null = null;
   const resume = (): void => {
@@ -1106,14 +1123,15 @@ function drained(
   return new ReadableStream<Uint8Array>(
     {
       start(controller) {
-        // `cancel` sets `gone` while the pump waits.
-        const full = (): boolean => !gone && (controller.desiredSize ?? 0) <= 0;
+        // `cancel` sets `gone`, and `source` ending sets `ended`, while the pump waits.
+        const full = (): boolean => !gone && !ended && (controller.desiredSize ?? 0) <= 0;
         const pump = async (): Promise<void> => {
           for (;;) {
             while (full()) {
-              await new Promise<void>((resolve) => {
+              const room = new Promise<void>((resolve) => {
                 wake = resolve;
               });
+              await Promise.race([room, settled]);
             }
             const { done, value } = await reader.read();
             if (done) {
@@ -1127,6 +1145,7 @@ function drained(
         // still there, sees the same error.
         pump().catch((error: unknown) => {
           failed();
+          reader.releaseLock();
           if (!gone) controller.error(error);
         });
       },

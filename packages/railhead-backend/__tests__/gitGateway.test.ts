@@ -335,6 +335,11 @@ function sideBands(report: string): string {
 /** A refused ref and an option line that together pass the 64 KiB report bound. */
 const OVERSIZED_REFUSAL = `${pkt(`ng refs/heads/a ${"x".repeat(60_000)}\n`)}${pkt(`option refname ${"y".repeat(10_000)}\n`)}`;
 
+/** About 4 MiB of side-band progress, four times the response buffer a push holds for its client. */
+const PROGRESS_FLOOD = Array.from({ length: 64 }, () =>
+  encoder.encode(pkt(`\u0002${"r".repeat(65_000)}`)),
+);
+
 function bytesOf(response: Response): Promise<Uint8Array> {
   return response.arrayBuffer().then((buffer) => new Uint8Array(buffer));
 }
@@ -1653,6 +1658,66 @@ describe("upstream responses", () => {
     });
   });
 
+  it("records nothing and logs one unknown outcome for a report that does not settle exactly the refs sent", async () => {
+    await withGateway(async (world) => {
+      const both = pushBody([`${ROOT} ${HEAD} refs/heads/a`, `${ROOT} ${HEAD} refs/heads/b`]);
+      const serve = async (statuses: string): Promise<void> => {
+        logged = [];
+        world.respond = () =>
+          gitResponse(
+            "git-receive-pack",
+            "result",
+            sideBand(`${pkt("unpack ok\n")}${statuses}0000`),
+          );
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", both),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+      };
+      const unsettled: [string, string][] = [
+        [
+          "every ref rewritten",
+          `${pkt("ok refs/heads/a\n")}${pkt(`option new-oid ${ROOT}\n`)}${pkt("ok refs/heads/b\n")}${pkt("option refname refs/heads/c\n")}`,
+        ],
+        [
+          "a confirmed ref beside a rewritten one",
+          `${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/b\n")}${pkt(`option new-oid ${ROOT}\n`)}`,
+        ],
+        ["a missing status", pkt("ok refs/heads/a\n")],
+        ["no status at all", ""],
+        [
+          "a ref not sent",
+          `${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/b\n")}${pkt("ok refs/heads/c\n")}`,
+        ],
+        [
+          "a ref swapped for one not sent",
+          `${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/c\n")}`,
+        ],
+      ];
+      for (const [label, statuses] of unsettled) {
+        await serve(statuses);
+        expect(pushedEvents(world), label).toEqual([]);
+        expect(unknownOutcomes(), label).toBe(1);
+      }
+      // A complete refusal of every ref moved nothing and is not left to reconciliation.
+      await serve(
+        `${pkt("ng refs/heads/b stale info\n")}${pkt("ng refs/heads/a non-fast-forward\n")}`,
+      );
+      expect(pushedEvents(world)).toEqual([]);
+      expect(logged).toEqual([]);
+      // One status each, in any order, settles the push.
+      await serve(`${pkt("ok refs/heads/b\n")}${pkt("ok refs/heads/a\n")}`);
+      expect(logged).toEqual([]);
+      expect(pushedEvents(world).map((event) => event.data)).toEqual([
+        { claimId: CLAIM, generation: 3, ref: "refs/heads/a", from: ROOT, to: HEAD },
+        { claimId: CLAIM, generation: 3, ref: "refs/heads/b", from: ROOT, to: HEAD },
+      ]);
+    });
+  });
+
   it("records nothing for a failed unpack, a fatal side band, a cut-off report or a refusal, and logs each unknown outcome", async () => {
     await withGateway(async (world) => {
       const update = pushBody([`${ROOT} ${HEAD} refs/heads/a`]);
@@ -1943,6 +2008,38 @@ describe("a client that stops reading a push's response", () => {
       expect(unknownOutcomes()).toBe(1);
     });
   });
+
+  it("ends the exchange at its deadline and logs the unknown outcome while the buffer is full", async () => {
+    await withGateway(async (world) => {
+      let upstreamCancelled = false;
+      world.respond = () =>
+        gitResponse(
+          "git-receive-pack",
+          "result",
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const chunk of PROGRESS_FLOOD) controller.enqueue(chunk);
+            },
+            cancel() {
+              upstreamCancelled = true;
+            },
+          }),
+        );
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      // The client neither reads nor cancels.
+      await new Promise((resolve) => setTimeout(resolve, FAST.maxDurationMs + 100));
+      expect(unknownOutcomes()).toBe(1);
+      expect(upstreamCancelled).toBe(true);
+      expect(pushedEvents(world)).toEqual([]);
+      await expect(bytesOf(response)).rejects.toThrow();
+      expect(unknownOutcomes()).toBe(1);
+    });
+  });
 });
 
 /** Arms `fault` once the upstream has the whole push, after the last pre-send check. */
@@ -2046,18 +2143,43 @@ describe("a push whose record fails", () => {
 });
 
 describe("push reports", () => {
-  it("reads a plain report-status-v2 report and drops a ref the server rewrote", () => {
-    const reader = new PushReportReader("plain");
+  it("reads a plain report, and knows nothing once the server rewrote a ref", () => {
+    const refs = ["refs/heads/a", "refs/heads/b"];
+    const reader = new PushReportReader("plain", refs);
     reader.push(
+      encoder.encode(
+        `${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${pkt("ng refs/heads/b stale info\n")}0000`,
+      ),
+    );
+    expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/a"]) });
+    const rewritten = new PushReportReader("plain", refs);
+    rewritten.push(
       encoder.encode(
         `${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/b\n")}${pkt("option new-oid 3333\n")}0000`,
       ),
     );
-    expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/a"]) });
+    expect(rewritten.end()).toEqual({ kind: "unknown" });
+  });
+
+  it("knows nothing unless the report covers exactly the refs sent", () => {
+    const refs = ["refs/heads/a", "refs/heads/b"];
+    for (const [label, statuses] of [
+      ["missing", pkt("ok refs/heads/a\n")],
+      ["empty", ""],
+      [
+        "extra",
+        `${pkt("ok refs/heads/a\n")}${pkt("ng refs/heads/b x\n")}${pkt("ok refs/heads/c\n")}`,
+      ],
+      ["swapped", `${pkt("ok refs/heads/a\n")}${pkt("ok refs/heads/c\n")}`],
+    ] as const) {
+      const reader = new PushReportReader("plain", refs);
+      reader.push(encoder.encode(`${pkt("unpack ok\n")}${statuses}0000`));
+      expect(reader.end(), label).toEqual({ kind: "unknown" });
+    }
   });
 
   it("reads a report split one byte at a time", () => {
-    const reader = new PushReportReader("side-band");
+    const reader = new PushReportReader("side-band", ["refs/heads/feature"]);
     for (const byte of PUSH_RESULT) reader.push(Uint8Array.of(byte));
     expect(reader.end()).toEqual({ kind: "reported", updated: new Set(["refs/heads/feature"]) });
   });
@@ -2070,14 +2192,18 @@ describe("push reports", () => {
       ["ng twice", `${pkt("ng refs/heads/x a\n")}${pkt("ng refs/heads/x b\n")}`],
     ];
     for (const [label, statuses] of lines) {
-      const reader = new PushReportReader("plain");
+      const reader = new PushReportReader("plain", ["refs/heads/a", "refs/heads/x"]);
       reader.push(
         encoder.encode(`${pkt("unpack ok\n")}${pkt("ok refs/heads/a\n")}${statuses}0000`),
       );
       expect(reader.end(), label).toEqual({ kind: "unknown" });
     }
     // One line each for refs that share a prefix is not a repeat.
-    const distinct = new PushReportReader("plain");
+    const distinct = new PushReportReader("plain", [
+      "refs/heads/x",
+      "refs/heads/x/y",
+      "refs/heads/xy",
+    ]);
     distinct.push(
       encoder.encode(
         `${pkt("unpack ok\n")}${pkt("ok refs/heads/x\n")}${pkt("ng refs/heads/x/y failed\n")}${pkt("ok refs/heads/xy\n")}0000`,
@@ -2090,24 +2216,24 @@ describe("push reports", () => {
   });
 
   it("tells a complete report of a failed unpack from one it cannot read", () => {
-    const refused = new PushReportReader("plain");
+    const refused = new PushReportReader("plain", ["refs/heads/a"]);
     refused.push(
       encoder.encode(`${pkt("unpack index-pack failed\n")}${pkt("ng refs/heads/a x\n")}0000`),
     );
     expect(refused.end()).toEqual({ kind: "refused" });
-    const unopened = new PushReportReader("plain");
+    const unopened = new PushReportReader("plain", ["refs/heads/a"]);
     unopened.push(encoder.encode(`${pkt("ok refs/heads/a\n")}0000`));
     expect(unopened.end()).toEqual({ kind: "unknown" });
-    const cutOff = new PushReportReader("plain");
+    const cutOff = new PushReportReader("plain", ["refs/heads/a"]);
     cutOff.push(encoder.encode(pkt("unpack index-pack failed\n")));
     expect(cutOff.end()).toEqual({ kind: "unknown" });
   });
 
   it("knows nothing without a report, or with bytes after it", () => {
-    const none = new PushReportReader("none");
+    const none = new PushReportReader("none", []);
     none.push(encoder.encode(`${pkt("unpack ok\n")}0000`));
     expect(none.end()).toEqual({ kind: "unknown" });
-    const trailing = new PushReportReader("plain");
+    const trailing = new PushReportReader("plain", ["refs/heads/a"]);
     trailing.push(encoder.encode(`${pkt("unpack ok\n")}0000${pkt("ok refs/heads/a\n")}`));
     expect(trailing.end()).toEqual({ kind: "unknown" });
   });

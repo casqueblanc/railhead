@@ -1,7 +1,8 @@
 // Reads the report a receive-pack response carries, while the response streams to the client, so
 // the gateway records a pushed ref only when the upstream itself reported it updated. Each
 // side-band packet is held only until it is complete, and the report itself is capped; anything
-// that does not parse as a report leaves the outcome unknown, which records nothing.
+// that does not parse as a report, or does not settle each ref the push sent, leaves the outcome
+// unknown, which records nothing and leaves the push to reconciliation.
 
 /** The longest report the reader keeps, in bytes: about 100 bytes per ref, as for the head. */
 const MAX_REPORT_BYTES = 64 * 1024;
@@ -15,7 +16,7 @@ const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** What the upstream reported about a push. */
 export type PushReport =
-  /** The pack was unpacked and these refs were updated. */
+  /** The pack was unpacked, every ref sent has one status, and these refs were updated. */
   | { readonly kind: "reported"; readonly updated: ReadonlySet<string> }
   /** The report was complete and said the pack was not unpacked: nothing was updated. */
   | { readonly kind: "refused" }
@@ -73,11 +74,13 @@ class PacketSplitter {
 
 /**
  * Feeds the response of one receive-pack request, chunk by chunk, and answers what it reported
- * once the response has ended. A report counts only if it is complete, its pack unpacked, and
- * nothing in the side band signalled a fatal error.
+ * once the response has ended. A report counts only if it is complete, its pack unpacked, it gives
+ * exactly one `ok` or `ng` for each ref the push sent and for no other, and nothing in the side
+ * band signalled a fatal error.
  */
 export class PushReportReader {
   readonly #framing: ReportFraming;
+  readonly #refs: ReadonlySet<string>;
   readonly #outer = new PacketSplitter();
   readonly #inner = new PacketSplitter();
   #reportBytes = 0;
@@ -85,8 +88,10 @@ export class PushReportReader {
   #lines: string[] = [];
   #reportDone = false;
 
-  constructor(framing: ReportFraming) {
+  /** `refs` are the refs the push sent, each once. */
+  constructor(framing: ReportFraming, refs: readonly string[]) {
     this.#framing = framing;
+    this.#refs = new Set(refs);
     if (framing === "none") this.#failed = true;
   }
 
@@ -116,30 +121,25 @@ export class PushReportReader {
     if (unpack === undefined || !unpack.startsWith("unpack ")) return UNKNOWN;
     if (unpack !== "unpack ok") return REFUSED;
     const updated = new Set<string>();
-    // report-status-v2 follows an `ok` line with `option` lines when the server changed what the
-    // client asked for; such a ref's outcome is not the one requested, so it counts as unknown.
-    const rewritten = new Set<string>();
     // Each ref has exactly one status line; a second one, even `ng` after `ok`, is a protocol error.
     const reported = new Set<string>();
-    let last: string | null = null;
     for (const line of rest) {
+      let ref: string;
       if (line.startsWith("ok ")) {
-        last = line.slice("ok ".length);
-        if (reported.has(last)) return UNKNOWN;
-        reported.add(last);
-        updated.add(last);
+        ref = line.slice("ok ".length);
+        updated.add(ref);
       } else if (line.startsWith("ng ")) {
-        const ref = line.slice("ng ".length).split(" ", 1)[0] ?? "";
-        if (reported.has(ref)) return UNKNOWN;
-        reported.add(ref);
-        last = null;
-      } else if (line.startsWith("option ")) {
-        if (last !== null) rewritten.add(last);
+        ref = line.slice("ng ".length).split(" ", 1)[0] ?? "";
       } else {
+        // report-status-v2 follows an `ok` line with `option` lines when the server changed what
+        // the client asked for: the ref or commit it ended at is not the one requested.
         return UNKNOWN;
       }
+      if (!this.#refs.has(ref) || reported.has(ref)) return UNKNOWN;
+      reported.add(ref);
     }
-    for (const ref of rewritten) updated.delete(ref);
+    // A ref the report leaves out may have been updated or not.
+    if (reported.size !== this.#refs.size) return UNKNOWN;
     return { kind: "reported", updated };
   }
 
