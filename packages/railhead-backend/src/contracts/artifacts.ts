@@ -40,6 +40,11 @@ export interface ArtifactsPort {
     scope: "read" | "write",
     ttlMs: number,
   ): Promise<PortResult<ArtifactsToken>>;
-  /** Revokes every token for `repo`, as `ready` and lease expiry require. */
+  /**
+   * Revokes every token for `repo`, as `ready` and lease expiry require. Success means every token
+   * the listing could see is revoked. When the listing cannot cover them all, the fork owes a
+   * sweep: success is still reported, but `token` refuses `repo` until a later sweep is clean or
+   * every token it may hold has expired, at most `MAX_TOKEN_TTL_MS` plus clock skew from now.
+   */
   revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<void>>;
 }

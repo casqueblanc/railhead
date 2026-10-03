@@ -6,9 +6,12 @@
 // current state. No method takes an actor or appends an arbitrary event.
 //
 // A repository exists once `initialize` has recorded it. Until then the object reads, but never
-// writes, its storage, so a request for a name nobody created leaves nothing behind. All state is
-// rebuilt from storage when the object starts, so eviction or hibernation loses nothing but live
-// subscriptions.
+// writes, its storage, so a request for a name nobody created leaves nothing behind. The two demo
+// seed objects are the exception: the demo repository's object records its seed's Artifacts
+// effects and its reset marker, and migrates the Artifacts adapter's tables to list forks, before
+// `initialize`; the seed control object keeps its seal key and spent proofs without ever being
+// initialized. All state is rebuilt from storage when the object starts, so eviction or
+// hibernation loses nothing but live subscriptions.
 
 import { DurableObject } from "cloudflare:workers";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
@@ -304,8 +307,10 @@ export class Repo extends DurableObject<Env> {
           // Subscribers follow the history being deleted: they end, and a board that subscribes
           // again starts from the new history.
           this.#installed?.ports.stream.endAll("revoked");
-          this.#installed = null;
           await this.ctx.storage.deleteAll();
+          // Only once storage is empty: a wipe that fails leaves the Repo installed, as storage
+          // still holds it, so a seed finds an initialized Repo without main and is refused.
+          this.#installed = null;
           // Whether the wipe removed the alarm or not, the next wake request must see storage.
           await this.#alarm.load();
         },
