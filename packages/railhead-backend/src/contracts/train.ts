@@ -107,7 +107,7 @@ export interface MergeIntentRecord {
   main: CommitSha | null;
   /** When it was authorized. */
   authorizedAt: number;
-  /** When it last changed. */
+  /** When it last changed; while `authorized` with attempts counted, when the last attempt began. */
   updatedAt: number;
 }
 
@@ -161,16 +161,53 @@ export interface TrainPort {
   resume(): Promise<void>;
 }
 
+/** What the main writer records about its progress on an intent. */
+export interface MergeIntentWrite {
+  /** Where the intent stands now. `authorized` records an attempt that has not settled. */
+  status: MergeIntentStatus;
+  /** Write attempts made so far, including one about to start. */
+  attempts: number;
+  /** Main as last observed by the writer, or `null` before it observed main. */
+  main: CommitSha | null;
+}
+
 /**
  * Authorizes a merge. Inside one Repo transaction it checks that the attempt passed on exactly its
  * candidate, that every pin's generation and every required decision version is still current,
  * and records the `MergeIntentRecord`. A repeat for the same attempt returns the same record.
+ *
+ * `record`, `unsettled` and `recordWrite` are fence methods: they are synchronous and touch only
+ * the Repo's storage. Called inside a caller's `log.transaction` body, what they read holds and what
+ * they write commits or rolls back with that transaction. Read outside one, a result may already be
+ * stale, so a caller re-reads inside the transaction whose write relies on it.
  */
 export interface AuthorizationPort {
   /** Authorizes the merge of a passed attempt. */
   authorize(attemptId: CheckRunId): Promise<PortResult<MergeIntentRecord>>;
   /** Reads an intent. */
   intent(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
+  /**
+   * The stored intent, or `null` when it is unknown or the module is missing; `null` is a refusal.
+   * Read it inside the caller's transaction when the result decides a write.
+   */
+  record(intentId: IntentId): MergeIntentRecord | null;
+  /**
+   * Every intent still `authorized` with a write attempt counted, oldest first: the writes that may
+   * have moved main unheard. Read it inside the caller's transaction when the result decides a
+   * write.
+   */
+  unsettled(): MergeIntentRecord[];
+  /**
+   * Records the main writer's progress, only if the intent is still `authorized` with exactly
+   * `expectedAttempts` attempts, and returns the updated record; otherwise changes nothing and
+   * returns `null`. Only the main writer calls it, inside the transaction that appends the
+   * `train.main` event when the intent settles.
+   */
+  recordWrite(
+    intentId: IntentId,
+    expectedAttempts: number,
+    change: MergeIntentWrite,
+  ): MergeIntentRecord | null;
 }
 
 /** The result of one conditional update of main. */
@@ -184,7 +221,16 @@ export type MainUpdate =
 
 /**
  * Main's ref. Only the main-writer module receives this port; no other port can mint a token that
- * writes main.
+ * writes main. An implementation must give the writer sole control of the ref: nothing else moves
+ * it, and it never returns to a commit it left. The writer's reconciliation depends on that, since
+ * it reads main anywhere but an intent's expected commit or candidate as proof the intent did not
+ * land. Neither call promises a deadline or cancellation, so the main writer bounds each one and
+ * treats an update that does not answer in time as uncertain. An implementation must send an update
+ * within `MAIN_REF_TIMEOUT_MS` of the call to `update`, including any time it holds the update in
+ * a queue or between retries, or drop it unsent; and a sent update that has not applied within
+ * `MAIN_UPDATE_LIFETIME_MS` of being sent must never apply. The writer measures both from the call:
+ * past `MAIN_UPDATE_EXPIRY_MS`, it reads main at the expected commit as proof the update did not
+ * land.
  */
 export interface MainRefPort {
   /** Reads main's current commit. */
@@ -201,8 +247,8 @@ export interface MainWriterPort {
    */
   head(): Promise<PortResult<CommitSha>>;
   /**
-   * Moves main for an authorized intent and records the outcome. An intent left `authorized` by an
-   * earlier attempt is reconciled by reading main before any new write.
+   * Moves main for an authorized intent and records the outcome. Every intent left `authorized` by
+   * an earlier attempt, this one or another, is reconciled by reading main before any new write.
    */
   publish(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
 }

@@ -174,6 +174,10 @@ class Fakes {
           return result;
         },
         intent: async () => fail("not_found", "No intent."),
+        // The scheduler reaches intents only through the main writer fake below.
+        record: (intentId) => this.intents.get(intentId) ?? null,
+        unsettled: () => [],
+        recordWrite: () => null,
       },
       mainWriter: {
         head: async () => {
