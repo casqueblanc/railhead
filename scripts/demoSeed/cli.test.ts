@@ -76,18 +76,19 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
   assert.deepEqual(lines.slice(1, 2), ["todo create repository demo/upload-app"]);
   assert.match(lines[2] ?? "", /^todo import main demo\/upload-app@main = [0-9a-f]{40}$/);
   assert.equal(
-    lines.filter((line) => line.startsWith("todo file issue demo/upload-app#")).length,
+    lines.filter((line) => line.startsWith("todo owner files issue demo/upload-app#")).length,
     3,
   );
-  assert.equal(
-    lines.at(-1),
-    "note decision upload-size-limit (A, B) is opened by an agent's question, not seeded",
-  );
+  assert.deepEqual(lines.slice(-2), [
+    "note decision upload-size-limit (a, b) is opened by an agent's question, not seeded",
+    "note planned against an empty instance: no live target exists yet",
+  ]);
 });
 
 test("reset --dry-run names only the demo repository", async () => {
   assert.deepEqual(await run(["reset", "--dry-run", "--source-root", source]), [
     "todo delete repository demo/upload-app",
+    "note planned against an instance holding only demo/upload-app: no live target exists yet",
   ]);
 });
 
@@ -109,6 +110,11 @@ test("seed and reset without --dry-run, and unknown commands, are refused", asyn
   await assert.rejects(run(["seed", "extra", "--dry-run", "--source-root", source]), SeedRefusal);
   await assert.rejects(run(["bundle", "--source-root", source]), /needs --out/);
   await assert.rejects(run(["seed", "--dry-run", "--source-root", scratch]), /not a commit/);
+  // A revision that Git would read as an option.
+  await assert.rejects(
+    run(["seed", "--dry-run", "--source-root", source, "--revision=--all"]),
+    /--all is not a commit/,
+  );
 });
 
 test("bundle --dry-run is refused and writes nothing", async () => {
@@ -195,14 +201,16 @@ test("the bundle is a repository that installs and runs its checks on its own", 
     assert.doesNotMatch(text, /catalog:|workspace:|@railhead\/scripts|\.\.\//, file);
   }
 
-  // From the bundle's own lockfile. The store the monorepo's install filled supplies most packages;
-  // pnpm fetches what it lacks, such as metadata for another platform's optional packages.
+  // From the bundle's own lockfile, offline: the versions are the catalog's (standalone.test.ts),
+  // so the store the monorepo's install filled holds every package, and the test never reaches
+  // the registry.
   const pnpm = (args: string[]) =>
     execFileSync("pnpm", args, { cwd: clone, encoding: "utf8", timeout: 180_000 });
-  pnpm(["install", "--frozen-lockfile", "--prefer-offline"]);
+  pnpm(["install", "--frozen-lockfile", "--offline"]);
   pnpm(["run", "typecheck"]);
   // The fixture's own tests and the current option's suite, under workerd.
-  const tests = stripVTControlCharacters(pnpm(["run", "test:run"]));
+  // The default reporter lists each file; Vitest picks a terser one when it detects an agent.
+  const tests = stripVTControlCharacters(pnpm(["run", "test:run", "--reporter=default"]));
   assert.match(tests, /✓ acceptance\/option-a\.test\.ts/);
   assert.match(tests, /Test Files {2}\d+ passed \(\d+\)\n/);
 });

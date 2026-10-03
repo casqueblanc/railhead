@@ -6,6 +6,10 @@
 // write failed is not retried here: the next run reads the target again first, so an uncertain
 // write is reconciled before anything is written a second time.
 //
+// Filing an issue is an owner action that needs the owner's passkey assertion, so the port has no
+// way to file one. The plan lists each seeded issue and whether the board already shows it; the
+// owner files the missing ones on the board.
+//
 // Reset deletes the demo repository by name and nothing else. It never lists the target to choose
 // what to delete, so another repository cannot be swept up with it.
 //
@@ -38,8 +42,6 @@ export interface SeedTarget {
   createRepo(ref: RepoRef): Promise<void>;
   /** Sets the empty main to the imported history's head. */
   importMain(ref: RepoRef, history: ImportedHistory): Promise<void>;
-  /** Files one issue. */
-  fileIssue(ref: RepoRef, issue: { readonly title: string; readonly body: string }): Promise<void>;
   /** Deletes the repository and everything in it. */
   deleteRepo(ref: RepoRef): Promise<void>;
 }
@@ -101,7 +103,10 @@ export async function planSeed(
   ];
 }
 
-/** Applies the missing steps of a fresh seed plan, in order, and returns the plan it applied. */
+/**
+ * Applies the missing repository and main steps of a fresh seed plan, in order, and returns the
+ * plan. Missing issues stay missing: the owner files them on the board.
+ */
 export async function seed(
   manifest: SeedManifest,
   history: ImportedHistory,
@@ -119,7 +124,7 @@ export async function seed(
         await target.importMain(ref, history);
         break;
       case "issue.file":
-        await target.fileIssue(ref, { title: step.issue.title, body: step.issue.body });
+        // The owner's step; the seed holds no authority to file an issue.
         break;
       case "repo.delete":
         throw new SeedRefusal("A seed plan never deletes.");
@@ -163,7 +168,7 @@ export function describePlan(plan: readonly PlannedStep[]): string[] {
       case "main.import":
         return `${mark} import main ${step.target} = ${step.head}`;
       case "issue.file":
-        return `${mark} file issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
+        return `${mark} owner files issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
       case "repo.delete":
         return `${mark} delete repository ${step.target}`;
       default:

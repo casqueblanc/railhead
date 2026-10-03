@@ -11,7 +11,18 @@ const manifest = loadManifest(
 const demo = { org: "demo", repo: "upload-app" };
 const history = { head: "a".repeat(40), commits: 4 };
 
-test("a seed creates the repository, imports main and files the three issues", async () => {
+/** Files the manifest's issues as the owner would on the board. */
+function fileSeededIssues(
+  target: MemoryTarget,
+  titles = manifest.issues.map((i) => i.title),
+): void {
+  for (const issue of manifest.issues) {
+    if (titles.includes(issue.title))
+      target.fileAsOwner(demo, { title: issue.title, body: issue.body });
+  }
+}
+
+test("a seed creates the repository and imports main, and leaves the issues to the owner", async () => {
   const target = new MemoryTarget();
 
   const plan = await seed(manifest, history, target);
@@ -20,15 +31,15 @@ test("a seed creates the repository, imports main and files the three issues", a
     plan.map((planned) => planned.status),
     ["missing", "missing", "missing", "missing", "missing"],
   );
-  assert.deepEqual(await target.read(demo), {
-    main: history.head,
-    issues: manifest.issues.map(({ title, body }) => ({ title, body })),
-  });
+  assert.deepEqual(await target.read(demo), { main: history.head, issues: [] });
+  // The port offers no way to file one: filing needs the owner's passkey assertion.
+  assert.equal("fileIssue" in target, false);
 });
 
 test("a repeated seed reconciles to the same state and writes nothing", async () => {
   const target = new MemoryTarget();
   await seed(manifest, history, target);
+  fileSeededIssues(target);
   const before = await target.read(demo);
 
   const again = await seed(manifest, history, target);
@@ -38,12 +49,10 @@ test("a repeated seed reconciles to the same state and writes nothing", async ()
   assert.equal(before?.issues.length, 3);
 });
 
-test("a seed whose issue write lost its response finishes without a duplicate", async () => {
+test("a seed reports which issues the owner has filed and which remain", async () => {
   const target = new MemoryTarget();
-  target.loseResponseOf("fileIssue");
-
-  await assert.rejects(seed(manifest, history, target), /fileIssue response lost/);
-  assert.equal((await target.read(demo))?.issues.length, 1);
+  await seed(manifest, history, target);
+  fileSeededIssues(target, [manifest.issues[0]?.title ?? ""]);
 
   const plan = await seed(manifest, history, target);
 
@@ -51,10 +60,7 @@ test("a seed whose issue write lost its response finishes without a duplicate", 
     plan.map((planned) => planned.status),
     ["done", "done", "done", "missing", "missing"],
   );
-  assert.deepEqual(
-    (await target.read(demo))?.issues.map((issue) => issue.title),
-    manifest.issues.map((issue) => issue.title),
-  );
+  assert.equal((await target.read(demo))?.issues.length, 1);
 });
 
 test("a seed that failed before importing main imports it on the next run", async () => {
@@ -78,7 +84,7 @@ test("a seed over another main or an edited issue is refused and writes nothing"
 
   const edited = new MemoryTarget();
   await edited.createRepo(demo);
-  await edited.fileIssue(demo, { title: manifest.issues[0]?.title ?? "", body: "Changed." });
+  edited.fileAsOwner(demo, { title: manifest.issues[0]?.title ?? "", body: "Changed." });
   await assert.rejects(seed(manifest, history, edited), /another body/);
   assert.equal((await edited.read(demo))?.main, null);
 });
@@ -86,7 +92,8 @@ test("a seed over another main or an edited issue is refused and writes nothing"
 test("issues the seed did not file are left alone", async () => {
   const target = new MemoryTarget();
   await target.createRepo(demo);
-  await target.fileIssue(demo, { title: "Filed by the owner", body: "Keep me." });
+  target.fileAsOwner(demo, { title: "Filed by the owner", body: "Keep me." });
+  fileSeededIssues(target);
 
   await seed(manifest, history, target);
 
@@ -103,7 +110,7 @@ test("reset deletes the demo repository and keeps every other one", async () => 
     { org: "demo", repo: "other" },
   ]) {
     await target.createRepo(other);
-    await target.fileIssue(other, { title: "Unrelated", body: "Untouched." });
+    target.fileAsOwner(other, { title: "Unrelated", body: "Untouched." });
   }
   await seed(manifest, history, target);
 
@@ -152,8 +159,8 @@ test("a dry run names every target", async () => {
   assert.deepEqual(lines, [
     "todo create repository demo/upload-app",
     `todo import main demo/upload-app@main = ${history.head}`,
-    'todo file issue demo/upload-app#seed-1: "Warn before uploading a file above the size limit"',
-    'todo file issue demo/upload-app#seed-2: "Let people upload files larger than 10 MB"',
-    'todo file issue demo/upload-app#seed-3: "Let people delete an upload"',
+    'todo owner files issue demo/upload-app#seed-1: "Warn before uploading a file above the size limit"',
+    'todo owner files issue demo/upload-app#seed-2: "Let people upload files larger than 10 MB"',
+    'todo owner files issue demo/upload-app#seed-3: "Let people delete an upload"',
   ]);
 });

@@ -138,6 +138,8 @@ test("a revision before the directory existed, or a missing directory, is refuse
   assert.throws(() => planHistory(request(source, "HEAD~4")), /No commit up to [0-9a-f]+ changes/);
   assert.throws(() => planHistory(request(source, "HEAD", [], "apps/none")), SeedRefusal);
   assert.throws(() => resolveCommit(source, "no-such-ref"), /not a commit/);
+  assert.throws(() => resolveCommit(source, "--all"), /--all is not a commit/);
+  assert.throws(() => resolveCommit(source, ""), /is not a commit/);
 });
 
 test("a shallow clone is refused rather than imported as a truncated history", () => {
@@ -297,4 +299,74 @@ test("a failed directory lookup fails the import instead of skipping that commit
   }
   assert.equal(existsSync(bundle), false);
   assert.equal(planHistory(request(source, "HEAD")).commits, 3);
+});
+
+test("the caller's Git config cannot change the imported history", () => {
+  const source = sourceRepo("config");
+  // A signed commit with a non-ASCII subject, signed by a stub gpg that also "verifies" noisily.
+  const bin = join(scratch, "config-bin");
+  mkdirSync(bin);
+  const gpg = join(bin, "gpg");
+  writeFileSync(
+    gpg,
+    [
+      "#!/bin/sh",
+      'for arg; do [ "$arg" = --verify ] && { echo "gpg: Signature made by a stub" >&2; exit 1; }; done',
+      "cat >/dev/null",
+      'printf "\\n[GNUPG:] SIG_CREATED D 1 8 00 1700000000 STUB\\n" >&2',
+      'printf -- "-----BEGIN PGP SIGNATURE-----\\n\\nstub\\n-----END PGP SIGNATURE-----\\n"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(gpg, 0o755);
+  writeFileSync(join(source, "apps", "demo", "index.ts"), "export const v = 3;\n");
+  git(source, ["add", "--all"]);
+  git(
+    source,
+    ["-c", `gpg.program=${gpg}`, "commit", "--quiet", "-S", "-m", "feat(demo): accept café"],
+    {
+      GIT_AUTHOR_DATE: "1700100000 +0000",
+      GIT_COMMITTER_DATE: "1700100000 +0000",
+    },
+  );
+  const expected = planHistory(request(source, "HEAD"));
+
+  const globalConfig = join(scratch, "config-gitconfig");
+  writeFileSync(
+    globalConfig,
+    [
+      "[log]",
+      "\tshowSignature = true",
+      "[i18n]",
+      "\tlogOutputEncoding = ISO-8859-1",
+      "[gpg]",
+      `\tprogram = ${gpg}`,
+      "",
+    ].join("\n"),
+  );
+  const saved = Object.entries(process.env).filter(([name]) => name.startsWith("GIT_CONFIG"));
+  const configEnv = {
+    GIT_CONFIG_GLOBAL: globalConfig,
+    // `git -c` from a parent Git process arrives this way.
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "log.showSignature",
+    GIT_CONFIG_VALUE_0: "true",
+  };
+  Object.assign(process.env, configEnv);
+  const bundle = join(scratch, "config.bundle");
+  try {
+    // The config does reach a plain Git call made with this environment.
+    assert.match(
+      execFileSync("git", ["-C", source, "show", "-s", "--format=%s", "HEAD"], {
+        encoding: "utf8",
+      }),
+      /Signature made by a stub/,
+    );
+    assert.deepEqual(writeHistoryBundle(request(source, "HEAD"), bundle), expected);
+  } finally {
+    for (const name of Object.keys(configEnv)) delete process.env[name];
+    Object.assign(process.env, Object.fromEntries(saved));
+  }
+  const clone = cloneOf(bundle, "config-clone");
+  assert.equal(git(clone, ["log", "-1", "--format=%s"]), "feat(demo): accept café");
 });

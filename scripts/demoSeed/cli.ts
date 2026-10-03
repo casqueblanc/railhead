@@ -73,6 +73,7 @@ export async function run(argv: readonly string[]): Promise<string[]> {
           manifest.decision.key,
           manifest.decision.options.map((o) => o.key),
         ),
+        "note planned against an empty instance: no live target exists yet",
       ];
     }
     case "reset": {
@@ -80,7 +81,10 @@ export async function run(argv: readonly string[]): Promise<string[]> {
       // Planned against an instance holding the demo repository, so the deletion is listed.
       const target = new MemoryTarget();
       await target.createRepo({ org: manifest.org, repo: manifest.repo });
-      return describePlan(await planReset(manifest, target));
+      return [
+        ...describePlan(await planReset(manifest, target)),
+        `note planned against an instance holding only ${manifest.org}/${manifest.repo}: no live target exists yet`,
+      ];
     }
     case "bundle": {
       if (values.out === undefined) throw new SeedRefusal("bundle needs --out FILE.");

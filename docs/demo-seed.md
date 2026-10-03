@@ -12,7 +12,7 @@ node scripts/demoSeed/cli.ts bundle --out main.bundle
 
 ## What the seed holds
 
-**Main.** Every commit of this repository that changed `demo/upload-app`, rewritten with that directory as the root, then one commit, `chore: make the app a standalone repository`. Each commit keeps its subject and dates, and the last one takes the selected revision's; author and committer are `Railhead demo <demo@railhead.dev>`. A commit that deleted the directory becomes a commit with an empty tree, and a revision at which the directory does not exist is refused. The same revision always produces the same head, so a repeated seed recognises a main it already imported, and reset followed by seed lands on the same base. A shallow clone is refused, because it would import a truncated history. Everything is read from the selected commit, including the acceptance checks the manifest is validated against; uncommitted changes never reach the bundle or its validation. The rewrite runs in a scratch repository and writes nothing to this one.
+**Main.** Every commit of this repository that changed `demo/upload-app`, rewritten with that directory as the root, then one commit, `chore: make the app a standalone repository`. Each commit keeps its subject and dates, and the last one takes the selected revision's; author and committer are `Railhead demo <demo@railhead.dev>`. A commit that deleted the directory becomes a commit with an empty tree, and a revision at which the directory does not exist is refused. The same revision always produces the same head, so a repeated seed recognises a main it already imported, and reset followed by seed lands on the same base. A shallow clone is refused, because it would import a truncated history. Everything is read from the selected commit, including the acceptance checks the manifest is validated against; uncommitted changes never reach the bundle or its validation. The rewrite runs in a scratch repository and writes nothing to this one. It ignores the caller's global and system Git config and inherited `GIT_*` settings, so a setting such as `log.showSignature` cannot change the head.
 
 **Standing alone.** In this monorepo the app takes its versions from the pnpm catalog, its compiler options from the root `tsconfig.json` and its workerd assertion from `@railhead/scripts`. The last commit replaces them, as listed in `scripts/demoSeed/standalone.ts`: `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `tsconfig.json` and `vitest.config.ts` from `fixtures/demo/standalone/`, `assert-workerd.ts` from `scripts/`, and `.node-version`; it removes the Vite+ `vite.config.ts`. A clone then runs `pnpm install --frozen-lockfile`, `pnpm run typecheck` and `pnpm run test:run` with nothing else. `standalone.test.ts` fails when these files drift from the catalog or the app's own config. After changing the app's dependencies, update `fixtures/demo/standalone/package.json` then run `pnpm install --lockfile-only` in that directory, which is its own pnpm workspace, to refresh its lockfile.
 
@@ -24,28 +24,30 @@ node scripts/demoSeed/cli.ts bundle --out main.bundle
 | Let people upload files larger than 10 MB         | `src/uploads.ts`, `src/limits.ts`, `src/store.ts`       | collides    |
 | Let people delete an upload                       | `src/index.ts`, `src/store.ts`, `__tests__/app.test.ts` | independent |
 
-**The decision.** `upload-size-limit`: what happens to an upload above 10 MB, option A (reject with 413, as the app does) or B (accept it in parts). Its scope is `src/limits.ts` and `src/uploads.ts`. The seed does not open it: an agent opens it by asking the question while working on one of the first two issues, and the owner answers on the board.
+**The decision.** `upload-size-limit`: what happens to an upload above 10 MB, option `a` (reject with 413, as the app does) or `b` (accept it in parts). Its scope is `src/limits.ts` and `src/uploads.ts`. The seed does not open it: an agent opens it by asking the question while working on one of the first two issues, and the owner answers on the board.
 
 ## The decision collision is intentional
 
-Two agents on separate issues reach the same open decision. That is what the demo exists to show: the warning and the large-upload support both depend on the answer, so one answer must reach both agents through their inboxes, and changing it later (A to B) must reach both again, superseding what each built on the old version. The third issue is independent, so one agent keeps working while the other two wait on the decision.
+Two agents on separate issues reach the same open decision. That is what the demo exists to show: the warning and the large-upload support both depend on the answer, so one answer must reach both agents through their inboxes, and changing it later (`a` to `b`) must reach both again, superseding what each built on the old version. The third issue is independent, so one agent keeps working while the other two wait on the decision.
 
-The manifest check enforces this shape: exactly three issues, exactly two touching the decision's scope, and a decision whose key and options match the tagged suites in the app's `acceptance/checks.json`, which the train runs for the option in force.
+The manifest check enforces this shape: exactly three issues, exactly two touching the decision's scope, and a decision whose key and options match the tagged suites in the app's `acceptance/checks.json` one for one, which the train runs for the option in force. The decision must also pass the agent wire's `ask` rules, lowercase option keys included, since an agent opens it by asking; `manifest.test.ts` checks the restated rules against `@railhead/shared` and the `ask` wire fixture.
 
 ## Repeatable seed, safe reset
 
 Seed and reset reconcile against a target through the `SeedTarget` port in `scripts/demoSeed/reconcile.ts`:
 
-- Seed reads the target, then writes only what is missing: the repository, its main, each issue. A second seed writes nothing. A seed that failed halfway, including a write whose response was lost, finishes on the next run without filing an issue twice.
+- Seed reads the target, then writes only what is missing: the repository and its main. A second seed writes nothing. A seed that failed halfway finishes on the next run.
+- Filing an issue is an owner action that needs a passkey assertion, so the port cannot file one. The plan lists each seeded issue as done when the board shows its title and as an owner step otherwise.
 - Seed refuses, writing nothing, when main already holds another head or a seeded title carries a different body. Reset first.
-- Issues the seed did not file are left alone.
+- Other issues are left alone.
+- The port takes no lock: run one seed at a time.
 - Reset deletes `demo/upload-app` by name. It never lists repositories to choose what to delete, so no other repository can go with it. Reset of an absent repository writes nothing.
 
 The tests in `scripts/demoSeed/` run these rules against an in-memory target, alongside other repositories that must survive a reset.
 
 ## Running it live
 
-There is no live target yet. The Worker has no entry that initializes a repository or imports its main, and no Artifacts binding; [#142](https://github.com/casqueblanc/railhead/issues/142) adds them and makes them the live `SeedTarget`. Until then `seed` and `reset` refuse to run without `--dry-run`, and nothing here creates a Cloudflare resource or reads a secret.
+There is no live target yet. The Worker has no entry that initializes a repository or imports its main, and no Artifacts binding; [#142](https://github.com/casqueblanc/railhead/issues/142) adds them and makes them the live `SeedTarget`, which reads, creates, imports and deletes but files no issue. Until then `seed` and `reset` refuse to run without `--dry-run`, and nothing here creates a Cloudflare resource or reads a secret.
 
 The owner's steps for H03 ([#68](https://github.com/casqueblanc/railhead/issues/68)), once #142 has merged and been deployed:
 

@@ -4,7 +4,9 @@
 //
 // The file is data read from disk, so it is parsed from `unknown` and every field is checked. The
 // limits restate those of `@railhead/shared/events` and `agent-api`, which this package cannot
-// import under plain `node`.
+// import under plain `node`. The decision must pass the agent wire's `ask` rules, since an agent
+// opens it by asking; `manifest.test.ts` checks the restated rules against the shared source and
+// the wire fixtures.
 
 import { readFileSync } from "node:fs";
 
@@ -23,11 +25,20 @@ const MAX_QUESTION_LENGTH = 2000;
 const MAX_OPTION_LABEL_LENGTH = 200;
 /** `MAX_LIST_LENGTH` in `@railhead/shared/events`. */
 const MAX_LIST_LENGTH = 64;
+/** `MIN_OPTIONS` in `@railhead/shared/events`. */
+export const MIN_OPTIONS = 2;
+/** `MAX_OPTIONS` in `@railhead/shared/events`. */
+export const MAX_OPTIONS = 8;
+/** `MAX_PATH_LENGTH` in `@railhead/shared/events`. */
+export const MAX_PATH_LENGTH = 1024;
+/** `MAX_SCOPE_BYTES` in `@railhead/shared/agent-api`. */
+export const MAX_SCOPE_BYTES = 8 * 1024;
 /** The demo has exactly this many agent tasks: one per seeded agent. */
 export const ISSUE_COUNT = 3;
 
 const SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const OPTION_KEY = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
+/** `OPTION_KEY` in `@railhead/shared/events` and `agent-api`: lowercase only. */
+export const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
 const DECISION_KEY = /^[a-z][a-z0-9-]{0,63}$/;
 // Relative, slash-separated, no empty, `.` or `..` segment and no control character.
 const UNPRINTABLE = /[\p{Cc}\p{Cs}]/u;
@@ -110,23 +121,23 @@ export function parseManifest(value: unknown): SeedManifest {
   if (!DECISION_KEY.test(key)) throw new SeedRefusal("decision.key is not a decision key.");
   const options = list(decisionRecord["options"], "decision.options").map((entry, index) => {
     const option = record(entry, `decision.options[${index}]`);
-    const optionKey = text(option, "key", 32);
-    if (!OPTION_KEY.test(optionKey)) {
-      throw new SeedRefusal(`decision.options[${index}].key is not an option key.`);
+    const optionKey = option["key"];
+    const label = option["label"];
+    if (typeof optionKey !== "string" || typeof label !== "string") {
+      throw new SeedRefusal(`decision.options[${index}] needs a key and a label.`);
     }
-    return { key: optionKey, label: text(option, "label", MAX_OPTION_LABEL_LENGTH) };
+    return { key: optionKey, label };
   });
-  if (options.length < 2) throw new SeedRefusal("decision.options needs at least two options.");
-  unique(
-    options.map((option) => option.key),
-    "decision.options keys",
-  );
-  const decision: SeedDecision = {
-    key,
-    question: text(decisionRecord, "question", MAX_QUESTION_LENGTH),
-    options,
-    scope: paths(decisionRecord["scope"], "decision.scope"),
-  };
+  const question = decisionRecord["question"];
+  const scope = list(decisionRecord["scope"], "decision.scope").map((entry, index) => {
+    if (typeof entry !== "string")
+      throw new SeedRefusal(`decision.scope[${index}] must be a path.`);
+    return entry;
+  });
+  if (typeof question !== "string") throw new SeedRefusal("decision.question must be text.");
+  assertAskable({ text: question, options, scope });
+  unique(scope, "decision.scope");
+  const decision: SeedDecision = { key, question, options, scope };
 
   const issues = list(root["issues"], "issues").map((entry, index) => {
     const issue = record(entry, `issues[${index}]`);
@@ -155,9 +166,57 @@ export function parseManifest(value: unknown): SeedManifest {
   return { org, repo, source, decision, issues };
 }
 
+/** An agent's question as the wire carries it: `AskRequest`'s `text`, `options` and `scope`. */
+export interface Ask {
+  readonly text: string;
+  readonly options: readonly SeedOption[];
+  readonly scope: readonly string[];
+}
+
 /**
- * Checks the decision against the app's `acceptance/checks.json`: the same decision key, and an
- * option for every tagged acceptance suite, so the check the train runs can follow the answer.
+ * Applies the agent wire's `ask` invariants (`validateAgentRequest` in `@railhead/shared/agent-api`)
+ * to a question, so the manifest cannot prescribe a decision no agent could open.
+ */
+export function assertAskable(ask: Ask): void {
+  if (ask.text.trim() === "") throw new SeedRefusal("decision.question must be non-blank text.");
+  if (ask.text.length > MAX_QUESTION_LENGTH) {
+    throw new SeedRefusal(`decision.question is longer than ${MAX_QUESTION_LENGTH} characters.`);
+  }
+  if (ask.options.length < MIN_OPTIONS || ask.options.length > MAX_OPTIONS) {
+    throw new SeedRefusal(
+      `decision.options must hold between ${MIN_OPTIONS} and ${MAX_OPTIONS} options.`,
+    );
+  }
+  unique(
+    ask.options.map((option) => option.key),
+    "decision.options keys",
+  );
+  for (const [index, option] of ask.options.entries()) {
+    if (!OPTION_KEY.test(option.key)) {
+      throw new SeedRefusal(`decision.options[${index}].key is not an option key.`);
+    }
+    if (option.label.trim() === "" || option.label.length > MAX_OPTION_LABEL_LENGTH) {
+      throw new SeedRefusal(`decision.options[${index}].label is blank or too long.`);
+    }
+  }
+  if (ask.scope.length === 0 || ask.scope.length > MAX_LIST_LENGTH) {
+    throw new SeedRefusal(`decision.scope must hold between 1 and ${MAX_LIST_LENGTH} paths.`);
+  }
+  for (const [index, path] of ask.scope.entries()) {
+    if (path.trim() === "" || path.length > MAX_PATH_LENGTH) {
+      throw new SeedRefusal(`decision.scope[${index}] is not a relative repository path.`);
+    }
+    repoPath(path, `decision.scope[${index}]`);
+  }
+  if (Buffer.byteLength(JSON.stringify(ask.scope), "utf8") > MAX_SCOPE_BYTES) {
+    throw new SeedRefusal(`decision.scope is larger than ${MAX_SCOPE_BYTES} bytes.`);
+  }
+}
+
+/**
+ * Checks the decision against the app's `acceptance/checks.json`: the same decision key, a suite
+ * for every option and an option for every suite, with the option in force among them, so the
+ * check the train runs can follow any answer.
  */
 export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): void {
   const root = record(checks, "checks.json");
@@ -165,11 +224,22 @@ export function assertMatchesChecks(manifest: SeedManifest, checks: unknown): vo
     throw new SeedRefusal("checks.json names a different decision than the manifest.");
   }
   const offered = new Set(manifest.decision.options.map((option) => option.key));
+  const tagged = new Set<string>();
   for (const [index, entry] of list(root["suites"], "checks.json suites").entries()) {
     const option = record(entry, `checks.json suites[${index}]`)["option"];
     if (typeof option !== "string" || !offered.has(option)) {
       throw new SeedRefusal(`checks.json suites[${index}] tags an option the decision lacks.`);
     }
+    tagged.add(option);
+  }
+  for (const option of offered) {
+    if (!tagged.has(option)) {
+      throw new SeedRefusal(`The decision offers ${option}, which no checks.json suite tags.`);
+    }
+  }
+  const current = record(root["current"], "checks.json current")["option"];
+  if (typeof current !== "string" || !offered.has(current)) {
+    throw new SeedRefusal("checks.json current names an option the decision lacks.");
   }
 }
 

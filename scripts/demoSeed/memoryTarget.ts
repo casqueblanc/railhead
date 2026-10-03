@@ -57,10 +57,9 @@ export class MemoryTarget implements SeedTarget {
     this.#after("importMain");
   }
 
-  async fileIssue(ref: RepoRef, issue: { title: string; body: string }): Promise<void> {
-    this.#before("fileIssue");
+  /** Files an issue as the owner does on the board; not part of the port. */
+  fileAsOwner(ref: RepoRef, issue: { title: string; body: string }): void {
     this.#existing(ref).issues.push({ title: issue.title, body: issue.body });
-    this.#after("fileIssue");
   }
 
   async deleteRepo(ref: RepoRef): Promise<void> {

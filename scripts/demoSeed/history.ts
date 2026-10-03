@@ -14,7 +14,7 @@
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { join } from "node:path";
 import { SeedRefusal } from "./manifest.ts";
 
@@ -60,6 +60,10 @@ const GIT_TIMEOUT_MS = 60_000;
 
 /** Resolves `revision` in the repository at `sourceRoot` to a full commit SHA, once. */
 export function resolveCommit(sourceRoot: string, revision: string): string {
+  // Git would read a leading `-` as an option.
+  if (revision === "" || revision.startsWith("-")) {
+    throw new SeedRefusal(`${revision} is not a commit.`);
+  }
   let commit: string;
   try {
     commit = git(sourceRoot, ["rev-parse", "--verify", "--quiet", `${revision}^{commit}`]).trim();
@@ -153,6 +157,9 @@ function metadataOf(root: string, commit: string): CommitMetadata {
   const [subject = "", authorDate = "", committerDate = ""] = git(root, [
     "show",
     "-s",
+    // The source's own config still applies, so override what it could change in this output.
+    "--no-show-signature",
+    "--encoding=UTF-8",
     "--format=%s%x00%ad%x00%cd",
     "--date=raw",
     commit,
@@ -252,9 +259,26 @@ function git(
   return execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
     timeout: GIT_TIMEOUT_MS,
-    // A user's global hooks, templates or signing settings must not change what is written.
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", ...env },
+    env: { ...isolatedEnv(), ...env },
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     ...(input === undefined ? {} : { input }),
   });
+}
+
+/**
+ * The caller's environment without its Git settings. A user's global or system config, a `git -c`
+ * passed down from a parent Git process, or a hook's `GIT_DIR` must not change what is read or
+ * written, so the same revision yields the same head on every machine.
+ */
+function isolatedEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !name.startsWith("GIT_")) env[name] = value;
+  }
+  return {
+    ...env,
+    GIT_CONFIG_GLOBAL: devNull,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
 }
