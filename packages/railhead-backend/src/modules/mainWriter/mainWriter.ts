@@ -8,11 +8,19 @@
 // records the outcome on the intent and appends `train.main`.
 //
 // An intent still `authorized` with attempts counted may have moved main without the writer
-// hearing it: the response was lost, or the object was recreated mid-write. So before any new
-// write, the writer reads main back. Main at the candidate means the write landed; main anywhere
-// else but the expected commit means main moved for another reason and the intent cannot apply;
-// main still at the expected commit means the write never applied and may be tried again, within
-// `MAX_WRITE_ATTEMPTS`. Nothing here forces main.
+// hearing it: the response was lost or late, or the object was recreated mid-write. Such intents
+// are found in storage, not in memory, so before any write, for this intent or another, the writer
+// reads main back and settles each one it can. Main at an intent's candidate means its write
+// landed. Main anywhere else but its expected commit means it can no longer land, because main
+// only moves forward and never returns to a commit it left; and it did not land, because no write
+// moves main off a candidate before that candidate's intent is settled. Main still at its expected
+// commit leaves it unsettled: its write may yet apply. While one is unsettled, only a write from
+// that same expected commit may start, so whichever of the two lands, the other's conditional
+// update can no longer apply and the next read-back tells them apart. Nothing here forces main.
+//
+// Every call to main's ref is bounded by a deadline. A read that does not answer in time refuses
+// the publication; an update that does not answer in time stays counted and is read back on the
+// next publication, like any uncertain write.
 
 import { isId, type CommitSha, type IntentId } from "@railhead/shared/events";
 import type { ClaimId, DecisionRef } from "@railhead/shared/events";
@@ -20,6 +28,7 @@ import { fail, ok, type PortResult } from "../../contracts/result";
 import type {
   AuthorizationPort,
   MainRefPort,
+  MainUpdate,
   MainWriterPort,
   MergeIntentRecord,
   MergeIntentStatus,
@@ -32,6 +41,9 @@ export const MAX_WRITE_ATTEMPTS = 3;
 
 /** Publications that may wait behind the one in progress before more are refused as `busy`. */
 export const MAX_QUEUED_PUBLICATIONS = 32;
+
+/** How long one call to main's ref may take before the writer stops waiting for it. */
+export const MAIN_REF_TIMEOUT_MS = 10_000;
 
 /** What the main writer needs from its Repo. */
 export interface MainWriterContext {
@@ -52,12 +64,17 @@ export interface MainWriterDeps {
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
 }
 
-/** Builds the main writer over main's ref. */
+/**
+ * Builds the main writer over main's ref. `refTimeoutMs` bounds each ref call; a publication makes
+ * at most `MAX_WRITE_ATTEMPTS` updates and one read before each, so it settles within a bound too.
+ */
 export function createMainWriter(
   context: MainWriterContext,
   deps: () => MainWriterDeps,
-  mainRef: MainRefPort,
+  ref: MainRefPort,
+  refTimeoutMs: number = MAIN_REF_TIMEOUT_MS,
 ): MainWriterPort {
+  const mainRef = boundedRef(ref, refTimeoutMs);
   // Publications run one at a time, so no two attempts interleave across an `await`.
   let tail: Promise<unknown> = Promise.resolve();
   let queued = 0;
@@ -85,21 +102,28 @@ export function createMainWriter(
 async function publish(
   log: EventLog,
   deps: MainWriterDeps,
-  mainRef: MainRefPort,
+  mainRef: BoundedRef,
   intentId: IntentId,
 ): Promise<PortResult<MergeIntentRecord>> {
   for (;;) {
-    const record = deps.authorization.record(intentId);
+    let record = deps.authorization.record(intentId);
     // The async read tells an unknown intent from a missing module.
     if (record === null) return refusal(await deps.authorization.intent(intentId));
     if (record.status !== "authorized") return ok(record);
 
-    if (record.attempts > 0) {
-      // An earlier attempt may have landed unheard: read main before anything else.
+    const unsettled = deps.authorization.unsettled();
+    if (unsettled.length > 0) {
+      // A write may have landed unheard: read main and settle what it shows before writing.
       const main = await mainRef.read();
       if (!main.ok) return main;
-      if (main.value !== record.expectedMain) {
-        return settle(log, deps, record, "reconciled", main.value);
+      const settled = reconcile(log, deps, unsettled, main.value);
+      if (!settled.ok) return settled;
+      record = deps.authorization.record(intentId);
+      if (record === null) return refusal(await deps.authorization.intent(intentId));
+      if (record.status !== "authorized") return ok(record);
+      const others = settled.value.filter((pending) => pending.intentId !== intentId);
+      if (others.length > 0 && record.expectedMain !== main.value) {
+        return fail("unavailable", "An earlier write to main is unresolved; try again later.");
       }
     }
 
@@ -124,10 +148,34 @@ async function publish(
       case "uncertain":
         // The loop reads main back before deciding whether to write again.
         continue;
+      case "timeout":
+        return fail("unavailable", "Main did not answer in time; it will be read back first.");
       default:
         return unreachable(update.value);
     }
   }
+}
+
+/**
+ * Settles every unsettled intent that `main` decides, each with its event, and returns the ones
+ * whose write may still apply: those whose expected commit is still main.
+ */
+function reconcile(
+  log: EventLog,
+  deps: MainWriterDeps,
+  unsettled: readonly MergeIntentRecord[],
+  main: CommitSha,
+): PortResult<MergeIntentRecord[]> {
+  const pending: MergeIntentRecord[] = [];
+  for (const record of unsettled) {
+    if (main === record.expectedMain && main !== record.candidate) {
+      pending.push(record);
+      continue;
+    }
+    const settled = settle(log, deps, record, "reconciled", main);
+    if (!settled.ok) return settled;
+  }
+  return ok(pending);
 }
 
 /**
@@ -211,6 +259,48 @@ function refusal(result: PortResult<MergeIntentRecord>): PortResult<MergeIntentR
   return result.ok
     ? fail("busy", "The merge intent changed during publication; try again.")
     : result;
+}
+
+/** An update that did not answer before the deadline; it may still apply. */
+type BoundedUpdate = MainUpdate | { kind: "timeout" };
+
+/** Main's ref as the writer calls it, with every call bounded. */
+interface BoundedRef {
+  read(): Promise<PortResult<CommitSha>>;
+  update(expected: CommitSha, next: CommitSha): Promise<PortResult<BoundedUpdate>>;
+}
+
+/** Main's ref with every call bounded by `timeoutMs`. A late answer is dropped. */
+function boundedRef(ref: MainRefPort, timeoutMs: number): BoundedRef {
+  return {
+    read: () =>
+      within(
+        ref.read(),
+        timeoutMs,
+        fail("unavailable", "Main could not be read in time; try again."),
+      ),
+    update: (expected, next) =>
+      within<BoundedUpdate>(ref.update(expected, next), timeoutMs, ok({ kind: "timeout" })),
+  };
+}
+
+/** `call`'s result, or `late` if it has not settled after `timeoutMs`. */
+async function within<T>(
+  call: Promise<PortResult<T>>,
+  timeoutMs: number,
+  late: PortResult<T>,
+): Promise<PortResult<T>> {
+  // A failure after the deadline has no one waiting for it.
+  call.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<PortResult<T>>((resolve) => {
+    timer = setTimeout(() => resolve(late), timeoutMs);
+  });
+  try {
+    return await Promise.race([call, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function unreachable(value: never): never {

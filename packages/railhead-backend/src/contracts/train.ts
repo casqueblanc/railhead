@@ -186,6 +186,11 @@ export interface AuthorizationPort {
    */
   record(intentId: IntentId): MergeIntentRecord | null;
   /**
+   * Every intent still `authorized` with a write attempt counted, oldest first: the writes that may
+   * have moved main unheard. Call it only inside the caller's transaction.
+   */
+  unsettled(): MergeIntentRecord[];
+  /**
    * Records the main writer's progress, only if the intent is still `authorized` with exactly
    * `expectedAttempts` attempts, and returns the updated record; otherwise changes nothing and
    * returns `null`. Only the main writer calls it, inside the transaction that appends the
@@ -209,7 +214,8 @@ export type MainUpdate =
 
 /**
  * Main's ref. Only the main-writer module receives this port; no other port can mint a token that
- * writes main.
+ * writes main. Neither call promises a deadline or cancellation, so the main writer bounds each one
+ * and treats an update that does not answer in time as uncertain.
  */
 export interface MainRefPort {
   /** Reads main's current commit. */
@@ -226,8 +232,8 @@ export interface MainWriterPort {
    */
   head(): Promise<PortResult<CommitSha>>;
   /**
-   * Moves main for an authorized intent and records the outcome. An intent left `authorized` by an
-   * earlier attempt is reconciled by reading main before any new write.
+   * Moves main for an authorized intent and records the outcome. Every intent left `authorized` by
+   * an earlier attempt, this one or another, is reconciled by reading main before any new write.
    */
   publish(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
 }

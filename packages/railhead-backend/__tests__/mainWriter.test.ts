@@ -12,6 +12,7 @@ import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
   CheckAttempt,
+  CheckReport,
   MainRefPort,
   MainUpdate,
   MainWriterPort,
@@ -35,6 +36,11 @@ const INTENT = "int_intent01";
 const MAIN = "a".repeat(40);
 const CANDIDATE = "c".repeat(40);
 const OTHER = "e".repeat(40);
+const ATTEMPT_B = "chk_attempt02";
+const INTENT_B = "int_intent02";
+const CANDIDATE_B = "b".repeat(40);
+/** Short enough for a test to wait out, long enough for an answering fake to beat. */
+const TIMEOUT_MS = 50;
 const CLAIM_A: ClaimId = "clm_claim001";
 const CLAIM_B: ClaimId = "clm_claim002";
 const DEC_FORMAT: DecisionRef = { decisionId: "dec_format01", version: 1 };
@@ -114,6 +120,19 @@ class World {
   ]);
 }
 
+/** The second intent's attempt: claim B alone, composed on `expectedMain`. */
+function attemptB(expectedMain: CommitSha): CheckAttempt {
+  return {
+    attemptId: ATTEMPT_B,
+    expectedMain,
+    candidate: CANDIDATE_B,
+    pins: [{ claimId: CLAIM_B, generation: 3, commit: "3".repeat(40) }],
+    definition: { name: "upload", source: expectedMain, digest: "d".repeat(64), acceptance: null },
+    decisions: [],
+    createdAt: NOW - 60_000,
+  };
+}
+
 function attempt(): CheckAttempt {
   return {
     attemptId: ATTEMPT,
@@ -136,35 +155,54 @@ interface Harness {
   writer: MainWriterPort;
 }
 
-function harness(storage: RepoStorage, world: World, ref: MainRefPort): Harness {
+/** The attempt with a passing report recorded against it. */
+function passed(checked: CheckAttempt): { attempt: CheckAttempt; report: CheckReport } {
+  return {
+    attempt: checked,
+    report: {
+      attemptId: checked.attemptId,
+      candidate: checked.candidate,
+      result: "pass",
+      logDigest: null,
+      finishedAt: NOW - 1_000,
+    },
+  };
+}
+
+/** The harness's options: where the second intent's attempt was composed, and the ref deadline. */
+interface Options {
+  secondExpected?: CommitSha;
+  timeoutMs?: number;
+}
+
+function harness(
+  storage: RepoStorage,
+  world: World,
+  ref: MainRefPort,
+  options: Options = {},
+): Harness {
   const log = EventLog.open(storage, REPO, () => NOW);
-  const authorization = createAuthorization(
+  const authorization: AuthorizationPort = createAuthorization(
     { storage, log, clock: () => NOW },
     {
-      attemptOutcome: (attemptId) =>
-        attemptId === ATTEMPT
-          ? {
-              attempt: attempt(),
-              report: {
-                attemptId: ATTEMPT,
-                candidate: CANDIDATE,
-                result: "pass",
-                logDigest: null,
-                finishedAt: NOW - 1_000,
-              },
-            }
-          : null,
+      attemptOutcome: (attemptId) => {
+        if (attemptId === ATTEMPT) return passed(attempt());
+        if (attemptId === ATTEMPT_B && options.secondExpected !== undefined) {
+          return passed(attemptB(options.secondExpected));
+        }
+        return null;
+      },
       currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
       currentVersions: (claimId) => world.versions.get(claimId) ?? null,
     },
-    () => INTENT,
+    () => (authorization.record(INTENT) === null ? INTENT : INTENT_B),
   );
   const deps: MainWriterDeps = {
     authorization,
     currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
     currentVersions: (claimId) => world.versions.get(claimId) ?? null,
   };
-  const writer = createMainWriter({ log }, () => deps, ref);
+  const writer = createMainWriter({ log }, () => deps, ref, options.timeoutMs);
   return { storage, log, authorization, writer };
 }
 
@@ -178,9 +216,10 @@ function withIntent<R>(
   body: (h: Harness) => Promise<R>,
   world: World = new World(),
   stub: DurableObjectStub = freshStub(),
+  options: Options = {},
 ): Promise<R> {
   return runInDurableObject(stub, async (_instance, state) => {
-    const h = harness(state.storage, world, ref);
+    const h = harness(state.storage, world, ref, options);
     const authorized = await h.authorization.authorize(ATTEMPT);
     expect(authorized).toMatchObject({ ok: true, value: { intentId: INTENT } });
     return body(h);
@@ -212,7 +251,12 @@ function mainEvents(log: EventLog): unknown[] {
   return log.replay(1, 10).events;
 }
 
-function mainEvent(seq: number, outcome: MainOutcome, main: CommitSha): unknown {
+function mainEvent(
+  seq: number,
+  outcome: MainOutcome,
+  main: CommitSha,
+  intentId: string = INTENT,
+): unknown {
   return {
     v: EVENT_SCHEMA_VERSION,
     seq,
@@ -220,7 +264,7 @@ function mainEvent(seq: number, outcome: MainOutcome, main: CommitSha): unknown 
     repo: REPO,
     actor: TRAIN_ACTOR,
     type: "train.main",
-    data: { intentId: INTENT, outcome, main },
+    data: { intentId, outcome, main },
   };
 }
 
@@ -604,6 +648,291 @@ describe("publish fails closed", () => {
       }
       expect(ref.updates).toHaveLength(1);
     });
+  });
+});
+
+/** Every `train.main` outcome recorded so far, in log order. */
+function outcomes(log: EventLog): unknown[] {
+  return log
+    .replay(0, 50)
+    .events.filter((event) => event.type === "train.main")
+    .map((event) => event.data);
+}
+
+/** Authorizes the second intent, composed on `expectedMain`. */
+async function authorizeB(h: Harness): Promise<void> {
+  expect(await h.authorization.authorize(ATTEMPT_B)).toMatchObject({
+    ok: true,
+    value: { intentId: INTENT_B, status: "authorized" },
+  });
+}
+
+describe("publish settles an earlier unresolved write before another intent writes", () => {
+  it("records the earlier landing before a later intent moves main past it", async () => {
+    // A lands but its answer is lost and main cannot be read back; B was composed on A's
+    // candidate, as a `head()` read during that window would allow.
+    const ref = new FakeMain(MAIN, ["lose"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.main).toBe(CANDIDATE);
+        await authorizeB(h);
+
+        // B may not write while A's write cannot be read back.
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+
+        ref.readFails = false;
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { intentId: INTENT_B, status: "updated", main: CANDIDATE_B },
+        });
+        expect(ref.updates).toEqual([
+          { expected: MAIN, next: CANDIDATE },
+          { expected: CANDIDATE, next: CANDIDATE_B },
+        ]);
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+          { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+        ]);
+        // A stays recorded as landed; a repeat neither reads nor writes.
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, CANDIDATE),
+        });
+        expect(ref.updates).toHaveLength(2);
+      },
+      new World(),
+      freshStub(),
+      { secondExpected: CANDIDATE },
+    );
+  });
+
+  it("finds the earlier landing after the object is recreated", async () => {
+    const stub = freshStub();
+    const ref = new FakeMain(MAIN, ["crash-after"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        await expect(h.writer.publish(INTENT)).rejects.toThrow("the object was reset");
+        await authorizeB(h);
+      },
+      new World(),
+      stub,
+      { secondExpected: CANDIDATE },
+    );
+    await evictDurableObject(stub);
+
+    const after = new FakeMain(ref.main);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const h = harness(state.storage, new World(), after, { secondExpected: CANDIDATE });
+      expect(await h.writer.publish(INTENT_B)).toMatchObject({
+        ok: true,
+        value: { intentId: INTENT_B, status: "updated", main: CANDIDATE_B },
+      });
+      expect(after.updates).toEqual([{ expected: CANDIDATE, next: CANDIDATE_B }]);
+      expect(outcomes(h.log)).toEqual([
+        { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+        { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+      ]);
+    });
+  });
+
+  it("holds a write from another commit while the earlier write may still land", async () => {
+    const stub = freshStub();
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        await authorizeB(h);
+      },
+      new World(),
+      stub,
+      { secondExpected: CANDIDATE },
+    );
+    await evictDurableObject(stub);
+
+    const after = new FakeMain(MAIN);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const h = harness(state.storage, new World(), after, { secondExpected: CANDIDATE });
+      // Main is still at A's expected commit, so A's write may yet apply: B does not write.
+      expect(await h.writer.publish(INTENT_B)).toMatchObject({ ok: false, code: "unavailable" });
+      expect(after.updates).toHaveLength(0);
+      expect(h.authorization.record(INTENT_B)).toMatchObject({ status: "authorized", attempts: 0 });
+
+      // A's write lands late; B's next publication records it before writing on top of it.
+      after.main = CANDIDATE;
+      expect(await h.writer.publish(INTENT_B)).toMatchObject({
+        ok: true,
+        value: { status: "updated", main: CANDIDATE_B },
+      });
+      expect(outcomes(h.log)).toEqual([
+        { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+        { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+      ]);
+    });
+  });
+
+  it("lets a write from the same commit proceed and settles the earlier one as not landed", async () => {
+    // A's attempts are used up with main still at its expected commit. B was composed on the
+    // same commit, so its conditional write and A's can never both apply.
+    const ref = new FakeMain(
+      MAIN,
+      Array.from({ length: MAX_WRITE_ATTEMPTS }, () => "drop"),
+    );
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        await authorizeB(h);
+
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { status: "updated", main: CANDIDATE_B },
+        });
+        expect(ref.updates.at(-1)).toEqual({ expected: MAIN, next: CANDIDATE_B });
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", MAX_WRITE_ATTEMPTS, CANDIDATE_B),
+        });
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+          { intentId: INTENT, outcome: "reconciled", main: CANDIDATE_B },
+        ]);
+      },
+      new World(),
+      freshStub(),
+      { secondExpected: MAIN },
+    );
+  });
+
+  it("rejects the later write when the earlier one lands first, and records both", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.readFails = true;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        ref.readFails = false;
+        await authorizeB(h);
+        // A's write lands between B's read-back and B's conditional write.
+        const original = ref.update.bind(ref);
+        ref.update = async (expected, next) => {
+          ref.main = CANDIDATE;
+          return original(expected, next);
+        };
+
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { status: "rejected", main: CANDIDATE },
+        });
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, CANDIDATE),
+        });
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT_B, outcome: "rejected", main: CANDIDATE },
+          { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+        ]);
+      },
+      new World(),
+      freshStub(),
+      { secondExpected: MAIN },
+    );
+  });
+});
+
+describe("publish bounds every call to main's ref", () => {
+  it("refuses within the deadline when a read-back never answers, writing nothing", async () => {
+    const ref = new FakeMain(MAIN, ["drop", "drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.read = () => new Promise(() => undefined);
+        const started = Date.now();
+        // The first attempt is uncertain; its read-back hangs.
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(Date.now() - started).toBeLessThan(TIMEOUT_MS * 10);
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        expect(h.log.head()).toBe(1);
+      },
+      new World(),
+      freshStub(),
+      { timeoutMs: TIMEOUT_MS },
+    );
+  });
+
+  it("keeps a timed-out write unresolved and frees the queue for the next publication", async () => {
+    let answer: ((result: PortResult<MainUpdate>) => void) | undefined;
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.update = (expected, next) => {
+          ref.updates.push({ expected, next });
+          return new Promise((resolve) => {
+            answer = resolve;
+          });
+        };
+        await authorizeB(h);
+        const first = h.writer.publish(INTENT);
+        const queued = h.writer.publish(INTENT_B);
+
+        expect(await first).toMatchObject({ ok: false, code: "unavailable" });
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        // B was composed on A's candidate: it waits, then is held without writing.
+        expect(await queued).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.updates).toEqual([{ expected: MAIN, next: CANDIDATE }]);
+
+        // The write lands and answers after the deadline; the late answer is dropped, and the
+        // next publication reads main back instead.
+        ref.main = CANDIDATE;
+        answer?.(ok({ kind: "updated" }));
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        ref.update = FakeMain.prototype.update.bind(ref);
+        expect(await h.writer.publish(INTENT_B)).toMatchObject({
+          ok: true,
+          value: { status: "updated", main: CANDIDATE_B },
+        });
+        expect(outcomes(h.log)).toEqual([
+          { intentId: INTENT, outcome: "reconciled", main: CANDIDATE },
+          { intentId: INTENT_B, outcome: "updated", main: CANDIDATE_B },
+        ]);
+      },
+      new World(),
+      freshStub(),
+      { secondExpected: CANDIDATE, timeoutMs: TIMEOUT_MS },
+    );
+  });
+
+  it("ignores a failure that arrives after the deadline", async () => {
+    let refuse: ((reason: Error) => void) | undefined;
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.update = () =>
+          new Promise((_resolve, reject) => {
+            refuse = reject;
+          });
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        refuse?.(new Error("the connection reset"));
+        ref.update = FakeMain.prototype.update.bind(ref);
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("updated", 2, CANDIDATE),
+        });
+      },
+      new World(),
+      freshStub(),
+      { timeoutMs: TIMEOUT_MS },
+    );
   });
 });
 

@@ -100,6 +100,14 @@ export function createAuthorization(
     },
     record: (intentId) =>
       isId("intent", intentId) ? readIntent(context.storage, "intent_id", intentId) : null,
+    unsettled: () =>
+      context.storage.sql
+        .exec<IntentRow>(
+          `SELECT * FROM merge_intents WHERE status = 'authorized' AND attempts > 0
+           ORDER BY authorized_at, intent_id`,
+        )
+        .toArray()
+        .map(toRecord),
     recordWrite: (intentId, expectedAttempts, change) =>
       recordWrite(context, intentId, expectedAttempts, change),
   };

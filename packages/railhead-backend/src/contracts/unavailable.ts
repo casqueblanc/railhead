@@ -104,6 +104,9 @@ export const unavailableAuthorization: AuthorizationPort = {
   authorize: refuse("authorization"),
   intent: refuse("authorization"),
   record: () => null,
+  unsettled: () => {
+    throw new UnavailableError("authorization");
+  },
   recordWrite: () => {
     throw new UnavailableError("authorization");
   },
