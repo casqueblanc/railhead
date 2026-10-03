@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
+import { mixedBatch } from "../../../../../fixtures/board/mixedBatch";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
 import {
   SYNTH_OWNER,
@@ -19,6 +20,7 @@ import {
 } from "../../../../../fixtures/board/syntheticLog";
 import {
   UPLOAD,
+  adapt,
   checkResult,
   decide,
   inbox,
@@ -495,10 +497,12 @@ describe("decision ripple and adaptation through a reversal", () => {
     ]);
   });
 
-  it("marks the claim adapted once its landed commit passes the current option's check", () => {
-    const state = after(decisionReversal, isMain("int_synth01"));
+  it("marks the claim adapted once the backend records its landed work adapted", () => {
+    const landed = after(decisionReversal, isMain("int_synth01"));
+    expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("landed");
+    expect(atlasAdapted(landed)).toBe(false);
+    const state = after(decisionReversal, (e) => e.type === "claim.adapted");
     expect(atlasAdapted(state)).toBe(true);
-    expect(state.claims[UPLOAD.atlasClaim]?.phase).toBe("landed");
     expect(isClaimAdapted(state, UPLOAD.birchClaim, UPLOAD.decision)).toBe(false);
   });
 
@@ -590,11 +594,16 @@ describe("acceptance checks before and after landing", () => {
     expect(atlasAdapted(state)).toBe(false);
   });
 
-  it("lands on a reconciled push but waits for the check on the landed commit", () => {
+  it("lands on a reconciled push but adapts only when the backend records it", () => {
     const landed = after(checkBeforeLand, isMain("int_synth12"));
     expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("landed");
     expect(atlasAdapted(landed)).toBe(false);
-    expect(atlasAdapted(fold(checkBeforeLand.events))).toBe(true);
+    // A pass on the landed commit after the landing is not the check the intent rests on.
+    const checked = fold(checkBeforeLand.events);
+    expect(atlasAdapted(checked)).toBe(false);
+    expect(
+      atlasAdapted(append(checked, adapt(UPLOAD.atlasClaim, "int_synth12", sizeDecision(1)))),
+    ).toBe(true);
   });
 
   it("does not land a reconciled intent when main is elsewhere", () => {
@@ -640,9 +649,10 @@ describe("acceptance results for old and current options", () => {
     expect(atlasAdapted(after(optionResults, isCheck("chk_synth23")))).toBe(false);
   });
 
-  it("uses the latest result on the landed commit", () => {
-    expect(atlasAdapted(after(optionResults, isCheck("chk_synth25")))).toBe(false);
-    const state = fold(optionResults.events);
+  it("follows the recorded adaptation, not later results on the landed commit", () => {
+    const checked = fold(optionResults.events);
+    expect(atlasAdapted(checked)).toBe(false);
+    const state = append(checked, adapt(UPLOAD.atlasClaim, "int_synth24", sizeDecision(2)));
     expect(atlasAdapted(state)).toBe(true);
 
     const regressed = append(
@@ -653,7 +663,82 @@ describe("acceptance results for old and current options", () => {
       }),
     );
     expect(regressed.stream).toEqual({ kind: "consistent" });
-    expect(atlasAdapted(regressed)).toBe(false);
+    expect(atlasAdapted(regressed)).toBe(true);
+  });
+
+  it("does not count an adaptation recorded for an older version", () => {
+    const state = append(
+      fold(optionResults.events),
+      adapt(UPLOAD.atlasClaim, "int_synth20", sizeDecision(1)),
+    );
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(atlasAdapted(state)).toBe(false);
+  });
+});
+
+describe("claim.adapted", () => {
+  it("adapts only the claim the backend recorded in a two-claim batch", () => {
+    const state = fold(mixedBatch.events);
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(birch(state)?.phase).toBe("landed");
+    expect(atlasAdapted(state)).toBe(true);
+    expect(isClaimAdapted(state, UPLOAD.birchClaim, UPLOAD.decision)).toBe(false);
+    expect(ripple(state)).toEqual([
+      {
+        agentId: UPLOAD.atlas,
+        claimId: UPLOAD.atlasClaim,
+        delivery: "acknowledged",
+        adapted: true,
+      },
+      { agentId: UPLOAD.birch, claimId: UPLOAD.birchClaim, delivery: "queued", adapted: false },
+    ]);
+  });
+
+  it("records a repeated adaptation once", () => {
+    const state = fold(mixedBatch.events);
+    const repeated = append(state, adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(1)));
+    expect(repeated.stream).toEqual({ kind: "consistent" });
+    expect(repeated.claims).toBe(state.claims);
+    expect(atlas(repeated)?.adaptations).toEqual([sizeDecision(1)]);
+  });
+
+  it.each([
+    [
+      "an intent that has not landed",
+      () => through(mixedBatch, last(mixedBatch) - 2),
+      adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(1)),
+      "did not land",
+    ],
+    [
+      "a claim the intent did not land",
+      () => fold(decisionReversal.events),
+      adapt(UPLOAD.birchClaim, "int_synth01", sizeDecision(1)),
+      "did not land claim",
+    ],
+    [
+      "a decision version never recorded",
+      () => fold(mixedBatch.events),
+      adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(2)),
+      "",
+    ],
+    [
+      "an unknown intent",
+      () => fold(mixedBatch.events),
+      adapt(UPLOAD.atlasClaim, "int_synthnone", sizeDecision(1)),
+      "",
+    ],
+  ])("halts on an adaptation for %s", (_name, start, step, message) => {
+    const before = start();
+    const state = append(before, step);
+    expect(state.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: before.cursor + 1,
+        message: expect.stringContaining(message),
+      },
+    });
+    expect(state.claims).toBe(before.claims);
   });
 });
 
@@ -755,5 +840,46 @@ describe("folding a long log", () => {
     expect(halted.checkRuns[run]?.results.map((entry) => entry.check)).toEqual(["first", "second"]);
     expect(Object.keys(halted.issues)).toEqual([issueId(1)]);
     expect({ ...halted, stream: null }).toEqual({ ...fold(log.events.slice(0, 3)), stream: null });
+  });
+});
+
+describe("totals and recent activity", () => {
+  it("counts each human event once, however often a replay repeats it", () => {
+    const once = fold(checkBeforeLand.events);
+    const replayed = fold(withReplayOverlap(checkBeforeLand, 2, 12));
+
+    expect(once.totals).toEqual({
+      humanActions: 7,
+      earliestAt: SYNTH_START_MS,
+      lastAt: SYNTH_START_MS + (last(checkBeforeLand) - 1) * 1000,
+    });
+    expect(replayed.totals).toEqual(once.totals);
+    expect(replayed.recent).toEqual(once.recent);
+  });
+
+  it("counts a landed merge's claims but not a rejected one's", () => {
+    const beforeRejection = after(checkBeforeLand, isMain("int_synth10"));
+    const rejected = after(checkBeforeLand, isMain("int_synth11"));
+    const landed = after(checkBeforeLand, isMain("int_synth12"));
+
+    expect(beforeRejection.recent.at(-1)?.changesLanded).toBe(1);
+    expect(rejected.recent.at(-1)?.changesLanded).toBe(1);
+    expect(landed.recent.at(-1)?.changesLanded).toBe(2);
+  });
+
+  it("leaves the counts unchanged when an event halts the fold", () => {
+    const base = fold(checkBeforeLand.events);
+    const halted = append(base, checkResult("chk_synthbad", "not-a-commit", "test", "fail"));
+
+    expect(halted.stream.kind).toBe("halted");
+    expect(halted.totals).toBe(base.totals);
+    expect(halted.recent).toBe(base.recent);
+  });
+
+  it("starts with no counts and no recent activity", () => {
+    const empty = emptyBoardState(SYNTH_REPO);
+
+    expect(empty.totals).toEqual({ humanActions: 0, earliestAt: null, lastAt: null });
+    expect(empty.recent).toEqual([]);
   });
 });

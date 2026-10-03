@@ -227,7 +227,7 @@ function withTakeover<T>(
       async repoAlarm() {
         alarm.fired();
         storedAlarm = null;
-        await resumeAll(REPO, resumables(ports));
+        await resumeAll(context, resumables(ports));
         await alarm.settle();
       },
       storedAlarm: () => storedAlarm,

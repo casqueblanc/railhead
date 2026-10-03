@@ -843,6 +843,47 @@ describe("question", () => {
   });
 });
 
+describe("currentDecision", () => {
+  it("reads the current version and its option, following a supersession", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      await h.decisions.record(h.grant({ decisionId, option: "reject", expectedVersion: null }));
+      expect(h.log.transaction(() => h.decisions.currentDecision(decisionId)).value).toEqual({
+        version: 1,
+        option: "reject",
+      });
+      await h.decisions.record(
+        h.grant({ decisionId, option: "chunk", expectedVersion: 1 }, "chl_grant0002"),
+      );
+      expect(h.log.transaction(() => h.decisions.currentDecision(decisionId)).value).toEqual({
+        version: 2,
+        option: "chunk",
+      });
+    });
+  });
+
+  it("answers for a decision whose claim the claims module no longer knows", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      await h.decisions.record(h.grant({ decisionId, option: "chunk", expectedVersion: null }));
+      // A merged claim has no current generation; the decision itself is still readable.
+      h.fence(() => null);
+      expect(h.decisions.currentVersions(CLAIM)).toBeNull();
+      expect(h.decisions.currentDecision(decisionId)).toEqual({ version: 1, option: "chunk" });
+    });
+  });
+
+  it("is unknown for an open question, an unknown decision and a non-decision id", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      expect(h.decisions.currentDecision(decisionId)).toBeNull();
+      expect(h.decisions.currentDecision("dec_unknown01")).toBeNull();
+      expect(h.decisions.currentDecision("clm_claim001")).toBeNull();
+      expect(h.decisions.currentDecision("")).toBeNull();
+    });
+  });
+});
+
 describe("requirements and currentVersions", () => {
   it("read the current version inside a transaction and refuse a non-claim id", async () => {
     await withDecisions(async (h) => {

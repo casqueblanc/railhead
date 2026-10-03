@@ -75,7 +75,7 @@ export const claimLanes = (state: BoardState): ClaimLane[] =>
     .map(({ lane }) => lane);
 
 /** The order lanes are listed in: blocked first, then active, then finished. */
-export const LANE_ORDER: Readonly<Record<LaneStatus["kind"], number>> = {
+const LANE_ORDER: Readonly<Record<LaneStatus["kind"], number>> = {
   refused: 0,
   waiting_on_decision: 1,
   working: 2,

@@ -264,6 +264,27 @@ impl ClaimReassigned {
     }
 }
 
+/// `claim.adapted`: the claim's work landed by an intent passed the acceptance check of a decision
+/// version it depended on, on the landed commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimAdapted {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The `int_` merge intent that landed the work.
+    pub intent_id: String,
+    /// The decision version the work was proven against.
+    pub decision: DecisionRef,
+}
+
+impl ClaimAdapted {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::Claim, &self.claim_id, "claimId")?;
+        require_id(IdKind::Intent, &self.intent_id, "intentId")?;
+        require_decision_ref(&self.decision)
+    }
+}
+
 /// `question.asked`: an agent asked the owner a question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -77,6 +77,7 @@ export const unavailableDecisions: DecisionsPort = {
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  currentDecision: () => null,
   transfer: () => {
     throw new UnavailableError("decisions");
   },

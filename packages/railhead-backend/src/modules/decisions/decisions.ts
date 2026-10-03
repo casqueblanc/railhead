@@ -615,6 +615,14 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       return dependencies(claimId);
     },
 
+    currentDecision(decisionId) {
+      if (!isId("decision", decisionId)) return null;
+      const current = currentVersion(decisionId);
+      if (current === 0) return null;
+      const row = versionOf(decisionId, current);
+      return row === undefined ? null : { version: current, option: row.option };
+    },
+
     transfer(tx, target) {
       const invalid = invalidTarget(target);
       if (invalid !== null) throw new DecisionsWriteError(invalid);
