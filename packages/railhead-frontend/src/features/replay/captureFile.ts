@@ -49,6 +49,9 @@ export const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
 /** Longest origin, organisation, repository name or synthetic description a capture records. */
 export const MAX_SOURCE_TEXT_LENGTH = 256;
 
+/** Largest time in milliseconds a `Date` can hold; a later one would break the page's clock. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
+
 /** Events requested per page while capturing; the board API serves at most 256. */
 export const CAPTURE_PAGE_SIZE = 256;
 
@@ -265,6 +268,12 @@ const checkCapture = (capture: Capture): CaptureResult => {
       return { ok: false, error: { kind: "gap", expected, found: event.seq } };
     }
     if (event.repo !== repo) return { ok: false, error: { kind: "foreign_repo", seq: event.seq } };
+    if (event.at > MAX_DATE_MS) {
+      return {
+        ok: false,
+        error: { kind: "invalid_event", seq: event.seq, message: "at is past the last date" },
+      };
+    }
     try {
       validateEvent(event);
     } catch (error) {
@@ -301,7 +310,11 @@ const checkCapturedSource = (
     const error = checkSourceText(source[field], `source.${field}`);
     if (error !== null) return error;
   }
-  if (!Number.isSafeInteger(source.capturedAt) || source.capturedAt < 1) {
+  if (
+    !Number.isSafeInteger(source.capturedAt) ||
+    source.capturedAt < 1 ||
+    source.capturedAt > MAX_DATE_MS
+  ) {
     return { kind: "malformed", path: "source.capturedAt" };
   }
   return null;

@@ -337,6 +337,25 @@ describe("parseCapture", () => {
     expect(parsedError(fileOf({ events }))).toMatchObject({ kind: "invalid_event", seq: 1 });
   });
 
+  it("refuses times a date cannot hold, which the page could not show", () => {
+    const events = issues(3);
+    events[1] = { ...issue(2), at: 8_640_000_000_000_001 };
+    expect(parsedError(fileOf({ events }))).toEqual({
+      kind: "invalid_event",
+      seq: 2,
+      message: "at is past the last date",
+    });
+    expect(
+      parsedError(fileOf({ source: { ...SOURCE, capturedAt: 8_640_000_000_000_001 } })),
+    ).toEqual({ kind: "malformed", path: "source.capturedAt" });
+  });
+
+  it("accepts the last time a date can hold", () => {
+    const events = issues(3);
+    events[2] = { ...issue(3), at: 8_640_000_000_000_000 };
+    expect(parseCapture(fileOf({ events })).ok).toBe(true);
+  });
+
   it("refuses a head that disagrees with the events", () => {
     expect(parsedError(fileOf({ head: 5 }))).toEqual({ kind: "head_mismatch", head: 5, last: 3 });
   });
