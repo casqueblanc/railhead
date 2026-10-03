@@ -5,6 +5,7 @@
 // storage the safety argument rests on: `MergeIntentRecord` is, and it is written in the Repo
 // transaction that authorizes the merge, before any write to main is attempted.
 
+import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
   CheckRunId,
@@ -156,6 +157,12 @@ export interface CheckPort {
    * result than one already recorded, is refused with `check_mismatch`.
    */
   report(run: CheckRunReport): Promise<PortResult<CheckAttempt>>;
+  /**
+   * What was recorded for an attempt this module held or started: its candidate, the command its
+   * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its output.
+   * An attempt it never recorded, or no longer keeps, is `not_found`.
+   */
+  detail(attemptId: CheckRunId): Promise<PortResult<CheckDetail>>;
 }
 
 /** A persisted check attempt and the report recorded for it, if one has been. */

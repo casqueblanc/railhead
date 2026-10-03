@@ -49,7 +49,7 @@ import {
   type QuestionOption,
   type RepoId,
   type UserId,
-} from "./events";
+} from "./events.ts";
 
 // =======================================================================================
 // Version, encoding and limits

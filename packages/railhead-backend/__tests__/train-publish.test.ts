@@ -194,6 +194,7 @@ function withRepo<R>(
         },
         // Reports reach the train through `recordCheck` in these tests.
         report: async () => fail("unavailable", "Not used."),
+        detail: async () => fail("unavailable", "Not used."),
       },
       authorization,
       mainWriter,

@@ -183,6 +183,7 @@ function withHandoff<T>(
           return ok({ attemptId: attempt.attemptId });
         },
         report: async () => fail("unavailable", "Not used."),
+        detail: async () => fail("unavailable", "Not used."),
       },
       merge: {
         compose: async (_main, pins) => {

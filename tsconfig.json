@@ -15,6 +15,7 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     // tsgo's parallel checkers each keep separate type caches, so every checker re-derives
     // capnweb's recursive type graphs; Cloudflare OS measured single-threaded as both faster and
     // smaller for a capnweb codebase.
