@@ -36,7 +36,11 @@ import type { RailheadEvent, UserId } from "@railhead/shared/events";
 import type { PortResult } from "../contracts/result";
 import { parseEvent } from "../contracts/wireShape";
 import { ownerEnrollment, type OwnerEnrollmentPort } from "../modules/owner/entry";
-import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
+import {
+  DELIVERY_TIMEOUT_MS,
+  type StreamListener,
+  type StreamSubscription,
+} from "../modules/stream/entry";
 import { repoObjectName, type Repo } from "../repo/RepoObject";
 
 type RepoStub = DurableObjectStub<Repo>;
@@ -104,7 +108,7 @@ class BoardApiImpl extends RpcTarget implements BoardApi {
     const bridge = new ListenerBridge(listener.dup());
     const result = await this.#repo.subscribe(cursor, bridge);
     if (!result.ok) {
-      bridge.release();
+      bridge.end();
       return toBoard(result);
     }
     return { ok: true, value: new SubscriptionImpl(result.value, bridge) };
@@ -163,9 +167,17 @@ class OwnerEnrollmentApiImpl extends RpcTarget implements OwnerEnrollmentApi {
   }
 }
 
-/** Carries a board listener across the Worker's RPC boundary into the Repo. */
+/**
+ * Carries a board listener across the Worker's RPC boundary into the Repo. It ends when the Repo
+ * releases it or tells it the subscription ended, and ending cancels the board calls still in
+ * flight, releases the board's listener and runs the subscription's cleanup.
+ */
 class ListenerBridge extends WorkersRpcTarget implements StreamListener {
   #listener: RpcStub<BoardListener> | null;
+  // The board calls in flight. Disposing one cancels it on the board's session.
+  readonly #calls = new Set<Disposable>();
+  #ended = false;
+  #onEnd: (() => void) | null = null;
 
   constructor(listener: RpcStub<BoardListener>) {
     super();
@@ -173,61 +185,121 @@ class ListenerBridge extends WorkersRpcTarget implements StreamListener {
   }
 
   async events(events: RailheadEvent[]): Promise<void> {
-    await this.#live().events(events);
+    await this.#call((listener) => listener.events(events));
   }
 
   async ended(reason: SubscriptionEnd): Promise<void> {
+    // Nothing follows the ending, so a delivery still in flight is abandoned now.
+    this.#cancelCalls();
     try {
-      await this.#live().ended(reason);
+      await this.#call((listener) => listener.ended(reason));
     } finally {
-      this.release();
+      this.end();
     }
   }
 
-  /** Releases the board's listener stub. */
-  release(): void {
-    this.#listener?.[Symbol.dispose]();
-    this.#listener = null;
+  /** Runs `callback` once the bridge ends, now if it already has. */
+  onEnd(callback: () => void): void {
+    if (this.#ended) callback();
+    else this.#onEnd = callback;
   }
 
-  #live(): RpcStub<BoardListener> {
+  /** Cancels the board calls in flight, releases the board's listener and runs `onEnd`, once. */
+  end(): void {
+    if (this.#ended) return;
+    this.#ended = true;
+    this.#cancelCalls();
+    this.#listener?.[Symbol.dispose]();
+    this.#listener = null;
+    const onEnd = this.#onEnd;
+    this.#onEnd = null;
+    onEnd?.();
+  }
+
+  // The runtime calls this once the Repo releases every stub of the bridge, which it does whenever
+  // the subscription ends, including the ends it tells nobody about.
+  [Symbol.dispose](): void {
+    this.end();
+  }
+
+  #cancelCalls(): void {
+    const calls = [...this.#calls];
+    this.#calls.clear();
+    for (const call of calls) call[Symbol.dispose]();
+  }
+
+  // Sends one board call, settling when it does, when the bridge ends, or after the delivery
+  // timeout, so a board that never answers holds the call no longer than the Repo waits for it.
+  async #call(send: (listener: RpcStub<BoardListener>) => Promise<void> & Disposable) {
     if (this.#listener === null) throw new Error("the subscription has ended");
-    return this.#listener;
+    const call = send(this.#listener);
+    this.#calls.add(call);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("the board listener timed out")),
+        DELIVERY_TIMEOUT_MS,
+      );
+    });
+    try {
+      await Promise.race([call, timedOut]);
+    } finally {
+      clearTimeout(timer);
+      if (this.#calls.delete(call)) call[Symbol.dispose]();
+    }
   }
 }
 
 /** A board subscription backed by the Repo's stream subscription. */
 @validateRpc<BoardSubscription>()
 class SubscriptionImpl extends RpcTarget implements BoardSubscription {
-  readonly #subscription: StreamSubscription;
+  // The Repo's handle, until the subscription ends however it ends. An ended subscription's stub
+  // stays valid for the board but holds nothing in the Repo.
+  #subscription: StreamSubscription | null;
   readonly #bridge: ListenerBridge;
+  #cancelling: Promise<void> | null = null;
 
   constructor(subscription: StreamSubscription, bridge: ListenerBridge) {
     super();
     this.#subscription = subscription;
     this.#bridge = bridge;
+    // The bridge may already have ended, before the Repo's `subscribe` returned.
+    bridge.onEnd(() => this.#close());
   }
 
   async cancel(): Promise<void> {
-    try {
-      await this.#subscription.cancel();
-    } finally {
-      this.#bridge.release();
-    }
+    this.#cancelling ??= this.#cancelRepo().finally(() => {
+      this.#cancelling = null;
+      this.#bridge.end();
+      this.#close();
+    });
+    await this.#cancelling;
   }
 
-  // Disposing the board's stub ends the subscription: the Repo side is cancelled now rather than
-  // at its next delivery, and the listener is released.
+  // Disposing the board's stub ends the subscription: the listener is released, and releasing the
+  // Repo's handle ends the Repo side now rather than at its next delivery.
   [Symbol.dispose](): void {
-    this.#subscription.cancel().catch((error: unknown) => {
-      // Only the error's name: its message may carry data from the Repo.
-      console.error(
-        "stream subscription cancel failed",
-        error instanceof Error ? error.name : "unknown",
-      );
-    });
-    this.#bridge.release();
+    this.#bridge.end();
+    this.#close();
   }
+
+  async #cancelRepo(): Promise<void> {
+    await this.#subscription?.cancel();
+  }
+
+  // Releases the Repo's handle, unless a cancel on it is in flight: that cancel releases it when
+  // it settles.
+  #close(): void {
+    if (this.#cancelling !== null) return;
+    const subscription = this.#subscription;
+    this.#subscription = null;
+    if (subscription !== null) dispose(subscription);
+  }
+}
+
+function dispose(value: object): void {
+  const fn: unknown = Reflect.get(value, Symbol.dispose);
+  if (typeof fn === "function") fn.call(value);
 }
 
 const BOARD_ERROR_CODES = {
