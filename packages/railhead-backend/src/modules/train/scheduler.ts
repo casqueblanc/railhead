@@ -1108,9 +1108,11 @@ export function createTrain(
       const pair = entries.filter(
         (entry) => samePin(entry.pin, first) || samePin(entry.pin, second),
       );
-      // A pair readied again during the merge is newer work than the merge composed, so both
-      // entries are composed again rather than parked behind a question about the older episode.
-      const parks = pair.length === 2 && !pair.some(renewed);
+      // A pair readied again during the merge, with the same commit or a deferred newer one, is
+      // newer work than the merge composed, so both entries are composed again rather than parked
+      // behind a question about the older work.
+      const parks =
+        pair.length === 2 && !pair.some((entry) => renewed(entry) || entry.nextCommit !== null);
       const parked = (entry: QueueEntry) => parks && pair.includes(entry);
       for (const entry of entries.filter(parked)) {
         settleEntry(sql, entry.pin, "parked", "conflict", now);

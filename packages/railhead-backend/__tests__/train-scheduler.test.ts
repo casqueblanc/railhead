@@ -2293,6 +2293,39 @@ describe("train ready episodes", () => {
     }, fakes);
   });
 
+  it("composes a pair again, unparked and unasked, when one was readied with a new commit during its merge", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Not yet.");
+    const redone = pin(1, 1, sha("9"));
+    // Only the merge with claim 1's older commit conflicts.
+    fakes.compose = (main, pins) =>
+      pins.some((p) => p.claimId === pin(1).claimId && p.commit === pin(1).commit) &&
+      pins.length === 2
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        : ok({ kind: "clean", candidate: candidateOf(main, pins) });
+    await withTrain(async ({ train, events }) => {
+      fakes.ready(pin(1), pin(2));
+      for (const p of [pin(1), pin(2)]) await train.enqueue(p);
+      fakes.head = () => ok(fakes.main);
+      const release = fakes.hold("merge.compose");
+      const driving = train.drive();
+      await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(1));
+
+      // Claim 1 is readied with a newer commit while the merge runs.
+      fakes.ready(redone);
+      const queued = train.enqueue(redone);
+      release();
+      expect(await queued).toEqual(ok({ queued: false }));
+      await driving;
+
+      expect(fakes.asked).toEqual([]);
+      expect(train.conflicts(8)).toEqual([]);
+      expect(events().map((event) => event.type)).not.toContain("train.conflict");
+      expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "batched" });
+      expect(lastStarted(fakes).pins).toEqual(expect.arrayContaining([redone, pin(2)]));
+    }, fakes);
+  });
+
   it("parks and asks about a pair whose re-readied entry conflicts again", async () => {
     const fakes = new Fakes();
     fakes.head = () => fail("unavailable", "Not yet.");
