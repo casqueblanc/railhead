@@ -8,14 +8,18 @@
 // again rather than inheriting any part of its result.
 //
 // Each `enqueue` and `recordCheck` drives the train until it waits for a check report or a port,
-// or the queue is empty. Accepting work also records, in the same transaction, that a drive is
-// owed and sets the Repo's alarm `DRIVE_LEASE_MS` later, so the work is resumed even if the object
-// stops during the drive and nothing else wakes it. When a drive ends, the train settles that debt
-// from storage: it asks the alarm to drive again at once when work arrived too late for the drive,
-// waits for the active attempt's deadline while a runner's report is due, backs off when a port
-// refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it.
-// Neither a backoff nor exhaustion outlasts a requested attempt's deadline: the wake stays due by
-// then, so the attempt expires even when no port answers again.
+// or the queue is empty. Whenever storage holds work the train owes (an active batch or a queued
+// pin), it also holds a wake row and the Repo's alarm is set for it. `recordDebt` is the only
+// writer of that row, and it writes inside the transaction that creates or restarts the debt:
+// accepting work and starting a drive record it due now with the alarm `DRIVE_LEASE_MS` later, so
+// the work is resumed even if the object stops during the drive and nothing else wakes it. When a
+// drive ends, the train settles that debt from storage: it asks the alarm to drive again at once
+// when work arrived too late for the drive, waits for the active attempt's deadline while a
+// runner's report is due, backs off when a port refused or the drive threw, up to
+// `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it. After the last of those drives the
+// row stays but is marked exhausted, and no alarm is asked for it; the next drive any call starts
+// restores it with a fresh count. Neither a backoff nor exhaustion outlasts a requested attempt's
+// deadline: the wake stays due by then, so the attempt expires even when no port answers again.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes.
 //
@@ -73,6 +77,7 @@ import {
   insertEntry,
   markCheckStarted,
   migrateTrain,
+  owesWork,
   readDrive,
   readEntry,
   readWake,
@@ -130,10 +135,13 @@ export const CHECK_DEADLINE_MS = 60 * 60_000;
 /**
  * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
  * all. After that the train stops asking and logs `train.wake_exhausted`; its work stays in storage
- * and the next `enqueue` or `recordCheck` drives it again. A requested check attempt keeps one wake
- * at its deadline, which expires it without a port.
+ * with a wake row marked `EXHAUSTED_FAILURES`, and the next `enqueue` or `recordCheck` drives it
+ * again. A requested check attempt keeps one wake at its deadline, which expires it without a port.
  */
 export const MAX_WAKE_FAILURES = 24;
+
+/** The failure count of a wake row whose retries ran out: it is kept, but no alarm is asked for. */
+export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
 
 /**
  * Most state transitions one call drives. Every transition that does not stop the drive settles or
@@ -197,6 +205,18 @@ export interface Train extends TrainPort {
 
 type Step = { kind: "continue" } | { kind: "stop"; outcome: DriveOutcome };
 
+/** Why `recordDebt` writes the wake row. */
+type Debt =
+  /**
+   * A call accepted work or a drive starts: stored work is due now, and the alarm at `alarmAt`
+   * resumes it if the drive never settles.
+   */
+  | { kind: "start"; alarmAt: number }
+  /** A drive ran clean. */
+  | { kind: "clean" }
+  /** A drive stopped on a port, threw or was superseded. */
+  | { kind: "failed" };
+
 const CONTINUE: Step = { kind: "continue" };
 
 /** One drive of this instance. */
@@ -238,7 +258,7 @@ export function createTrain(
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
   const owed = readWake(sql);
-  if (owed !== null) context.wake(owed.dueAt);
+  if (owed !== null && !isExhausted(owed)) context.wake(owed.dueAt);
 
   function drive(): Promise<DriveOutcome> {
     if (running !== null) {
@@ -248,14 +268,18 @@ export function createTrain(
     return startDrive();
   }
 
-  /** Takes the next generation with a fresh lease and drives under it. */
+  /**
+   * Takes the next generation with a fresh lease and drives under it. The lease and the debt for
+   * the stored work commit together before any port is called, so a drive that restarts exhausted
+   * work is resumed by the alarm even when the object stops before the drive settles.
+   */
   function startDrive(): Promise<DriveOutcome> {
     const now = clock();
     const generation = context.storage.transactionSync((): number => {
       const next = (readDrive(sql)?.generation ?? 0) + 1;
       const leaseUntil = now + DRIVE_LEASE_MS;
       writeDrive(sql, { generation: next, leaseUntil });
-      context.wake(leaseUntil);
+      recordDebt(now, { kind: "start", alarmAt: leaseUntil });
       return next;
     });
     const current: Drive = { generation, again: false };
@@ -341,30 +365,9 @@ export function createTrain(
       outcome.kind === "blocked" ||
       outcome.kind === "yielded" ||
       outcome.kind === "superseded";
-    // The alarm is asked for inside the transaction, so the row and the alarm commit together.
-    const exhausted = context.storage.transactionSync((): boolean => {
-      if (!holds(generation)) return false;
-      if (failed) {
-        const failures = (readWake(sql)?.failures ?? 0) + 1;
-        // Expiring a requested attempt needs no port, so neither backoff nor exhaustion may wait
-        // past its deadline.
-        const deadline = pendingDeadline();
-        if (failures > MAX_WAKE_FAILURES) {
-          if (deadline === null) clearWake(sql);
-          else writeWakeIn({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
-          return true;
-        }
-        const retryAt = now + wakeDelay(failures);
-        writeWakeIn({ dueAt: deadline === null ? retryAt : Math.min(retryAt, deadline), failures });
-      } else if (hasMovableWork(sql)) {
-        writeWakeIn({ dueAt: now, failures: 0 });
-      } else {
-        const deadline = pendingDeadline();
-        if (deadline === null) clearWake(sql);
-        else writeWakeIn({ dueAt: deadline, failures: 0 });
-      }
-      return false;
-    });
+    const exhausted = context.storage.transactionSync(
+      (): boolean => holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" }),
+    );
     if (exhausted) {
       console.error(
         JSON.stringify({
@@ -373,6 +376,50 @@ export function createTrain(
           failures: MAX_WAKE_FAILURES,
         }),
       );
+    }
+  }
+
+  /**
+   * Writes the wake row the stored work requires after `debt`, inside the caller's transaction, and
+   * asks the Repo's alarm for it; the row and the alarm commit together. Every path that accepts
+   * work or starts, retries, exhausts or ends a drive goes through here. Returns whether this write
+   * exhausted the retries.
+   */
+  function recordDebt(now: number, debt: Debt): boolean {
+    const wake = readWake(sql);
+    switch (debt.kind) {
+      case "start": {
+        if (!owesWork(sql)) return false;
+        // Restarting exhausted work grants a fresh count; any other start keeps the count so far.
+        const failures = wake === null || isExhausted(wake) ? 0 : wake.failures;
+        writeWake(sql, { dueAt: now, failures });
+        context.wake(debt.alarmAt);
+        return false;
+      }
+      case "clean": {
+        const deadline = pendingDeadline();
+        if (hasMovableWork(sql)) writeWakeIn({ dueAt: now, failures: 0 });
+        else if (deadline !== null) writeWakeIn({ dueAt: deadline, failures: 0 });
+        else clearWake(sql);
+        return false;
+      }
+      case "failed": {
+        const failures = (wake?.failures ?? 0) + 1;
+        // Expiring a requested attempt needs no port, so neither backoff nor exhaustion may wait
+        // past its deadline.
+        const deadline = pendingDeadline();
+        if (failures > MAX_WAKE_FAILURES) {
+          if (deadline !== null) writeWakeIn({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
+          else if (owesWork(sql)) writeWake(sql, { dueAt: now, failures: EXHAUSTED_FAILURES });
+          else clearWake(sql);
+          return true;
+        }
+        const retryAt = now + wakeDelay(failures);
+        writeWakeIn({ dueAt: deadline === null ? retryAt : Math.min(retryAt, deadline), failures });
+        return false;
+      }
+      default:
+        return unreachable(debt);
     }
   }
 
@@ -386,15 +433,6 @@ export function createTrain(
   function pendingDeadline(): number | null {
     const batch = activeBatch(sql);
     return batch?.state === "checking" ? batch.checkDeadline : null;
-  }
-
-  /**
-   * Records, inside the caller's transaction and as its last write, that accepted work is owed a
-   * drive now, and sets the alarm that resumes it if the drive that follows never settles.
-   */
-  function oweDrive(now: number): void {
-    writeWake(sql, { dueAt: now, failures: readWake(sql)?.failures ?? 0 });
-    context.wake(now + DRIVE_LEASE_MS);
   }
 
   async function pass(generation: number): Promise<DriveOutcome> {
@@ -770,7 +808,8 @@ export function createTrain(
 
   async function resume(): Promise<void> {
     const owedNow = readWake(sql);
-    if (owedNow === null) return;
+    // Exhausted work waits for a call; an alarm another module asked for does not restart it.
+    if (owedNow === null || isExhausted(owedNow)) return;
     const now = clock();
     // Another module's alarm may fire first; ask again for this train's own time.
     if (owedNow.dueAt > now) {
@@ -839,7 +878,7 @@ export function createTrain(
         return fail("busy", "The train's queue is full.");
       }
       insertEntry(sql, pin, now);
-      oweDrive(now);
+      recordDebt(now, { kind: "start", alarmAt: now + DRIVE_LEASE_MS });
       return ok({ queued: true });
     });
     if (!result.ok) return result;
@@ -891,7 +930,7 @@ export function createTrain(
           acceptance: attempt.definition.acceptance,
         },
       });
-      oweDrive(now);
+      recordDebt(now, { kind: "start", alarmAt: now + DRIVE_LEASE_MS });
       return ok(attempt);
     });
     const { value } = result;
@@ -909,6 +948,11 @@ export function createTrain(
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
     entries: (limit) => recentEntries(sql, boundLimit(limit)),
   };
+}
+
+/** Whether the wake's retries ran out, so only a call drives its work again. */
+function isExhausted(wake: PendingWake): boolean {
+  return wake.failures >= EXHAUSTED_FAILURES;
 }
 
 /** `WAKE_BASE_MS` doubled for each failure after the first, at most `WAKE_MAX_MS`. */

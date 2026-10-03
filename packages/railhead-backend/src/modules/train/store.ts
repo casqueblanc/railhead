@@ -7,7 +7,8 @@
 // `train_wake` holds at most one row: the drive the train owes and when it is due. A call that
 // accepts work writes it in the same transaction, so the debt survives a restart even when the
 // Repo's alarm was never set. While the active batch waits for a runner's report, the row is due at
-// the attempt's deadline.
+// the attempt's deadline. Once the scheduler's retries run out, the row stays with its failures
+// marked exhausted, so work in storage always has a row.
 //
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
@@ -568,6 +569,17 @@ export function writeDrive(sql: SqlStorage, lease: DriveLease): void {
     lease.generation,
     lease.leaseUntil,
   );
+}
+
+/** Whether storage holds work the train owes a drive: an active batch or a queued pin. */
+export function owesWork(sql: SqlStorage): boolean {
+  const row = sql
+    .exec<{ owes: number }>(
+      `SELECT EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
+         OR EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued') AS owes`,
+    )
+    .toArray()[0];
+  return row?.owes === 1;
 }
 
 /**

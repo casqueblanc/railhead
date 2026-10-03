@@ -20,6 +20,7 @@ import {
   CHECK_DEADLINE_MS,
   createTrain,
   DRIVE_LEASE_MS,
+  EXHAUSTED_FAILURES,
   MAX_QUEUE,
   MAX_RETRIES,
   MAX_WAKE_FAILURES,
@@ -98,6 +99,8 @@ class Fakes {
   startGate: (() => Promise<void>) | null = null;
   /** The port call that never answers, if any. */
   hang: PortCall | null = null;
+  /** Port calls that wait for a test to release them. */
+  readonly holds = new Map<PortCall, Promise<void>>();
   /** How long the train waits on each port call. */
   portTimeoutMs = PORT_TIMEOUT_MS;
   readonly intents = new Map<string, MergeIntentRecord>();
@@ -109,6 +112,17 @@ class Fakes {
   /** Never settles while `call` is the hung one. */
   async answer(call: PortCall): Promise<void> {
     if (this.hang === call) await new Promise<never>(() => {});
+    await this.holds.get(call);
+  }
+
+  /** Makes every `call` wait until the returned function releases them. */
+  hold(call: PortCall): () => void {
+    const { promise, resolve } = released();
+    this.holds.set(call, promise);
+    return () => {
+      this.holds.delete(call);
+      resolve();
+    };
   }
 
   ports(real: RepoPorts): RepoPorts {
@@ -180,6 +194,15 @@ class Fakes {
       },
     };
   }
+}
+
+/** A promise and the function that settles it. */
+function released(): { promise: Promise<void>; resolve: () => void } {
+  let settle: (() => void) | null = null;
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  return { promise, resolve: () => settle?.() };
 }
 
 /** A distinct candidate for each main and pin list, as a real merge would produce. */
@@ -274,6 +297,28 @@ function owed(sql: SqlStorage): PendingWake {
   const wake = readWake(sql);
   if (wake === null) throw new Error("the train owes no drive");
   return wake;
+}
+
+/**
+ * Asserts the train's wake invariant from storage alone: while an active batch or a queued pin is
+ * stored, a wake row is too, and unless that row is exhausted, the latest alarm the train asked for
+ * is due no later than the row or the latest drive's lease, whichever is later.
+ */
+function expectDebtCovered(sql: SqlStorage, wakes: number[], exhausted: boolean): void {
+  const work = sql
+    .exec<{ n: number }>(
+      `SELECT (SELECT COUNT(*) FROM train_batches WHERE active = 1)
+         + (SELECT COUNT(*) FROM train_queue WHERE state = 'queued') AS n`,
+    )
+    .toArray()[0];
+  const wake = readWake(sql);
+  if ((work?.n ?? 0) === 0) return;
+  expect(wake).not.toBeNull();
+  if (wake === null) return;
+  expect(wake.failures === EXHAUSTED_FAILURES).toBe(exhausted);
+  if (exhausted) return;
+  const lease = sql.exec<{ lease: number }>("SELECT lease_until AS lease FROM train_drive").one();
+  expect(wakes.at(-1)).toBeLessThanOrEqual(Math.max(wake.dueAt, lease.lease));
 }
 
 /** A clock a lease behind real time, so a lease alarm it asks for is due within a second. */
@@ -882,10 +927,16 @@ describe("train wake", () => {
       // The last drive asks for its lease but no backoff.
       advance(WAKE_MAX_MS);
       await train.resume();
-      expect(readWake(sql)).toBeNull();
+      expect(owed(sql)).toEqual({ dueAt: now(), failures: EXHAUSTED_FAILURES });
       expect(wakes).toHaveLength(2 * MAX_WAKE_FAILURES + 2);
       expect(fakes.composeCalls).toHaveLength(MAX_WAKE_FAILURES + 1);
       expect(train.batches(64)).toMatchObject([{ batchId: 1, state: "composing" }]);
+
+      // An alarm another module asked for neither drives exhausted work nor asks again.
+      advance(WAKE_MAX_MS);
+      await train.resume();
+      expect(fakes.composeCalls).toHaveLength(MAX_WAKE_FAILURES + 1);
+      expect(wakes).toHaveLength(2 * MAX_WAKE_FAILURES + 2);
 
       // The work stayed in storage: the next call composes the same batch again.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
@@ -894,6 +945,148 @@ describe("train wake", () => {
       expect(train.batches(64)).toMatchObject([
         { batchId: 1, state: "checking", checkStarted: true },
       ]);
+    }, fakes);
+  });
+
+  it("keeps a wake for owed work through accept, failure, exhaustion, a duplicate ready, a crash and a deadline", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, wakes, restart, now, advance }) => {
+      fakes.ready(pin(1));
+
+      // Accept: the pin is composed and its check started; the wake waits for the deadline.
+      await train.enqueue(pin(1));
+      const first = lastStarted(fakes);
+      expectDebtCovered(sql, wakes, false);
+
+      // Fail: an errored check sends the pin back, and its next batch stops on the merge port.
+      fakes.compose = () => fail("unavailable", "Sandbox offline.");
+      await train.recordCheck(report(first, "error"));
+      expect(train.batches(2).map((b) => [b.state, b.failure])).toEqual([
+        ["composing", null],
+        ["failed", "check_error"],
+      ]);
+      expect(owed(sql).failures).toBe(1);
+      expectDebtCovered(sql, wakes, false);
+
+      // Retry until exhaustion: the work stays stored under an exhausted row and no alarm.
+      while (owed(sql).failures <= MAX_WAKE_FAILURES) {
+        advance(owed(sql).dueAt - now());
+        await train.resume();
+        expectDebtCovered(sql, wakes, owed(sql).failures === EXHAUSTED_FAILURES);
+      }
+      const asked = wakes.length;
+      const composes = fakes.composeCalls.length;
+
+      // Duplicate ready: the existing pin restarts the drive, which commits a due wake with its
+      // lease before the merge port is asked, and the merge port then stops answering.
+      fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
+      const release = fakes.hold("merge.compose");
+      const duplicate = train.enqueue(pin(1));
+      await vi.waitFor(() => expect(fakes.composeCalls).toHaveLength(composes + 1));
+      expect(owed(sql)).toEqual({ dueAt: now(), failures: 0 });
+      expect(wakes.slice(asked)).toEqual([now() + DRIVE_LEASE_MS]);
+      expectDebtCovered(sql, wakes, false);
+
+      // Crash: the object stops mid-drive. The rebuilt train asks for the wake again.
+      const again = restart();
+      expect(wakes.at(-1)).toBe(owed(sql).dueAt);
+      expectDebtCovered(sql, wakes, false);
+
+      // The lease alarm resumes the retained batch with no other call.
+      fakes.holds.delete("merge.compose");
+      advance(DRIVE_LEASE_MS);
+      await again.resume();
+      const resumed = lastStarted(fakes);
+      expect(resumed.pins).toEqual([pin(1)]);
+      expect(again.batches(1)).toMatchObject([
+        { batchId: 2, state: "checking", checkStarted: true },
+      ]);
+      expectDebtCovered(sql, wakes, false);
+
+      // The stopped drive's late answer changes nothing.
+      release();
+      expect(await duplicate).toEqual(ok({ queued: false }));
+      expect(again.batches(1)).toMatchObject([{ batchId: 2, attemptId: resumed.attemptId }]);
+      expectDebtCovered(sql, wakes, false);
+
+      // Deadline: the silent attempt expires and the pin is checked on a fresh one.
+      advance(owed(sql).dueAt - now());
+      await again.resume();
+      const fresh = lastStarted(fakes);
+      expect(fresh.attemptId).not.toBe(resumed.attemptId);
+      expect(again.batches(2).map((b) => [b.state, b.failure])).toEqual([
+        ["checking", null],
+        ["failed", "check_timeout"],
+      ]);
+      expectDebtCovered(sql, wakes, false);
+
+      // Land: nothing is owed and the row is gone.
+      await again.recordCheck(report(fresh, "pass"));
+      expect(states(again)).toEqual({ "clm_claim001@1": "landed" });
+      expect(readWake(sql)).toBeNull();
+      expectDebtCovered(sql, wakes, false);
+    }, fakes);
+  });
+
+  it("restores the wake when a duplicate report restarts an exhausted landing, so the alarm lands it after a crash", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, wakes, restart, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const attempt = lastStarted(fakes);
+      fakes.authorize = () => fail("unavailable", "Authorization offline.");
+      const passed = report(attempt, "pass");
+      expect(await train.recordCheck(passed)).toEqual(ok(attempt));
+      while (owed(sql).failures <= MAX_WAKE_FAILURES) {
+        advance(owed(sql).dueAt - now());
+        await train.resume();
+      }
+      expect(owed(sql).failures).toBe(EXHAUSTED_FAILURES);
+      expect(train.batches(1)).toMatchObject([{ state: "passed", intentId: null }]);
+      const asked = wakes.length;
+
+      // The runner repeats its report; the drive it starts hangs on authorization.
+      fakes.authorize = (a) => ok(intentFor(a, fakes.authorized.length));
+      const release = fakes.hold("authorization.authorize");
+      const authorizations = fakes.authorized.length;
+      const duplicate = train.recordCheck(passed);
+      await vi.waitFor(() => expect(fakes.authorized).toHaveLength(authorizations + 1));
+      expect(owed(sql)).toEqual({ dueAt: now(), failures: 0 });
+      expect(wakes.slice(asked)).toEqual([now() + DRIVE_LEASE_MS]);
+
+      // The object stops; the lease alarm alone lands the batch under the same attempt.
+      const again = restart();
+      fakes.holds.delete("authorization.authorize");
+      advance(DRIVE_LEASE_MS);
+      await again.resume();
+      expect(fakes.main).toBe(attempt.candidate);
+      expect(fakes.authorized.slice(authorizations)).toEqual([
+        attempt.attemptId,
+        attempt.attemptId,
+      ]);
+      expect(states(again)).toEqual({ "clm_claim001@1": "landed" });
+      expect(readWake(sql)).toBeNull();
+
+      release();
+      expect(await duplicate).toEqual(ok(attempt));
+      expect(fakes.published).toHaveLength(1);
+    }, fakes);
+  });
+
+  it("restores no wake when a duplicate ready finds no stored work", async () => {
+    const fakes = new Fakes();
+    await withTrain(async ({ train, sql, wakes }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      await train.recordCheck(report(lastStarted(fakes), "pass"));
+      expect(readWake(sql)).toBeNull();
+      const asked = wakes.length;
+
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+      expect(readWake(sql)).toBeNull();
+      // With nothing owed, the drive asks for no alarm either.
+      expect(wakes).toHaveLength(asked);
+      expect(fakes.composeCalls).toHaveLength(1);
     }, fakes);
   });
 
