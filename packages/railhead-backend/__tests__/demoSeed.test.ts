@@ -125,31 +125,44 @@ class SeedFake implements SeedArtifacts {
   onNextPush: (() => void) | null = null;
 
   /** Holds the next `create` before it creates anything, as a request whose effect is delayed. */
-  holdNextCreate(): { reached: Promise<void>; release: () => void } {
-    let reach: (() => void) | undefined;
-    let release: (() => void) | undefined;
-    const reached = new Promise<void>((resolve) => {
-      reach = resolve;
-    });
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.#createGate = async () => {
-      reach?.();
-      await held;
-    };
-    return { reached, release: () => release?.() };
+  holdNextCreate(): Hold {
+    const hold = held();
+    this.#createGate = hold;
+    return hold;
   }
 
-  #createGate: (() => Promise<void>) | null = null;
+  /** Holds the next `delete` before it deletes anything, as a request whose effect is delayed. */
+  holdNextDelete(): Hold {
+    const hold = held();
+    this.#deleteGate = hold;
+    return hold;
+  }
+
+  /**
+   * Holds the next push after its token is accepted: the client's request may time out, and main is
+   * created when the hold is released, as a push Artifacts applies late.
+   */
+  holdNextPush(): Hold {
+    const hold = held();
+    this.#pushGate = hold;
+    return hold;
+  }
+
+  #createGate: Hold | null = null;
+  #deleteGate: Hold | null = null;
+  #pushGate: Hold | null = null;
 
   /** Makes the next `create` take effect and never answer, as when its object was evicted. */
   hangAfterNextCreate = false;
+  /** Makes the next `delete` take effect and never answer, as when its object was evicted. */
+  hangAfterNextDelete = false;
+  /** Runs once after the next deletion takes effect. */
+  afterNextDelete: ((name: string) => void) | null = null;
 
   async create(name: string): Promise<unknown> {
     const gate = this.#createGate;
     this.#createGate = null;
-    if (gate !== null) await gate();
+    if (gate !== null) await gate.wait();
     if (this.fake.repos.has(name)) throw new FakeArtifactsError("ALREADY_EXISTS");
     this.fake.seed(name, []);
     const token = this.fake.mintFor(name, "write", 86_400);
@@ -185,12 +198,23 @@ class SeedFake implements SeedArtifacts {
   }
 
   async delete(name: string): Promise<boolean> {
+    const gate = this.#deleteGate;
+    this.#deleteGate = null;
+    if (gate !== null) await gate.wait();
     if (this.failNextDelete || this.failDeleteOf === name) {
       this.failNextDelete = false;
       throw new FakeArtifactsError("INTERNAL_ERROR");
     }
     this.deleted.push(name);
-    return this.fake.repos.delete(name);
+    const existed = this.fake.repos.delete(name);
+    const after = this.afterNextDelete;
+    this.afterNextDelete = null;
+    after?.(name);
+    if (this.hangAfterNextDelete) {
+      this.hangAfterNextDelete = false;
+      return new Promise(() => {});
+    }
+    return existed;
   }
 
   /** Artifacts' receive-pack: creates main at the command's head for a live token. */
@@ -214,9 +238,53 @@ class SeedFake implements SeedArtifacts {
     const repo = name === undefined ? undefined : this.fake.repos.get(name);
     if (repo === undefined || !this.fake.accepts(token)) return new Response("", { status: 403 });
     const head = command.split(" ")[1] ?? "";
+    const gate = this.#pushGate;
+    this.#pushGate = null;
+    if (gate !== null) {
+      // Main is created from the zero id when the hold is released, if it still exists and is
+      // empty, whether or not the client still waits.
+      const applied = gate.wait().then(() => {
+        const current = name === undefined ? undefined : this.fake.repos.get(name);
+        if (current !== undefined && current.commits.length === 0) current.commits.push(head);
+      });
+      await new Promise<void>((resolve, reject) => {
+        void applied.then(resolve);
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The push timed out", "TimeoutError"));
+        });
+      });
+      return new Response(pkt(["unpack ok", "ok refs/heads/main"]));
+    }
     repo.commits.splice(0, repo.commits.length, head);
     if (fault === "lose-response") throw new TypeError("response lost");
     return new Response(pkt(["unpack ok", "ok refs/heads/main"]));
+  };
+}
+
+/** A call held at a point until `release`; `reached` resolves once it is held. */
+interface Hold {
+  reached: Promise<void>;
+  release: () => void;
+  /** Called by the held call: marks it reached and waits for `release`. */
+  wait: () => Promise<void>;
+}
+
+function held(): Hold {
+  let reach: (() => void) | undefined;
+  let release: (() => void) | undefined;
+  const reached = new Promise<void>((resolve) => {
+    reach = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    reached,
+    release: () => release?.(),
+    wait: () => {
+      reach?.();
+      return gate;
+    },
   };
 }
 
@@ -312,6 +380,20 @@ interface TargetSetup {
 }
 
 const SHORT_CALLS: SeedTargetLimits = { ...SEED_TARGET_LIMITS, callTimeoutMs: 50 };
+
+const UNCONFIRMED = {
+  ok: false,
+  code: "internal",
+  message:
+    "An earlier change to Artifacts never answered and its effect cannot be confirmed yet; try again later.",
+};
+
+const PUSH_UNCONFIRMED = {
+  ok: false,
+  code: "internal",
+  message:
+    "An earlier push to main never answered and may still land; seed again before resetting.",
+};
 
 function withTarget(
   body: (setup: TargetSetup) => Promise<void>,
@@ -525,33 +607,178 @@ describe("seed target", () => {
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, waits out a create the previous object never saw answered", () =>
+  it("after a restart, settles a create the previous object never saw answered by reading main", () =>
     withTarget(
-      async ({ seed, target, host, main, clock, restart }) => {
+      async ({ seed, target, host, main, restart }) => {
         seed.hangAfterNextCreate = true;
         expect(await target.seed(HEAD, fakePack())).toMatchObject({
           ok: false,
           code: "internal",
         });
 
-        // The new object cannot see the old call answer, so it waits out the call's window.
+        // The new object cannot see the old call answer, but main exists, so the create took
+        // effect and cannot take effect again: the reset needs no wait.
         const restarted = restart();
-        expect(await restarted.reset()).toMatchObject({ ok: false, code: "internal" });
-        expect(await restarted.seed(HEAD, fakePack())).toMatchObject({
-          ok: false,
-          code: "internal",
-        });
-        clock.now += SEED_TARGET_LIMITS.orphanSettleMs - 1;
-        expect(await restarted.reset()).toMatchObject({ ok: false, code: "internal" });
-        expect(seed.fake.repos.has(main)).toBe(true);
-
-        clock.now += 1;
         expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
         expect(seed.fake.repos.has(main)).toBe(false);
         expect(host.wipes).toBe(1);
       },
       { limits: SHORT_CALLS },
     ));
+
+  it("after a restart, refuses a create that has not taken effect however old, until it does", () =>
+    withTarget(
+      async ({ seed, target, host, main, clock, restart }) => {
+        seed.hangAfterNextCreate = true;
+        const create = seed.holdNextCreate();
+        const first = target.seed(HEAD, fakePack());
+        await create.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+
+        // An hour later the create still has not landed: neither a reset nor a seed may run.
+        const restarted = restart();
+        clock.now += 3_600_000;
+        expect(await restarted.reset()).toEqual(UNCONFIRMED);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(UNCONFIRMED);
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(0);
+
+        // The create lands and never answers; main read back settles it, and the reset deletes it.
+        create.release();
+        expect(await eventually(() => restarted.reset())).toEqual(
+          ok({ kind: "demo.reset", deleted: true }),
+        );
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(1);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, refuses until a delete that has not taken effect does, then seeds safely", () =>
+    withTarget(
+      async ({ seed, target, host, main, clock, restart }) => {
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+        seed.hangAfterNextDelete = true;
+        const deletion = seed.holdNextDelete();
+        const first = target.reset();
+        await deletion.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+
+        const restarted = restart();
+        clock.now += 3_600_000;
+        expect(await restarted.reset()).toEqual(UNCONFIRMED);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(UNCONFIRMED);
+        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+        expect(host.wipes).toBe(0);
+
+        // The delete lands and never answers. Main is gone, so it is settled: the reset finishes,
+        // and a new main is not deleted by it afterwards.
+        deletion.release();
+        expect(await eventually(() => restarted.reset())).toEqual(
+          ok({ kind: "demo.reset", deleted: true }),
+        );
+        expect(host.wipes).toBe(1);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("after a restart, refuses while a token mint the old object never saw answered stands", () =>
+    withTarget(
+      async ({ seed, target, host, main, clock, restart }) => {
+        seed.fake.seed(main, []);
+        const mint = seed.fake.pauseNext("createTokenBeforeMint");
+        const first = target.seed(HEAD, fakePack());
+        await mint.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+
+        // A minted token cannot be told apart from the others, so age alone never settles it.
+        const restarted = restart();
+        clock.now += 3_600_000;
+        expect(await restarted.reset()).toEqual(UNCONFIRMED);
+        expect(seed.pushes).toEqual([]);
+        expect(host.wipes).toBe(0);
+
+        mint.release();
+        expect(await eventually(() => restarted.reset())).toEqual(
+          ok({ kind: "demo.reset", deleted: true }),
+        );
+        expect(seed.fake.repos.has(main)).toBe(false);
+      },
+      { limits: SHORT_CALLS },
+    ));
+
+  it("refuses to reset while a push that timed out may still land, until main holds it", () =>
+    withTarget(
+      async ({ seed, target, host, main, restart }) => {
+        const push = seed.holdNextPush();
+        const first = target.seed(HEAD, fakePack());
+        await push.reached;
+        expect(await first).toMatchObject({ ok: false, code: "internal" });
+        expect(seed.fake.repos.get(main)?.commits).toEqual([]);
+
+        // Neither this object nor a restarted one resets while the push may land.
+        expect(await target.reset()).toEqual(PUSH_UNCONFIRMED);
+        expect(await restart().reset()).toEqual(PUSH_UNCONFIRMED);
+        expect(seed.deleted).toEqual([]);
+        expect(host.wipes).toBe(0);
+
+        // The push lands late. Main now holds a commit, so no push can land on it any more, and
+        // the reset deletes it.
+        push.release();
+        expect(await eventually(() => target.reset())).toEqual(
+          ok({ kind: "demo.reset", deleted: true }),
+        );
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(host.wipes).toBe(1);
+      },
+      { limits: { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000, pushTimeoutMs: 50 } },
+    ));
+
+  it("settles a push that never answered when seeding again creates main", () =>
+    withTarget(
+      async ({ seed, target, host, main }) => {
+        const push = seed.holdNextPush();
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+        expect(await target.reset()).toEqual(PUSH_UNCONFIRMED);
+
+        expect(await target.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+        expect(host.wipes).toBe(1);
+
+        // The first push applies only to a main that still exists.
+        push.release();
+        await Promise.resolve();
+        expect(seed.fake.repos.has(main)).toBe(false);
+      },
+      { limits: { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000, pushTimeoutMs: 50 } },
+    ));
+
+  it("does not report a reset when main reappears after its deletion", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      seed.afterNextDelete = (name) => {
+        if (name === main) seed.fake.seed(main, [OTHER_HEAD]);
+      };
+      expect(await target.reset()).toEqual({
+        ok: false,
+        code: "internal",
+        message: "Main reappeared while the demo repository was reset; try again.",
+      });
+      expect(host.wipes).toBe(0);
+      expect(host.initialized).toBe(true);
+
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(seed.fake.repos.has(main)).toBe(false);
+      expect(host.wipes).toBe(1);
+    }));
 
   it("revokes the push token on a same-head retry after its revocation failed", () =>
     withTarget(async ({ seed, target, host, main }) => {
@@ -810,11 +1037,10 @@ describe("seed target", () => {
       expect(await restart().seed(HEAD, fakePack())).toEqual(refused);
       expect(host.initializeCalls).toBe(1);
 
-      // A reset that finishes asks again for the fork already gone, deletes the rest and clears
-      // the way.
+      // A reset that finishes skips the fork already gone, deletes the rest and clears the way.
       seed.failDeleteOf = null;
       expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
-      expect(seed.deleted).toEqual([first, first, second, main]);
+      expect(seed.deleted).toEqual([first, second, main]);
       expect(host.wipes).toBe(1);
       expect(await target.seed(HEAD, fakePack())).toEqual(
         ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),

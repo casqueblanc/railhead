@@ -20,10 +20,20 @@
 // changes Artifacts (create, token mint, delete) is recorded in storage before it starts, and a
 // timeout does not settle it: every later seed and reset is refused as busy until the call answers,
 // so a create that lands late cannot follow a reset that reported success. A late handle is
-// disposed and a late token revoked. A create or mint record also stands for the token it may have
-// left: the seed sweeps main's tokens before it initializes the Repo, on a retry that finds main
-// already in place as well, and clears the record only once no live token is left. Tokens stay in
-// this module and are never logged or returned.
+// disposed and a late token revoked. A call a previous incarnation never saw answered is not
+// forgotten with age: it stands until reading Artifacts back shows that it took effect, and refuses
+// every seed and reset while it stands. A create or mint record also stands for the token it may
+// have left: the seed sweeps main's tokens before it initializes the Repo, on a retry that finds
+// main already in place as well, and clears the record only once no live token is left. Tokens
+// stay in this module and are never logged or returned.
+//
+// A push answered with a status report or a refusal cannot land later. One that timed out or lost
+// its answer may, so every push is recorded before it is sent and its record stands until it is
+// answered or main holds a commit, which a push creating main from the zero id can no longer
+// change. A reset refuses while a push record stands; seeding again settles it. After its
+// deletions the reset reads main back and reports failure if anything recreated it. This assumes a
+// late push applies to the repository it authenticated against, not to a later repository of the
+// same name; that is not measured.
 
 import type { DemoSeedResult, DemoSeedState } from "@railhead/shared/board-api";
 import { isCommitSha, type CommitSha, type RepoId } from "@railhead/shared/events";
@@ -31,7 +41,6 @@ import {
   ARTIFACTS_LIMITS,
   artifactsCode,
   boundedCall,
-  MINT_CLOCK_SKEW_MS,
   mainRepoName,
   recordedForks,
   revokeActiveTokens,
@@ -83,11 +92,6 @@ export interface SeedTargetContext {
 export interface SeedTargetLimits extends TokenSweepLimits {
   /** How long the push may take. */
   readonly pushTimeoutMs: number;
-  /**
-   * How long after it started a binding call a previous incarnation left unanswered counts as
-   * settled. How late a call can take effect is not measured.
-   */
-  readonly orphanSettleMs: number;
   /** How long a read of main answers every later read, so unauthenticated reads stay bounded. */
   readonly readCacheMs: number;
 }
@@ -101,9 +105,6 @@ export const SEED_TARGET_LIMITS: SeedTargetLimits = {
   sweepDeadlineMs: ARTIFACTS_LIMITS.sweepDeadlineMs,
   maxRevokesPerSweep: ARTIFACTS_LIMITS.maxRevokesPerSweep,
   pushTimeoutMs: 60_000,
-  // The adapter's rule for a mint a previous incarnation never saw answered: its requested lifetime
-  // and the clock skew.
-  orphanSettleMs: PUSH_TOKEN_TTL_SECONDS * 1000 + MINT_CLOCK_SKEW_MS,
   readCacheMs: 5_000,
 };
 
@@ -134,10 +135,26 @@ const MIGRATIONS: readonly string[] = [
     id INTEGER PRIMARY KEY CHECK (id = 1),
     started_at INTEGER NOT NULL
   ) STRICT`,
+  // The repository a call changes, so a call left unanswered can be read back.
+  `ALTER TABLE demo_seed_effects ADD COLUMN name TEXT`,
+  // One row per push that has not been answered while main holds no commit.
+  `CREATE TABLE demo_seed_pushes (
+    id INTEGER PRIMARY KEY,
+    incarnation TEXT NOT NULL,
+    started_at INTEGER NOT NULL
+  ) STRICT`,
 ];
 
 /** A binding call that changes Artifacts, recorded before it starts. */
 type EffectKind = "create" | "mint" | "delete";
+
+/** A recorded call a previous incarnation never saw answered. */
+interface Orphan {
+  readonly id: number;
+  readonly kind: EffectKind;
+  /** The repository it changes; `null` on a record written before names were kept. */
+  readonly name: string | null;
+}
 
 /** Builds the seed target of the demo repository's `Repo`. */
 export function createSeedTarget(
@@ -196,13 +213,16 @@ export function createSeedTarget(
    */
   function effect<T>(
     kind: EffectKind,
+    name: string,
     call: () => Promise<T>,
     late: (value: T) => Promise<void> = async () => undefined,
   ): Promise<T> {
     const { id } = sql
       .exec<{ id: number }>(
-        "INSERT INTO demo_seed_effects (kind, incarnation, started_at) VALUES (?, ?, ?) RETURNING id",
+        `INSERT INTO demo_seed_effects (kind, name, incarnation, started_at)
+         VALUES (?, ?, ?, ?) RETURNING id`,
         kind,
+        name,
         incarnation,
         context.clock(),
       )
@@ -241,32 +261,78 @@ export function createSeedTarget(
   }
 
   /**
-   * Whether an earlier binding call may still change Artifacts. A call of this incarnation is
+   * Refuses while an earlier binding call may still change Artifacts. A call of this incarnation is
    * waited for until it answers. One a previous incarnation started and never saw answered cannot
-   * answer here, and
-   * Artifacts offers no way to cancel it, so it counts as settled once `orphanSettleMs` has passed
-   * since it started; a call that takes effect later than that is not covered.
+   * answer here, and Artifacts offers no way to cancel it, so it stands until Artifacts read back
+   * shows that it took effect: a create once main exists, since main was missing when it started
+   * and no other create runs while its record stands; a delete once its repository is gone, since
+   * the reset deletes only a repository it found and nothing else deletes one. A mint, and a create
+   * or delete whose effect is not visible, refuse however long ago they started.
    */
-  function unresolved(): boolean {
+  async function pendingEffects(artifacts: SeedArtifacts): Promise<PortResult<never> | null> {
     migrate(context.storage, SEED_OWNER, MIGRATIONS);
-    if (unanswered.size > 0) return true;
-    const horizon = context.clock() - limits.orphanSettleMs;
-    sql.exec(
-      `DELETE FROM demo_seed_effects
-       WHERE kind = 'delete' AND incarnation != ? AND started_at <= ?`,
-      incarnation,
-      horizon,
-    );
-    return (
-      sql
-        .exec(
-          `SELECT 1 FROM demo_seed_effects
-           WHERE answered = 0 AND incarnation != ? AND started_at > ? LIMIT 1`,
-          incarnation,
-          horizon,
-        )
-        .toArray().length > 0
-    );
+    if (unanswered.size > 0) return busy();
+    const orphans = sql
+      .exec<{ id: number; kind: string; name: string | null }>(
+        "SELECT id, kind, name FROM demo_seed_effects WHERE answered = 0 AND incarnation != ?",
+        incarnation,
+      )
+      .toArray()
+      .map(orphan);
+    for (const record of orphans) {
+      if (record === null) return unconfirmed();
+      const landed = await orphanLanded(artifacts, record);
+      if (!landed.ok) return landed;
+      if (!landed.value) return unconfirmed();
+      // A delete that took effect leaves nothing owed; a create or mint may have left a token.
+      if (record.kind === "delete")
+        sql.exec("DELETE FROM demo_seed_effects WHERE id = ?", record.id);
+      else sql.exec("UPDATE demo_seed_effects SET answered = 1 WHERE id = ?", record.id);
+    }
+    return null;
+  }
+
+  /** Whether Artifacts shows that `record`'s call took effect. */
+  async function orphanLanded(
+    artifacts: SeedArtifacts,
+    record: Orphan,
+  ): Promise<PortResult<boolean>> {
+    switch (record.kind) {
+      case "create":
+        return record.name === null ? ok(false) : repoExists(artifacts, record.name);
+      case "delete": {
+        if (record.name === null) return ok(false);
+        const found = await repoExists(artifacts, record.name);
+        return found.ok ? ok(!found.value) : found;
+      }
+      case "mint":
+        // A token nobody saw minted cannot be told from the others main holds.
+        return ok(false);
+      default: {
+        const unknown: never = record.kind;
+        return unknown;
+      }
+    }
+  }
+
+  /** Whether the repository `name` exists. */
+  async function repoExists(artifacts: SeedArtifacts, name: string): Promise<PortResult<boolean>> {
+    try {
+      (await opened(artifacts, name))[Symbol.dispose]();
+      return ok(true);
+    } catch (error) {
+      return artifactsCode(error) === "NOT_FOUND" ? ok(false) : artifactsFailed();
+    }
+  }
+
+  /** Forgets every push once main holds a commit: a push creates main only from the zero id. */
+  function settlePushes(main: CommitSha | null | "missing"): void {
+    if (main !== null && main !== "missing") sql.exec("DELETE FROM demo_seed_pushes");
+  }
+
+  /** Whether a push may still create main. */
+  function pushPending(): boolean {
+    return sql.exec("SELECT 1 FROM demo_seed_pushes LIMIT 1").toArray().length > 0;
   }
 
   /** Whether a create or mint on main may have left a token no sweep has revoked since. */
@@ -320,7 +386,7 @@ export function createSeedTarget(
   ): Promise<PortResult<{ remote: string; token: string }>> {
     if (!exists) {
       try {
-        await effect("create", () => artifacts.create(name));
+        await effect("create", name, () => artifacts.create(name));
       } catch (error) {
         if (artifactsCode(error) !== "ALREADY_EXISTS") return artifactsFailed();
       }
@@ -330,6 +396,7 @@ export function createSeedTarget(
       const { remote } = await bounded(repo.info());
       const minted = await effect(
         "mint",
+        name,
         () => repo.createToken("write", PUSH_TOKEN_TTL_SECONDS),
         // A token minted after its timeout reached nobody; the sweep that follows covers a failure.
         async (late) => {
@@ -380,22 +447,34 @@ export function createSeedTarget(
       return exclusive(async () => {
         const { artifacts } = context;
         if (artifacts === undefined) return noArtifacts();
-        if (unresolved()) return busy();
+        const pending = await pendingEffects(artifacts);
+        if (pending !== null) return pending;
         if (resetPending()) return halfReset();
         const name = await mainRepoName(context.repoId);
         const before = await readMain(artifacts, name);
         if (!before.ok) return before;
+        settlePushes(before.value);
         let outcome: PushOutcome | null = null;
         if (before.value !== head) {
           if (before.value !== null && before.value !== "missing") return otherHead();
           if (context.initialized()) return halfReset();
           const access = await writeAccess(artifacts, name, before.value !== "missing");
           if (!access.ok) return access;
+          const { id } = sql
+            .exec<{ id: number }>(
+              "INSERT INTO demo_seed_pushes (incarnation, started_at) VALUES (?, ?) RETURNING id",
+              incarnation,
+              context.clock(),
+            )
+            .one();
           outcome = await pushMain(
             { ...access.value, head, pack },
             context.fetch,
             limits.pushTimeoutMs,
           );
+          // An answered push cannot land later; one without an answer stands until main holds a
+          // commit.
+          if (outcome !== "uncertain") sql.exec("DELETE FROM demo_seed_pushes WHERE id = ?", id);
         }
         // Every token a seed asked for is revoked before the Repo opens main to anyone, on a retry
         // that finds main already in place too. The records are cleared only by a clean sweep.
@@ -403,6 +482,7 @@ export function createSeedTarget(
         // Whatever the push reported, main as Artifacts now holds it is the answer.
         const after = outcome === null ? before : await readMain(artifacts, name);
         if (!after.ok) return after;
+        settlePushes(after.value);
         if (after.value !== head) {
           return after.value === null || after.value === "missing"
             ? fail("internal", `The push did not create main (${outcome ?? "skipped"}); try again.`)
@@ -425,7 +505,15 @@ export function createSeedTarget(
       return exclusive(async () => {
         const { artifacts } = context;
         if (artifacts === undefined) return noArtifacts();
-        if (unresolved()) return busy();
+        const pending = await pendingEffects(artifacts);
+        if (pending !== null) return pending;
+        const main = await mainRepoName(context.repoId);
+        if (pushPending()) {
+          const current = await readMain(artifacts, main);
+          if (!current.ok) return current;
+          settlePushes(current.value);
+          if (pushPending()) return pushUnconfirmed();
+        }
         // Main goes last, so a deletion that fails leaves it in place behind the forks.
         let forks: string[];
         try {
@@ -433,7 +521,7 @@ export function createSeedTarget(
         } catch {
           return fail("internal", "The demo repository's fork records could not be read.");
         }
-        const names = [...forks, await mainRepoName(context.repoId)];
+        const names = [...forks, main];
         let deleted = context.initialized();
         // A deletion that fails, or answers without reaching us, may still have deleted something.
         sql.exec(
@@ -441,11 +529,25 @@ export function createSeedTarget(
           context.clock(),
         );
         for (const name of names) {
+          // Only a repository found is deleted, so a delete left unanswered is settled once its
+          // repository is gone.
+          const found = await repoExists(artifacts, name);
+          if (!found.ok) return found;
+          if (!found.value) continue;
           try {
-            if (await effect("delete", () => artifacts.delete(name))) deleted = true;
+            if (await effect("delete", name, () => artifacts.delete(name))) deleted = true;
           } catch {
             return artifactsFailed();
           }
+        }
+        // A create or push that took effect after the reset began would show as main again.
+        const after = await readMain(artifacts, main);
+        if (!after.ok) return after;
+        if (after.value !== "missing") {
+          return fail(
+            "internal",
+            "Main reappeared while the demo repository was reset; try again.",
+          );
         }
         // Every call answered, and main and its forks are gone with their tokens: the wipe drops no
         // record that still matters. The marker goes first, since the wipe leaves no table to clear;
@@ -473,6 +575,32 @@ export function artifactsBinding(env: Env): SeedArtifacts | undefined {
 
 function noArtifacts(): PortResult<never> {
   return fail("unavailable", "This instance has no Artifacts binding.");
+}
+
+/** Reads one effect record, or `null` when its kind is not one this code wrote. */
+function orphan(row: { id: number; kind: string; name: string | null }): Orphan | null {
+  switch (row.kind) {
+    case "create":
+    case "mint":
+    case "delete":
+      return { id: row.id, kind: row.kind, name: row.name };
+    default:
+      return null;
+  }
+}
+
+function unconfirmed(): PortResult<never> {
+  return fail(
+    "internal",
+    "An earlier change to Artifacts never answered and its effect cannot be confirmed yet; try again later.",
+  );
+}
+
+function pushUnconfirmed(): PortResult<never> {
+  return fail(
+    "internal",
+    "An earlier push to main never answered and may still land; seed again before resetting.",
+  );
 }
 
 function busy(): PortResult<never> {
