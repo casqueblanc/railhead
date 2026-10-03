@@ -176,6 +176,9 @@ pub enum EventPayload {
     /// A claim's action was refused.
     #[serde(rename = "claim.refused")]
     ClaimRefused(ClaimRefused),
+    /// A superseded pin returned a ready claim to working.
+    #[serde(rename = "claim.reopened")]
+    ClaimReopened(ClaimReopened),
     /// A claim's lease ended.
     #[serde(rename = "claim.expired")]
     ClaimExpired(ClaimExpired),
@@ -233,6 +236,7 @@ impl EventPayload {
             Self::ClaimPushed(_) => "claim.pushed",
             Self::ClaimReady(_) => "claim.ready",
             Self::ClaimRefused(_) => "claim.refused",
+            Self::ClaimReopened(_) => "claim.reopened",
             Self::ClaimExpired(_) => "claim.expired",
             Self::ClaimReassigned(_) => "claim.reassigned",
             Self::QuestionAsked(_) => "question.asked",
@@ -256,6 +260,7 @@ impl EventPayload {
             Self::InboxAcked(_) => Recorder::Agent,
             Self::AgentJoined(_)
             | Self::ClaimRefused(_)
+            | Self::ClaimReopened(_)
             | Self::ClaimExpired(_)
             | Self::ClaimReassigned(_)
             | Self::InboxQueued(_)
@@ -286,6 +291,7 @@ impl EventPayload {
             | Self::ClaimPushed(_)
             | Self::ClaimReady(_)
             | Self::ClaimRefused(_)
+            | Self::ClaimReopened(_)
             | Self::ClaimExpired(_)
             | Self::ClaimReassigned(_)
             | Self::QuestionAsked(_)
@@ -309,6 +315,7 @@ impl EventPayload {
             Self::ClaimPushed(data) => data.validate(),
             Self::ClaimReady(data) => data.validate(),
             Self::ClaimRefused(data) => data.validate(),
+            Self::ClaimReopened(data) => data.validate(),
             Self::ClaimExpired(data) => data.validate(),
             Self::ClaimReassigned(data) => data.validate(),
             Self::QuestionAsked(data) => data.validate(),
