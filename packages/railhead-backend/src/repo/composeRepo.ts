@@ -60,6 +60,15 @@ export interface RepoContext {
   readonly clock: () => number;
   /** The Worker's bindings. Secrets read from it never reach a client, an event or a log line. */
   readonly env: Env;
+  /**
+   * Asks the Repo to run its alarm no later than `at`, in milliseconds since the Unix epoch. The
+   * Repo keeps one alarm at the earliest time any module asked for and calls every module's
+   * `resume` when it fires, so a module records what it owes in its own tables and asks again from
+   * `resume` when its time has not come. The alarm write is issued at once, so a wake asked for
+   * inside a transaction commits with that transaction's rows; ask for it as the transaction's last
+   * write.
+   */
+  readonly wake: (at: number) => void;
 }
 
 /** Every module's port, as other modules and the adapters see them. Main's ref is not here. */
@@ -119,6 +128,36 @@ export class CompositionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CompositionError";
+  }
+}
+
+/** A module the Repo's alarm resumes. */
+export interface Resumable {
+  /** The module's name in `RepoPorts`, for logs. */
+  readonly module: keyof RepoPorts;
+  /** Moves work the module owes. */
+  resume(): Promise<void>;
+}
+
+/** The modules the Repo's alarm resumes, in composition order. */
+export function resumables(ports: RepoPorts): readonly Resumable[] {
+  return [{ module: "train", resume: () => ports.train.resume() }];
+}
+
+/**
+ * Resumes each module in order. A module that throws is logged by name, never with its message,
+ * and does not stop the others; each module asks for its own next wake.
+ */
+export async function resumeAll(repoId: RepoId, modules: readonly Resumable[]): Promise<void> {
+  for (const { module, resume } of modules) {
+    try {
+      await resume();
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "unknown";
+      console.error(
+        JSON.stringify({ event: "repo.resume_failed", repo: repoId, module, error: name }),
+      );
+    }
   }
 }
 

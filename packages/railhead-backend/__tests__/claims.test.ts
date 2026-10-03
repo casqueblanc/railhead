@@ -73,7 +73,14 @@ function inRepo<T>(
     const main = await mainRepoName(REPO);
     if (!fake.repos.has(main)) fake.seed(main, [ROOT, HEAD]);
     const log = EventLog.open(state.storage, REPO, fake.clock);
-    const context = { repoId: REPO, storage: state.storage, log, clock: fake.clock, env };
+    const context = {
+      repoId: REPO,
+      storage: state.storage,
+      log,
+      clock: fake.clock,
+      env,
+      wake: () => {},
+    };
     const artifacts = createArtifactsAdapter({ ...context, namespace: fake }, FAST);
     const base = composeRepo(context);
     // Main is read through the main writer's `head`, answered here from the fake's main.
@@ -464,7 +471,14 @@ describe("allocation failures", () => {
   it("refuses allocation in the installed composition, whose main writer is missing", async () => {
     await runInDurableObject(freshStub(), async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO);
-      const context = { repoId: REPO, storage: state.storage, log, clock: () => 1, env };
+      const context = {
+        repoId: REPO,
+        storage: state.storage,
+        log,
+        clock: () => 1,
+        env,
+        wake: () => {},
+      };
       const base = composeRepo(context);
       const port = claimsEntry(context, () => base);
       expect((await port.fileIssue(grant("Ready"))).ok).toBe(true);
