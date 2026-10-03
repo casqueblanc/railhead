@@ -1863,7 +1863,7 @@ describe("train ready episodes", () => {
 });
 
 describe("train batch fence", () => {
-  it("forms no batch when a pin's decision versions move while main is read, then forms under the new ones", async () => {
+  it("forms no batch when a pin's decision versions move while main is read, and schedules its re-ready", async () => {
     const fakes = new Fakes();
     const v1: DecisionRef = { decisionId: "dec_upload001", version: 1 };
     const v2: DecisionRef = { decisionId: "dec_upload001", version: 2 };
@@ -1873,13 +1873,21 @@ describe("train batch fence", () => {
       const release = fakes.hold("mainWriter.head");
       const enqueued = train.enqueue(pin(1));
       await vi.waitFor(() => expect(fakes.reached).toContain("mainWriter.head"));
+      // Version 2 supersedes the pin; the claims module reopens the claim, so it has no pin.
       fakes.requirements.set(pin(1).claimId, [v2]);
+      fakes.pins.delete(pin(1).claimId);
       release();
       await enqueued;
 
-      // The first form was refused; the next one read the new requirements and the same pin.
-      expect(train.batches(8)).toHaveLength(1);
-      expect(lastStarted(fakes).decisions).toEqual([v2]);
+      expect(train.batches(8)).toEqual([]);
+      expect(fakes.composeCalls).toEqual([]);
+      expect(train.entries(1)[0]).toMatchObject({ state: "dropped", reason: "pin_changed" });
+
+      // The holder marks adapted work ready under version 2, and that pin is scheduled.
+      const adapted = pin(1, 1, sha("f"));
+      fakes.ready(adapted);
+      expect(await train.enqueue(adapted)).toEqual(ok({ queued: true }));
+      expect(lastStarted(fakes)).toMatchObject({ pins: [adapted], decisions: [v2] });
     }, fakes);
   });
 
