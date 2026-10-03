@@ -37,7 +37,8 @@ pub enum RunError {
     TimedOut(Duration),
 }
 
-/// Runs `command` and waits at most `limit` for it, capturing stdout when `capture` is set.
+/// Runs `command` and waits at most `limit` for it, counted from before it is started, capturing
+/// stdout when `capture` is set.
 ///
 /// A child still running at the deadline, or one whose captured stdout is still held open then by a
 /// process it started, is stopped and reaped, with its process group on Unix, before this returns.
@@ -50,6 +51,17 @@ pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Fini
     let deadline = Instant::now().checked_add(limit).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "the deadline is too far away")
     })?;
+    run_until(command, limit, capture, || Ok(deadline))
+}
+
+/// [`run`], stopping the child at the time `deadline` returns once the child is running. Tests use
+/// it to start a deadline only once the child has set itself up.
+fn run_until(
+    command: &mut Command,
+    limit: Duration,
+    capture: bool,
+    deadline: impl FnOnce() -> io::Result<Instant>,
+) -> Result<Finished, RunError> {
     command.stdout(if capture {
         Stdio::piped()
     } else {
@@ -58,6 +70,13 @@ pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Fini
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
     let mut child = command.spawn()?;
+    let deadline = match deadline() {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            stop(&mut child)?;
+            return Err(error.into());
+        }
+    };
     let stdout = match child.stdout.take() {
         None => None,
         Some(mut pipe) => {
@@ -160,6 +179,11 @@ fn stop(child: &mut Child) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// How long a loaded machine may take to start a child or let it exit. Only a stuck child,
+    /// such as one sleeping for ten minutes, takes this long.
+    const PATIENCE: Duration = Duration::from_secs(60);
 
     fn sh(script: &str) -> Command {
         let mut command = Command::new("sh");
@@ -167,13 +191,52 @@ mod tests {
         command
     }
 
-    /// Whether `pid` still runs two seconds from now; an orphan killed by the group signal may
-    /// briefly remain until init reaps it.
+    /// A shell command that starts a background process ignoring `SIGTERM`, which writes its own
+    /// process id to `ready` once the signal is ignored, so only the group kill ends it.
+    fn stubborn(ready: &Path) -> String {
+        format!(
+            "sh -c 'trap \"\" TERM; echo $$ > \"$0.tmp\"; mv \"$0.tmp\" \"$0\"; exec sleep 600' '{}' &",
+            ready.display()
+        )
+    }
+
+    /// Waits until `ready` exists, so a deadline starts only once the child's processes are set up.
+    fn once_ready(ready: &Path) -> io::Result<()> {
+        let until = Instant::now() + PATIENCE;
+        while !ready.exists() {
+            if Instant::now() > until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the child never started",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// A deadline `limit` from when `ready` exists.
+    fn limit_once_ready(
+        ready: &Path,
+        limit: Duration,
+    ) -> impl FnOnce() -> io::Result<Instant> + '_ {
+        move || {
+            once_ready(ready)?;
+            Ok(Instant::now() + limit)
+        }
+    }
+
+    fn pid(path: &Path) -> anyhow::Result<i32> {
+        Ok(std::fs::read_to_string(path)?.trim().parse()?)
+    }
+
+    /// Whether `pid` still runs after [`PATIENCE`]; an orphan killed by the group signal may
+    /// remain briefly until init reaps it.
     fn alive(pid: i32) -> bool {
         let Some(pid) = rustix::process::Pid::from_raw(pid) else {
             return false;
         };
-        let until = Instant::now() + Duration::from_secs(2);
+        let until = Instant::now() + PATIENCE;
         while rustix::process::test_kill_process(pid).is_ok() {
             if Instant::now() > until {
                 return true;
@@ -197,23 +260,30 @@ mod tests {
     #[test]
     fn a_child_past_its_deadline_is_stopped_with_its_own_children() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let pids = dir.path().join("pids");
-        // The child waits on a grandchild that ignores SIGTERM, so only the group kill ends it.
+        let child = dir.path().join("child");
+        let grandchild = dir.path().join("grandchild");
+        // The child waits on its stubborn grandchild, so it outlives any deadline.
         let script = format!(
-            "(trap '' TERM; sleep 600) & echo $! > '{0}'; echo $$ >> '{0}'; wait",
-            pids.display()
+            "echo $$ > '{}'; {} wait",
+            child.display(),
+            stubborn(&grandchild)
         );
         let started = Instant::now();
-        let error = run(&mut sh(&script), Duration::from_millis(300), true).err();
+        let limit = Duration::from_millis(300);
+        let error = run_until(
+            &mut sh(&script),
+            limit,
+            true,
+            limit_once_ready(&grandchild, limit),
+        )
+        .err();
         assert!(
-            matches!(error, Some(RunError::TimedOut(limit)) if limit == Duration::from_millis(300)),
+            matches!(error, Some(RunError::TimedOut(stopped)) if stopped == limit),
             "{error:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let recorded = std::fs::read_to_string(&pids)?;
-        let recorded: Vec<i32> = recorded.lines().map(str::parse).collect::<Result<_, _>>()?;
-        assert_eq!(recorded.len(), 2);
-        for pid in recorded {
+        // Stopped, not waited out: the grandchild would sleep for ten minutes.
+        assert!(started.elapsed() < PATIENCE * 2, "{:?}", started.elapsed());
+        for pid in [pid(&child)?, pid(&grandchild)?] {
             assert!(!alive(pid), "process {pid} outlived the deadline");
         }
         Ok(())
@@ -222,18 +292,88 @@ mod tests {
     #[test]
     fn a_descendant_holding_stdout_past_the_deadline_is_stopped() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let pid = dir.path().join("pid");
-        // The child exits at once, leaving a SIGTERM-ignoring process that keeps stdout open.
-        let script = format!("(trap '' TERM; sleep 600) & echo $! > '{}'", pid.display());
+        let grandchild = dir.path().join("grandchild");
+        // The child exits at once, leaving a stubborn process that keeps stdout open.
+        let script = stubborn(&grandchild);
         let started = Instant::now();
-        let error = run(&mut sh(&script), Duration::from_millis(300), true).err();
+        let limit = Duration::from_millis(300);
+        let error = run_until(
+            &mut sh(&script),
+            limit,
+            true,
+            limit_once_ready(&grandchild, limit),
+        )
+        .err();
         assert!(
-            matches!(error, Some(RunError::TimedOut(limit)) if limit == Duration::from_millis(300)),
+            matches!(error, Some(RunError::TimedOut(stopped)) if stopped == limit),
             "{error:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let recorded: i32 = std::fs::read_to_string(&pid)?.trim().parse()?;
+        assert!(started.elapsed() < PATIENCE * 2, "{:?}", started.elapsed());
+        let recorded = pid(&grandchild)?;
         assert!(!alive(recorded), "process {recorded} outlived the deadline");
+        Ok(())
+    }
+
+    #[test]
+    fn a_child_is_stopped_when_its_start_fails() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let grandchild = dir.path().join("grandchild");
+        let script = format!("{} wait", stubborn(&grandchild));
+        let error = run_until(&mut sh(&script), Duration::from_secs(600), true, || {
+            once_ready(&grandchild)?;
+            Err(io::Error::other("set-up failed"))
+        })
+        .err();
+        assert!(
+            matches!(&error, Some(RunError::Io(io)) if io.to_string() == "set-up failed"),
+            "{error:?}"
+        );
+        let recorded = pid(&grandchild)?;
+        assert!(
+            !alive(recorded),
+            "process {recorded} outlived the failed start"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deadline_fixed_before_the_child_runs_counts_its_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let grandchild = dir.path().join("grandchild");
+        let script = format!("{} wait", stubborn(&grandchild));
+        // As `run` does, the deadline is fixed before the child starts. The child takes longer
+        // than that to get going, so it is stopped at once rather than given the whole limit then.
+        let limit = PATIENCE * 2;
+        let fixed = Instant::now() + Duration::from_millis(300);
+        let error = run_until(&mut sh(&script), limit, true, || {
+            once_ready(&grandchild)?;
+            thread::sleep(fixed.saturating_duration_since(Instant::now()));
+            Ok(fixed)
+        })
+        .err();
+        let stopped = Instant::now();
+        assert!(
+            matches!(error, Some(RunError::TimedOut(reported)) if reported == limit),
+            "{error:?}"
+        );
+        let late = stopped.duration_since(fixed);
+        assert!(late < PATIENCE, "{late:?}");
+        let recorded = pid(&grandchild)?;
+        assert!(!alive(recorded), "process {recorded} outlived the deadline");
+        Ok(())
+    }
+
+    #[test]
+    fn a_limit_too_far_away_starts_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("started");
+        let script = format!("touch '{}'", marker.display());
+        let error = run(&mut sh(&script), Duration::MAX, false).err();
+        assert!(
+            matches!(&error, Some(RunError::Io(io)) if io.kind() == io::ErrorKind::InvalidInput),
+            "{error:?}"
+        );
+        assert!(!marker.exists());
         Ok(())
     }
 

@@ -37,6 +37,16 @@ const POLL_MARGIN: Duration = Duration::from_millis(500);
 /// not polled faster than this.
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Test-only: a directory through which a test holds `--wait` until it is ready to time it. Read in
+/// debug builds alone, so integration tests can time a wait from a moment they observe rather than
+/// from whenever a loaded machine got the process running. Release builds compile none of it.
+#[cfg(debug_assertions)]
+const WAIT_GATE_ENV: &str = "RH_TEST_WAIT_GATE";
+
+/// Test-only: how long `--wait` stays held at the gate before giving up.
+#[cfg(debug_assertions)]
+const WAIT_GATE_LIMIT: Duration = Duration::from_secs(120);
+
 /// Arguments of `rh ask`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct Args {
@@ -332,6 +342,11 @@ fn wait_for(
         "waiting up to {seconds} s for the answer to {question_id}; if interrupted, resume with rh ask --question {question_id} --wait {seconds}"
     ))
     .map_err(Error::Output)?;
+    // A debug build lets a test hold the wait until it is ready to time it.
+    #[cfg(debug_assertions)]
+    if let Some(gate) = std::env::var_os(WAIT_GATE_ENV) {
+        pass_wait_gate(std::path::Path::new(&gate), WAIT_GATE_LIMIT)?;
+    }
     let deadline = Instant::now() + wait;
     loop {
         let started = Instant::now();
@@ -374,6 +389,40 @@ fn wait_for(
         retryable: true,
         next: Some(NextCommand::Ask),
     })
+}
+
+/// Test-only: writes `ready` in `gate`, then blocks until `go` exists there, so the wait's deadline
+/// starts no earlier than the moment the test lets it go.
+///
+/// # Errors
+///
+/// [`LocalCode::InvalidInput`] when `ready` cannot be written, or `go` has not appeared within
+/// `limit`.
+#[cfg(debug_assertions)]
+fn pass_wait_gate(gate: &std::path::Path, limit: Duration) -> Result<()> {
+    let invalid = |message: String| Error::Local {
+        code: LocalCode::InvalidInput,
+        message,
+        retryable: false,
+        next: None,
+    };
+    std::fs::write(gate.join("ready"), b"").map_err(|error| {
+        invalid(format!(
+            "{WAIT_GATE_ENV} names no directory a wait can mark ready: {error}"
+        ))
+    })?;
+    let go = gate.join("go");
+    let until = Instant::now() + limit;
+    while !go.exists() {
+        if Instant::now() >= until {
+            return Err(invalid(format!(
+                "{WAIT_GATE_ENV} was not opened within {} ms",
+                limit.as_millis()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 /// How long to pause before polling again after `error`, or `None` when the poll must not be
@@ -568,6 +617,90 @@ mod tests {
         let command = <Args as clap::Args>::augment_args(clap::Command::new("ask"));
         let matches = command.no_binary_name(true).try_get_matches_from(args)?;
         <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+    }
+
+    #[cfg(debug_assertions)]
+    fn gate_error(result: Result<()>) -> Option<String> {
+        match result {
+            Err(Error::Local {
+                code: LocalCode::InvalidInput,
+                message,
+                ..
+            }) => Some(message),
+            _ => None,
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gated_wait_marks_itself_ready_and_holds_until_go() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let ready = gate.path().join("ready");
+        let go = gate.path().join("go");
+        let test = std::thread::spawn({
+            let (ready, go) = (ready.clone(), go.clone());
+            move || -> std::io::Result<Instant> {
+                while !ready.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                let opened = Instant::now();
+                std::fs::write(&go, b"")?;
+                Ok(opened)
+            }
+        });
+        pass_wait_gate(gate.path(), Duration::from_secs(60))?;
+        let passed = Instant::now();
+        let opened = test
+            .join()
+            .map_err(|_| anyhow::anyhow!("the opener panicked"))??;
+        // Held until `go` existed, not merely until `ready` was written.
+        assert!(passed >= opened, "{:?}", opened.duration_since(passed));
+        assert!(ready.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_already_open_passes_at_once() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        std::fs::write(gate.path().join("go"), b"")?;
+        let started = Instant::now();
+        pass_wait_gate(gate.path(), Duration::ZERO)?;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(gate.path().join("ready").exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_that_is_not_a_directory_is_refused() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let missing = gate.path().join("missing");
+        let message = gate_error(pass_wait_gate(&missing, Duration::from_secs(60)));
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("RH_TEST_WAIT_GATE names no directory")),
+            "{message:?}"
+        );
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_gate_never_opened_gives_up_at_its_limit() -> anyhow::Result<()> {
+        let gate = tempfile::tempdir()?;
+        let limit = Duration::from_millis(200);
+        let started = Instant::now();
+        let message = gate_error(pass_wait_gate(gate.path(), limit));
+        assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+        assert_eq!(
+            message.as_deref(),
+            Some("RH_TEST_WAIT_GATE was not opened within 200 ms")
+        );
+        Ok(())
     }
 
     #[test]
