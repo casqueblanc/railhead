@@ -207,6 +207,45 @@ fn refuses_an_event_recorded_by_the_wrong_kind_of_actor() -> TestResult {
             ..
         })
     ));
+
+    let mut reopened = opened();
+    set(&mut reopened, "/type", json!("claim.reopened"))?;
+    set(
+        &mut reopened,
+        "/data",
+        json!({
+            "claimId": "clm_42abcd", "generation": 1,
+            "decisions": [{"decisionId": "dec_upload1", "version": 2}],
+        }),
+    )?;
+    assert!(matches!(
+        decode(&reopened),
+        Err(Error::WrongActor {
+            event_type: "claim.reopened",
+            required: "the system"
+        })
+    ));
+    set(
+        &mut reopened,
+        "/actor",
+        json!({"kind": "human", "id": "usr_lemarier"}),
+    )?;
+    assert!(matches!(
+        decode(&reopened),
+        Err(Error::WrongActor {
+            event_type: "claim.reopened",
+            required: "the system"
+        })
+    ));
+    set(
+        &mut reopened,
+        "/actor",
+        json!({"kind": "system", "id": "sys_claims"}),
+    )?;
+    assert!(matches!(
+        decode(&reopened)?.payload,
+        EventPayload::ClaimReopened(_)
+    ));
     Ok(())
 }
 

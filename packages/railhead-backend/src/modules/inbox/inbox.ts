@@ -13,6 +13,7 @@
 //
 // `readyGate` reads the unacknowledged items of one claim at one generation. It has no default: an
 // empty answer means the store holds no unacknowledged item for that claim and generation.
+// `readyGateNow` reads the same synchronously, so `ready` can read it inside its own transaction.
 //
 // Every item must fit the smaller budget on its own, so the oldest item always fits and the agent
 // can acknowledge its way through the inbox. `queue` refuses a larger one.
@@ -117,6 +118,21 @@ export function createInbox(context: RepoContext): InboxPort {
   const { storage, log, clock, repoId } = context;
   migrate(storage, INBOX_OWNER, MIGRATIONS);
   const sql = storage.sql;
+
+  /** The unacknowledged items of a validated claim and generation, as the ready gate. */
+  function gate(claimId: string, generation: number): ReadyGate {
+    const items = sql
+      .exec<{ item: number }>(
+        `SELECT item FROM inbox_items
+         WHERE claim_id = ? AND generation = ? AND acked_at IS NULL ORDER BY item LIMIT ?`,
+        claimId,
+        generation,
+        MAX_GATE_ITEMS,
+      )
+      .toArray()
+      .map((row) => row.item);
+    return items.length === 0 ? { kind: "clear" } : { kind: "blocked", items };
+  }
 
   function foreign(agent: AgentPrincipal): boolean {
     return agent.kind !== "agent" || agent.repoId !== repoId || !isId("agent", agent.agentId);
@@ -286,17 +302,14 @@ export function createInbox(context: RepoContext): InboxPort {
       if (!Number.isSafeInteger(generation) || generation < 1) {
         return fail("invalid_request", "The generation must be a whole number from 1.");
       }
-      const items = sql
-        .exec<{ item: number }>(
-          `SELECT item FROM inbox_items
-           WHERE claim_id = ? AND generation = ? AND acked_at IS NULL ORDER BY item LIMIT ?`,
-          claimId,
-          generation,
-          MAX_GATE_ITEMS,
-        )
-        .toArray()
-        .map((row) => row.item);
-      return ok(items.length === 0 ? { kind: "clear" } : { kind: "blocked", items });
+      return ok(gate(claimId, generation));
+    },
+
+    readyGateNow(claimId, generation) {
+      if (!isId("claim", claimId) || !Number.isSafeInteger(generation) || generation < 1) {
+        return null;
+      }
+      return gate(claimId, generation);
     },
   };
 }

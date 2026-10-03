@@ -213,6 +213,12 @@ export type EventPayload =
       type: "claim.refused";
       data: { claimId: ClaimId; generation: number; reason: RefusalReason };
     }
+  | {
+      // A decision version recorded after ready superseded the pin, so the claim is working again
+      // and its holder must adapt the work and mark it ready at `decisions`, the current versions.
+      type: "claim.reopened";
+      data: { claimId: ClaimId; generation: number; decisions: DecisionRef[] };
+    }
   | { type: "claim.expired"; data: { claimId: ClaimId; generation: number } }
   | {
       type: "claim.reassigned";
@@ -322,6 +328,7 @@ export const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked"];
 export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "agent.joined",
   "claim.refused",
+  "claim.reopened",
   "claim.expired",
   "claim.reassigned",
   "inbox.queued",
@@ -460,6 +467,11 @@ function validatePayload(event: EventPayload): void {
     case "claim.refused":
       requireId("claim", event.data.claimId, "claimId");
       requirePositiveInteger(event.data.generation, "generation");
+      return;
+    case "claim.reopened":
+      requireId("claim", event.data.claimId, "claimId");
+      requirePositiveInteger(event.data.generation, "generation");
+      requireDecisionRefs(event.data.decisions, "decisions");
       return;
     case "claim.expired":
       requireId("claim", event.data.claimId, "claimId");

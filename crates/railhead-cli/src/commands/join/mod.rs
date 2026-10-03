@@ -255,6 +255,15 @@ impl Authenticated {
 ///
 /// [`LocalCode::NoSession`] in those cases; otherwise when the store fails or the login fails.
 pub fn session(agent: &Agent<'_>) -> Result<Authenticated> {
+    session_with(agent, &agent.client()?)
+}
+
+/// As [`session`], logging in through `client`, so a caller can bound the login's requests.
+///
+/// # Errors
+///
+/// As [`session`].
+pub fn session_with(agent: &Agent<'_>, client: &http::Client) -> Result<Authenticated> {
     if let Some(token) = agent.stored_session()? {
         return Ok(Authenticated::Stored(token));
     }
@@ -275,11 +284,10 @@ pub fn session(agent: &Agent<'_>) -> Result<Authenticated> {
     }
     let key = SigningKey::load(store, &identity.name)?
         .ok_or_else(|| no_session(identity, "it has no key to log in with"))?;
-    let client = agent.client()?;
     let login = agent
         .invocation
         .runtime
-        .block_on(login(&client, identity, &key))
+        .block_on(login(client, identity, &key))
         .map_err(|error| match error {
             Error::Http(http::Error::Rejected { error, .. })
                 if error.code == AgentErrorCode::IdentityPending =>

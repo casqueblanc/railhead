@@ -55,4 +55,11 @@ export interface InboxPort {
   queue(tx: EventTransaction, target: InboxTarget, item: QueuedItem): number;
   /** The ready gate for a claim at a generation. */
   readyGate(claimId: ClaimId, generation: number): Promise<PortResult<ReadyGate>>;
+  /**
+   * The ready gate as `readyGate` reads it, or `null` when it is unknown, such as for a malformed
+   * claim or generation or a missing module. This is a fence reader: it is synchronous and reads
+   * only the Repo's storage, so a caller calls it inside the transaction that records `ready`, and
+   * what it returns holds until that transaction commits. `null` is never clear.
+   */
+  readyGateNow(claimId: ClaimId, generation: number): ReadyGate | null;
 }

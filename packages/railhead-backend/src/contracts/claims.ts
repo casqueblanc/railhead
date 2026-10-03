@@ -61,7 +61,11 @@ export interface ClaimsPort {
     claimId: ClaimId,
     request: ReadyRequest,
   ): Promise<PortResult<ReadyResult>>;
-  /** The claim's current pin, for the train. Fails unless the claim is ready. */
+  /**
+   * The claim's current pin, for the train. Fails unless the claim is ready at its recorded decision
+   * versions with a clear inbox gate; a superseded pin reopens the claim and fails with
+   * `decision_superseded`.
+   */
   pin(claimId: ClaimId): Promise<PortResult<ClaimPin>>;
   /**
    * The claim's current ownership generation, or `null` when it is unknown, such as for an unknown
