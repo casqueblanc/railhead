@@ -9,16 +9,16 @@
 //
 // A pin is queued only inside the transaction that records `ready`, and the Repo's alarm drives
 // the train once it commits; each `recordCheck` drives it at once. A drive runs until the train
-// waits for a check report or a port, or the queue is empty. Whenever storage holds work the train owes (an active batch or a queued
-// pin), it also holds a wake row and the Repo's alarm is set for it. `recordDebt` is the only
-// writer of that row, and it writes inside the transaction that creates or restarts the debt:
-// accepting work records it due now with the alarm due now, and starting a drive records it with
-// the alarm `DRIVE_LEASE_MS` later, so the work is resumed even if the object stops before or
-// during the drive and nothing else wakes it. When a
-// drive ends, the train settles that debt from storage: it asks the alarm to drive again at once
-// when work arrived too late for the drive, waits for the active attempt's deadline while a
-// runner's report is due, backs off when a port refused or the drive threw, up to
-// `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it. After the last of those drives the
+// waits for a check report or a port, or the queue is empty. Whenever storage holds work the train
+// owes (an active batch or a queued pin), it also holds a wake row and the Repo's alarm is set for
+// it. `recordDebt` is the only writer of that row, and it writes inside the transaction that
+// creates or restarts the debt: accepting work records it due now with the alarm due now, and
+// starting a drive records it with the alarm `DRIVE_LEASE_MS` later, so the work is resumed even if
+// the object stops before or during the drive and nothing else wakes it. When a drive ends, the
+// train settles that debt from storage: it asks the alarm to drive again at once when work arrived
+// too late for the drive, waits for the active attempt's deadline while a runner's report is due,
+// backs off when a port refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row, and
+// otherwise clears it. After the last of those drives the
 // row stays but is marked exhausted, and no alarm is asked for it; the next drive any call starts
 // restores it with a fresh count. Neither a backoff nor exhaustion outlasts a requested attempt's
 // deadline: the wake stays due by then, so the attempt expires even when no port answers again.
