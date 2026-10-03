@@ -4,6 +4,7 @@
     "**/wrangler.jsonc",
     "**/*.gen.ts",
     "pnpm-lock.yaml",
+    "fixtures/demo/standalone/pnpm-lock.yaml",
     "Cargo.lock"
   ]
 }

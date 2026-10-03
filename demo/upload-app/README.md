@@ -23,7 +23,7 @@ Option B's suite expects these routes, which do not exist yet:
 
 `acceptance/checks.json` tags each suite with its decision option and the decision version that chose it, and names the option in force. The train reads it from main, never from the candidate.
 
-`pnpm --filter @railhead/demo-upload-app test:run` runs the fixture's own tests and the current option's suite. `UPLOAD_ACCEPTANCE=B@2` runs option B's suite instead; a selection that names no tagged suite stops the run before any test starts. The 9 and 11 MB bodies are generated when the tests run, from fixed seeds, and never committed.
+`pnpm --filter @railhead/demo-upload-app test:run` runs the fixture's own tests and the current option's suite. `UPLOAD_ACCEPTANCE=b@2` runs option B's suite instead; a selection that names no tagged suite stops the run before any test starts. The 9 and 11 MB bodies are generated when the tests run, from fixed seeds, and never committed.
 
 `__tests__/suites.test.ts` judges the suites themselves: option B's fails on the current app, passes on an in-memory double of B, and catches a changed byte, a missing part and a file lost on restart.
 

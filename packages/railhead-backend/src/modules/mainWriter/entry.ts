@@ -1,9 +1,21 @@
 // Main writer: publishes authorized intents to main and reconciles uncertain writes. It is the only
-// module that receives main's ref. Until its task installs the module, every call refuses with
-// `unavailable` and has no effect.
+// module that receives main's ref. The implementation is `createMainWriter` in `mainWriter.ts`.
 
-import { unavailableMainWriter } from "../../contracts/unavailable";
 import type { MainWriterFactory } from "../../repo/composeRepo";
+import { createMainWriter } from "./mainWriter";
 
 /** Builds the main writer of one repository. */
-export const mainWriter: MainWriterFactory = () => unavailableMainWriter;
+export const mainWriter: MainWriterFactory = (context, ports, mainRef) =>
+  createMainWriter(
+    context,
+    () => {
+      const { authorization, claims, decisions, train } = ports();
+      return {
+        authorization,
+        attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
+        currentGeneration: (claimId) => claims.currentGeneration(claimId),
+        currentVersions: (claimId) => decisions.currentVersions(claimId),
+      };
+    },
+    mainRef,
+  );
