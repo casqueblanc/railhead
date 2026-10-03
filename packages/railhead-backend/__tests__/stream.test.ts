@@ -322,7 +322,40 @@ describe("stream subscriptions", () => {
       expect(await port.subscribe(0, new Recorder())).toMatchObject({ ok: true });
     });
   });
+
+  it("ends a subscription whose handle is disposed without cancel, once", async () => {
+    await withLog(async (log) => {
+      const port = streamPort(log);
+      const recorder = new Recorder();
+      const handle = value(await port.subscribe(0, recorder));
+      const others = [];
+      for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
+        others.push(value(await port.subscribe(0, new Recorder())));
+      }
+
+      dispose(handle);
+      dispose(handle);
+      await handle.cancel();
+      append(log, 1);
+      await settle();
+
+      expect(recorder.batches).toEqual([]);
+      expect(recorder.ends).toEqual([]);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({ ok: true });
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+      await Promise.all(others.map((other) => other.cancel()));
+    });
+  });
 });
+
+function dispose(target: object): void {
+  const fn: unknown = Reflect.get(target, Symbol.dispose);
+  if (typeof fn !== "function") throw new TypeError("Expected a disposable value.");
+  fn.call(target);
+}
 
 // Through the Worker, as the board reaches it.
 
@@ -363,6 +396,61 @@ async function appendIn(stub: DurableObjectStub<Repo>, repoId: string, count: nu
   await runInDurableObject(stub, (_instance, state) => {
     append(EventLog.open(state.storage, repoId), count);
   });
+}
+
+class NativeRecorder extends WorkersRpcTarget implements StreamListener {
+  readonly seqs: number[] = [];
+
+  async events(events: RailheadEvent[]): Promise<void> {
+    this.seqs.push(...events.map((event) => event.seq));
+  }
+
+  async ended(): Promise<void> {}
+}
+
+describe("subscriptions through the Repo binding", () => {
+  it("frees the slot when the native handle is released without cancel", async () => {
+    const { stub, repoId } = await freshRepo();
+    const released = new NativeRecorder();
+    const handle = value(await stub.subscribe(0, released));
+    const others = [];
+    for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
+      others.push(value(await stub.subscribe(0, new NativeRecorder())));
+    }
+    expect(await stub.subscribe(0, new NativeRecorder())).toMatchObject({
+      ok: false,
+      code: "quota_exceeded",
+    });
+
+    // The Repo stays resident through the held stubs, and no event is appended to wake anything.
+    dispose(handle);
+    const reused = await subscribeWhenFree(stub);
+    await appendIn(stub, repoId, 1);
+    await settle();
+
+    expect(released.seqs).toEqual([]);
+    expect(await stub.subscribe(0, new NativeRecorder())).toMatchObject({
+      ok: false,
+      code: "quota_exceeded",
+    });
+    for (const other of [reused, ...others]) {
+      await other.cancel();
+      dispose(other);
+    }
+  });
+});
+
+/** Subscribes once a slot frees, retrying for at most `ms`; the release reaches the Repo later. */
+async function subscribeWhenFree(stub: DurableObjectStub<Repo>, ms = 5_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const result = await stub.subscribe(0, new NativeRecorder());
+    if (result.ok) return result.value;
+    if (result.code !== "quota_exceeded" || Date.now() > deadline) {
+      throw new Error(`expected a free slot, got ${result.code}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 describe("board subscriptions over the RPC session", () => {

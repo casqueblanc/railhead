@@ -228,6 +228,12 @@ class SubscriptionHandle extends RpcTarget implements StreamSubscription {
   async cancel(): Promise<void> {
     this.#subscription.end(null);
   }
+
+  // The runtime calls this once every stub of the handle is released, including when the Worker's
+  // execution context ends before its cancel arrives, so a lost cancel still frees the slot.
+  [Symbol.dispose](): void {
+    this.#subscription.end(null);
+  }
 }
 
 // A duplicate of `listener` when it is an RPC stub, or `listener` itself.
