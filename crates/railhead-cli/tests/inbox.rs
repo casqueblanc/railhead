@@ -1015,7 +1015,8 @@ async fn ask_reports_a_refused_or_inconsistent_question() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn an_ask_whose_answer_is_lost_names_the_key_to_reconcile_it() -> anyhow::Result<()> {
-    // A backend that reads the request and closes the connection without answering.
+    // A backend that reads the request and closes the connection without answering: a dropped
+    // connection is reported as unreachable, as every other command reports it.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let origin = format!("http://{}", listener.local_addr()?);
     let closer = std::thread::spawn(move || {
@@ -1028,7 +1029,7 @@ async fn an_ask_whose_answer_is_lost_names_the_key_to_reconcile_it() -> anyhow::
     let run = rh_in_clone(&world, &ask_args(QUESTION, "src/upload.ts"))?;
     let _ = closer.join();
     assert_eq!(run.code, Some(1), "{}", run.stdout);
-    assert_eq!(run.at("/error/code")?, json!("timeout"));
+    assert_eq!(run.at("/error/code")?, json!("unreachable"));
     assert_eq!(run.at("/error/retryable")?, json!(true));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
     let message = run.at("/error/message")?;

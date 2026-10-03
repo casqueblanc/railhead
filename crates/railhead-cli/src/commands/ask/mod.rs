@@ -193,9 +193,8 @@ fn ask(
         .block_on(client.send::<_, QuestionResult>(&endpoint, Some(&session), &request))
     {
         Ok(response) => response,
-        Err(http::Error::Timeout(_) | http::Error::Transport(_)) => {
-            return Err(uncertain(LocalCode::Timeout));
-        }
+        Err(http::Error::Timeout(_)) => return Err(uncertain(LocalCode::Timeout)),
+        Err(http::Error::Transport(_)) => return Err(uncertain(LocalCode::Unreachable)),
         Err(http::Error::Malformed { .. } | http::Error::ResponseTooLarge(_)) => {
             return Err(uncertain(LocalCode::MalformedResponse));
         }
@@ -309,8 +308,10 @@ fn resumable(error: Error, question_id: &str, request_id: &str, seconds: u64) ->
 /// to resume if the wait is interrupted. `last` is what is already known of the question, such as
 /// the result of asking it. Returns the last answer and whether the wait ran out.
 ///
-/// The deadline holds locally: no poll, nor the session renewal before it, runs past it. A poll
-/// still pending then is dropped, and the wait ends with the last known state.
+/// A poll never runs past the deadline: one still pending then is dropped, and the wait ends with
+/// the last known state. A session renewal that logs in can overrun it by up to one request
+/// timeout, plus any wait for another process's login on the session lock; bounding that login
+/// by the deadline is casqueblanc/railhead#153.
 ///
 /// # Errors
 ///
