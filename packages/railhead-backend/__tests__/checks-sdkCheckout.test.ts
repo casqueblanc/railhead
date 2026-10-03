@@ -641,6 +641,33 @@ describe("RailheadSandbox's storage after retirement", () => {
     });
   });
 
+  it("is deleted again after a restart revives it for a late start past the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      await sandbox.alarm();
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+
+      // The object restarts: the SDK's constructor recreates its table and alarm. A late start for
+      // the incarnation runs nothing and records the retirement again.
+      const revived = new RailheadSandbox(
+        state as ConstructorParameters<typeof RailheadSandbox>[0],
+        env,
+      );
+      await state.blockConcurrencyWhile(async () => undefined);
+      const policy = { host: HOST, namespace: NAMESPACE, read: [REPO], write: null };
+      await expect(revived.railheadStart(policy, deadline)).rejects.toThrow("refused: expired");
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+
+      await revived.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
   it("keeps its record and schedules a retry when deleting its storage fails, then finishes", async () => {
     await withRailheadSandbox(null, async (sandbox, _container, state) => {
       const deadline = Date.now() + 30;

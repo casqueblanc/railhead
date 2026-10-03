@@ -112,11 +112,13 @@ export class RailheadSandbox extends Sandbox<Env> {
 
   /**
    * Runs the SDK's alarm, which calls `railheadExpire` when it is due. Afterwards, once the fence is
-   * `disposable`, deletes all the object's storage and then its alarm, so a sandbox leaves no object
-   * behind. The deletion follows the SDK's alarm rather than running inside it, which still writes
-   * its schedule table after each callback. A deletion that fails leaves the record in place and
-   * schedules another alarm, backing off like a teardown, up to `MAX_TEARDOWN_ATTEMPTS` in a row;
-   * the alarm is removed only once the storage is gone.
+   * `disposable`, deletes all the object's storage, so a sandbox leaves no object behind. The
+   * deletion follows the SDK's alarm rather than running inside it, which still writes its schedule
+   * table after each callback. `deleteAll` removes the alarm with the data in one step on SQLite
+   * storage, so no partial state is left for a later alarm to finish. A deletion that fails leaves
+   * the record in place and schedules another alarm, backing off like a teardown, up to
+   * `MAX_TEARDOWN_ATTEMPTS` in a row. An object revived after its deletion, such as by a late
+   * release or start, records its retirement again and is deleted again past that deadline.
    */
   override async alarm(alarmProps?: AlarmInvocationInfo): Promise<void> {
     await super.alarm(alarmProps);
@@ -136,9 +138,7 @@ export class RailheadSandbox extends Sandbox<Env> {
           error: error instanceof Error ? error.name : "unknown",
         }),
       );
-      return;
     }
-    await this.ctx.storage.deleteAlarm();
   }
 
   // The SDK calls a CI run issues on this object, each run through `fenceSandbox`.
