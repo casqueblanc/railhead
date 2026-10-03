@@ -235,21 +235,6 @@ describe("unavailable modules", () => {
           operation: "fetch",
         }),
         ports.sessions.authenticate(TOKEN),
-        // Decisions is installed, but asking needs the claims module to confirm the claim.
-        ports.decisions.ask(
-          { kind: "agent", agentId: "agt_atlas01", ownerId: "usr_lemarier", repoId },
-          CLAIM,
-          {
-            generation: 1,
-            requestId: "req_upload0000000001",
-            text: "Reject or chunk?",
-            options: [
-              { key: "reject", label: "Reject" },
-              { key: "chunk", label: "Chunk" },
-            ],
-            scope: ["src/upload.ts"],
-          },
-        ),
       ]);
     });
 
@@ -409,8 +394,8 @@ describe("agent dispatch", () => {
     await withFakePorts({ view: fail("identity_revoked", "Revoked.") }, async (ports, calls) => {
       expect(
         await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: { route: "status" }, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
         ),
       ).toMatchObject({ ok: false, error: { code: "identity_revoked" } });
       expect(calls).toEqual(["authenticate", "view"]);
@@ -418,8 +403,8 @@ describe("agent dispatch", () => {
     await withFakePorts({ activeClaim: fail("unavailable", "Claims are down.") }, async (ports) => {
       expect(
         await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: { route: "status" }, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
         ),
       ).toMatchObject({ ok: false, error: { code: "unavailable" } });
     });
