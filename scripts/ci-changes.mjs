@@ -1,16 +1,20 @@
-// Decides whether a CI job must run for a pull request, from the paths the pull request changes.
-// Each job in `.github/workflows/` pipes `git diff --name-only` into it as its first step and skips
-// its remaining steps on `false`, so the job still reports success under its usual name.
+// Decides whether a CI job must run, from the triggering event and, for a pull request, the paths it
+// changes. Each job in `.github/workflows/` pipes `git diff --name-only` into it as its first step
+// and skips its remaining steps on `false`, so the job still reports success under its usual name.
 //
-//   git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs <job>
+//   git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs <job> <event>
 //
-// prints `run=true` or `run=false` for `$GITHUB_OUTPUT`. Plain JavaScript, like rust-check.mjs, so
-// it runs on whatever Node the runner has, before any setup step.
+// prints `run=true` or `run=false` for `$GITHUB_OUTPUT`; `<event>` is `github.event_name`. Plain
+// JavaScript, like rust-check.mjs, so it runs on whatever Node the runner has, before any setup step.
 //
 // Each job lists the paths known not to be its inputs, and runs when any changed path falls outside
 // that list. A path no list names, such as a new top-level directory, therefore runs every job, and
-// so does a change to the workflows or to this file. Pushes to `main` never come through here: the
-// workflows run every job on them.
+// so does a change to the workflows or to this file.
+//
+// Only a pull request is classified. A push to `main` and a merge queue's `merge_group` run every
+// job: the merge group is the combination of `main` and the pull requests queued ahead, and that
+// combination is what the queue exists to prove. Any other event fails without a decision, so a new
+// trigger has to be added here deliberately.
 
 /** Root Markdown (README.md, AGENTS.md, CLAUDE.md) and the license files. */
 const ROOT_PROSE = /^(?:[^/]+\.md|LICENSE|NOTICE)$/;
@@ -49,13 +53,21 @@ const NOT_INPUTS = {
   ],
 };
 
+/** Per event, whether it is classified by path or runs every job. */
+const EVENTS = { pull_request: "classify", push: "all", merge_group: "all" };
+
 // A renamed file must be listed under both names (`--no-renames`), so moving a file out of a job's
 // inputs still runs that job. No paths means nothing to check.
-const job = process.argv[2];
+const [job, event] = process.argv.slice(2);
 if (job === undefined || !Object.hasOwn(NOT_INPUTS, job)) {
   process.stderr.write(`ci-changes: expected one of ${Object.keys(NOT_INPUTS).join(", ")}\n`);
   process.exit(2);
 }
+if (event === undefined || !Object.hasOwn(EVENTS, event)) {
+  process.stderr.write(`ci-changes: expected an event, one of ${Object.keys(EVENTS).join(", ")}\n`);
+  process.exit(2);
+}
+// Read every path even when the event ignores them, so `git diff` never writes into a closed pipe.
 const chunks = [];
 for await (const chunk of process.stdin) {
   chunks.push(chunk);
@@ -65,6 +77,7 @@ const paths = Buffer.concat(chunks)
   .split("\n")
   .filter((line) => line.length > 0);
 const skippable = NOT_INPUTS[job];
-const run = paths.some((path) => !skippable.some((pattern) => pattern.test(path)));
-process.stderr.write(`ci-changes: ${paths.length} changed paths, ${job} run=${run}\n`);
+const run =
+  EVENTS[event] === "all" || paths.some((path) => !skippable.some((pattern) => pattern.test(path)));
+process.stderr.write(`ci-changes: ${event}, ${paths.length} changed paths, ${job} run=${run}\n`);
 process.stdout.write(`run=${run}\n`);

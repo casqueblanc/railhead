@@ -15,8 +15,18 @@
 // definition; a repeat of the recorded result is accepted again, anything else is `check_mismatch`.
 // It stores the output cut to its end with its digest, passes the result to the train, which checks
 // it against its own attempt and deadline, and then releases the sandbox slot.
+//
+// `detail` reads one stored attempt back for the board: candidate, command and state, with the
+// output cut again to `MAX_CHECK_DETAIL_LOG_BYTES`. It never reads Artifacts or the definition.
 
-import { isCommitSha, type CheckRunId, type CommitSha, type RepoId } from "@railhead/shared/events";
+import { MAX_CHECK_DETAIL_LOG_BYTES, type CheckDetailState } from "@railhead/shared/board-api";
+import {
+  isCommitSha,
+  isId,
+  type CheckRunId,
+  type CommitSha,
+  type RepoId,
+} from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../contracts/result";
 import type { CheckAttempt, CheckDefinition, CheckPort, CheckRunReport } from "../contracts/train";
 import type { RepoPorts } from "../repo/composeRepo";
@@ -134,7 +144,8 @@ export function createChecks(deps: ChecksDeps): CheckPort {
       } catch {
         return fail("unavailable", "The candidate could not be compared with main.");
       }
-      if (edited.length > 0) return repeatStart(attempts.hold(identity, edited, clock()), identity);
+      if (edited.length > 0)
+        return repeatStart(attempts.hold(identity, check.value.command, edited, clock()), identity);
 
       const policy = parseSandboxPolicy({
         host: source.host,
@@ -151,7 +162,13 @@ export function createChecks(deps: ChecksDeps): CheckPort {
       }
       const { slot } = admission.value;
       if (slot.deadline === null) throw new Error("an admitted sandbox slot has no deadline");
-      const started = attempts.start(identity, slot.sandbox, slot.deadline, clock());
+      const started = attempts.start(
+        identity,
+        check.value.command,
+        slot.sandbox,
+        slot.deadline,
+        clock(),
+      );
       if (!sameIdentity(started, identity) || started.state.kind !== "started") {
         return repeatStart(started, identity);
       }
@@ -199,6 +216,20 @@ export function createChecks(deps: ChecksDeps): CheckPort {
       });
       await release(report.attemptId);
       return accepted;
+    },
+
+    async detail(attemptId) {
+      if (!isId("checkRun", attemptId)) return fail("invalid_request", "Not a check run id.");
+      const stored = attempts.get(attemptId);
+      if (stored === null) return fail("not_found", "No record of that check run is kept.");
+      return ok({
+        checkRunId: stored.attemptId,
+        candidate: stored.candidate,
+        expectedMain: stored.expectedMain,
+        definitionDigest: stored.digest,
+        command: stored.command,
+        state: detailState(stored.state),
+      });
     },
   };
 
@@ -276,6 +307,27 @@ function repeatStart(
       return ok({ attemptId: stored.attemptId });
     default:
       return unreachable(stored.state);
+  }
+}
+
+function detailState(state: AttemptRecord["state"]): CheckDetailState {
+  switch (state.kind) {
+    case "held":
+      return { kind: "held", paths: state.paths };
+    case "started":
+      return { kind: "started", deadline: state.deadline };
+    case "reported": {
+      const logTail = boundedLog(state.log, MAX_CHECK_DETAIL_LOG_BYTES);
+      return {
+        kind: "reported",
+        result: state.result,
+        finishedAt: state.finishedAt,
+        logTail,
+        logCut: logTail.length < state.log.length,
+      };
+    }
+    default:
+      return unreachable(state);
   }
 }
 

@@ -164,6 +164,7 @@ class Fakes {
         },
         // Reports reach the train through `recordCheck` in these tests.
         report: unavailableChecks.report,
+        detail: unavailableChecks.detail,
       },
       authorization: {
         authorize: async (attemptId) => {

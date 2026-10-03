@@ -4,11 +4,12 @@
 // `seed` creates the repository and imports main in one action, and `reset` deletes it. A plan
 // compares what the manifest wants with what the target reports and lists each step with whether
 // it is already in place, so a repeat after success writes nothing. A step whose write failed is
-// not retried here: the next run reads the target again first, so an uncertain write is reconciled
-// before anything is written a second time.
+// not retried here: the next seed reads the target again first, so an uncertain seed is reconciled
+// before anything is written a second time. Reset reads nothing first (see below), so an uncertain
+// reset is the owner's to inspect before approving another.
 //
-// Each backend write needs its own owner passkey assertion. The live adapter obtains it (#148); the
-// port does not carry one.
+// Each backend write needs its own owner passkey assertion. The live adapter, `liveTarget.ts`,
+// holds it; the port does not carry one.
 //
 // Issues are read through `BoardIssues`, a separate port: `DemoSeedApi` has no issue read. Filing an
 // issue is an owner action on the board, so neither port can file one. The plan lists each seeded
@@ -24,8 +25,8 @@
 // even when `read` finds nothing: a seed that failed after importing main leaves that main in
 // place behind a repository `read` does not report, and only the target's reset clears it.
 //
-// The live target does not exist yet; until it does the commands only plan, and
-// `docs/demo-seed.md` gives the owner's steps.
+// `liveTarget.ts` implements both ports against a deployed Railhead, and `docs/demo-seed.md`
+// gives the owner's steps.
 
 import {
   assertDemoTarget,
@@ -78,10 +79,26 @@ export interface BoardIssue {
   readonly body: string;
 }
 
+/** What one read of the board found. */
+export interface BoardScan {
+  /** The repository's issues titled one of the titles asked for, in filing order. */
+  readonly issues: readonly BoardIssue[];
+  /**
+   * The board history the issues were read from, or `null` when the repository does not exist. A
+   * reset starts a new history, so a repository reset and seeded again at the same main has another.
+   */
+  readonly history: string | null;
+}
+
 /** The board's issues for one repository: the read `DemoSeedApi` does not offer. */
 export interface BoardIssues {
-  /** The repository's open issues in filing order, empty when it does not exist. */
-  issues(ref: RepoRef): Promise<readonly BoardIssue[]>;
+  /**
+   * The repository's open issues titled one of `titles`, all read from one history; no issues and
+   * no history when it does not exist.
+   */
+  scan(ref: RepoRef, titles: ReadonlySet<string>): Promise<BoardScan>;
+  /** The board's current history for the repository, or `null` when it does not exist. */
+  history(ref: RepoRef): Promise<string | null>;
 }
 
 /** The target refused a write because it holds something else, as the backend's `action_stale`. */
@@ -118,7 +135,11 @@ export function demoRef(ref: RepoRef): RepoRef {
   return { org: ref.org, repo: ref.repo };
 }
 
-/** Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. */
+/**
+ * Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. It
+ * reads `target` before and after scanning `board`, then the board's history, and refuses when the
+ * two target reads differ or the board's history is no longer the one its issues came from.
+ */
 export async function planSeed(
   manifest: SeedManifest,
   history: ImportedHistory,
@@ -137,7 +158,22 @@ export async function planSeed(
       `${name} already has main at ${state.main}, not the import's ${history.head}. Reset it first.`,
     );
   }
-  const filed = Map.groupBy(await board.issues(ref), (issue) => issue.title);
+  const titles = new Set(manifest.issues.map((issue) => issue.title));
+  const scanned = await board.scan(ref, titles);
+  const filed = Map.groupBy(scanned.issues, (issue) => issue.title);
+  // Another operator may reset and seed the repository while this plans: at another head the plan
+  // would mark a main done that is not this one, and at the same head the issues read may belong
+  // to the deleted board. Each shows as a changed main or a new history. This narrows the window
+  // but does not close it: the plan is several calls, not one snapshot.
+  const again = await target.read(ref);
+  const boardHistory = await board.history(ref);
+  if (
+    (again === null) !== (state === null) ||
+    again?.main !== state?.main ||
+    boardHistory !== scanned.history
+  ) {
+    throw new SeedRefusal(`The repository ${name} changed during planning; run again.`);
+  }
 
   return [
     {
