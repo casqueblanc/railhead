@@ -20,8 +20,8 @@ interface FakeApp {
   noLimit?: boolean;
   /** Serves the chunked routes of option B. */
   chunked?: boolean;
-  /** Flips one byte of every file read back. */
-  corrupt?: boolean;
+  /** How a file is read back: changed by one byte, cut off after half, or followed by endless bytes. */
+  readBack?: "corrupt" | "brokenOff" | "endless";
 }
 
 interface Started {
@@ -90,8 +90,27 @@ const startApp = async (app: FakeApp): Promise<Started> => {
         const file = files.get(read[1]);
         if (file === undefined) return json(response, 404, { error: "Not found." });
         const served = Buffer.from(file);
-        if (app.corrupt === true && served.byteLength > 0) served[0] = (served[0] ?? 0) ^ 0xff;
+        if (app.readBack === "corrupt" && served.byteLength > 0) {
+          served[0] = (served[0] ?? 0) ^ 0xff;
+        }
         response.writeHead(200, { "content-type": "application/octet-stream" });
+        if (app.readBack === "brokenOff") {
+          // Headers and half the file reach the verifier before the connection drops.
+          response.write(served.subarray(0, served.byteLength / 2), () => {
+            setTimeout(() => response.destroy(), 50);
+          });
+          return;
+        }
+        if (app.readBack === "endless") {
+          const chunk = Buffer.alloc(1_000_000);
+          const pour = () => {
+            while (!response.destroyed && response.write(chunk));
+            if (!response.destroyed) response.once("drain", pour);
+          };
+          response.once("close", () => response.off("drain", pour));
+          pour();
+          return;
+        }
         response.end(served);
         return;
       }
@@ -292,7 +311,7 @@ describe("verify-app-revision", () => {
   });
 
   test("fails when the stored file reads back different", async () => {
-    const app = await startApp({ revision: () => MAIN, corrupt: true });
+    const app = await startApp({ revision: () => MAIN, readBack: "corrupt" });
     try {
       const result = await run(["--url", app.origin, "--expect", MAIN, "--option", "A"]);
       assert.equal(result.code, 1);
@@ -302,6 +321,61 @@ describe("verify-app-revision", () => {
         nine?.observed ?? "",
         /read back as 9000000 bytes with SHA-256 [0-9a-f]{64}, not the 9000000 bytes sent/,
       );
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("records a read-back that breaks off after its headers as a failure", async () => {
+    const app = await startApp({ revision: () => MAIN, readBack: "brokenOff" });
+    const out = join(scratch, "broken-off.json");
+    try {
+      const result = await run([
+        "--url",
+        app.origin,
+        "--expect",
+        MAIN,
+        "--option",
+        "A",
+        "--out",
+        out,
+      ]);
+      assert.equal(result.code, 1);
+      const written = record(readFileSync(out, "utf8"));
+      assert.deepEqual(written, record(result.stdout));
+      assert.equal(written.result, "fail");
+      const [nine, eleven] = written.observations;
+      assert.equal(nine?.ok, false);
+      assert.match(nine?.observed ?? "", /^Reading upload up-1 back broke off after \d+ bytes: /);
+      assert.equal(eleven?.ok, true);
+      assert.equal(written.revisionAfter, MAIN);
+      assert.match(result.stderr, /does not hold at .*: 9 MB in one request\./);
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("stops reading back at the bytes sent when the app answers with more", async () => {
+    const app = await startApp({ revision: () => MAIN, readBack: "endless" });
+    const out = join(scratch, "endless.json");
+    try {
+      const result = await run([
+        "--url",
+        app.origin,
+        "--expect",
+        MAIN,
+        "--option",
+        "A",
+        "--out",
+        out,
+      ]);
+      assert.equal(result.code, 1);
+      const [nine] = record(readFileSync(out, "utf8")).observations;
+      assert.deepEqual(nine, {
+        name: "9 MB in one request",
+        ok: false,
+        observed: "Upload up-1 read back as more than the 9000000 bytes sent.",
+      });
     } finally {
       await app.close();
     }

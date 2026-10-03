@@ -129,7 +129,11 @@ const uploadId = (body, what) => {
   return body.id;
 };
 
-/** Reads upload `id` back and compares its digest with the bytes sent. */
+/**
+ * Reads upload `id` back and compares its digest with the bytes sent. The body is hashed as it
+ * arrives and never held whole: more bytes than were sent fail at once, so an oversized or endless
+ * answer cannot exhaust memory. A body that breaks off or outlasts the timeout is a failed check.
+ */
 const readBack = async (origin, id, sent) => {
   const response = await request(
     origin,
@@ -141,11 +145,34 @@ const readBack = async (origin, id, sent) => {
     await response.body?.cancel();
     throw new CheckFailed(`Reading upload ${id} back returned ${response.status}.`);
   }
-  const stored = new Uint8Array(await response.arrayBuffer());
-  const storedSha = sha256(stored);
-  if (stored.byteLength !== sent.byteLength || storedSha !== sha256(sent)) {
+  if (response.body === null) throw new CheckFailed(`Reading upload ${id} back returned no body.`);
+  const hash = createHash("sha256");
+  let received = 0;
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > sent.byteLength) {
+        throw new CheckFailed(
+          `Upload ${id} read back as more than the ${sent.byteLength} bytes sent.`,
+        );
+      }
+      hash.update(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    if (error instanceof CheckFailed) throw error;
+    const reason = error instanceof Error ? error.name : "unknown error";
     throw new CheckFailed(
-      `Upload ${id} read back as ${stored.byteLength} bytes with SHA-256 ${storedSha}, ` +
+      `Reading upload ${id} back broke off after ${received} bytes: ${reason}.`,
+    );
+  }
+  const storedSha = hash.digest("hex");
+  if (received !== sent.byteLength || storedSha !== sha256(sent)) {
+    throw new CheckFailed(
+      `Upload ${id} read back as ${received} bytes with SHA-256 ${storedSha}, ` +
         `not the ${sent.byteLength} bytes sent.`,
     );
   }
@@ -249,16 +276,22 @@ const elevenInParts = async (origin) => {
   return `201 in ${parts} parts; read back intact (${body.byteLength} bytes, SHA-256 ${digest})`;
 };
 
+/** Runs one check. Any error is its failure, recorded rather than thrown, so the record is kept. */
 const observe = async (name, check) => {
   try {
     return { name, ok: true, observed: await check() };
   } catch (error) {
-    if (!(error instanceof CheckFailed)) throw error;
-    return { name, ok: false, observed: error.message };
+    return { name, ok: false, observed: failureReason(error) };
   }
 };
 
-/** Runs every check against `origin` and returns the record. Never throws for a failed check. */
+/** A failure's message when it is a {@link CheckFailed}; otherwise only the error's type. */
+const failureReason = (error) =>
+  error instanceof CheckFailed
+    ? error.message
+    : `Failed unexpectedly: ${error instanceof Error ? error.name : "unknown error"}.`;
+
+/** Runs every check against `origin` and returns the record. Never throws: a failure is recorded. */
 const verify = async ({ origin, expected, option }) => {
   const record = {
     app: origin,
@@ -274,8 +307,7 @@ const verify = async ({ origin, expected, option }) => {
   try {
     record.revisionBefore = await readRevision(origin);
   } catch (error) {
-    if (!(error instanceof CheckFailed)) throw error;
-    record.reason = error.message;
+    record.reason = failureReason(error);
     return record;
   }
   if (record.revisionBefore !== expected) {
@@ -291,8 +323,7 @@ const verify = async ({ origin, expected, option }) => {
   try {
     record.revisionAfter = await readRevision(origin);
   } catch (error) {
-    if (!(error instanceof CheckFailed)) throw error;
-    record.reason = `After the uploads: ${error.message}`;
+    record.reason = `After the uploads: ${failureReason(error)}`;
     return record;
   }
   if (record.revisionAfter !== expected) {

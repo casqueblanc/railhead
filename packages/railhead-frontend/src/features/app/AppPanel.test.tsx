@@ -65,7 +65,30 @@ describe("AppPanel", () => {
     expect(text()).not.toContain("Stale deployment");
     expect(container.querySelectorAll(`[title="${MAIN}"]`)).toHaveLength(2);
     expect(iframe()?.getAttribute("src")).toBe("https://upload.example.dev");
-    expect(iframe()?.getAttribute("sandbox")).toBe("allow-scripts allow-forms allow-same-origin");
+  });
+
+  it("embeds the app in an opaque-origin sandbox that cannot reach the board", async () => {
+    await render(
+      feedAt(MAIN),
+      fakeApp(() => Response.json({ revision: MAIN })),
+    );
+
+    const frame = iframe();
+    expect(frame?.getAttribute("sandbox")).toBe("allow-scripts allow-forms");
+    const tokens = frame?.getAttribute("sandbox")?.split(/\s+/) ?? [];
+    const forbidden = [
+      "allow-same-origin",
+      "allow-top-navigation",
+      "allow-top-navigation-by-user-activation",
+      "allow-top-navigation-to-custom-protocols",
+      "allow-popups",
+      "allow-popups-to-escape-sandbox",
+      "allow-modals",
+      "allow-downloads",
+    ];
+    expect(tokens.filter((token) => forbidden.includes(token))).toEqual([]);
+    expect(frame?.hasAttribute("allow")).toBe(false);
+    expect(frame?.getAttribute("referrerpolicy")).toBe("no-referrer");
   });
 
   it("marks an older deployment stale and names both commits", async () => {

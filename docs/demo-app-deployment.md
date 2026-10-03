@@ -6,7 +6,7 @@ The deployed app reports the main commit it was built from at `GET /api/revision
 
 ## What the app holds
 
-Its `wrangler.jsonc` declares the `UPLOADS` Durable Object and one plain-text var, `APP_REVISION`, which defaults to `unknown`. Nothing else. Do not add a secret, a service binding to Railhead, or any Railhead token to it: the app's code is written by agents and its revision route is readable from any origin.
+Its `wrangler.jsonc` declares the `UPLOADS` Durable Object and one plain-text var, `APP_REVISION`, which defaults to `unknown`. Nothing else. Do not add a secret, a service binding to Railhead, or any Railhead token to it: the app's code is written by agents, and its revision route and `POST /api/uploads` answer any origin. Uploads are open because the board embeds the app in a sandboxed frame with an opaque origin, from which the page's own upload is a cross-origin request.
 
 ## Deploy a landed commit
 
@@ -45,11 +45,11 @@ node scripts/verify-app-revision.mjs \
 Use `--option B` for H06. The script:
 
 - reads `/api/revision` and exits 1, uploading nothing, unless it is exactly `--expect`;
-- uploads 9 MB in one request and reads it back, comparing SHA-256;
+- uploads 9 MB in one request and reads it back, comparing SHA-256 as the bytes arrive and failing as soon as more come back than were sent;
 - for A, sends 11 MB in one request and expects 413 with `Files above 10 MB are not accepted`; for B, sends 11 MB through the chunked routes and reads it back;
 - reads `/api/revision` again and fails if the deployment changed during the run.
 
-It prints the record as JSON and writes it to `--out`. Exit 0 means every check held; 1 means one failed or the app could not be reached; 2 means the arguments are invalid. Keep the file with the run's evidence.
+It prints the record as JSON and writes it to `--out`, failures included: a read-back that breaks off or times out is a failed observation, not a crash. Exit 0 means every check held; 1 means one failed or the app could not be reached; 2 means the arguments are invalid. Keep the file with the run's evidence.
 
 Running it with the previous commit's SHA after a new deploy, or the new SHA against an app not yet redeployed, must exit 1. That is the check that the app on screen is the landed commit.
 
@@ -61,7 +61,7 @@ The board reads the app's URL when it is built, from `VITE_DEMO_APP_URL`:
 VITE_DEMO_APP_URL=https://railhead-demo-upload.<account subdomain>.workers.dev pnpm build
 ```
 
-Then deploy Railhead as usual. A board built without it says **No app configured**; one whose URL is the board's own origin is refused, since the embed lets the app run scripts. The section embeds the app and checks its revision every 30 seconds and whenever main moves, so a redeploy shows without a reload.
+Then deploy Railhead as usual. A board built without it says **No app configured**; one whose URL is the board's own origin is refused. The section embeds the app with `sandbox="allow-scripts allow-forms"`: the frame's origin is opaque, so the app cannot read the board's document, storage or session even if it navigates itself to the board, and it cannot navigate the board or open windows. It checks the app's revision every 30 seconds and whenever main moves, so a redeploy shows without a reload.
 
 ## What this does not prove
 

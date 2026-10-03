@@ -23,6 +23,9 @@ import { ShortSha } from "../claims/ShortSha";
 import { deploymentStatus, type AppLocation, type DeploymentStatus } from "./appRevision";
 import { useAppRevision } from "./useAppRevision";
 
+/** The only powers the embedded app gets: running its script and submitting its form. */
+export const APP_SANDBOX = "allow-scripts allow-forms";
+
 interface AppPanelProps {
   feed: BoardFeed;
   location: AppLocation;
@@ -98,7 +101,10 @@ const Deployment = ({ feed, origin, fetchRevision }: DeploymentProps) => {
         <iframe
           src={origin}
           title="The deployed demo app"
-          sandbox="allow-scripts allow-forms allow-same-origin"
+          // Agent-written code runs in here. Without allow-same-origin the frame has an opaque
+          // origin, so even a page that navigates itself to the board cannot reach the board's
+          // document, storage or session; it cannot navigate the board or open windows either.
+          sandbox={APP_SANDBOX}
           referrerPolicy="no-referrer"
           loading="lazy"
           className="h-80 w-full rounded-md border border-kumo-line bg-kumo-base"

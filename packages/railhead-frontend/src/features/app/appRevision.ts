@@ -17,8 +17,8 @@ export type AppLocation =
 
 /**
  * Reads the app's location from the build variable's value, which may be absent or malformed. The
- * board's own origin is refused: the app is embedded with scripts and its own origin allowed, which
- * is only safe while that origin is not the board's.
+ * board's own origin is refused: the app's revision would then be read with the board's authority,
+ * and an app served beside the board is not the separately deployed one this panel describes.
  */
 export const appLocation = (raw: unknown, boardOrigin: string): AppLocation => {
   if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {

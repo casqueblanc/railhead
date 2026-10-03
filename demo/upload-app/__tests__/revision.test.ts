@@ -50,3 +50,63 @@ describe("GET /api/revision", () => {
     }
   });
 });
+
+describe("uploads from the board's sandboxed frame", () => {
+  it("answers the preflight for a POST from an opaque origin", async () => {
+    const response = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "null",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type",
+      },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(response.headers.get("access-control-allow-methods")).toBe("POST");
+    expect(response.headers.get("access-control-allow-headers")).toBe("content-type");
+    expect(response.headers.get("access-control-max-age")).toBe("600");
+    expect(response.headers.get("access-control-allow-credentials")).toBeNull();
+  });
+
+  it("lets an opaque origin read both a stored upload and a refusal", async () => {
+    const stored = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      method: "POST",
+      headers: { origin: "null", "content-type": "application/octet-stream" },
+      body: new Uint8Array([1, 2, 3]),
+    });
+    expect(stored.status).toBe(201);
+    expect(stored.headers.get("access-control-allow-origin")).toBe("*");
+    expect(await stored.json()).toMatchObject({ size: 3 });
+
+    const empty = await SELF.fetch(`${ORIGIN}/api/uploads`, {
+      method: "POST",
+      headers: { origin: "null", "content-type": "application/octet-stream" },
+      body: new Uint8Array(),
+    });
+    expect(empty.status).toBe(400);
+    expect(empty.headers.get("access-control-allow-origin")).toBe("*");
+    expect(await empty.json()).toEqual({ error: "The file is empty." });
+  });
+
+  it("keeps every other route and method closed to other origins", async () => {
+    const cases: [string, string][] = [
+      ["OPTIONS", "/"],
+      ["OPTIONS", "/api/uploads/missing"],
+      ["GET", "/api/uploads"],
+    ];
+    for (const [method, path] of cases) {
+      const response = await SELF.fetch(`${ORIGIN}${path}`, {
+        method,
+        headers: { origin: "null" },
+      });
+      await response.body?.cancel();
+      expect({
+        method,
+        path,
+        status: response.status,
+        allowOrigin: response.headers.get("access-control-allow-origin"),
+      }).toEqual({ method, path, status: 405, allowOrigin: null });
+    }
+  });
+});
