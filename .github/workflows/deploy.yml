@@ -48,6 +48,10 @@ jobs:
             echo "::error::The ref does not resolve to a commit on main; only main's history is deployed"
             exit 1
           fi
+          if [ ! -f scripts/write-worker-secrets.mjs ]; then
+            echo "::error::The commit predates this deploy workflow; roll back to it with wrangler rollback instead"
+            exit 1
+          fi
 
       - name: Enable Corepack
         run: corepack enable
