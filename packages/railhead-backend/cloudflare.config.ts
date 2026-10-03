@@ -26,6 +26,10 @@ export default defineRailheadWorker({
     RELYING_PARTY_HOST: { type: "text", value: "railhead.mashin.workers.dev" },
     // The one-time token that opens enrollment of the first owner passkey, set by the operator.
     OWNER_BOOTSTRAP_TOKEN: bindings.secret(),
+    // The instance's session signing secret, set by the operator at deploy: at least 32 random
+    // characters. Each repository derives its challenge and token keys from it; without it agents
+    // cannot log in. Replacing it ends every session.
+    SESSION_SIGNING_SECRET: bindings.secret(),
   },
   exports: {
     Repo: { type: "durable-object", storage: "sqlite" },

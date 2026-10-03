@@ -1,7 +1,7 @@
 import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { newWebSocketRpcSession, type RpcTarget } from "capnweb";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_AGENT_REQUEST_BYTES,
   type AgentRouteName,
@@ -17,7 +17,7 @@ import type { AgentPrincipal } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import { parseAgentResponse } from "../src/contracts/wireShape";
 import { dispatchAgent, type AgentCommand } from "../src/gateway/agentDispatch";
-import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
+import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 
@@ -211,6 +211,7 @@ describe("unavailable modules", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => 0,
         env,
+        wake: () => {},
       });
       return Promise.all([
         ports.checks.start({
@@ -231,7 +232,6 @@ describe("unavailable modules", () => {
         ports.mainWriter.publish("int_intent01"),
         // Claims decide Git access themselves now; the Artifacts module behind them is missing.
         ports.artifacts.revokeTokens("rh-f-missing"),
-        ports.sessions.authenticate(TOKEN),
       ]);
     });
 
@@ -262,6 +262,7 @@ async function withFakePorts<R>(
       log: EventLog.open(state.storage, repoId),
       clock: () => 0,
       env,
+      wake: () => {},
     });
     const calls: string[] = [];
     const ports: RepoPorts = {
@@ -302,6 +303,61 @@ async function withFakePorts<R>(
     return body(ports, calls);
   });
 }
+
+describe("Repo alarm", () => {
+  it("resumes every module after one throws, logging the failure by name only", async () => {
+    const order: string[] = [];
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await resumeAll("rep_alarm0001", [
+        {
+          module: "train",
+          resume: async () => {
+            order.push("train");
+            throw new TypeError("secret port text");
+          },
+        },
+        {
+          module: "sandbox",
+          resume: async () => {
+            order.push("sandbox");
+          },
+        },
+      ]);
+      expect(order).toEqual(["train", "sandbox"]);
+      expect(logged.mock.calls).toEqual([
+        [
+          JSON.stringify({
+            event: "repo.resume_failed",
+            repo: "rep_alarm0001",
+            module: "train",
+            error: "TypeError",
+          }),
+        ],
+      ]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("resumes nothing for an empty list and lists the train for a composed Repo", async () => {
+    await expect(resumeAll("rep_alarm0001", [])).resolves.toBeUndefined();
+    const { stub, repoId } = await freshRepo();
+    const modules = await runInDurableObject(stub, (_instance, state) =>
+      resumables(
+        composeRepo({
+          repoId,
+          storage: state.storage,
+          log: EventLog.open(state.storage, repoId),
+          clock: () => 0,
+          env,
+          wake: () => {},
+        }),
+      ).map((entry) => entry.module),
+    );
+    expect(modules).toEqual(["train"]);
+  });
+});
 
 describe("agent dispatch", () => {
   const work: AgentCommand = { route: "work" };
@@ -487,8 +543,9 @@ describe("agent HTTP routes", () => {
       body,
       headers: { ...JSON_HEADERS, Authorization: `Bearer ${TOKEN}` },
     });
-    expect(withToken.status).toBe(503);
-    expect(await agentError(withToken, "claim")).toBe("unavailable");
+    // The token is not one this repository signed, whatever the body claims.
+    expect(withToken.status).toBe(401);
+    expect(await agentError(withToken, "claim")).toBe("unauthenticated");
     expect(await logHead(stub, repoId)).toBe(0);
   });
 
@@ -590,8 +647,9 @@ describe("agent HTTP routes", () => {
     const work = await agentRequest(name, "/work", {
       headers: { Authorization: `Bearer ${TOKEN}` },
     });
-    expect(work.status).toBe(503);
-    expect(await agentError(work, "work")).toBe("unavailable");
+    // A bodyless call reaches the Repo, whose sessions module refuses the unsigned token.
+    expect(work.status).toBe(401);
+    expect(await agentError(work, "work")).toBe("unauthenticated");
   });
 
   it("answer a repository nobody initialized with not_found", async () => {

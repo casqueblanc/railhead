@@ -108,7 +108,7 @@ async function withDecisions<R>(
   const { stub, repoId } = repo ?? (await freshRepo());
   return runInDurableObject(stub, async (_instance, state) => {
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env };
+    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let active: PortResult<ClaimView | null> = ok(claimView());
@@ -557,12 +557,12 @@ describe("record", () => {
           ),
         ).toMatchObject({ ok: false, code: "action_stale" });
       }
-      // Replacing the current answer belongs to supersession, which is not installed.
+      // Replacing the answer with the option it already chose records nothing.
       expect(
         await h.decisions.record(
-          h.grant({ decisionId, option: "reject", expectedVersion: 1 }, "chl_grant0003"),
+          h.grant({ decisionId, option: "chunk", expectedVersion: 1 }, "chl_grant0003"),
         ),
-      ).toMatchObject({ ok: false, code: "unavailable" });
+      ).toMatchObject({ ok: false, code: "invalid_request" });
 
       expect(types(h.events())).toEqual(["question.asked", "decision.recorded", "inbox.queued"]);
       expect(h.count("decision_versions")).toBe(1);

@@ -154,6 +154,11 @@ export interface TrainPort {
    * between this read and the write that relies on it is not a fence.
    */
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
+  /**
+   * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
+   * for the next wake itself. It never throws for a port's failure.
+   */
+  resume(): Promise<void>;
 }
 
 /**

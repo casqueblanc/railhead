@@ -44,10 +44,16 @@ const PORTS: [PortName, object][] = [
 const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
   ["decisions.currentVersions", null],
+  ["decisions.transfer", "throws"],
+  ["decisions.relied", "throws"],
+  ["decisions.obligations", null],
   ["inbox.queue", "throws"],
   ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
 ]);
+
+/** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */
+const RESUMERS = new Set(["train.resume"]);
 
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {
@@ -63,7 +69,10 @@ describe("unavailable ports", () => {
           sync.set(`${port}.${method}`, "throws");
           continue;
         }
-        if (result instanceof Promise) {
+        if (RESUMERS.has(`${port}.${method}`)) {
+          // The alarm's resume owes nothing while the module is missing, so it refuses nothing.
+          expect(await result, `${port}.${method}`).toBeUndefined();
+        } else if (result instanceof Promise) {
           expect(await result, `${port}.${method}`).toEqual(unavailable(port));
         } else {
           sync.set(`${port}.${method}`, result);
@@ -88,7 +97,14 @@ describe("unavailable ports", () => {
       stub,
       async (_instance, state) => {
         const log = EventLog.open(state.storage, repoId);
-        const ports = composeRepo({ repoId, storage: state.storage, log, clock: () => 0, env });
+        const ports = composeRepo({
+          repoId,
+          storage: state.storage,
+          log,
+          clock: () => 0,
+          env,
+          wake: () => {},
+        });
         // A30's fence reads these in the transaction that would write the intent. Each must say
         // unknown (`null`), never a generation or an empty decision list a record could match,
         // including for an empty claim id.

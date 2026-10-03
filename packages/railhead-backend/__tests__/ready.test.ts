@@ -80,7 +80,14 @@ function withReady<T>(
     const main = await mainRepoName(REPO);
     fake.seed(main, [ROOT, HEAD]);
     const log = EventLog.open(state.storage, REPO, fake.clock);
-    const context = { repoId: REPO, storage: state.storage, log, clock: fake.clock, env };
+    const context = {
+      repoId: REPO,
+      storage: state.storage,
+      log,
+      clock: fake.clock,
+      env,
+      wake: () => {},
+    };
     const base = composeRepo(context);
     const artifacts = world.artifacts
       ? createArtifactsAdapter(

@@ -65,13 +65,23 @@ export const unavailableInbox: InboxPort = {
   readyGateNow: () => null,
 };
 
-/** Decisions while its module is missing: no requirement list, so nothing is authorized. */
+/**
+ * Decisions while its module is missing: no requirement list, so nothing is authorized, and no
+ * dependency is moved or relied on, so its caller's transaction rolls back.
+ */
 export const unavailableDecisions: DecisionsPort = {
   ask: refuse("decisions"),
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  transfer: () => {
+    throw new UnavailableError("decisions");
+  },
+  relied: () => {
+    throw new UnavailableError("decisions");
+  },
+  obligations: () => null,
 };
 
 /** Artifacts while its module is missing. */
@@ -93,11 +103,15 @@ export const unavailableChecks: CheckPort = {
   start: refuse("checks"),
 };
 
-/** The train while its module is missing: no report is recorded and no attempt is known. */
+/**
+ * The train while its module is missing: no report is recorded, no attempt is known and nothing is
+ * owed, so `resume` does nothing.
+ */
 export const unavailableTrain: TrainPort = {
   enqueue: refuse("train"),
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  resume: async () => {},
 };
 
 /** Authorization while its module is missing: no intent is authorized. */
