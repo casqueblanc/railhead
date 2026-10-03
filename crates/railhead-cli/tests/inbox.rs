@@ -9,8 +9,8 @@ use std::fs;
 use std::io::{self, Read, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -180,8 +180,9 @@ const PATIENCE: Duration = Duration::from_secs(120);
 /// than any bound a test asserts, so a run stopped here had already failed.
 const OVERRUN: Duration = Duration::from_secs(30);
 
-/// A child process killed with its descendants and reaped if the test lets go of it while it
-/// runs, so a stalled `rh`, and any Git it started, fails its test instead of hanging the job.
+/// A child process, started as the leader of a process group of its own, killed with its
+/// descendants and reaped when the test lets go of it. A stalled `rh`, any Git it started, and any
+/// process left in its group after it exited fail the test instead of hanging the job.
 struct Reaped(Child);
 
 impl Drop for Reaped {
@@ -189,9 +190,7 @@ impl Drop for Reaped {
         // Drop cannot report a failure: a child that already exited is the outcome wanted, and the
         // wait reaps it either way.
         #[cfg(unix)]
-        if matches!(self.0.try_wait(), Ok(None)) {
-            kill_tree(self.0.id());
-        }
+        kill_tree(self.0.id(), matches!(self.0.try_wait(), Ok(None)));
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -207,17 +206,23 @@ fn signal(signal: &str, pid: u32) {
         .status();
 }
 
-/// Kills `root` and every process descended from it. `subprocess::run` starts each Git in a
-/// process group of its own, so a group signal would miss it; the tree is walked by parent
-/// instead. Each process found is stopped first, so none starts another after the walk saw it.
+/// Kills the process group `root` leads, `root` itself while `runs`, and every process descended
+/// from them. `subprocess::run` starts each Git in a process group of its own, so a group signal
+/// would miss it; the tree is walked by parent as well. A descendant orphaned by `root`'s exit is
+/// found through the group, which outlives its leader while a member runs; one that also left the
+/// group is out of reach once `root` has exited. Each process found is stopped first, so none
+/// starts another after the walk saw it.
 #[cfg(unix)]
-fn kill_tree(root: u32) {
-    let mut tree = vec![root];
-    signal("-STOP", root);
+fn kill_tree(root: u32, runs: bool) {
+    let mut tree = Vec::new();
+    if runs {
+        signal("-STOP", root);
+        tree.push(root);
+    }
     // Bounded: each round stops at least one new process or ends the walk.
     for _ in 0..64 {
         let Ok(table) = Command::new("ps")
-            .args(["-A", "-o", "pid=", "-o", "ppid="])
+            .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="])
             .stderr(Stdio::null())
             .output()
         else {
@@ -227,13 +232,17 @@ fn kill_tree(root: u32) {
             .lines()
             .filter_map(|line| {
                 let mut fields = line.split_whitespace().map(str::parse::<u32>);
-                match (fields.next(), fields.next()) {
-                    (Some(Ok(pid)), Some(Ok(parent))) => Some((pid, parent)),
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some(Ok(pid)), Some(Ok(parent)), Some(Ok(group))) => {
+                        Some((pid, parent, group))
+                    }
                     _ => None,
                 }
             })
-            .filter(|(pid, parent)| tree.contains(parent) && !tree.contains(pid))
-            .map(|(pid, _)| pid)
+            .filter(|(pid, parent, group)| {
+                (*group == root || tree.contains(parent)) && !tree.contains(pid)
+            })
+            .map(|(pid, _, _)| pid)
             .collect();
         if found.is_empty() {
             break;
@@ -248,21 +257,32 @@ fn kill_tree(root: u32) {
     }
 }
 
-/// Reads `pipe` to its end on a thread of its own, so a full pipe cannot stall the child.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<io::Result<Vec<u8>>> {
+/// Reads `pipe` to its end on a thread of its own, so a full pipe cannot stall the child. The
+/// thread ends when every holder of the pipe's write end has exited.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            pipe.read_to_end(&mut bytes)?;
-        }
-        Ok(bytes)
-    })
+        let read = match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
+            None => Ok(bytes),
+        };
+        // A receiver that gave up has already failed its test.
+        let _ = sender.send(read);
+    });
+    receiver
 }
 
-fn joined(reader: JoinHandle<io::Result<Vec<u8>>>) -> anyhow::Result<Vec<u8>> {
-    Ok(reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("a pipe reader panicked"))??)
+/// What `reader` read, or [`None`] when a descendant still held the pipe open at `until`.
+fn collected(
+    reader: &Receiver<io::Result<Vec<u8>>>,
+    until: Instant,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match reader.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        Ok(read) => Ok(Some(read?)),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+        Err(RecvTimeoutError::Disconnected) => anyhow::bail!("a pipe reader panicked"),
+    }
 }
 
 /// The debug-build gate `rh ask` holds its `--wait` at: `rh` writes `ready` in the directory and
@@ -288,7 +308,8 @@ impl Gate {
     }
 
     /// [`Gate::run`], stopping `rh` and failing when it has not reached its wait within `patience`,
-    /// or still runs `limit` after the gate opened.
+    /// or still runs `limit` after the gate opened. A descendant holding `rh`'s output open after
+    /// `rh` exited counts as `rh` still running.
     fn run_within(
         &self,
         mut command: Command,
@@ -296,6 +317,8 @@ impl Gate {
         limit: Duration,
     ) -> anyhow::Result<(Run, Instant, Instant)> {
         command.env("RH_TEST_WAIT_GATE", self.dir.path());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = Reaped(command.spawn()?);
         let stdout = drain(child.0.stdout.take());
         let stderr = drain(child.0.stderr.take());
@@ -303,7 +326,9 @@ impl Gate {
         let until = Instant::now() + patience;
         while !ready.exists() {
             if let Some(status) = child.0.try_wait()? {
-                let stderr = joined(stderr)?;
+                let stderr = collected(&stderr, until)?.ok_or_else(|| {
+                    anyhow::anyhow!("rh exited before its wait, its output still open {patience:?} after it started")
+                })?;
                 anyhow::bail!(
                     "rh exited before its wait: {status} {}",
                     String::from_utf8_lossy(&stderr)
@@ -332,10 +357,12 @@ impl Gate {
             std::thread::sleep(Duration::from_millis(5));
         };
         let exited = Instant::now();
+        let still_open =
+            || anyhow::anyhow!("rh's output was still open {limit:?} after its gate opened");
         let output = Output {
             status,
-            stdout: joined(stdout)?,
-            stderr: joined(stderr)?,
+            stdout: collected(&stdout, until)?.ok_or_else(still_open)?,
+            stderr: collected(&stderr, until)?.ok_or_else(still_open)?,
         };
         Ok((finish(&output)?, go, exited))
     }
@@ -468,6 +495,85 @@ fn a_stopped_run_takes_its_descendants_with_it() -> anyhow::Result<()> {
     );
     assert!(gone(&pid)?, "the stopped run still runs");
     assert!(gone(&descendant)?, "its descendant outlived it");
+    Ok(())
+}
+
+/// A shell standing in for an `rh` that leaves a sleeping descendant behind: the descendant stays
+/// in its process group, records its process id in `descendant` and holds `held` (`1` for stdout,
+/// `2` for stderr) open; the shell then runs `script` and exits with status 3.
+#[cfg(unix)]
+fn orphaning(descendant: &Path, held: u8, script: &str) -> Command {
+    let other = if held == 1 { 2 } else { 1 };
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            &format!(
+                "sh -c 'echo $$ > \"$1\"; exec sleep 600' sh '{descendant}' {other}>/dev/null & \
+                 while [ ! -s '{descendant}' ]; do sleep 0.01; done; {script} exit 3",
+                descendant = descendant.display(),
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descendant_holding_stderr_before_the_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let descendant = gate.dir.path().join("descendant");
+    let patience = Duration::from_secs(5);
+    let started = Instant::now();
+    let error = gate
+        .run_within(orphaning(&descendant, 2, ""), patience, PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh exited before its wait, its output still open 5s after it started")
+    );
+    assert!(
+        started.elapsed() < patience + OVERRUN,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(gate.go.get().is_none());
+    assert!(gone(&descendant)?, "the descendant outlived the run");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descendant_holding_stdout_after_the_gate_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let descendant = gate.dir.path().join("descendant");
+    // The shell exits only once the gate is open, so it is seen reaching its wait.
+    let script = format!(
+        "touch '{ready}'; while [ ! -e '{go}' ]; do sleep 0.01; done;",
+        ready = gate.dir.path().join("ready").display(),
+        go = gate.dir.path().join("go").display(),
+    );
+    let error = gate
+        .run_within(
+            orphaning(&descendant, 1, &script),
+            PATIENCE,
+            Duration::from_millis(300),
+        )
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh's output was still open 300ms after its gate opened")
+    );
+    let go = gate
+        .go
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("the gate never opened"))?;
+    assert!(go.elapsed() < OVERRUN, "{:?}", go.elapsed());
+    assert!(gone(&descendant)?, "the descendant outlived the run");
     Ok(())
 }
 
