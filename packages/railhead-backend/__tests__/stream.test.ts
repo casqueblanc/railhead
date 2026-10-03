@@ -853,14 +853,15 @@ async function freeSlots(taken: Awaited<ReturnType<typeof takeSlots>>): Promise<
   }
 }
 
-/** Subscribes `listener` once the board's last slot frees, retrying for at most `ms`. */
+/** Subscribes `listener` from `cursor` once the board's last slot frees, retrying for at most `ms`. */
 async function boardSubscribeWhenFree(
   board: RpcStub<BoardApi>,
   listener: BoardListener,
+  cursor = 0,
   ms = 5_000,
 ) {
   for (let waited = 0; ; waited += 5) {
-    const result = await board.subscribe(0, listener);
+    const result = await board.subscribe(cursor, listener);
     if (result.ok) return result.value;
     if (result.code !== "quota_exceeded" || waited > ms) {
       throw new Error(`expected a free slot, got ${result.code}`);
@@ -1003,6 +1004,123 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
     expect(handle).toBeDefined();
     expect(reused).toBeDefined();
     await freeSlots(taken);
+    api[Symbol.dispose]();
+  });
+});
+
+// A log the Repo cannot read, through the Worker. Replay refuses an event whose stored schema
+// version it does not support, as it refuses one that is missing.
+
+/** Sets the stored schema version of event `seq`; 1 is the supported one. */
+async function setSchemaVersion(
+  stub: DurableObjectStub<Repo>,
+  seq: number,
+  version: number,
+): Promise<void> {
+  await runInDurableObject(stub, (_instance, state) => {
+    state.storage.sql.exec(
+      "UPDATE events SET body = json_set(body, '$.v', ?) WHERE seq = ?",
+      version,
+      seq,
+    );
+  });
+}
+
+/** Appends one event that is unreadable from the moment it commits, as the observer reads it. */
+async function appendUnreadable(stub: DurableObjectStub<Repo>, repoId: string): Promise<number> {
+  return runInDurableObject(stub, (_instance, state) => {
+    const { value: seq } = EventLog.open(state.storage, repoId).transaction((tx) => {
+      const event = tx.append(HUMAN, issue(0));
+      state.storage.sql.exec(
+        "UPDATE events SET body = json_set(body, '$.v', 2) WHERE seq = ?",
+        event.seq,
+      );
+      return event.seq;
+    });
+    return seq;
+  });
+}
+
+describe("board subscriptions over a log the Repo cannot read", () => {
+  it("ends with restart before an unreadable event, releases both sides, and resumes once it reads", async () => {
+    const { name, stub, repoId } = await freshRepo();
+    await appendIn(stub, repoId, 3);
+    await setSchemaVersion(stub, 3, 2);
+    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const { session, api } = await countedSession();
+    using board = value(await api.openBoard("acme", name));
+    const baseline = session.getStats().exports;
+    const failed = new ScriptedBoard(async () => {});
+
+    // The board keeps the ended handle; the Repo frees the slot regardless.
+    using handle = value(await board.subscribe(2, failed));
+    await waitFor(() => failed.ends.length === 1);
+    await waitFor(() => session.getStats().exports === baseline);
+    // From the head, which reads nothing, so this subscription stays live and holds the slot.
+    const reused = await boardSubscribeWhenFree(board, new ScriptedBoard(async () => {}), 3);
+    await settle();
+
+    expect(failed.ends).toEqual(["restart"]);
+    expect(failed.deliveries).toBe(0);
+    expect(await board.subscribe(0, new ScriptedBoard(never))).toMatchObject({
+      ok: false,
+      code: "quota_exceeded",
+    });
+    await handle.cancel();
+    reused[Symbol.dispose]();
+    await freeSlots(taken);
+
+    // The board resumes from the last cursor it applied once the event reads again.
+    await setSchemaVersion(stub, 3, 1);
+    const resumed = new BoardRecorder();
+    using live = value(await board.subscribe(2, resumed));
+    await appendIn(stub, repoId, 1);
+    await waitFor(() => resumed.seqs.length === 2);
+    await settle();
+
+    expect(resumed.seqs).toEqual([3, 4]);
+    expect(resumed.ends).toEqual([]);
+    await live.cancel();
+    api[Symbol.dispose]();
+  });
+
+  it("ends an established subscription with restart when a later event is unreadable", async () => {
+    const { name, stub, repoId } = await freshRepo();
+    await appendIn(stub, repoId, 2);
+    const taken = await takeSlots(stub, MAX_SUBSCRIPTIONS - 1);
+    const { session, api } = await countedSession();
+    using board = value(await api.openBoard("acme", name));
+    const baseline = session.getStats().exports;
+    const listener = new BoardRecorder();
+
+    using handle = value(await board.subscribe(0, listener));
+    await waitFor(() => listener.seqs.length === 2);
+    const unreadable = await appendUnreadable(stub, repoId);
+    await waitFor(() => listener.ends.length === 1);
+    await waitFor(() => session.getStats().exports === baseline);
+    using reused = await boardSubscribeWhenFree(board, new ScriptedBoard(async () => {}), 3);
+    await settle();
+
+    expect(unreadable).toBe(3);
+    expect(listener.seqs).toEqual([1, 2]);
+    expect(listener.ends).toEqual(["restart"]);
+    expect(await board.subscribe(3, new ScriptedBoard(never))).toMatchObject({
+      ok: false,
+      code: "quota_exceeded",
+    });
+    await handle.cancel();
+    await reused.cancel();
+    await freeSlots(taken);
+
+    await setSchemaVersion(stub, unreadable, 1);
+    const resumed = new BoardRecorder();
+    using live = value(await board.subscribe(2, resumed));
+    await waitFor(() => resumed.seqs.length === 1);
+    await settle();
+
+    expect(resumed.seqs).toEqual([3]);
+    expect(resumed.ends).toEqual([]);
+    await live.cancel();
     api[Symbol.dispose]();
   });
 });
