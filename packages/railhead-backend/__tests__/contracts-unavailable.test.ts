@@ -48,6 +48,7 @@ const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
   ["claims.workingGeneration", null],
   ["claims.workingEpisode", null],
+  ["claims.readyPin", null],
   ["decisions.currentVersions", null],
   ["decisions.transfer", "throws"],
   ["decisions.relied", "throws"],
@@ -55,6 +56,7 @@ const SYNC = new Map<string, unknown>([
   ["inbox.queue", "throws"],
   ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
+  ["train.hasEntry", null],
   ["train.queue", "throws"],
 ]);
 
@@ -122,6 +124,7 @@ describe("unavailable ports", () => {
             ports.claims.workingGeneration("clm_claim001"),
             ports.claims.workingEpisode("clm_claim001"),
           ],
+          ready: ports.claims.readyPin("clm_claim001"),
           decisions: ports.decisions.currentVersions("clm_claim001"),
         }));
         return {
@@ -133,7 +136,12 @@ describe("unavailable ports", () => {
       },
     );
 
-    expect(read).toEqual({ attempt: null, generations: [null, null, null, null], decisions: null });
+    expect(read).toEqual({
+      attempt: null,
+      generations: [null, null, null, null],
+      ready: null,
+      decisions: null,
+    });
     expect(appended).toBe(0);
     expect(head).toBe(0);
     expect(authorized).toEqual(unavailable("authorization"));

@@ -7,9 +7,10 @@
 // records a pass the runner did not report, and a failed batch's pins are composed and checked
 // again rather than inheriting any part of its result.
 //
-// A pin is queued only inside the transaction that records `ready`, and the Repo's alarm drives
-// the train once it commits; each `recordCheck` drives it at once. A drive runs until the train
-// waits for a check report or a port, or the queue is empty. Whenever storage holds work the train
+// A pin is queued only inside the transaction that records `ready`, or that repeats it for a pin
+// with no entry, and the Repo's alarm drives the train once it commits; each `recordCheck` drives
+// it at once. A drive runs until the train waits for a check report or a port, or the queue is
+// empty. Whenever storage holds work the train
 // owes (an active batch or a queued pin), it also holds a wake row and the Repo's alarm is set for
 // it. `recordDebt` is the only writer of that row, and it writes inside the transaction that
 // creates or restarts the debt: accepting work records it due now with the alarm due now, and
@@ -71,6 +72,7 @@ import {
   MAX_CHECK_NAME_LENGTH,
   MAX_PATH_LENGTH,
   type Actor,
+  type ClaimId,
   type CommitSha,
   type CheckRunId,
   type DecisionRef,
@@ -94,6 +96,7 @@ import type {
 } from "../../contracts/train";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import type { EventTransaction } from "../../repo/eventLog";
+import { checkFence, type FenceReaders } from "../../train/authorize";
 import {
   activeBatch,
   batchByAttempt,
@@ -306,6 +309,11 @@ export function createTrain(
   const { log, clock } = context;
   const sql = context.storage.sql;
   let running: Running | null = null;
+  const fenceReaders: FenceReaders = {
+    currentGeneration: (claimId) => ports().claims.currentGeneration(claimId),
+    currentVersions: (claimId) => ports().decisions.currentVersions(claimId),
+    readyPin: (claimId) => ports().claims.readyPin(claimId),
+  };
   let discarding: Promise<void> | null = null;
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
@@ -565,15 +573,17 @@ export function createTrain(
 
     const pins = members.map((entry) => entry.pin);
     const now = clock();
+    const decisions = uniqueDecisions(required);
     fenced(generation, () => {
       // A pin queued during the reads above may have changed an entry; form again from storage.
       const unchanged = members.every((entry) => stillObserved(entry));
       if (!unchanged || activeBatch(sql) !== null) return;
-      insertBatch(
-        sql,
-        { expectedMain: main.value, pins, decisions: uniqueDecisions(required), definition },
-        now,
-      );
+      // A decision recorded during those reads may have superseded a pin. Each claim must still be
+      // ready at its entry's episode with a clear inbox gate, under exactly `decisions`; otherwise
+      // the next form reads its pin again, which reopens a superseded claim and drops its entry.
+      if (!members.every((entry) => stillReady(entry))) return;
+      if (!checkFence(fenceReaders, pins, decisions, null).ok) return;
+      insertBatch(sql, { expectedMain: main.value, pins, decisions, definition }, now);
     });
     return CONTINUE;
   }
@@ -908,6 +918,19 @@ export function createTrain(
   }
 
   /**
+   * Whether the claim of the waiting entry `observed` is still ready at the entry's episode with a
+   * clear inbox gate. A fence read: call it inside the transaction whose write relies on it.
+   */
+  function stillReady(observed: QueueEntry): boolean {
+    const { claimId, generation } = observed.pin;
+    const ready = ports().claims.readyPin(claimId);
+    return (
+      ready?.episode === observed.episode &&
+      ports().inbox.readyGateNow(claimId, generation)?.kind === "clear"
+    );
+  }
+
+  /**
    * Drives without throwing, so a port that rejects or a broken invariant cannot turn a committed
    * result into a thrown error; the drive has already asked for its retry. The error is logged by
    * name only, never with its message, which may carry a port's text.
@@ -1036,6 +1059,10 @@ export function createTrain(
     };
   }
 
+  function hasEntry(claimId: ClaimId, generation: number): boolean {
+    return readEntry(sql, claimId, generation) !== null;
+  }
+
   function queue(
     _tx: EventTransaction,
     pin: ClaimPin,
@@ -1156,6 +1183,7 @@ export function createTrain(
     queue,
     recordCheck,
     attemptOutcome,
+    hasEntry,
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),

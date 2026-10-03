@@ -8,6 +8,7 @@ import {
   type DecisionRef,
   type MainOutcome,
 } from "@railhead/shared/events";
+import type { ReadyPin } from "../src/contracts/claims";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -50,6 +51,7 @@ const CANDIDATE_B = "b".repeat(40);
 const TIMEOUT_MS = 50;
 const CLAIM_A: ClaimId = "clm_claim001";
 const CLAIM_B: ClaimId = "clm_claim002";
+const CLAIM_C: ClaimId = "clm_claim003";
 const DEC_FORMAT: DecisionRef = { decisionId: "dec_format01", version: 1 };
 
 /** How the fake ref answers one conditional update. */
@@ -131,20 +133,37 @@ class World {
   generations = new Map<ClaimId, number>([
     [CLAIM_A, 1],
     [CLAIM_B, 3],
+    [CLAIM_C, 1],
   ]);
   versions = new Map<ClaimId, DecisionRef[] | null>([
     [CLAIM_A, [DEC_FORMAT]],
     [CLAIM_B, []],
+    [CLAIM_C, []],
   ]);
+  /** Each ready claim's pinned commit; a claim missing here is not ready. */
+  ready = new Map<ClaimId, CommitSha>([
+    [CLAIM_A, "1".repeat(40)],
+    [CLAIM_B, "2".repeat(40)],
+    [CLAIM_C, "3".repeat(40)],
+  ]);
+
+  /** The claim's ready pin, recorded under the versions current now. */
+  readyPin(claimId: ClaimId): ReadyPin | null {
+    const commit = this.ready.get(claimId);
+    const generation = this.generations.get(claimId);
+    const decisions = this.versions.get(claimId) ?? null;
+    if (commit === undefined || generation === undefined || decisions === null) return null;
+    return { pin: { claimId, generation, commit }, episode: 1, decisions };
+  }
 }
 
-/** The second intent's attempt: claim B alone, composed on `expectedMain`. */
+/** The second intent's attempt: claim C alone, composed on `expectedMain`. */
 function attemptB(expectedMain: CommitSha): CheckAttempt {
   return {
     attemptId: ATTEMPT_B,
     expectedMain,
     candidate: CANDIDATE_B,
-    pins: [{ claimId: CLAIM_B, generation: 3, commit: "3".repeat(40) }],
+    pins: [{ claimId: CLAIM_C, generation: 1, commit: "3".repeat(40) }],
     definition: { name: "upload", source: expectedMain, digest: "d".repeat(64), acceptance: null },
     decisions: [],
     createdAt: NOW - 60_000,
@@ -216,6 +235,7 @@ function harness(
     },
     currentGeneration: (claimId) => world.generations.get(claimId) ?? null,
     currentVersions: (claimId) => world.versions.get(claimId) ?? null,
+    readyPin: (claimId) => world.readyPin(claimId),
   };
   const authorization: AuthorizationPort = createAuthorization(
     { storage, log, clock },
@@ -381,6 +401,7 @@ describe("publish refuses invalid input", () => {
           attemptOutcome: () => null,
           currentGeneration: () => null,
           currentVersions: () => null,
+          readyPin: () => null,
         }),
         ref,
       );
@@ -567,6 +588,29 @@ describe("publish fences claims and decisions", () => {
         expect(ref.updates).toHaveLength(0);
         expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
         expect(h.log.head()).toBe(1);
+      },
+      world,
+    );
+  });
+
+  it("refuses when a claim is no longer ready with its pinned commit", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    await withIntent(
+      ref,
+      async (h) => {
+        world.ready.set(CLAIM_B, "9".repeat(40));
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        world.ready.delete(CLAIM_B);
+        expect(await h.writer.publish(INTENT)).toMatchObject({
+          ok: false,
+          code: "decision_superseded",
+        });
+        expect(ref.updates).toHaveLength(0);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord());
       },
       world,
     );

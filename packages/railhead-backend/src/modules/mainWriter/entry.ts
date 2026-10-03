@@ -15,6 +15,7 @@ export const mainWriter: MainWriterFactory = (context, ports, mainRef) =>
         attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
         currentGeneration: (claimId) => claims.currentGeneration(claimId),
         currentVersions: (claimId) => decisions.currentVersions(claimId),
+        readyPin: (claimId) => claims.readyPin(claimId),
       };
     },
     mainRef,

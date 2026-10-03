@@ -9,6 +9,7 @@ import type { CheckDetail } from "@railhead/shared/board-api";
 import type {
   CheckResult,
   CheckRunId,
+  ClaimId,
   CommitSha,
   DecisionRef,
   IntentId,
@@ -199,7 +200,7 @@ export interface AttemptOutcome {
 /**
  * The train's queue and its check bookkeeping.
  *
- * `attemptOutcome` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * `attemptOutcome` and `hasEntry` are fence readers: each is synchronous and reads only the Repo's storage, so a
  * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
  * until that transaction commits. Read outside a transaction, the result may already be stale.
  */
@@ -216,7 +217,8 @@ export interface TrainPort {
    * to an older read. Every accepted pin asks for a drive, restarting a wake whose retries ran out.
    * A pin of an older generation than one queued is `stale_generation`. A refusal writes nothing; a
    * missing module throws, so the caller's transaction rolls back. Only the claims module calls it,
-   * in the transaction that records `ready`.
+   * in the transaction that records `ready`, or that answers a repeated `ready` when `hasEntry`
+   * finds no entry.
    */
   queue(tx: EventTransaction, pin: ClaimPin, episode: number): PortResult<{ queued: boolean }>;
   /** Records a runner's report if it matches its persisted attempt; otherwise `check_mismatch`. */
@@ -227,6 +229,12 @@ export interface TrainPort {
    * between this read and the write that relies on it is not a fence.
    */
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
+  /**
+   * Whether the queue holds an entry, in any state, for the claim at `generation`, or `null` when the
+   * module is missing. Call it only inside the caller's transaction. The claims module reads it when
+   * a ready claim is marked ready again, to queue a pin that never reached the train.
+   */
+  hasEntry(claimId: ClaimId, generation: number): boolean | null;
   /**
    * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
    * for the next wake itself. It never throws for a port's failure.

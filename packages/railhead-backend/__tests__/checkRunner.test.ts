@@ -1451,8 +1451,17 @@ describe("a held check through the train", () => {
       const composed = composeRepo(context);
       const ports = (): RepoPorts => ({
         ...composed,
-        claims: { ...composed.claims, pin: async () => ok(pin) },
-        decisions: { ...composed.decisions, requirements: async () => ok([]) },
+        claims: {
+          ...composed.claims,
+          pin: async () => ok(pin),
+          currentGeneration: () => pin.generation,
+          readyPin: () => ({ pin, episode: 1, decisions: [] }),
+        },
+        decisions: {
+          ...composed.decisions,
+          requirements: async () => ok([]),
+          currentVersions: () => [],
+        },
         mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
         merge: {
           compose: async () => ok({ kind: "clean", candidate: CANDIDATE }),
@@ -1461,7 +1470,7 @@ describe("a held check through the train", () => {
       });
       const train = queueing(createTrain(context, ports), context.log);
 
-      await train.enqueue(pin);
+      await train.enqueue(pin, 1);
       const first = train.batches(1)[0];
       const blockedOutcome = await train.drive();
       const wakeWhileHeld = wakes.at(-1);

@@ -61,6 +61,8 @@ interface Setup {
   composed: ClaimPin[][];
   /** Every check attempt started, oldest first. */
   started: CheckAttempt[];
+  /** Every merge intent the main writer was asked to publish, oldest first. */
+  published: string[];
   /** The claim's queue entries and their states. */
   entries(): { commit: string; state: string; next: string | null }[];
   /** Files an issue and claims it for agent 1, with `commits` pushed to its fork. */
@@ -137,6 +139,7 @@ function withHandoff<T>(
     };
     const composed: ClaimPin[][] = [];
     const started: CheckAttempt[] = [];
+    const published: string[] = [];
     let held: { reach(): void; released: Promise<void> } | null = null;
     const base = composeRepo(context);
     const claims = createClaims(context, () => ports);
@@ -147,6 +150,7 @@ function withHandoff<T>(
       attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
       currentGeneration: (claimId) => claims.currentGeneration(claimId),
       currentVersions: (claimId) => decisions.currentVersions(claimId),
+      readyPin: (claimId) => claims.readyPin(claimId),
     });
     const ports: RepoPorts = {
       ...base,
@@ -174,6 +178,10 @@ function withHandoff<T>(
       mainWriter: {
         ...base.mainWriter,
         head: async () => (setup.mainUp ? ok(MAIN) : fail("unavailable", "Main cannot be read.")),
+        publish: async (intentId) => {
+          published.push(intentId);
+          return base.mainWriter.publish(intentId);
+        },
       },
       checks: {
         definitions: async (main) =>
@@ -209,6 +217,7 @@ function withHandoff<T>(
       wakes,
       composed,
       started,
+      published,
       entries: () =>
         train.entries(64).map((entry) => ({
           commit: entry.pin.commit,
@@ -436,6 +445,76 @@ describe("ready hands its pin to the train", () => {
     });
   });
 
+  it("queues a ready pin the train never received when the ready is repeated, once", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      // A ready claim with no queue entry, as a pin whose handoff was lost would leave it.
+      setup.sql.exec("DELETE FROM train_queue");
+      setup.sql.exec("DELETE FROM train_wake");
+      const head = setup.log.head();
+
+      const repaired = await setup.claims.ready(agent(1), claim.claimId, request);
+      const again = await setup.claims.ready(agent(1), claim.claimId, request);
+
+      expect(repaired).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(again).toMatchObject({ ok: true, value: { repeated: true } });
+      expect(setup.log.head()).toBe(head);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+      expect(readWake(setup.sql)).not.toBeNull();
+
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.composed).toEqual([[pin]]);
+      expect(setup.started).toHaveLength(1);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+    });
+  });
+
+  it("queues nothing for a repeated ready whose pin a newer decision superseded", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      setup.sql.exec("DELETE FROM train_queue");
+      await setup.decide(claim.claimId, first.decisionId);
+
+      // The repeat reopens the superseded pin and is refused at the unacknowledged version.
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+      ).toMatchObject({ ok: false, code: "unacked_decision" });
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.entries()).toEqual([]);
+    });
+  });
+
+  it("answers a repeated ready while the train is missing without queuing", async () => {
+    let missing = false;
+    await withHandoff(
+      async (setup) => {
+        const claim = await setup.open(WORK);
+        const request = { generation: 1, commit: WORK };
+        expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+        setup.sql.exec("DELETE FROM train_queue");
+        missing = true;
+
+        expect(await setup.claims.ready(agent(1), claim.claimId, request)).toMatchObject({
+          ok: true,
+          value: { repeated: true },
+        });
+        expect(setup.entries()).toEqual([]);
+      },
+      (train) => ({
+        ...train,
+        hasEntry: (claimId, generation) =>
+          missing
+            ? unavailableTrain.hasEntry(claimId, generation)
+            : train.hasEntry(claimId, generation),
+        queue: (tx, pin, episode) =>
+          missing ? unavailableTrain.queue(tx, pin, episode) : train.queue(tx, pin, episode),
+      }),
+    );
+  });
+
   it("records no ready while the train is missing", async () => {
     await withHandoff(
       async (setup) => {
@@ -535,6 +614,33 @@ describe("a re-ready after a superseded decision", () => {
       expect(setup.composed).toEqual([[pin]]);
       expect(setup.started.at(-1)).toMatchObject({ pins: [pin], decisions: [second] });
       expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+    });
+  });
+
+  it("forms no batch for a pin a decision superseded after the train read it", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+
+      // The train reads the pin under version 1; a version 2 is recorded before the batch forms.
+      const hold = setup.holdNextPin();
+      const drive = setup.train.resume();
+      await hold.reached;
+      await setup.decide(claim.claimId, first.decisionId);
+      hold.release();
+      await drive;
+
+      // The next read reopens the superseded claim and drops its entry. Nothing was checked,
+      // authorized or published for the old pin.
+      expect(setup.train.batches(8)).toEqual([]);
+      expect(setup.composed).toEqual([]);
+      expect(setup.started).toEqual([]);
+      expect(setup.published).toEqual([]);
+      const events = setup.log.replay(0, 64).events.map((event) => event.type);
+      expect(events).not.toContain("train.intent");
+      expect(events).not.toContain("train.main");
+      expect(events.at(-1)).toBe("claim.reopened");
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "dropped", next: null }]);
     });
   });
 

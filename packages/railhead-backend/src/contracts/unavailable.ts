@@ -51,6 +51,7 @@ export const unavailableClaims: ClaimsPort = {
   currentGeneration: () => null,
   workingGeneration: () => null,
   workingEpisode: () => null,
+  readyPin: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
 };
@@ -118,6 +119,7 @@ export const unavailableTrain: TrainPort = {
   },
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  hasEntry: () => null,
   resume: async () => {},
 };
 

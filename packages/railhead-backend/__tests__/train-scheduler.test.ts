@@ -36,6 +36,7 @@ import {
 import {
   insertEntry,
   migrateTrain,
+  readEntry,
   readWake,
   writeWake,
   type PendingWake,
@@ -142,7 +143,11 @@ class Fakes {
     };
   }
 
-  ports(real: RepoPorts): RepoPorts {
+  /**
+   * The ports the train sees. A ready pin's fence readers follow `pins` and `requirements`, at the
+   * episode its queue entry in `sql` holds, so a test that changes either changes what they answer.
+   */
+  ports(real: RepoPorts, sql: SqlStorage): RepoPorts {
     return {
       ...real,
       claims: {
@@ -151,6 +156,18 @@ class Fakes {
           await this.answer("claims.pin");
           const current = this.pins.get(claimId);
           return current === undefined ? fail("not_found", "No such claim.") : ok(current);
+        },
+        currentGeneration: (claimId) => this.pins.get(claimId)?.generation ?? null,
+        readyPin: (claimId) => {
+          const current = this.pins.get(claimId);
+          if (current === undefined) return null;
+          const entry = readEntry(sql, claimId, current.generation);
+          if (entry === null) return null;
+          return {
+            pin: current,
+            episode: entry.episode,
+            decisions: this.requirements.get(claimId) ?? [],
+          };
         },
       },
       decisions: {
@@ -301,7 +318,7 @@ function withTrain<R>(body: (harness: Harness) => Promise<R>, fakes = new Fakes(
       env,
       wake: (at) => (forDiscard(at) ? discardWakes : wakes).push(at),
     };
-    const ports = fakes.ports(composeRepo(context));
+    const ports = fakes.ports(composeRepo(context), state.storage.sql);
     const build = () =>
       queueing(
         createTrain(context, () => ports, fakes.portTimeoutMs),

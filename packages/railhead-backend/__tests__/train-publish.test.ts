@@ -6,7 +6,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { CommitSha, RailheadEvent } from "@railhead/shared/events";
-import type { ClaimPin } from "../src/contracts/claims";
+import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import type {
   AuthorizationPort,
@@ -21,7 +21,7 @@ import {
   MAX_WRITE_ATTEMPTS,
 } from "../src/modules/mainWriter/mainWriter";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
-import { readWake } from "../src/modules/train/store";
+import { readEntry, readWake } from "../src/modules/train/store";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { createAuthorization } from "../src/train/authorize";
@@ -159,10 +159,19 @@ function withRepo<R>(
     const currentVersions = (claimId: string): [] | null => (current.has(claimId) ? [] : null);
     const started: CheckAttempt[] = [];
     const real = composeRepo(context);
+    const readyPin = (claimId: string): ReadyPin | null => {
+      const found = current.get(claimId);
+      const entry =
+        found === undefined ? null : readEntry(state.storage.sql, claimId, found.generation);
+      return found === undefined || entry === null
+        ? null
+        : { pin: found, episode: entry.episode, decisions: [] };
+    };
     const readers = {
       attemptOutcome: (attemptId: string) => train.attemptOutcome(attemptId),
       currentGeneration,
       currentVersions,
+      readyPin,
     };
     const authorization = createAuthorization(context, readers);
     const mainWriter: MainWriterPort = createMainWriter(
@@ -179,8 +188,10 @@ function withRepo<R>(
           const found = current.get(claimId);
           return found === undefined ? fail("not_found", "No such claim.") : ok(found);
         },
+        currentGeneration,
+        readyPin,
       },
-      decisions: { ...real.decisions, requirements: async () => ok([]) },
+      decisions: { ...real.decisions, requirements: async () => ok([]), currentVersions },
       merge: {
         compose: async (main, composed) =>
           ok({ kind: "clean", candidate: candidateOf(main, composed) }),

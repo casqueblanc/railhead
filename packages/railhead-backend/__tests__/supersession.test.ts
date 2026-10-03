@@ -355,6 +355,11 @@ function authorizer(h: Harness, scheduled: CheckAttempt): AuthorizationPort {
           : null,
       currentGeneration: (claimId) => h.ports().claims.currentGeneration(claimId),
       currentVersions: (claimId) => h.decisions.currentVersions(claimId),
+      // Each pin is ready under the versions the check was scheduled under.
+      readyPin: (claimId) => {
+        const pin = scheduled.pins.find((scheduledPin) => scheduledPin.claimId === claimId);
+        return pin === undefined ? null : { pin, episode: 1, decisions: scheduled.decisions };
+      },
     },
     () => "int_intent01",
   );
