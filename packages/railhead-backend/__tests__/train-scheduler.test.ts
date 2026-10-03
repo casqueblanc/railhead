@@ -1073,7 +1073,7 @@ describe("train conflict questions", () => {
       expect(wakes.at(-1)).toBe(wake.dueAt);
       wakes.length = 0;
       const again = restart();
-      expect(await again.startup).toBe(true);
+      expect(await again.startup()).toBe(true);
       expect(wakes).toEqual([wake.dueAt]);
     }, fakes);
   });
