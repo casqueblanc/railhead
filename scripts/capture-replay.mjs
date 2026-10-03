@@ -7,7 +7,9 @@
 // `readEvents` page by page) and needs no credential: it takes none, sends none and writes none.
 // The origin is reduced to scheme, host and port, so a user name, password, path or query given
 // with it never reaches the file. Each event is copied field by field and validated by the board's
-// capture module before anything is written, and an existing file is never overwritten.
+// capture module before anything is written. The file appears whole or not at all, and an
+// existing file is never replaced (see `write-new-file.ts`): a capture killed partway can leave a
+// `.<file>.<uuid>.partial` file beside the output, which is safe to delete.
 //
 // The file is labelled `captured` with its origin, repository and time. Only a capture a person
 // made this way from a real run may be called a captured run; development fixtures are labelled
@@ -17,7 +19,6 @@
 // is untrusted.
 
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { newWebSocketRpcSession } from "capnweb";
 import { API_PATH } from "../packages/railhead-shared/src/api.ts";
@@ -26,6 +27,7 @@ import {
   captureLog,
   serializeCapture,
 } from "../packages/railhead-frontend/src/features/replay/captureFile.ts";
+import { writeNewFile } from "./write-new-file.ts";
 
 /** Longest a single backend call may take before the capture fails, in milliseconds. */
 const CALL_TIMEOUT_MS = 30_000;
@@ -86,7 +88,7 @@ const parseOptions = (argv) => {
   ) {
     throw new CaptureFailure("--repo must be <org>/<name>");
   }
-  // Checked again when writing, with `wx`; this only saves a capture that could not be kept.
+  // Checked again when publishing the file; this only saves a capture that could not be kept.
   if (existsSync(out)) throw new CaptureFailure(`${out} already exists; choose a new file`);
   return { origin: url.origin, org, name, out };
 };
@@ -127,15 +129,20 @@ const capture = async ({ origin, org, name, out }) => {
     if (!result.ok) throw new CaptureFailure(captureErrorText(result.error));
     const serialized = serializeCapture(result.capture);
     if (!serialized.ok) throw new CaptureFailure(captureErrorText(serialized.error));
-    try {
-      await writeFile(out, serialized.text, { flag: "wx" });
-    } catch (error) {
-      const code = error instanceof Error && "code" in error ? String(error.code) : "unknown";
-      throw new CaptureFailure(
-        `could not write ${out} (${code}); an existing file is never replaced`,
-      );
+    const written = await writeNewFile(out, serialized.text);
+    const leftover =
+      written.leftover === null ? "" : `; remove the temporary file ${written.leftover}`;
+    switch (written.kind) {
+      case "written":
+        if (leftover !== "") process.stderr.write(`capture-replay: wrote ${out}${leftover}\n`);
+        return result.capture;
+      case "exists":
+        throw new CaptureFailure(`${out} already exists; choose a new file${leftover}`);
+      case "failed":
+        throw new CaptureFailure(`could not write ${out} (${written.code})${leftover}`);
+      default:
+        throw new CaptureFailure(`could not write ${out}`);
     }
-    return result.capture;
   } finally {
     board?.[Symbol.dispose]();
     api[Symbol.dispose]();

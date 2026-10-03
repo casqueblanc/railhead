@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import {
+  SYNTH_OWNER,
   SYNTH_REPO,
   synthAgent,
   synthCommit,
@@ -8,8 +9,15 @@ import {
   withReplayOverlap,
 } from "../../../../../fixtures/board/syntheticLog";
 import { emptyBoardState, foldEvent, foldEvents } from "../board/boardState";
-import { serializeCapture, type Capture } from "./captureFile";
-import { firstFrame, frameAt, lastFrame, openReplay, replayCapture } from "./replayLog";
+import { MAX_CAPTURE_EVENTS, serializeCapture, type Capture } from "./captureFile";
+import {
+  CHECKPOINT_INTERVAL,
+  firstFrame,
+  frameAt,
+  lastFrame,
+  openReplay,
+  replayCapture,
+} from "./replayLog";
 import { syntheticCapture } from "./syntheticReplays";
 
 const capture = syntheticCapture(decisionReversal);
@@ -93,5 +101,79 @@ describe("frameAt", () => {
     expect(frameAt(replay, lastFrame(replay), -4)).toEqual(firstFrame(replay));
     expect(frameAt(replay, firstFrame(replay), capture.head + 9)).toEqual(lastFrame(replay));
     expect(frameAt(replay, firstFrame(replay), capture.head).board).toBe(replay.final);
+  });
+});
+
+/** A capture of `count` filed issues: the log whose fold costs the most per event. */
+const filedIssues = (count: number): Capture =>
+  syntheticCapture(
+    syntheticLog(
+      "Synthetic filed issues",
+      Array.from({ length: count }, (_, index) => ({
+        actor: SYNTH_OWNER,
+        type: "issue.filed" as const,
+        data: { issueId: `iss_synth${index.toString(36).padStart(6, "0")}`, title: "t", body: "" },
+      })),
+    ),
+  );
+
+describe("checkpoints", () => {
+  const long = filedIssues(CHECKPOINT_INTERVAL * 3 + 5);
+  const replay = (() => {
+    const result = replayCapture(long);
+    if (!result.ok) throw new Error(result.message);
+    return result.replay;
+  })();
+  const longPrefix = (count: number) =>
+    foldEvents(emptyBoardState(SYNTH_REPO), long.events.slice(0, count));
+
+  it("stores the board after each whole interval, starting from the empty board", () => {
+    expect(replay.checkpoints).toEqual(
+      [0, 1, 2, 3].map((n) => longPrefix(n * CHECKPOINT_INTERVAL)),
+    );
+  });
+
+  it("moves back to a checkpoint without refolding, and just past one from it", () => {
+    const at = 2 * CHECKPOINT_INTERVAL;
+    expect(frameAt(replay, lastFrame(replay), at).board).toBe(replay.checkpoints[2]);
+    expect(frameAt(replay, lastFrame(replay), at + 1)).toEqual({
+      position: at + 1,
+      board: longPrefix(at + 1),
+    });
+    expect(frameAt(replay, lastFrame(replay), at - 1)).toEqual({
+      position: at - 1,
+      board: longPrefix(at - 1),
+    });
+  });
+
+  it("jumps forward past a checkpoint from the checkpoint, and within an interval from the frame", () => {
+    const early = frameAt(replay, firstFrame(replay), 3);
+    const later = frameAt(replay, early, CHECKPOINT_INTERVAL * 3 + 2);
+    expect(later).toEqual({
+      position: CHECKPOINT_INTERVAL * 3 + 2,
+      board: longPrefix(later.position),
+    });
+    expect(frameAt(replay, later, later.position + 1)).toEqual({
+      position: later.position + 1,
+      board: longPrefix(later.position + 1),
+    });
+  });
+
+  it("opens a capture at the event limit and steps back from its end", () => {
+    const result = openReplay(textOf(filedIssues(MAX_CAPTURE_EVENTS)));
+    if (!result.ok) throw new Error(result.message);
+    const { final, checkpoints } = result.replay;
+    expect(Object.keys(final.issues)).toHaveLength(MAX_CAPTURE_EVENTS);
+    expect(checkpoints).toHaveLength(Math.floor(MAX_CAPTURE_EVENTS / CHECKPOINT_INTERVAL) + 1);
+    const back = frameAt(result.replay, lastFrame(result.replay), MAX_CAPTURE_EVENTS - 1);
+    expect(Object.keys(back.board.issues)).toHaveLength(MAX_CAPTURE_EVENTS - 1);
+    expect(back.board.cursor).toBe(MAX_CAPTURE_EVENTS - 1);
+  });
+
+  it("refuses a capture one event past the limit", () => {
+    expect(openReplay(textOf(filedIssues(MAX_CAPTURE_EVENTS + 1)))).toEqual({
+      ok: false,
+      message: expect.stringContaining(`at most ${MAX_CAPTURE_EVENTS} events`),
+    });
   });
 });

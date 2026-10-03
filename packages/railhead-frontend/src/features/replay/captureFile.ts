@@ -40,8 +40,15 @@ export const CAPTURE_FORMAT = "railhead.replay";
 /** The capture file version this module reads and writes. */
 export const CAPTURE_VERSION = 1;
 
-/** Most events one capture may hold. A longer log is refused rather than truncated. */
-export const MAX_CAPTURE_EVENTS = 20_000;
+/**
+ * Most events one capture may hold. A longer log is refused rather than truncated.
+ *
+ * Bounded by the board's fold, which copies a whole record for each event it adds to it, so opening
+ * a log costs time quadratic in its length. Measured in Node on an M-series Mac with a log of only
+ * `issue.filed` events, the worst case: 62 ms at 1,000 events, 347 ms at 2,000, 2.3 s at 5,000 and
+ * 46 s at 20,000. Raise this only once the fold is linear.
+ */
+export const MAX_CAPTURE_EVENTS = 2_000;
 
 /** Most bytes of UTF-8 JSON one capture file may hold. */
 export const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
