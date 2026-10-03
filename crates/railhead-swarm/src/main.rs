@@ -49,7 +49,7 @@ use tokio::task::JoinSet;
 use crate::agent::{Agent, Landings, Shared};
 use crate::events::{Emitter, Event, StopReason, Writer};
 use crate::plan::Plan;
-use crate::process::{AgentEnv, Runner};
+use crate::process::{AgentEnv, Reaper, Runner, STOP_GRACE};
 use crate::progress::{HomeLock, Progress, ProgressFile, RunKey};
 use crate::scenario::{MAX_SCENARIO_BYTES, Scenario};
 
@@ -203,12 +203,14 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
 
     let started = Instant::now();
     let (events, mut received) = Emitter::channel();
+    let runner = Runner::new(
+        cli.rh.clone(),
+        scenario.bounds.concurrency,
+        scenario.bounds.command_timeout,
+    );
+    let reaper = runner.reaper();
     let shared = Arc::new(Shared {
-        runner: Runner::new(
-            cli.rh.clone(),
-            scenario.bounds.concurrency,
-            scenario.bounds.command_timeout,
-        ),
+        runner,
         events,
         bounds: scenario.bounds,
         fork_prefix: scenario.repository.fork_prefix(&scenario.origin),
@@ -259,7 +261,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
             () = tokio::time::sleep(run_timeout) => StopReason::TimedOut,
         }
     };
-    let stopped_by = supervise(&mut writer, &mut agents, &mut received, stop).await?;
+    let stopped_by = supervise(&mut writer, &mut agents, &reaper, &mut received, stop).await?;
     while let Ok(event) = received.try_recv() {
         writer.write(&event)?;
     }
@@ -275,11 +277,12 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
 
 /// Writes the agents' events until the last agent ends or `stop` resolves, then stops every
 /// agent and waits for it, whatever ended the loop, a write error included. Aborting an agent
-/// drops its children, which kills them, so none outlives this and writes into a clone the run
-/// is about to remove.
+/// asks its running child to stop; the reaper waits for each such child, killing it after
+/// [`STOP_GRACE`], so none outlives this and writes into a clone the run is about to remove.
 async fn supervise<W: Write>(
     writer: &mut Writer<W>,
     agents: &mut JoinSet<()>,
+    reaper: &Reaper,
     received: &mut mpsc::Receiver<Event>,
     stop: impl Future<Output = StopReason>,
 ) -> io::Result<StopReason> {
@@ -299,6 +302,7 @@ async fn supervise<W: Write>(
     .await;
     agents.abort_all();
     while agents.join_next().await.is_some() {}
+    reaper.reap(STOP_GRACE).await;
     outcome
 }
 
@@ -355,6 +359,7 @@ mod tests {
         let outcome = supervise(
             &mut writer,
             &mut agents,
+            &Reaper::default(),
             &mut received,
             std::future::pending(),
         )
@@ -371,9 +376,13 @@ mod tests {
         let mut agents = JoinSet::new();
         let killed = agent_holding(&mut agents);
         let mut writer = Writer::new(Vec::new(), Instant::now());
-        let stopped = supervise(&mut writer, &mut agents, &mut received, async {
-            StopReason::TimedOut
-        })
+        let stopped = supervise(
+            &mut writer,
+            &mut agents,
+            &Reaper::default(),
+            &mut received,
+            async { StopReason::TimedOut },
+        )
         .await?;
         assert_eq!(stopped, StopReason::TimedOut);
         assert!(agents.is_empty());
@@ -390,11 +399,68 @@ mod tests {
         let stopped = supervise(
             &mut writer,
             &mut agents,
+            &Reaper::default(),
             &mut received,
             std::future::pending(),
         )
         .await?;
         assert_eq!(stopped, StopReason::Completed);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_run_returns_only_after_its_children_exited() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let clone = dir.path().join("clone");
+        std::fs::create_dir(&clone)?;
+        let done = dir.path().join("done");
+        // An `rh` that is still writing into its clone when it is asked to stop.
+        let rh = dir.path().join("rh");
+        std::fs::write(
+            &rh,
+            format!(
+                "#!/bin/sh\ntrap 'sleep 0.3; touch {}; exit 0' TERM\nwhile :; do touch {}/x; sleep 0.05; done\n",
+                done.display(),
+                clone.display()
+            ),
+        )?;
+        std::fs::set_permissions(&rh, std::fs::Permissions::from_mode(0o755))?;
+        let runner = Runner::new(rh, 1, std::time::Duration::from_secs(60));
+        let reaper = runner.reaper();
+        let env = AgentEnv {
+            name: agent_name(0),
+            home: dir.path().to_owned(),
+        };
+        let (_events, mut received) = Emitter::channel();
+        let mut agents = JoinSet::new();
+        let workdir = clone.clone();
+        agents.spawn(async move {
+            let _ = runner
+                .rh::<serde_json::Value>(&env, &workdir, &["work"])
+                .await;
+        });
+        let mut writer = Writer::new(Vec::new(), Instant::now());
+        // Stopped once the child is running with its trap set.
+        let running = clone.join("x");
+        let stopped = supervise(&mut writer, &mut agents, &reaper, &mut received, async {
+            for _ in 0..500 {
+                if running.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            StopReason::Interrupted
+        })
+        .await?;
+        assert_eq!(stopped, StopReason::Interrupted);
+        assert!(done.exists(), "returned before the child finished stopping");
+        // Nothing writes into the clone any more, so removing it succeeds and stays removed.
+        std::fs::remove_dir_all(&clone)?;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!clone.exists());
         Ok(())
     }
 

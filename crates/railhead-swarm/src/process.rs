@@ -6,20 +6,27 @@
 //! are untrusted. `rh` runs with `--json` and its one envelope is decoded; nothing else of its
 //! output is kept. Stdout is read through a byte limit, and a child that writes past it is killed
 //! at once.
+//!
+//! A child whose agent is stopped mid-command is not killed outright: it is asked to stop with
+//! `SIGTERM` and handed to the run's [`Reaper`], which gives every such child [`STOP_GRACE`] to
+//! exit, kills what is left, and reaps them all before the run removes its clones.
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use railhead_protocol::{AgentErrorCode, InboxDigest};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncReadExt as _;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
+
+/// How long a stopped child has to exit after `SIGTERM` before it is killed.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Largest output read from one child, in bytes. `rh` bounds a response at 1 MiB.
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -190,12 +197,98 @@ pub struct AgentEnv {
     pub home: PathBuf,
 }
 
+/// The children of stopped agents, asked to stop and waiting to be reaped.
+#[derive(Debug, Clone, Default)]
+pub struct Reaper(Arc<Mutex<Vec<Child>>>);
+
+impl Reaper {
+    fn adopt(&self, child: Child) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(child);
+    }
+
+    /// Waits up to `grace` for every adopted child to exit, then kills and reaps the rest.
+    pub async fn reap(&self, grace: Duration) {
+        let mut children =
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        // A wait that fails leaves the child to the kill below.
+        let _ = tokio::time::timeout(grace, async {
+            for child in &mut children {
+                let _ = child.wait().await;
+            }
+        })
+        .await;
+        for child in &mut children {
+            // `kill` fails only when the child already exited, which is the outcome wanted.
+            let _ = child.kill().await;
+        }
+    }
+}
+
+/// A running child. Dropped before it was waited on, as when its agent is aborted, it is asked
+/// to stop and handed to the [`Reaper`].
+struct Running<'a> {
+    child: Option<Child>,
+    reaper: &'a Reaper,
+}
+
+impl Running<'_> {
+    fn child(&mut self) -> Result<&mut Child, Error> {
+        self.child.as_mut().ok_or(Error::TimedOut("child"))
+    }
+
+    /// Kills the child now and reaps it.
+    async fn kill(mut self) {
+        if let Some(mut child) = self.child.take() {
+            // `kill` fails only when the child already exited.
+            let _ = child.kill().await;
+        }
+    }
+
+    /// The child was waited on: nothing is left to stop.
+    fn finished(mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        terminate(&mut child);
+        self.reaper.adopt(child);
+    }
+}
+
+/// Asks `child` to stop: `SIGTERM` on Unix, so it can clean up, and a kill elsewhere.
+fn terminate(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Pid, Signal, kill_process};
+        if let Some(pid) = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw)
+        {
+            // It may have exited already; the reaper reaps it either way.
+            let _ = kill_process(pid, Signal::TERM);
+            return;
+        }
+    }
+    // Fails only when the child already exited.
+    let _ = child.start_kill();
+}
+
 /// Starts children within the run's bounds.
 #[derive(Debug, Clone)]
 pub struct Runner {
     rh: PathBuf,
     timeout: Duration,
     permits: Arc<Semaphore>,
+    reaper: Reaper,
 }
 
 impl Runner {
@@ -207,7 +300,14 @@ impl Runner {
             rh,
             timeout,
             permits: Arc::new(Semaphore::new(permits)),
+            reaper: Reaper::default(),
         }
+    }
+
+    /// Where the children of stopped agents go, for the run to reap before it removes its clones.
+    #[must_use]
+    pub fn reaper(&self) -> Reaper {
+        self.reaper.clone()
     }
 
     /// Runs `rh --json <args>` in `dir` as the agent and decodes its envelope.
@@ -297,12 +397,15 @@ impl Runner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let mut child = command
+        let child = command
             .spawn()
             .map_err(|source| Error::Spawn { program, source })?;
-        let stdout = child.stdout.take();
-        // Dropping the child on timeout kills it.
-        tokio::time::timeout(self.timeout, async {
+        let mut running = Running {
+            child: Some(child),
+            reaper: &self.reaper,
+        };
+        let stdout = running.child()?.stdout.take();
+        let outcome = tokio::time::timeout(self.timeout, async {
             let mut bytes = Vec::new();
             if let Some(stdout) = stdout {
                 // One byte past the limit is enough to know it was crossed.
@@ -315,11 +418,10 @@ impl Runner {
                     .map_err(|source| Error::Spawn { program, source })?;
             }
             if bytes.len() > MAX_OUTPUT_BYTES {
-                // `kill` fails only when the child already exited; dropping it kills it otherwise.
-                let _ = child.kill().await;
                 return Err(Error::TooMuchOutput(program));
             }
-            let status = child
+            let status = running
+                .child()?
                 .wait()
                 .await
                 .map_err(|source| Error::Spawn { program, source })?;
@@ -328,8 +430,21 @@ impl Runner {
                 bytes,
             })
         })
-        .await
-        .map_err(|_| Error::TimedOut(program))?
+        .await;
+        match outcome {
+            Ok(Ok(output)) => {
+                running.finished();
+                Ok(output)
+            }
+            Ok(Err(error)) => {
+                running.kill().await;
+                Err(error)
+            }
+            Err(_) => {
+                running.kill().await;
+                Err(Error::TimedOut(program))
+            }
+        }
     }
 }
 
@@ -341,6 +456,90 @@ struct Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Waits up to five seconds for `path` to appear.
+    #[cfg(unix)]
+    async fn appears(path: &Path) -> anyhow::Result<()> {
+        for _ in 0..500 {
+            if path.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::bail!("{} never appeared", path.display())
+    }
+
+    /// A child running `script` under `sh`, stopped as an aborted agent's is once its trap is set
+    /// (the script touches `$1`).
+    #[cfg(unix)]
+    async fn abandoned(reaper: &Reaper, script: &str) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ready = dir.path().join("ready");
+        let child = Command::new("sh")
+            .args(["-c", script, "sh"])
+            .arg(&ready)
+            .kill_on_drop(true)
+            .spawn()?;
+        appears(&ready).await?;
+        drop(Running {
+            child: Some(child),
+            reaper,
+        });
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_child_is_asked_to_stop_and_reaped_after_it_exits() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let done = dir.path().join("done");
+        let reaper = Reaper::default();
+        // It cleans up on SIGTERM, slowly.
+        abandoned(
+            &reaper,
+            &format!(
+                "trap 'sleep 0.3; touch {}; exit 0' TERM; touch \"$1\"; while :; do sleep 0.05; done",
+                done.display()
+            ),
+        )
+        .await?;
+        reaper.reap(STOP_GRACE).await;
+        assert!(done.exists(), "reaped before the child finished stopping");
+        assert!(
+            reaper
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_ignores_the_request_is_killed_after_the_grace() -> anyhow::Result<()> {
+        let reaper = Reaper::default();
+        abandoned(
+            &reaper,
+            "trap '' TERM; touch \"$1\"; while :; do sleep 0.05; done",
+        )
+        .await?;
+        let started = std::time::Instant::now();
+        reaper.reap(Duration::from_millis(200)).await;
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < STOP_GRACE,
+            "{took:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nothing_to_reap_returns_at_once() {
+        let started = std::time::Instant::now();
+        Reaper::default().reap(STOP_GRACE).await;
+        assert!(started.elapsed() < STOP_GRACE);
+    }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Data {
