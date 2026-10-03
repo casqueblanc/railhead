@@ -4,17 +4,23 @@
 //
 // - `queue` runs inside the caller's transaction and appends `inbox.queued`.
 // - `pending` and `digest` return the oldest unacknowledged items and append `inbox.delivered` for
-//   each one returned for the first time. A repeat, after a lost response or a reconnect, returns
-//   the same items again and appends nothing. Delivery is not acknowledgement.
+//   each one returned for the first time. Both stop at a byte budget as well as an item count, so
+//   an inbox page and the digest piggybacked on it stay within `MAX_AGENT_RESPONSE_BYTES`; the
+//   rest wait, still pending, for the next call. A repeat, after a lost response or a reconnect,
+//   returns the same items again and appends nothing. Delivery is not acknowledgement.
 // - `ack` records the agent's plan for an item it was delivered and appends `inbox.acked` with the
 //   agent as actor. A repeat returns the first acknowledgement and appends nothing.
 //
 // `readyGate` reads the unacknowledged items of one claim at one generation. It has no default: an
 // empty answer means the store holds no unacknowledged item for that claim and generation.
 //
+// Every item must fit the smaller budget on its own, so the oldest item always fits and the agent
+// can acknowledge its way through the inbox. `queue` refuses a larger one.
+//
 // Plans and decision text are untrusted. They are stored and returned as bounded data, never logged.
 
 import {
+  MAX_AGENT_RESPONSE_BYTES,
   MAX_INBOX_PAGE,
   MAX_PIGGYBACK_ITEMS,
   type AckResult,
@@ -75,6 +81,21 @@ export const MAX_GATE_ITEMS = MAX_LIST_LENGTH;
 /** Longest option key a decision view may carry. */
 const MAX_OPTION_KEY_LENGTH = 32;
 
+/** Most UTF-8 bytes of serialized items one `pending` page carries. */
+export const MAX_INBOX_PAGE_BYTES = MAX_AGENT_RESPONSE_BYTES / 2;
+
+/**
+ * Most UTF-8 bytes of serialized items the digest on a command result carries. With a full page
+ * beside it, a quarter of the response remains for the envelope.
+ */
+export const MAX_DIGEST_BYTES = MAX_AGENT_RESPONSE_BYTES / 4;
+
+/**
+ * Largest serialized item `queue` accepts, in UTF-8 bytes. It fits either budget alone, so the
+ * oldest item is always returned.
+ */
+export const MAX_INBOX_ITEM_BYTES = MAX_DIGEST_BYTES;
+
 interface ItemRow extends Record<string, SqlStorageValue> {
   item: number;
   claim_id: string;
@@ -111,8 +132,10 @@ export function createInbox(context: RepoContext): InboxPort {
     return row?.n ?? 0;
   }
 
-  // Returns the oldest `limit` unacknowledged items and records first deliveries, in one transaction.
-  function deliver(agentId: AgentId, limit: number): InboxResult {
+  // Returns the oldest unacknowledged items, at most `limit` of them and at most `budget` serialized
+  // bytes, and records first deliveries, in one transaction. Items past either bound are left
+  // undelivered.
+  function deliver(agentId: AgentId, limit: number, budget: number): InboxResult {
     return log.transaction((tx) => {
       const rows = tx.sql
         .exec<ItemRow>(
@@ -122,8 +145,19 @@ export function createInbox(context: RepoContext): InboxPort {
           limit,
         )
         .toArray();
-      const now = clock();
+      const selected: Array<{ row: ItemRow; item: InboxItem }> = [];
+      let used = 0;
       for (const row of rows) {
+        const item = readItem(row);
+        // One more byte for the comma between array elements.
+        const size = serializedBytes(item) + 1;
+        // `queue` keeps every item within the budget, so the oldest is always selected.
+        if (selected.length > 0 && used + size > budget) break;
+        used += size;
+        selected.push({ row, item });
+      }
+      const now = clock();
+      for (const { row } of selected) {
         if (row.delivered_at !== null) continue;
         tx.sql.exec(
           "UPDATE inbox_items SET delivered_at = ? WHERE agent_id = ? AND item = ?",
@@ -136,7 +170,7 @@ export function createInbox(context: RepoContext): InboxPort {
           data: { agentId, claimId: row.claim_id, item: row.item },
         });
       }
-      return { items: rows.map(readItem), pending: pendingCount(agentId) };
+      return { items: selected.map(({ item }) => item), pending: pendingCount(agentId) };
     }).value;
   }
 
@@ -149,12 +183,12 @@ export function createInbox(context: RepoContext): InboxPort {
           `The limit must be a whole number from 1 to ${MAX_INBOX_PAGE}.`,
         );
       }
-      return ok(deliver(agent.agentId, limit));
+      return ok(deliver(agent.agentId, limit, MAX_INBOX_PAGE_BYTES));
     },
 
     async digest(agent): Promise<PortResult<InboxDigest>> {
       if (foreign(agent)) return notForThisRepo();
-      return ok(deliver(agent.agentId, MAX_PIGGYBACK_ITEMS));
+      return ok(deliver(agent.agentId, MAX_PIGGYBACK_ITEMS, MAX_DIGEST_BYTES));
     },
 
     async ack(agent, item, plan): Promise<PortResult<AckResult>> {
@@ -213,6 +247,19 @@ export function createInbox(context: RepoContext): InboxPort {
         )
         .toArray()[0];
       const item = (last?.last ?? 0) + 1;
+      const queuedAt = clock();
+      const size = serializedBytes({
+        item,
+        claimId,
+        queuedAt,
+        entry: queued.entry,
+        decision: queued.decision,
+      });
+      if (size > MAX_INBOX_ITEM_BYTES) {
+        throw new InboxQueueError(
+          `the item serializes to ${size} bytes, more than ${MAX_INBOX_ITEM_BYTES}`,
+        );
+      }
       tx.sql.exec(
         `INSERT INTO inbox_items (agent_id, item, claim_id, generation, entry, decision, queued_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -222,7 +269,7 @@ export function createInbox(context: RepoContext): InboxPort {
         generation,
         JSON.stringify(queued.entry),
         queued.decision === null ? null : JSON.stringify(queued.decision),
-        clock(),
+        queuedAt,
       );
       // validateEvent checks the entry; a refusal throws and rolls the caller's transaction back.
       tx.append(INBOX_ACTOR, {
@@ -266,6 +313,13 @@ function readItem(row: ItemRow): InboxItem {
   const entry: InboxEntry = JSON.parse(row.entry);
   const decision: DecisionView | null = row.decision === null ? null : JSON.parse(row.decision);
   return { item: row.item, claimId: row.claim_id, queuedAt: row.queued_at, entry, decision };
+}
+
+const encoder = new TextEncoder();
+
+/** The UTF-8 length of an item as a response serializes it. */
+function serializedBytes(item: InboxItem): number {
+  return encoder.encode(JSON.stringify(item)).byteLength;
 }
 
 /** A refused `queue` call. It throws inside the caller's transaction, which then rolls back. */

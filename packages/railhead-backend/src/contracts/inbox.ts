@@ -37,17 +37,20 @@ export type QueuedItem =
 
 /** One agent's inbox. Returning an item to the agent records it as delivered, never as acknowledged. */
 export interface InboxPort {
-  /** Unacknowledged items, oldest first, at most `limit`. */
+  /**
+   * Unacknowledged items, oldest first, at most `limit` and within a byte budget; the oldest is
+   * always included. `pending` counts every unacknowledged item, returned or not.
+   */
   pending(agent: AgentPrincipal, limit: number): Promise<PortResult<InboxResult>>;
-  /** The items piggybacked on a command result. */
+  /** The items piggybacked on a command result, bounded like `pending` by a smaller budget. */
   digest(agent: AgentPrincipal): Promise<PortResult<InboxDigest>>;
   /** Acknowledges the agent's own item. A repeat returns the first acknowledgement. */
   ack(agent: AgentPrincipal, item: number, plan: string): Promise<PortResult<AckResult>>;
   /**
    * Queues one item inside the caller's transaction, which also records the change that caused it,
    * and returns its item number. The caller has checked, in the same transaction, that the target
-   * agent holds the claim at that generation. Throws on an invalid target or item, so the whole
-   * transaction rolls back; nothing is queued by default.
+   * agent holds the claim at that generation. Throws on an invalid target or item, or an item too
+   * large to fit a response, so the whole transaction rolls back; nothing is queued by default.
    */
   queue(tx: EventTransaction, target: InboxTarget, item: QueuedItem): number;
   /** The ready gate for a claim at a generation. */

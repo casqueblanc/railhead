@@ -1,12 +1,31 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { MAX_INBOX_PAGE, MAX_PIGGYBACK_ITEMS, type DecisionView } from "@railhead/shared/agent-api";
-import { MAX_PLAN_LENGTH, type RailheadEvent } from "@railhead/shared/events";
+import {
+  MAX_AGENT_RESPONSE_BYTES,
+  MAX_INBOX_PAGE,
+  MAX_PIGGYBACK_ITEMS,
+  type DecisionView,
+} from "@railhead/shared/agent-api";
+import {
+  MAX_LIST_LENGTH,
+  MAX_PATH_LENGTH,
+  MAX_PLAN_LENGTH,
+  type RailheadEvent,
+} from "@railhead/shared/events";
 import type { InboxPort, InboxTarget, QueuedItem } from "../src/contracts/inbox";
 import type { AgentPrincipal } from "../src/contracts/principals";
+import { ok } from "../src/contracts/result";
 import { UnavailableError, unavailableInbox } from "../src/contracts/unavailable";
-import { createInbox, InboxQueueError, MAX_GATE_ITEMS } from "../src/modules/inbox/inbox";
+import { parseAgentResponse } from "../src/contracts/wireShape";
+import { dispatchAgent, type AgentCommand, type AgentReply } from "../src/gateway/agentDispatch";
+import {
+  createInbox,
+  InboxQueueError,
+  MAX_GATE_ITEMS,
+  MAX_INBOX_ITEM_BYTES,
+} from "../src/modules/inbox/inbox";
+import { composeRepo } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 
@@ -48,6 +67,11 @@ interface Harness {
   events(): RailheadEvent[];
   /** Advances the clock by `ms`. */
   tick(ms: number): void;
+  /**
+   * Dispatches `command` as the composed Repo would for an authenticated `agent()`, with this
+   * inbox, and returns the reply and its serialized UTF-8 length.
+   */
+  dispatch(command: AgentCommand): Promise<{ reply: AgentReply; bytes: number }>;
 }
 
 async function freshRepo(): Promise<{ stub: DurableObjectStub<Repo>; repoId: string }> {
@@ -68,17 +92,25 @@ async function withInbox<R>(
     let now = NOW;
     const clock = () => now;
     const log = EventLog.open(state.storage, repoId, clock);
-    const inbox = createInbox({ repoId, storage: state.storage, log, clock, env });
+    const context = { repoId, storage: state.storage, log, clock, env };
+    const inbox = createInbox(context);
+    const agent = (id = "agt_atlas01"): AgentPrincipal => ({
+      kind: "agent",
+      agentId: id,
+      ownerId: "usr_lemarier",
+      repoId,
+    });
+    const real = composeRepo(context);
+    const ports = {
+      ...real,
+      sessions: { ...real.sessions, authenticate: async () => ok(agent()) },
+      inbox,
+    };
     const harness: Harness = {
       inbox,
       log,
       repoId,
-      agent: (id = "agt_atlas01") => ({
-        kind: "agent",
-        agentId: id,
-        ownerId: "usr_lemarier",
-        repoId,
-      }),
+      agent,
       queue: (item = DECISION, target = {}) =>
         log.transaction((tx) =>
           inbox.queue(
@@ -91,6 +123,12 @@ async function withInbox<R>(
       tick: (ms) => {
         now += ms;
       },
+      dispatch: async (command) => {
+        const reply = await dispatchAgent({ repoId, ports }, { command, token: "aaaa.bbbb.cccc" });
+        // What `respond` in agentHttp.ts writes.
+        const serialized = JSON.stringify(reply);
+        return { reply, bytes: new TextEncoder().encode(serialized).byteLength };
+      },
     };
     return body(harness);
   });
@@ -98,6 +136,50 @@ async function withInbox<R>(
 
 function types(events: RailheadEvent[]): string[] {
   return events.map((event) => event.type);
+}
+
+/** `DECISION` with another scope. */
+function scopedDecision(scope: string[]): QueuedItem {
+  return {
+    entry: { kind: "decision", decision: { decisionId: VIEW.decisionId, version: VIEW.version } },
+    decision: { ...VIEW, scope },
+  };
+}
+
+/** A decision whose scope holds the most paths, each `char` repeated to the longest path. */
+function wideDecision(char: string): QueuedItem {
+  const path = char.repeat(MAX_PATH_LENGTH / char.length);
+  return scopedDecision(Array.from({ length: MAX_LIST_LENGTH }, () => path));
+}
+
+/** A decision whose scope holds `scopeChars` control characters, each a six-byte JSON escape. */
+function escapedDecision(scopeChars: number): QueuedItem {
+  const scope: string[] = [];
+  for (let rest = scopeChars; rest > 0; rest -= MAX_PATH_LENGTH) {
+    scope.push("\u0007".repeat(Math.min(rest, MAX_PATH_LENGTH)));
+  }
+  return scopedDecision(scope);
+}
+
+/** The UTF-8 length of `queued` as the first item of an inbox, queued at `NOW`. */
+function firstItemBytes(queued: QueuedItem): number {
+  const item = { item: 1, claimId: CLAIM, queuedAt: NOW, ...queued };
+  return new TextEncoder().encode(JSON.stringify(item)).byteLength;
+}
+
+/** Item numbers with an `inbox.delivered` fact. */
+function deliveredItems(events: RailheadEvent[]): number[] {
+  return events.flatMap((event) => (event.type === "inbox.delivered" ? [event.data.item] : []));
+}
+
+/** One `inbox` sync through the agent dispatch, read back as the CLI parses it. */
+async function sync(h: Harness, limit: number) {
+  const { reply, bytes } = await h.dispatch({ route: "inbox", limit });
+  const pair = parseAgentResponse("inbox", JSON.parse(JSON.stringify(reply)));
+  if (pair.route !== "inbox" || !pair.response.ok || pair.response.inbox === null) {
+    throw new Error("the inbox sync failed");
+  }
+  return { page: pair.response.data, digest: pair.response.inbox, bytes };
 }
 
 describe("queue", () => {
@@ -165,6 +247,60 @@ describe("queue", () => {
   });
 });
 
+describe("item size", () => {
+  it("accepts the widest ASCII and multibyte scopes and refuses an item no response can carry", async () => {
+    await withInbox(async (h) => {
+      expect(h.queue(wideDecision("a"))).toBe(1);
+      // Three UTF-8 bytes per character: about 197 KB of scope.
+      expect(h.queue(wideDecision("界"))).toBe(2);
+      // Four bytes per surrogate pair.
+      expect(h.queue(wideDecision("😀"))).toBe(3);
+
+      // A control character serializes as a six-byte escape: about 393 KB of scope.
+      const escaped = wideDecision("\u0007");
+      expect(() =>
+        h.log.transaction((tx) => {
+          tx.append(
+            { kind: "human", id: "usr_lemarier" },
+            { type: "issue.filed", data: { issueId: "iss_issue001", title: "Upload", body: "" } },
+          );
+          return h.inbox.queue(
+            tx,
+            { agentId: "agt_atlas01", claimId: CLAIM, generation: 1 },
+            escaped,
+          );
+        }),
+      ).toThrow(InboxQueueError);
+      expect(types(h.events())).toEqual(["inbox.queued", "inbox.queued", "inbox.queued"]);
+      expect(h.queue()).toBe(4);
+    });
+  });
+
+  it("returns an item of exactly the largest size the queue accepts", async () => {
+    await withInbox(async (h) => {
+      // The most escaped scope characters (six bytes each) that still fit, by bisection.
+      let chars = 0;
+      let over = MAX_INBOX_ITEM_BYTES;
+      while (over - chars > 1) {
+        const mid = Math.floor((chars + over) / 2);
+        if (firstItemBytes(escapedDecision(mid)) <= MAX_INBOX_ITEM_BYTES) chars = mid;
+        else over = mid;
+      }
+      const largest = escapedDecision(chars);
+      const slack = MAX_INBOX_ITEM_BYTES - firstItemBytes(largest);
+      expect(slack).toBeGreaterThanOrEqual(0);
+      expect(slack).toBeLessThan(10);
+
+      expect(() => h.queue(escapedDecision(chars + 1))).toThrow(InboxQueueError);
+      expect(h.queue(largest)).toBe(1);
+      const { page, digest, bytes } = await sync(h, 1);
+      expect(page.items.map((i) => i.item)).toEqual([1]);
+      expect(digest.items.map((i) => i.item)).toEqual([1]);
+      expect(bytes).toBeLessThanOrEqual(MAX_AGENT_RESPONSE_BYTES);
+    });
+  });
+});
+
 describe("delivery", () => {
   it("returns items oldest first and records each first delivery once", async () => {
     await withInbox(async (h) => {
@@ -224,6 +360,60 @@ describe("delivery", () => {
       // Item 65 was never returned, so it is the only one without a delivery fact.
       const delivered = h.events().filter((event) => event.type === "inbox.delivered");
       expect(delivered).toHaveLength(MAX_INBOX_PAGE);
+    });
+  });
+
+  it("keeps every response within MAX_AGENT_RESPONSE_BYTES while an agent drains wide items", async () => {
+    await withInbox(async (h) => {
+      const count = 24;
+      for (let n = 0; n < count; n += 1) h.queue(wideDecision(n % 2 === 0 ? "界" : "a"));
+      // Every item number a response has carried, in its page or its digest.
+      const carried = new Set<number>();
+      const carry = (items: Array<{ item: number }>) => {
+        for (const { item } of items) carried.add(item);
+      };
+
+      // A one-item sync with a large backlog: the digest beside it is cut by bytes, not count.
+      const first = await sync(h, 1);
+      expect(first.bytes).toBeLessThanOrEqual(MAX_AGENT_RESPONSE_BYTES);
+      expect(first.page.items.map((i) => i.item)).toEqual([1]);
+      expect(first.page.pending).toBe(count);
+      expect(first.digest.pending).toBe(count);
+      const digested = first.digest.items.map((i) => i.item);
+      expect(digested).toEqual(Array.from({ length: digested.length }, (_, n) => n + 1));
+      expect(digested.length).toBeLessThan(MAX_PIGGYBACK_ITEMS);
+      carry(first.page.items);
+      carry(first.digest.items);
+      // Only the items a response carried have a delivery fact.
+      expect(deliveredItems(h.events())).toEqual([...carried]);
+
+      let next = 1;
+      for (let round = 0; round < count && next <= count; round += 1) {
+        const { page, digest, bytes } = await sync(h, MAX_INBOX_PAGE);
+        expect(bytes).toBeLessThanOrEqual(MAX_AGENT_RESPONSE_BYTES);
+        const items = page.items.map((i) => i.item);
+        // Oldest first from the oldest unacknowledged item, cut by bytes well short of the limit.
+        expect(items).toEqual(Array.from({ length: items.length }, (_, n) => next + n));
+        expect(items.length).toBeGreaterThan(0);
+        expect(page.pending).toBe(count - next + 1);
+        if (round === 0) expect(items.length).toBeLessThan(count);
+        carry(page.items);
+        carry(digest.items);
+        for (const item of items) {
+          const ack = await h.dispatch({ route: "ack", item, body: { plan: "Scope noted." } });
+          expect(ack.bytes).toBeLessThanOrEqual(MAX_AGENT_RESPONSE_BYTES);
+          if (!ack.reply.ok || ack.reply.inbox === null) throw new Error("the ack failed");
+          expect(ack.reply.data).toMatchObject({ item, repeated: false });
+          carry(ack.reply.inbox.items);
+        }
+        expect(new Set(deliveredItems(h.events()))).toEqual(carried);
+        next += items.length;
+      }
+      expect(next).toBe(count + 1);
+      expect(await h.inbox.pending(h.agent(), MAX_INBOX_PAGE)).toEqual({
+        ok: true,
+        value: { items: [], pending: 0 },
+      });
     });
   });
 
