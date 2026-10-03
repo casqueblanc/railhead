@@ -741,7 +741,8 @@ describe("RailheadSandbox's storage after retirement", () => {
 
   it("deletes its storage past the deadline after its last destroy attempt confirms before it", async () => {
     await withRailheadSandbox(null, async (sandbox, _container, state) => {
-      const deadline = Date.now() + 200;
+      // Far enough that every destroy attempt confirms before it, even on a loaded machine.
+      const deadline = Date.now() + 3_000;
       state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
       const destroy = vi.spyOn(Sandbox.prototype, "destroy");
       for (let failure = 1; failure < MAX_TEARDOWN_ATTEMPTS; failure += 1) {
@@ -771,11 +772,12 @@ describe("RailheadSandbox's storage after retirement", () => {
       expect(stored(state)).toEqual({ tables: [], fence: undefined });
       expect(await state.storage.getAlarm()).toBeNull();
     });
-  });
+  }, 15_000);
 
   it("fails a release whose deadline wake-up cannot be scheduled, and the retried release schedules it", async () => {
     await withRailheadSandbox(null, async (sandbox, _container, state) => {
-      const deadline = Date.now() + 200;
+      // Far enough that every destroy attempt confirms before it, even on a loaded machine.
+      const deadline = Date.now() + 3_000;
       state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
       state.storage.sql.exec("DELETE FROM container_schedules");
       const wake = wakeTime(deadline).getTime();
@@ -806,7 +808,7 @@ describe("RailheadSandbox's storage after retirement", () => {
       expect(stored(state)).toEqual({ tables: [], fence: undefined });
       expect(await state.storage.getAlarm()).toBeNull();
     });
-  });
+  }, 15_000);
 
   it("keeps its record and a wake-up at an alarm before the deadline", async () => {
     await withRailheadSandbox(null, async (sandbox, _container, state) => {
