@@ -5,20 +5,27 @@ on:
     branches:
       - main
   pull_request:
+  merge_group:
+    types:
+      - checks_requested
 
 permissions:
   contents: read
 
-# A newer push to a pull request cancels the run it replaces. On `main` every run gets a group of its
-# own: a shared group would still cancel a run left pending behind another, even without
-# `cancel-in-progress`.
+# A newer push to a pull request cancels the run it replaces. On `main` and in the merge queue every
+# run gets a group of its own: a shared group would still cancel a run left pending behind another,
+# even without `cancel-in-progress`, and a merge-group run has to finish to prove its group.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# On a pull request each job first asks scripts/ci-changes.mjs whether the change touches its inputs,
-# and on `false` skips its remaining steps. The job still reports success under its usual name, so a
-# required check never waits on a job that did not run. Pushes to `main` run every step.
+# Each job first asks scripts/ci-changes.mjs whether it must run. On a pull request that depends on
+# whether the change touches the job's inputs, and on `false` the job skips its remaining steps. The
+# job still reports success under its usual name, so a required check never waits on a job that did
+# not run. Pushes to `main` and merge groups always run every step.
+#
+# Caches are saved from `main` and pull requests, never from a merge group: its ref
+# (`gh-readonly-queue/...`) is gone once the group lands, so no later run could restore the entry.
 jobs:
   # Parallel to `test` so lint and test failures surface on the same run. Package type checking
   # lives in Build; `scripts/` is checked here instead.
@@ -27,7 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Depth 2 so the pull request's merge commit has its base, `HEAD^1`, to diff against.
+      # Depth 2 so the pull request's merge commit has its base, `HEAD^1`, to diff against. A push or
+      # merge group reads the same diff but runs every job regardless.
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,9 +44,10 @@ jobs:
 
       - name: Detect lint inputs
         id: changes
-        if: github.event_name == 'pull_request'
         shell: bash
-        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs lint >> "$GITHUB_OUTPUT"
+        env:
+          EVENT: ${{ github.event_name }}
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs lint "$EVENT" >> "$GITHUB_OUTPUT"
 
       # Vite+ downloads its own pnpm for `vp install` and exposes no shim, so this is what puts
       # `pnpm` on PATH for the steps below.
@@ -92,9 +101,10 @@ jobs:
 
       - name: Detect build and test inputs
         id: changes
-        if: github.event_name == 'pull_request'
         shell: bash
-        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs test >> "$GITHUB_OUTPUT"
+        env:
+          EVENT: ${{ github.event_name }}
+        run: git diff --no-renames --name-only HEAD^1 HEAD | node scripts/ci-changes.mjs test "$EVENT" >> "$GITHUB_OUTPUT"
 
       - name: Enable Corepack
         if: steps.changes.outputs.run != 'false'
@@ -107,15 +117,18 @@ jobs:
         with:
           node-version-file: .node-version
           cache: true
+          cache-save: ${{ github.event_name != 'merge_group' }}
           run-install: true
 
       # The `vp run` task cache, after the install so the install cannot touch it. Vite+ fingerprints
       # each task's inputs itself and replays only an exact match, so the key only has to be fresh:
       # each run saves under its commit and restores the newest entry for the same lockfile. The
-      # type checks never cache (scripts/typecheck-task-vite-config.ts).
+      # type checks never cache (scripts/typecheck-task-vite-config.ts). Restore and save are separate
+      # steps so a merge group can restore without saving.
       - name: Restore the Vite+ task cache
+        id: task-cache
         if: steps.changes.outputs.run != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: node_modules/.vite/task-cache
           key: vp-tasks-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.sha }}
@@ -134,3 +147,13 @@ jobs:
       - name: Explain task cache misses
         if: steps.changes.outputs.run != 'false'
         run: pnpm exec vp run --last-details
+
+      # Skipped on an exact hit, which only a rerun of the same commit gets.
+      - name: Save the Vite+ task cache
+        if: >-
+          steps.changes.outputs.run != 'false' && github.event_name != 'merge_group' &&
+          steps.task-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node_modules/.vite/task-cache
+          key: ${{ steps.task-cache.outputs.cache-primary-key }}
