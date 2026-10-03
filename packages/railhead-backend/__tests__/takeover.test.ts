@@ -20,9 +20,10 @@ import { unavailableSessions } from "../src/contracts/unavailable";
 import { createGitGateway } from "../src/git/gateway";
 import { CLAIM_LEASE_MS, REVOKE_RETRY_MS, createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
-import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
+import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
+import { EarliestAlarm } from "../src/repo/storage";
 
 const REPO = "rep_takeover001";
 const ROOT = "1".repeat(40);
@@ -70,6 +71,15 @@ interface Setup {
   artifacts: ArtifactsPort;
   /** When set, each `revokeTokens` awaits it before reaching Artifacts. */
   holdRevocation: (() => Promise<void>) | null;
+  /**
+   * Fires the Repo's alarm as `Repo.alarm` does: the alarm forgets its time, every resumable module
+   * resumes through `resumeAll`, and the alarm's writes settle. The clock does not move.
+   */
+  repoAlarm: () => Promise<void>;
+  /** The time the Repo's alarm is set for, or `null` when none is set. */
+  storedAlarm: () => number | null;
+  /** How many times the alarm reached each module after claims. */
+  laterResumes: { git: number; train: number };
 }
 
 /** Runs `body` in a fresh Repo with real claims, inbox and decisions, and fake Artifacts. */
@@ -80,6 +90,18 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
     fake.seed(await mainRepoName(REPO), [ROOT, HEAD]);
     const log = EventLog.open(state.storage, REPO, fake.clock);
     const wakes: number[] = [];
+    // The alarm's storage is kept here, so no real alarm fires in the background.
+    let storedAlarm: number | null = null;
+    const alarm = new EarliestAlarm(
+      {
+        getAlarm: async () => storedAlarm,
+        setAlarm: async (at) => {
+          storedAlarm = typeof at === "number" ? at : at.getTime();
+        },
+      },
+      noop,
+    );
+    await alarm.load();
     const context = {
       repoId: REPO,
       storage: state.storage,
@@ -88,6 +110,7 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       env,
       wake: (at: number) => {
         wakes.push(at);
+        void alarm.request(at);
       },
     };
     const base = composeRepo(context);
@@ -110,12 +133,27 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
     };
     const decisions = createDecisions(context, () => ports);
     const port = createClaims(context, () => ports);
+    const laterResumes = { git: 0, train: 0 };
     const ports: RepoPorts = {
       ...base,
       claims: port,
       artifacts,
       decisions,
       mainWriter: { ...base.mainWriter, head: async () => ok(HEAD) },
+      git: {
+        ...base.git,
+        resume() {
+          laterResumes.git += 1;
+          return base.git.resume();
+        },
+      },
+      train: {
+        ...base.train,
+        resume() {
+          laterResumes.train += 1;
+          return base.train.resume();
+        },
+      },
     };
     const setup: Setup = {
       fake,
@@ -148,6 +186,14 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       minted: [],
       artifacts,
       holdRevocation: null,
+      async repoAlarm() {
+        alarm.fired();
+        storedAlarm = null;
+        await resumeAll(REPO, resumables(ports));
+        await alarm.settle();
+      },
+      storedAlarm: () => storedAlarm,
+      laterResumes,
     };
     const result = await body(setup);
     expect(fake.openHandles).toBe(0);
@@ -173,6 +219,19 @@ async function fireAlarm(setup: Setup): Promise<void> {
     if (at > now) return;
   }
   throw new Error("the alarm kept asking to fire at once");
+}
+
+/**
+ * Fires the Repo's alarm again while it is set at or before the current time, as the runtime
+ * would, without moving the clock. Fails when it keeps asking to fire at once.
+ */
+async function fireDue(setup: Setup): Promise<void> {
+  for (let firing = 0; firing < 8; firing += 1) {
+    const at = setup.storedAlarm();
+    if (at === null || at > setup.fake.clock()) return;
+    await setup.repoAlarm();
+  }
+  throw new Error("the Repo's alarm kept asking to fire at once");
 }
 
 function noop(): void {}
@@ -707,6 +766,113 @@ describe("takeover", () => {
         value: { scope: "write", fence: { generation: 2 } },
       });
     });
+  });
+
+  it("keeps a wake when a revocation throws on the alarm, and hands the claim over once it recovers", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      setup.fake.advance(CLAIM_LEASE_MS);
+      setup.holdRevocation = () => Promise.reject(new Error("storage reset"));
+
+      // The alarm expires the claim and its revocation throws. The alarm still reaches the later
+      // modules and stays set for the retry, so the owed revocation is not stranded.
+      await setup.repoAlarm();
+      expect(setup.laterResumes).toEqual({ git: 1, train: 1 });
+      await fireDue(setup);
+      const retry = setup.fake.clock() + REVOKE_RETRY_MS;
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        state: "expired",
+        revoke_due: retry,
+      });
+      expect(setup.storedAlarm()).toBe(retry);
+      expect(setup.revoked).toEqual([fork]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(true);
+      expectFailure(await setup.port.work(agent(2)), "busy");
+      expect(setup.storedAlarm()).toBe(retry);
+
+      // At the retry the revocation no longer throws: the alarm settles it and nothing stays owed.
+      setup.holdRevocation = null;
+      setup.fake.advance(REVOKE_RETRY_MS);
+      await setup.repoAlarm();
+      await fireDue(setup);
+      expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
+      expect(setup.storedAlarm()).toBeNull();
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+      expect(setup.revoked).toEqual([fork, fork]);
+
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2 } },
+      });
+      expect(types(setup.events()).at(-1)).toBe("claim.reassigned");
+    });
+  });
+
+  it("revokes at most one fork per work or claim call and drains the rest across alarms that reach the later modules", async () => {
+    for (const call of ["work", "claim"] as const) {
+      await withTakeover(async (setup) => {
+        const sweepMs = 20_000;
+        const claims: { claimId: string; issueId: string; fork: string }[] = [];
+        for (let n = 1; n <= 6; n += 1) {
+          const issueId = await setup.file(`Issue ${n}`);
+          const claimed = await setup.port.work(agent(n));
+          if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
+          const { claimId } = claimed.value.claim;
+          claims.push({ claimId, issueId, fork: await forkRepoName(REPO, claimId) });
+        }
+        const forks = claims.map(({ fork }) => fork);
+        const owed = (): number =>
+          setup.sql
+            .exec<{ n: number }>(
+              "SELECT COUNT(*) AS n FROM claims_claims WHERE revoke_due IS NOT NULL",
+            )
+            .one().n;
+        // Every lease lapses together, and each revocation takes a slow sweep.
+        setup.fake.advance(CLAIM_LEASE_MS);
+        setup.holdRevocation = async () => {
+          setup.fake.advance(sweepMs);
+        };
+
+        // Agent 7's call expires all six but awaits only the oldest issue's sweep, then takes it over.
+        const started = setup.fake.clock();
+        const oldest = claims[0]?.issueId ?? "";
+        const answer =
+          call === "work" ? setup.port.work(agent(7)) : setup.port.claim(agent(7), oldest);
+        expect(await answer, call).toMatchObject({
+          ok: true,
+          value: { claim: { claimId: claims[0]?.claimId, generation: 2 } },
+        });
+        expect(setup.fake.clock() - started).toBe(sweepMs);
+        expect(setup.revoked).toEqual(forks.slice(0, 1));
+        expect(owed()).toBe(5);
+        // The rest are owed now, so the alarm is due at once.
+        expect(setup.storedAlarm()).toBeLessThanOrEqual(setup.fake.clock());
+
+        // The first alarm sweeps four, oldest first, reaches the later modules and stays due at once.
+        await setup.repoAlarm();
+        expect(setup.revoked).toEqual(forks.slice(0, 5));
+        expect(setup.laterResumes).toEqual({ git: 1, train: 1 });
+        expect(owed()).toBe(1);
+        expect(setup.storedAlarm()).toBeLessThanOrEqual(setup.fake.clock());
+
+        // The next sweeps the last; the alarm then waits for agent 7's lease.
+        await setup.repoAlarm();
+        expect(setup.revoked).toEqual(forks);
+        expect(setup.laterResumes).toEqual({ git: 2, train: 2 });
+        expect(owed()).toBe(0);
+        await fireDue(setup);
+        expect(setup.revoked).toEqual(forks);
+        expect(setup.storedAlarm()).toBe(started + sweepMs + CLAIM_LEASE_MS);
+
+        // The next expired claim is settled already, so agent 8 takes it over with no sweep.
+        expect(await setup.port.work(agent(8))).toMatchObject({
+          ok: true,
+          value: { claim: { claimId: claims[1]?.claimId, generation: 2 } },
+        });
+        expect(setup.revoked).toEqual(forks);
+      });
+    }
   });
 
   it("treats a partial token listing as unrevoked until a later sweep reports revoked", async () => {

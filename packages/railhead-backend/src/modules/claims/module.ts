@@ -31,10 +31,13 @@
 //
 // An allocating or working claim is a lease of `CLAIM_LEASE_MS`, renewed by every call of its
 // holder that reaches this module: status, `work`, `claim`, `ready`, an `ask` (which reads the
-// active claim) and Git authorization. `work` and `claim` renew it before they await other forks'
-// revocations, so a slow revocation never lapses a lease its holder called inside. A ready claim
-// does not lapse, since the train holds its pin; a reopened claim starts a new lease. The lapse is
-// checked at the time of use: a holder call after it, the Repo's alarm or another agent's `work` or
+// active claim) and Git authorization. `work` and `claim` renew it before they await another
+// fork's revocation, so a slow revocation never lapses a lease its holder called inside. Each awaits
+// at most one due revocation, the oldest issue's; the Repo's alarm revokes the rest a few at a time
+// and fires again at once while more are due, so a backlog delays neither a request nor the alarm's
+// later modules. A thrown revocation is retried like a failed one. A ready claim does not lapse,
+// since the train holds its pin; a reopened claim starts a new lease. The lapse is checked at the
+// time of use: a holder call after it, the Repo's alarm or another agent's `work` or
 // `claim` expires the claim and appends `claim.expired`. Both fence readers, `currentGeneration`
 // and `workingGeneration`, read a lapsed working claim as unknown even before that, so no push is
 // recorded past the deadline. From the expiry on, the former holder is refused and the fork's tokens
@@ -124,8 +127,20 @@ export const CLAIM_LEASE_MS = 30 * 60_000;
 /** How long after a failed or pending revocation the Repo's alarm tries it again. */
 export const REVOKE_RETRY_MS = 60_000;
 
-/** Most lapsed leases, or revocations, one call or alarm handles, so each stays bounded. */
+/** Most lapsed leases one call or alarm expires, so each stays bounded. */
 const RELEASE_BATCH = 16;
+
+/**
+ * Most due revocations a `work` or `claim` call awaits before it chooses, so an agent waits on at
+ * most one other fork's sweep. The alarm revokes the rest.
+ */
+const REVOKE_PER_REQUEST = 1;
+
+/**
+ * Most due revocations one alarm awaits, so the modules after claims are reached within a few
+ * sweeps. While more are due, the claims deadline is already past and the alarm fires again at once.
+ */
+const REVOKE_PER_ALARM = 4;
 
 /** Builds the claims port of one repository and migrates its tables. */
 export function createClaims(
@@ -232,7 +247,17 @@ export function createClaims(
     claimId: ClaimId,
     generation: number,
   ): Promise<PortResult<TokenRevocation>> => {
-    const revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, claimId));
+    let revoked: PortResult<TokenRevocation>;
+    try {
+      revoked = await ports().artifacts.revokeTokens(await forkRepoName(repoId, claimId));
+    } catch (error) {
+      // A revocation that throws is retried like a failed one, rather than at once by every wake.
+      log.transaction((tx) => {
+        recordRevocation(tx.sql, claimId, generation, clock() + REVOKE_RETRY_MS);
+        wakeForDeadline(tx.sql);
+      });
+      throw error;
+    }
     log.transaction((tx) => {
       const next = revocationSettled(revoked) ? null : clock() + REVOKE_RETRY_MS;
       recordRevocation(tx.sql, claimId, generation, next);
@@ -241,9 +266,9 @@ export function createClaims(
     return revoked;
   };
 
-  /** Revokes the fork tokens of expired and ready claims whose revocation is due, up to a batch. */
-  const releaseDue = async (): Promise<void> => {
-    for (const row of dueRevocations(context.storage.sql, clock(), RELEASE_BATCH)) {
+  /** Revokes the fork tokens of expired and ready claims whose revocation is due, up to `limit`. */
+  const releaseDue = async (limit: number): Promise<void> => {
+    for (const row of dueRevocations(context.storage.sql, clock(), limit)) {
       await revoke(row.claimId, row.generation);
     }
   };
@@ -275,10 +300,17 @@ export function createClaims(
     return ok({ row: taken, resumed: false });
   };
 
-  /** Expires lapsed claims and revokes what is due, so a takeover sees them settled. */
-  const release = async (): Promise<void> => {
-    expireLapsed();
-    await releaseDue();
+  /**
+   * Expires lapsed claims and revokes up to `limit` due revocations, so a takeover sees them
+   * settled. Whatever throws, it asks for the next deadline, so a revocation still owed keeps a wake.
+   */
+  const release = async (limit: number): Promise<void> => {
+    try {
+      expireLapsed();
+      await releaseDue(limit);
+    } finally {
+      wakeForDeadline(context.storage.sql);
+    }
   };
 
   /** Opens an allocating claim's fork, or returns an opened claim as it is. */
@@ -384,7 +416,7 @@ export function createClaims(
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
       holdActive(agent.agentId);
-      await release();
+      await release(REVOKE_PER_REQUEST);
       const chosen = log.transaction((tx): Chosen => {
         const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
@@ -411,7 +443,7 @@ export function createClaims(
       if (foreign !== null) return foreign;
       if (!isId("issue", issueId)) return fail("invalid_request", "The issue id is malformed.");
       holdActive(agent.agentId);
-      await release();
+      await release(REVOKE_PER_REQUEST);
       const chosen = log.transaction((tx): Chosen => {
         const { sql } = tx;
         const active = activeClaimOf(sql, agent.agentId);
@@ -613,8 +645,7 @@ export function createClaims(
     },
 
     async resume() {
-      await release();
-      wakeForDeadline(context.storage.sql);
+      await release(REVOKE_PER_ALARM);
     },
   };
 }

@@ -260,11 +260,14 @@ export function expireClaim(
   return updated.length === 1;
 }
 
-/** Claims whose revocation is due at or before `now`, earliest first, at most `limit`. */
+/**
+ * Claims whose revocation is due at or before `now`, oldest issue first, at most `limit`. The
+ * oldest is first in line for takeover, so revoking it first is what lets a takeover proceed.
+ */
 export function dueRevocations(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
   return rows(
     sql.exec<RawClaim>(
-      `${SELECT_CLAIM} WHERE c.revoke_due <= ? ORDER BY c.revoke_due, c.claim_id LIMIT ?`,
+      `${SELECT_CLAIM} WHERE c.revoke_due <= ? ORDER BY i.filed_seq, c.claim_id LIMIT ?`,
       now,
       limit,
     ),
