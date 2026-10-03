@@ -13,7 +13,12 @@ import {
   type SessionResult,
 } from "@railhead/shared/agent-api";
 import type { OwnerAction } from "@railhead/shared/board-api";
-import { importSessionKey, signSessionToken, verifySessionToken } from "../src/auth/sessionToken";
+import {
+  deriveSessionKey,
+  MIN_SIGNING_SECRET_LENGTH,
+  signSessionToken,
+  verifySessionToken,
+} from "../src/auth/sessionToken";
 import type { IdentityPort, SessionsPort } from "../src/contracts/identity";
 import type { GrantFor, SessionClaims } from "../src/contracts/principals";
 import type { PortResult } from "../src/contracts/result";
@@ -26,6 +31,15 @@ const ORIGIN = "https://railhead.mashin.workers.dev";
 const ORG = "acme";
 const USER = "usr_owner01";
 const enc = new TextEncoder();
+/** The signing secret `vitest.config.ts` gives the pool, so modules composed from `env` share it. */
+const SECRET = "test-only-session-signing-secret-0123456789";
+
+/** A token key derived from a fresh random secret. */
+async function randomKey(): Promise<CryptoKey> {
+  const key = await deriveSessionKey(crypto.randomUUID(), "rep_demo0001", "token");
+  if (key === undefined) throw new Error("a UUID is a long enough secret");
+  return key;
+}
 
 // ---------------------------------------------------------------------------------------------
 // An agent's SSH key: Ed25519 from WebCrypto, signing armored SSHSIG as `ssh-keygen -Y sign` does.
@@ -144,7 +158,7 @@ interface Harness {
     overrides?: { signer?: AgentKey; namespace?: string },
   ): Promise<{ challenge: ChallengeResult; request: SessionRequest }>;
   /** A second sessions module over the same storage, as after the Repo restarts. */
-  restart(): SessionsPort;
+  restart(options?: { signingSecret: string | undefined }): SessionsPort;
 }
 
 async function withSessions(body: (harness: Harness) => Promise<void>): Promise<void> {
@@ -215,7 +229,8 @@ async function withSessions(body: (harness: Harness) => Promise<void>): Promise<
         };
         return { challenge, request };
       },
-      restart: () => createSessions(context, () => ports, { origin: ORIGIN }),
+      restart: ({ signingSecret } = { signingSecret: SECRET }) =>
+        createSessions(context, () => ports, { origin: ORIGIN, signingSecret }),
     });
   });
 }
@@ -247,12 +262,96 @@ describe("challenges", () => {
 
   it("refuses to issue a challenge when the instance has no origin", async () => {
     await withSessions(async ({ context }) => {
-      const sessions = createSessions(context, () => composeRepo(context), { origin: undefined });
+      const sessions = createSessions(context, () => composeRepo(context), {
+        origin: undefined,
+        signingSecret: SECRET,
+      });
       expect(await sessions.issueChallenge({ agentId: "agt_atlas01" })).toMatchObject({
         ok: false,
         code: "internal",
       });
     });
+  });
+});
+
+describe("the signing secret", () => {
+  it("leaves every call unavailable without a usable secret, changing nothing", async () => {
+    await withSessions(async ({ sessions, enroll, login, restart, consumed }) => {
+      const agent = await enroll();
+      const { request } = await login(agent);
+      const { token } = value(await sessions.redeem((await login(agent)).request));
+      for (const secret of [undefined, "", "x".repeat(MIN_SIGNING_SECRET_LENGTH - 1)]) {
+        const unsigned = restart({ signingSecret: secret });
+        const refused = { ok: false, code: "unavailable" };
+        expect(await unsigned.issueChallenge({ agentId: agent.agentId })).toMatchObject(refused);
+        expect(await unsigned.redeem(request)).toMatchObject(refused);
+        expect(await unsigned.authenticate(token)).toMatchObject(refused);
+      }
+      expect(consumed()).toBe(1);
+      // The same challenge still redeems once the secret is back.
+      value(await restart().redeem(request));
+    });
+  });
+
+  it("accepts a secret of exactly the shortest length", async () => {
+    await withSessions(async ({ enroll, restart }) => {
+      const sessions = restart({ signingSecret: "s".repeat(MIN_SIGNING_SECRET_LENGTH) });
+      const agent = await enroll();
+      const challenge = value(await sessions.issueChallenge({ agentId: agent.agentId }));
+      const request = {
+        agentId: agent.agentId,
+        challengeId: challenge.challengeId,
+        signature: await agent.key.sign(challenge.message),
+      };
+      const { token } = value(await sessions.redeem(request));
+      value(await sessions.authenticate(token));
+      // Its keys are not the configured secret's.
+      expect(await restart().authenticate(token)).toMatchObject({
+        ok: false,
+        code: "unauthenticated",
+      });
+    });
+  });
+
+  it("stores no signing key, and a replaced secret ends sessions and open challenges", async () => {
+    await withSessions(async ({ sessions, enroll, login, restart, context }) => {
+      const agent = await enroll();
+      const open = await login(agent);
+      const { token } = value(await sessions.redeem((await login(agent)).request));
+      const tables = context.storage.sql
+        .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE name LIKE 'sessions%'")
+        .toArray()
+        .map((row) => row.name)
+        .toSorted();
+      expect(tables).toEqual(["sessions_challenge", "sessions_challenge_agent"]);
+
+      const rotated = restart({ signingSecret: `${SECRET}-rotated` });
+      expect(await rotated.authenticate(token)).toMatchObject({
+        ok: false,
+        code: "unauthenticated",
+      });
+      expect(await rotated.redeem(open.request)).toMatchObject({
+        ok: false,
+        code: "challenge_invalid",
+      });
+      value(await restart().authenticate(token));
+    });
+  });
+
+  it("derives a separate key per repository and purpose, and none from a short secret", async () => {
+    const data = enc.encode("same input");
+    async function mac(secret: string, repoId: string, purpose: "challenge" | "token") {
+      const key = await deriveSessionKey(secret, repoId, purpose);
+      if (key === undefined) throw new Error("expected a key");
+      return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
+    }
+    const base = await mac(SECRET, "rep_demo0001", "token");
+    expect(await mac(SECRET, "rep_demo0001", "token")).toEqual(base);
+    expect(await mac(SECRET, "rep_demo0002", "token")).not.toEqual(base);
+    expect(await mac(SECRET, "rep_demo0001", "challenge")).not.toEqual(base);
+    expect(await mac(`${SECRET}!`, "rep_demo0001", "token")).not.toEqual(base);
+    expect(await deriveSessionKey(undefined, "rep_demo0001", "token")).toBeUndefined();
+    expect(await deriveSessionKey("short", "rep_demo0001", "token")).toBeUndefined();
   });
 });
 
@@ -407,6 +506,36 @@ describe("redeeming a challenge", () => {
     });
   });
 
+  it("refuses a challenge that expires while its signature is being checked, consuming nothing", async () => {
+    await withSessions(async ({ enroll, login, clock, context, consumed }) => {
+      const ports = composeRepo(context);
+      let expiresAt = 0;
+      // The clock passes the challenge's expiry between the open check and the consuming transaction.
+      const sessions = createSessions(
+        context,
+        () => ({
+          ...ports,
+          identity: {
+            ...ports.identity,
+            view: async (principal) => {
+              clock.now = expiresAt;
+              return ports.identity.view(principal);
+            },
+          },
+        }),
+        { origin: ORIGIN, signingSecret: SECRET },
+      );
+      const agent = await enroll();
+      const { challenge, request } = await login(agent);
+      expiresAt = challenge.expiresAt;
+      expect(await sessions.redeem(request)).toMatchObject({
+        ok: false,
+        code: "challenge_invalid",
+      });
+      expect(consumed()).toBe(0);
+    });
+  });
+
   it("refuses unconfirmed and revoked agents after their signature checks, consuming nothing", async () => {
     await withSessions(async ({ sessions, identity, enroll, login, repoId, consumed }) => {
       const pending = await enroll({ pending: true });
@@ -493,7 +622,7 @@ describe("authenticating a token", () => {
         jti: "0".repeat(32),
       };
       // Claims re-encoded under the real MAC, and valid claims under a key this repository lacks.
-      const otherKey = await importSessionKey(crypto.getRandomValues(new Uint8Array(32)));
+      const otherKey = await randomKey();
       const foreign = await signSessionToken(otherKey, forgedClaims);
       const reencoded = `${header}.${foreign.split(".")[1] ?? ""}.${mac}`;
       for (const bad of [
@@ -554,7 +683,7 @@ describe("session tokens", () => {
   };
 
   it("round-trips its claims and refuses claims that break the layout", async () => {
-    const key = await importSessionKey(crypto.getRandomValues(new Uint8Array(32)));
+    const key = await randomKey();
     const token = await signSessionToken(key, claims);
     expect(await verifySessionToken(key, token, claims.iat)).toEqual({ ok: true, claims });
     expect(await verifySessionToken(key, token, claims.exp)).toEqual({

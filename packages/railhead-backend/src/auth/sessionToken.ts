@@ -1,10 +1,14 @@
 // Session tokens: `<header>.<claims>.<mac>`, each part base64url without padding. The header is
 // fixed, the claims are `SessionClaims` as JSON, and the MAC is HMAC-SHA256 over the first two
-// parts with a key only the issuing repository holds. Only that repository verifies its tokens, so
+// parts with a key only the issuing repository uses. Only that repository verifies its tokens, so
 // a symmetric key is enough and no other party ever needs to read one.
+//
+// No key is stored. Each repository's keys are derived at use, with HKDF-SHA256, from the
+// instance's signing secret (a Worker secret), the repository id and the key's purpose, so a read
+// of a repository's database yields nothing that signs, and replacing the secret ends every session.
 
 import { isSessionTokenForm, SESSION_TTL_MS } from "@railhead/shared/agent-api";
-import { isId } from "@railhead/shared/events";
+import { isId, type RepoId } from "@railhead/shared/events";
 import type { SessionClaims } from "../contracts/principals";
 import { decodeBase64Url, encodeBase64Url } from "../modules/owner/encoding";
 
@@ -14,8 +18,14 @@ const HEADER = encodeBase64Url(new TextEncoder().encode('{"alg":"HS256","typ":"J
 /** Largest claims part read, in bytes; real claims are under 200. */
 const MAX_CLAIMS_BYTES = 1024;
 
-/** Length of a session HMAC key, in bytes. */
-export const SESSION_KEY_BYTES = 32;
+/** Fewest characters a signing secret may have; a shorter one leaves sessions unavailable. */
+export const MIN_SIGNING_SECRET_LENGTH = 32;
+
+/** HKDF salt shared by every session key. */
+const KEY_SALT = new TextEncoder().encode("railhead-session-keys-v1");
+
+/** What a derived key signs: login challenge ids, or session tokens. */
+export type SessionKeyPurpose = "challenge" | "token";
 
 const JTI = /^[0-9a-f]{32}$/;
 
@@ -27,12 +37,36 @@ export type SessionTokenResult =
   | { readonly ok: true; readonly claims: SessionClaims }
   | { readonly ok: false; readonly reason: SessionTokenFailure };
 
-/** Imports `secret`, {@link SESSION_KEY_BYTES} random bytes, as the HMAC key tokens are signed with. */
-export function importSessionKey(secret: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
-  return crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-    "verify",
-  ]);
+/**
+ * Derives the HMAC key repository `repoId` signs `purpose` with from the instance's `secret`, or
+ * `undefined` when `secret` is missing or shorter than {@link MIN_SIGNING_SECRET_LENGTH}. The key
+ * cannot be exported.
+ */
+export async function deriveSessionKey(
+  secret: string | undefined,
+  repoId: RepoId,
+  purpose: SessionKeyPurpose,
+): Promise<CryptoKey | undefined> {
+  if (secret === undefined || secret.length < MIN_SIGNING_SECRET_LENGTH) return undefined;
+  const base = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    "HKDF",
+    false,
+    ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: KEY_SALT,
+      info: new TextEncoder().encode(`${purpose}\n${repoId}`),
+    },
+    base,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    false,
+    ["sign", "verify"],
+  );
 }
 
 /** Signs `claims` with `key`. */
