@@ -30,7 +30,7 @@ export interface StreamListener {
   ended(reason: SubscriptionEnd): Promise<void>;
 }
 
-/** A live subscription. */
+/** A live subscription. It holds its slot until every reference to it is released, ended or not. */
 export interface StreamSubscription {
   /** Ends the subscription; no listener call follows the returned promise. */
   cancel(): Promise<void>;
@@ -44,7 +44,8 @@ export interface StreamPort {
 
 /**
  * Most subscriptions one repository holds; past it `subscribe` fails with `quota_exceeded`. An
- * ended subscription keeps its slot until its listener calls in flight settle or time out.
+ * ended subscription keeps its slot until its handle is released and its listener calls in flight
+ * settle or time out.
  */
 export const MAX_SUBSCRIPTIONS = 256;
 
@@ -129,6 +130,9 @@ class Subscription {
   #ended = false;
   // An `ended` call is in flight.
   #ending = false;
+  #listenerReleased = false;
+  // Every reference to the subscription's handle is gone.
+  #handleReleased = false;
   #finished = false;
 
   constructor(
@@ -181,13 +185,27 @@ class Subscription {
       });
   }
 
-  // Frees the slot and releases the listener once the subscription has ended and no listener call
-  // is in flight, so the slot bound also bounds the calls and timers a churning subscriber leaves.
+  /** Learns that the handle is gone: the subscription ends, and its slot may be freed. */
+  releaseHandle(): void {
+    this.#handleReleased = true;
+    this.end(null);
+    this.#finish();
+  }
+
+  // Releases the listener once the subscription has ended and no listener call is in flight, and
+  // frees the slot once the handle is released too. Releasing the listener is how the subscriber
+  // learns of an end it was not told about, and its cleanup is what releases the handle; holding
+  // the slot until then makes the slot bound also bound the calls, timers and handles a churning
+  // subscriber leaves on either side.
   #finish(): void {
-    if (!this.#ended || this.#sending || this.#ending || this.#finished) return;
+    if (!this.#ended || this.#sending || this.#ending) return;
+    if (!this.#listenerReleased) {
+      this.#listenerReleased = true;
+      release(this.#listener);
+    }
+    if (!this.#handleReleased || this.#finished) return;
     this.#finished = true;
     this.#onEnd();
-    this.#release();
   }
 
   async #pump(): Promise<void> {
@@ -229,12 +247,6 @@ class Subscription {
       return false;
     }
   }
-
-  // Releases the listener's duplicate, when the transport gave a stub.
-  #release(): void {
-    const dispose: unknown = Reflect.get(this.#listener, Symbol.dispose);
-    if (typeof dispose === "function") dispose.call(this.#listener);
-  }
 }
 
 /** The subscription as the Worker holds it, across the Repo's RPC boundary. */
@@ -253,7 +265,7 @@ class SubscriptionHandle extends RpcTarget implements StreamSubscription {
   // The runtime calls this once every stub of the handle is released, including when the Worker's
   // execution context ends before its cancel arrives, so a lost cancel still frees the slot.
   [Symbol.dispose](): void {
-    this.#subscription.end(null);
+    this.#subscription.releaseHandle();
   }
 }
 
@@ -262,17 +274,26 @@ function retain(listener: StreamListener & { dup?: () => StreamListener }): Stre
   return listener.dup?.() ?? listener;
 }
 
-// Settles with `promise`'s outcome, or with "timeout" after `ms`.
-async function withTimeout(promise: Promise<void>, ms: number): Promise<"done" | "timeout"> {
+// Settles with `call`'s outcome, or with "timeout" after `ms`, then releases the call's result.
+// An RPC call's result holds the Repo until it is disposed, settled or not; disposing one still in
+// flight abandons it.
+async function withTimeout(call: Promise<void>, ms: number): Promise<"done" | "timeout"> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), ms);
   });
   try {
-    return await Promise.race([promise.then((): "done" => "done"), timedOut]);
+    return await Promise.race([call.then((): "done" => "done"), timedOut]);
   } finally {
     clearTimeout(timer);
+    release(call);
   }
+}
+
+// Disposes `value` when the transport made it disposable: a stub or an RPC call's result.
+function release(value: object): void {
+  const dispose: unknown = Reflect.get(value, Symbol.dispose);
+  if (typeof dispose === "function") dispose.call(value);
 }
 
 // Only the error's name: a message may carry data from the listener's side.
