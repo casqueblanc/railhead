@@ -15,11 +15,12 @@ import type { DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok } from "../src/contracts/result";
-import type { CheckAttempt, TrainPort } from "../src/contracts/train";
+import type { CheckAttempt, MainRefPort, TrainPort } from "../src/contracts/train";
 import { unavailableTrain } from "../src/contracts/unavailable";
 import { createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
+import { createMainWriter } from "../src/modules/mainWriter/mainWriter";
 import {
   createTrain,
   EXHAUSTED_FAILURES,
@@ -107,8 +108,8 @@ interface HandoffOptions {
 
 /**
  * Runs `body` in a fresh Repo with the real claims, inbox, decisions, train and authorization
- * modules. Artifacts is the fake behind the real adapter; main, the check definitions, merging and
- * check runs are fakes the train reaches through its ports.
+ * modules. Artifacts is the fake behind the real adapter; the real main writer moves a fake main
+ * ref; the check definitions, merging and check runs are fakes the train reaches through its ports.
  */
 function withHandoff<T>(
   body: (setup: Setup) => Promise<T>,
@@ -145,6 +146,27 @@ function withHandoff<T>(
     const published: string[] = [];
     let held: { reach(): void; released: Promise<void> } | null = null;
     const base = composeRepo(context);
+    // Main moves only by a conditional update, as the main writer's ref allows.
+    let mainAt: CommitSha = MAIN;
+    const mainRef: MainRefPort = {
+      read: async () => (setup.mainUp ? ok(mainAt) : fail("unavailable", "Main cannot be read.")),
+      update: async (expected, next) => {
+        if (mainAt !== expected) return ok({ kind: "rejected", actual: mainAt });
+        mainAt = next;
+        return ok({ kind: "updated" });
+      },
+    };
+    const writer = createMainWriter(
+      context,
+      () => ({
+        authorization,
+        attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
+        currentGeneration: (claimId) => claims.currentGeneration(claimId),
+        currentVersions: (claimId) => decisions.currentVersions(claimId),
+        readyPin: (claimId) => claims.readyPin(claimId),
+      }),
+      mainRef,
+    );
     const claims = createClaims(context, () => ports);
     const inbox = createInbox(context);
     const decisions = createDecisions(context, () => ports);
@@ -179,17 +201,16 @@ function withHandoff<T>(
       train: install(train),
       authorization,
       mainWriter: {
-        ...base.mainWriter,
         head: async () => {
           if (mainGate !== null) {
             mainGate.reached();
             await mainGate.released;
           }
-          return setup.mainUp ? ok(MAIN) : fail("unavailable", "Main cannot be read.");
+          return mainRef.read();
         },
         publish: async (intentId) => {
           published.push(intentId);
-          return base.mainWriter.publish(intentId);
+          return writer.publish(intentId);
         },
       },
       checks: {
@@ -923,6 +944,41 @@ describe("a re-ready while the train's retries have run out", () => {
 });
 
 describe("a re-ready of a commit that already landed", () => {
+  it("answers a repeat of the landed episode as done, with no refusal or new work", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await setup.train.resume();
+      const attempt = setup.started[0];
+      if (attempt === undefined) throw new Error("no check was started");
+      const recorded = await setup.train.recordCheck({
+        attemptId: attempt.attemptId,
+        candidate: attempt.candidate,
+        result: "pass",
+        logDigest: null,
+        finishedAt: attempt.createdAt,
+      });
+      expect(recorded.ok).toBe(true);
+      await setup.train.resume();
+      expect(setup.published).toHaveLength(1);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
+      expect(setup.train.batches(8).map((batch) => batch.state)).toEqual(["landed"]);
+
+      // The holder's first answer was lost; it repeats the same ready before any decision changes.
+      const head = setup.log.head();
+      const wakes = setup.wakes.length;
+      const wake = readWake(setup.sql);
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
+      ).toMatchObject({ ok: true, value: { repeated: true, claim: { state: "ready" } } });
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
+      expect(setup.train.batches(8)).toHaveLength(1);
+      expect(setup.log.head()).toBe(head);
+      expect(setup.wakes.length).toBe(wakes);
+      expect(readWake(setup.sql)).toEqual(wake);
+    });
+  });
+
   it("is refused after a superseding decision, so no ready skips the new version's check", async () => {
     await withHandoff(async (setup) => {
       const { claim, first } = await readyUnderFirst(setup);
