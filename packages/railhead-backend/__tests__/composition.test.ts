@@ -17,7 +17,13 @@ import type { AgentPrincipal } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import { parseAgentResponse } from "../src/contracts/wireShape";
 import { dispatchAgent, type AgentCommand } from "../src/gateway/agentDispatch";
-import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
+import {
+  composeRepo,
+  RESUME_RETRY_MS,
+  resumables,
+  resumeAll,
+  type RepoPorts,
+} from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 
@@ -254,7 +260,7 @@ describe("unavailable modules", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => 0,
         env,
-        wake: () => {},
+        wake: async () => true,
       });
       return Promise.all([
         ports.checks.start({
@@ -274,7 +280,7 @@ describe("unavailable modules", () => {
         ports.authorization.authorize("chk_attempt1"),
         ports.mainWriter.publish("int_intent01"),
         // Claims decide Git access themselves now; the Artifacts module behind them is missing.
-        ports.artifacts.revokeTokens("rh-f-missing"),
+        ports.artifacts.revokeTokens("rh-f-missing", { seq: 0, startedAt: 0 }),
       ]);
     });
 
@@ -305,7 +311,7 @@ async function withFakePorts<R>(
       log: EventLog.open(state.storage, repoId),
       clock: () => 0,
       env,
-      wake: () => {},
+      wake: async () => true,
     });
     const calls: string[] = [];
     const ports: RepoPorts = {
@@ -350,9 +356,18 @@ async function withFakePorts<R>(
 describe("Repo alarm", () => {
   it("resumes every module after one throws, logging the failure by name only", async () => {
     const order: string[] = [];
+    const wakes: number[] = [];
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const context = {
+      repoId: "rep_alarm0001",
+      clock: () => 5_000,
+      wake: async (at: number) => {
+        wakes.push(at);
+        return true;
+      },
+    };
     try {
-      await resumeAll("rep_alarm0001", [
+      await resumeAll(context, [
         {
           module: "train",
           resume: async () => {
@@ -375,16 +390,30 @@ describe("Repo alarm", () => {
             repo: "rep_alarm0001",
             module: "train",
             error: "TypeError",
+            retryAt: 5_000 + RESUME_RETRY_MS,
           }),
         ],
       ]);
+      // The failed module may not have asked for its next wake, so the alarm asks for a retry.
+      expect(wakes).toEqual([5_000 + RESUME_RETRY_MS]);
     } finally {
       logged.mockRestore();
     }
   });
 
-  it("resumes nothing for an empty list and lists the Git gateway and the train for a composed Repo", async () => {
-    await expect(resumeAll("rep_alarm0001", [])).resolves.toBeUndefined();
+  it("resumes nothing for an empty list and lists claims, the Git gateway, the train and adaptation for a composed Repo", async () => {
+    const wakes: number[] = [];
+    const context = {
+      repoId: "rep_alarm0001",
+      clock: () => 0,
+      wake: async (at: number) => {
+        wakes.push(at);
+        return true;
+      },
+    };
+    await expect(resumeAll(context, [])).resolves.toBeUndefined();
+    // Nothing failed, so no retry wake is asked for.
+    expect(wakes).toEqual([]);
     const { stub, repoId } = await freshRepo();
     const modules = await runInDurableObject(stub, (_instance, state) =>
       resumables(
@@ -394,11 +423,11 @@ describe("Repo alarm", () => {
           log: EventLog.open(state.storage, repoId),
           clock: () => 0,
           env,
-          wake: () => {},
+          wake: async () => true,
         }),
       ).map((entry) => entry.module),
     );
-    expect(modules).toEqual(["git", "train"]);
+    expect(modules).toEqual(["claims", "git", "train", "adaptation"]);
   });
 });
 

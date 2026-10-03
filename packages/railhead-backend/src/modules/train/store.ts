@@ -10,13 +10,31 @@
 // the attempt's deadline. Once the scheduler's retries run out, the row stays with its failures
 // marked exhausted, so work in storage always has a row.
 //
+// A queue entry is keyed by claim and generation, and each call to queue a pin is a new ready episode
+// of that claim: a claim reopened after a superseded decision keeps its generation, so its next pin
+// reuses the entry. A waiting entry takes the new commit, a settled one is queued again, both as
+// fresh work with retries, isolation and drop reason cleared even when the commit is unchanged, and a
+// batched one keeps its commit for the active batch and holds the new one in `next_commit` until
+// that batch settles. `episode` records the claim's episode of the pin the entry holds, and
+// `next_episode` that of `next_commit`; a drive that read an entry settles it only while its
+// episode is unchanged, so a ready episode queued during the drive's reads is kept. A batched entry
+// also records in `batched_episode` the episode its batch was formed for. A re-ready of the batched
+// commit raises `episode` past it, and the batch's result then belongs to the older episode only:
+// the entry goes back to the queue as fresh work rather than taking that result.
+//
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
 // latest one, so a drive that outlived its lease and was taken over cannot change state again.
+//
+// `merge_attempt` names the merge attempt of a batch's latest compose, recorded before the merge
+// port is called, so its candidate prefix is known whatever the compose did. `train_discards` holds
+// the attempts whose candidate refs the train still has to delete: a batch's attempt when it
+// settles, and an earlier attempt when a new compose of the same batch supersedes it. Each row is
+// due no earlier than `MERGE_PUSH_WINDOW_MS` after it was queued, so its compose can no longer push.
 
 import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
-import type { CheckDefinition } from "../../contracts/train";
+import { MERGE_PUSH_WINDOW_MS, type CheckDefinition } from "../../contracts/train";
 import type { RepoStorage } from "../../repo/storage";
 import { migrate } from "../../repo/storage";
 
@@ -72,6 +90,17 @@ const MIGRATIONS: readonly string[] = [
     lease_until INTEGER NOT NULL
   ) STRICT`,
   "ALTER TABLE train_batches ADD COLUMN check_held INTEGER NOT NULL DEFAULT 0 CHECK (check_held IN (0, 1))",
+  "ALTER TABLE train_batches ADD COLUMN merge_attempt TEXT",
+  `CREATE TABLE train_discards (
+    attempt TEXT PRIMARY KEY,
+    due_at INTEGER NOT NULL,
+    failures INTEGER NOT NULL CHECK (failures >= 0)
+  ) STRICT`,
+  "ALTER TABLE train_queue ADD COLUMN next_commit TEXT",
+  "ALTER TABLE train_queue ADD COLUMN episode INTEGER NOT NULL DEFAULT 0 CHECK (episode >= 0)",
+  "ALTER TABLE train_queue ADD COLUMN next_episode INTEGER",
+  "ALTER TABLE train_queue ADD COLUMN batched_episode INTEGER",
+  "UPDATE train_queue SET batched_episode = episode WHERE state = 'batched'",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -125,6 +154,12 @@ export interface QueueEntry {
   retries: number;
   /** Why it left the queue, or `null`. */
   reason: DropReason | null;
+  /** The claim's ready episode the entry was last queued for. */
+  episode: number;
+  /** While batched, the commit of a newer ready episode, queued once the batch settles; or `null`. */
+  nextCommit: CommitSha | null;
+  /** The ready episode its latest batch was formed for, or `null` before it was first batched. */
+  batchedEpisode: number | null;
 }
 
 /** Where one batch stands. */
@@ -171,6 +206,8 @@ export interface BatchRecord {
   decisions: DecisionRef[];
   /** The trusted check definition, read from `expectedMain`. */
   definition: CheckDefinition;
+  /** The merge attempt of its latest compose, once one was asked for. */
+  mergeAttempt: string | null;
   /** The composed commit, once the merge was clean. */
   candidate: CommitSha | null;
   /** The check attempt on `candidate`, once recorded. */
@@ -207,6 +244,9 @@ type QueueRow = {
   isolate: number;
   retries: number;
   reason: string | null;
+  episode: number;
+  next_commit: string | null;
+  batched_episode: number | null;
 };
 
 type BatchRow = {
@@ -216,6 +256,7 @@ type BatchRow = {
   pins: string;
   decisions: string;
   definition: string;
+  merge_attempt: string | null;
   candidate: string | null;
   attempt_id: string | null;
   attempt_at: number | null;
@@ -231,9 +272,10 @@ type BatchRow = {
   updated_at: number;
 };
 
-const QUEUE_COLUMNS = "claim_id, generation, commit_sha, state, isolate, retries, reason";
+const QUEUE_COLUMNS =
+  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit, batched_episode";
 const BATCH_COLUMNS =
-  "batch_id, state, expected_main, pins, decisions, definition, candidate, attempt_id, attempt_at, check_started, check_held, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
+  "batch_id, state, expected_main, pins, decisions, definition, merge_attempt, candidate, attempt_id, attempt_at, check_started, check_held, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
 /** The queue entry of `claimId` at `generation`, or `null`. */
 export function readEntry(sql: SqlStorage, claimId: string, generation: number): QueueEntry | null {
@@ -299,16 +341,80 @@ export function recentEntries(sql: SqlStorage, limit: number): QueueEntry[] {
     .map(toEntry);
 }
 
-/** Adds a waiting entry at the back of the queue. */
-export function insertEntry(sql: SqlStorage, pin: ClaimPin, now: number): void {
+/** Adds a waiting entry for ready episode `episode` at the back of the queue. */
+export function insertEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
     `INSERT INTO train_queue
-       (claim_id, generation, commit_sha, position, state, isolate, retries, reason, enqueued_at, updated_at)
-     VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), 'queued', 0, 0, NULL, ?, ?)`,
+       (claim_id, generation, commit_sha, position, state, isolate, retries, reason, episode,
+        enqueued_at, updated_at)
+     VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), 'queued', 0, 0, NULL,
+       ?, ?, ?)`,
     pin.claimId,
     pin.generation,
     pin.commit,
+    episode,
     now,
+    now,
+  );
+}
+
+/**
+ * Queues ready episode `episode` of a claim whose entry is waiting or settled: the entry takes the
+ * commit and episode as fresh work, with its retries, isolation, drop reason and held commit
+ * cleared, even when the commit is the one it already held. A waiting entry keeps its place; a
+ * settled one goes to the back.
+ */
+export function requeueEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET commit_sha = ?, episode = ?, isolate = 0, retries = 0, reason = NULL,
+       next_commit = NULL, next_episode = NULL, updated_at = ?,
+       position = CASE WHEN state = 'queued' THEN position
+         ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue) END,
+       state = 'queued'
+     WHERE claim_id = ? AND generation = ? AND state <> 'batched'`,
+    pin.commit,
+    episode,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+}
+
+/**
+ * Holds the commit of ready episode `episode` on a batched entry until its batch settles, or, when
+ * the episode pinned the batched commit again, clears any held commit and takes the episode, which
+ * the batch's result then no longer settles.
+ */
+export function deferCommit(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET next_commit = CASE WHEN commit_sha = ? THEN NULL ELSE ? END,
+       next_episode = CASE WHEN commit_sha = ? THEN NULL ELSE ? END,
+       episode = CASE WHEN commit_sha = ? THEN ? ELSE episode END,
+       updated_at = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'batched'`,
+    pin.commit,
+    pin.commit,
+    pin.commit,
+    episode,
+    pin.commit,
+    episode,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+}
+
+/**
+ * Queues, at the back with fresh counters, the newer commit and episode each entry held while it
+ * was batched. Call it after a batch's entries settle.
+ */
+export function promoteDeferred(sql: SqlStorage, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET commit_sha = next_commit, next_commit = NULL,
+       episode = COALESCE(next_episode, episode), next_episode = NULL, state = 'queued',
+       isolate = 0, retries = 0, reason = NULL, updated_at = ?,
+       position = (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue)
+     WHERE next_commit IS NOT NULL AND state <> 'batched'`,
     now,
   );
 }
@@ -382,7 +488,10 @@ export function recentBatches(sql: SqlStorage, limit: number): BatchRecord[] {
     .map(toBatch);
 }
 
-/** Records a new active batch over `pins` and marks their entries batched. Returns its id. */
+/**
+ * Records a new active batch over `pins` and marks their entries batched for the episode each
+ * holds. Returns its id.
+ */
 export function insertBatch(
   sql: SqlStorage,
   batch: {
@@ -409,13 +518,33 @@ export function insertBatch(
   if (row === undefined) throw new Error("the batch insert returned no row");
   for (const pin of batch.pins) {
     sql.exec(
-      "UPDATE train_queue SET state = 'batched', updated_at = ? WHERE claim_id = ? AND generation = ?",
+      `UPDATE train_queue SET state = 'batched', batched_episode = episode, updated_at = ?
+       WHERE claim_id = ? AND generation = ?`,
       now,
       pin.claimId,
       pin.generation,
     );
   }
   return row.batch_id;
+}
+
+/**
+ * Records `attempt` as the batch's merge attempt, before the merge port is asked to compose under
+ * it. An earlier attempt it supersedes is queued for discard.
+ */
+export function recordMergeAttempt(
+  sql: SqlStorage,
+  batchId: number,
+  attempt: string,
+  now: number,
+): void {
+  queueDiscard(sql, batchId, now);
+  sql.exec(
+    "UPDATE train_batches SET merge_attempt = ?, updated_at = ? WHERE batch_id = ?",
+    attempt,
+    now,
+    batchId,
+  );
 }
 
 /** Records the clean merge and the check attempt on its candidate. */
@@ -515,19 +644,78 @@ export function recordIntent(
   );
 }
 
-/** Settles the active batch. */
+/** Settles the active batch and queues its merge attempt for discard. */
 export function settleBatch(
   sql: SqlStorage,
   batchId: number,
   outcome: { state: "landed" } | { state: "failed"; failure: BatchFailure },
   now: number,
 ): void {
+  queueDiscard(sql, batchId, now);
   sql.exec(
     "UPDATE train_batches SET active = NULL, state = ?, failure = ?, updated_at = ? WHERE batch_id = ?",
     outcome.state,
     outcome.state === "failed" ? outcome.failure : null,
     now,
     batchId,
+  );
+}
+
+/** Queues the batch's current merge attempt, if any, for discard once its compose cannot push. */
+function queueDiscard(sql: SqlStorage, batchId: number, now: number): void {
+  sql.exec(
+    `INSERT INTO train_discards (attempt, due_at, failures)
+       SELECT merge_attempt, ?, 0 FROM train_batches
+       WHERE batch_id = ? AND merge_attempt IS NOT NULL
+     ON CONFLICT (attempt) DO NOTHING`,
+    now + MERGE_PUSH_WINDOW_MS,
+    batchId,
+  );
+}
+
+/** A merge attempt whose candidate refs the train still has to delete. */
+export interface PendingDiscard {
+  /** The merge attempt. */
+  attempt: string;
+  /** When the next discard is due, in milliseconds since the Unix epoch. */
+  dueAt: number;
+  /** How many discards of it failed in a row. */
+  failures: number;
+}
+
+/** Up to `limit` discards due at `now`, earliest first. */
+export function dueDiscards(sql: SqlStorage, now: number, limit: number): PendingDiscard[] {
+  return sql
+    .exec<{ attempt: string; due_at: number; failures: number }>(
+      `SELECT attempt, due_at, failures FROM train_discards WHERE due_at <= ?
+       ORDER BY due_at, attempt LIMIT ?`,
+      now,
+      limit,
+    )
+    .toArray()
+    .map((row) => ({ attempt: row.attempt, dueAt: row.due_at, failures: row.failures }));
+}
+
+/** When the earliest pending discard is due, or `null` when none is pending. */
+export function nextDiscardAt(sql: SqlStorage): number | null {
+  const row = sql
+    .exec<{ due_at: number | null }>("SELECT MIN(due_at) AS due_at FROM train_discards")
+    .toArray()[0];
+  return row?.due_at ?? null;
+}
+
+/** Records that the attempt's candidate refs are gone. */
+export function completeDiscard(sql: SqlStorage, attempt: string): void {
+  sql.exec("DELETE FROM train_discards WHERE attempt = ?", attempt);
+}
+
+/** Records a failed discard of the attempt and when to try it again. */
+export function retryDiscard(sql: SqlStorage, discard: PendingDiscard): void {
+  sql.exec(
+    "UPDATE train_discards SET due_at = ?, failures = ? WHERE attempt = ?",
+    discard.dueAt,
+    discard.failures,
+    discard.attempt,
   );
 }
 
@@ -629,6 +817,9 @@ function toEntry(row: QueueRow): QueueEntry {
     isolate: row.isolate === 1,
     retries: row.retries,
     reason: row.reason === null ? null : parseDropReason(row.reason),
+    episode: row.episode,
+    nextCommit: row.next_commit,
+    batchedEpisode: row.batched_episode,
   };
 }
 
@@ -644,6 +835,7 @@ function toBatch(row: BatchRow): BatchRecord {
     pins,
     decisions,
     definition,
+    mergeAttempt: row.merge_attempt,
     candidate: row.candidate,
     attemptId: row.attempt_id,
     attemptAt: row.attempt_at,

@@ -10,6 +10,11 @@
 // said halts the fold with a typed fault instead of producing a plausible board. Badges that
 // depend on several facts, such as "adapted", are computed by selectors over the folded facts and
 // are never stored.
+//
+// Totals are counted from applied events only, so a duplicate, which the fold ignores by its
+// sequence number, never adds to one. Recent activity is bucketed by the minute each event was
+// recorded and kept only for the window that ends at the newest event's minute, so it is bounded and
+// a replay shows the same numbers as the live board did.
 
 import { INVITE_TTL_MS } from "@railhead/shared/board-api";
 import {
@@ -38,6 +43,11 @@ import {
 
 /** How many recent pushes a claim keeps for its lane. Older pushes remain in the log. */
 export const MAX_LANE_PUSHES = 20;
+
+/** How many minutes of recent activity the board keeps, ending at the newest event's minute. */
+export const ACTIVITY_WINDOW_MINUTES = 10;
+
+const MINUTE_MS = 60_000;
 
 /** Where an agent's inbox item stands. Each state is recorded by a separate event. */
 export type InboxDelivery = "queued" | "delivered" | "acknowledged";
@@ -110,6 +120,11 @@ export interface ClaimState {
   refusal: { generation: number; reason: RefusalReason } | null;
   /** Intents that landed this claim on main, oldest first. */
   landings: readonly IntentId[];
+  /**
+   * The decision versions the backend recorded this claim's landed work as adapted to, in log
+   * order. See `isClaimAdapted`.
+   */
+  adaptations: readonly DecisionRef[];
 }
 
 /** A question asked from a claim. Text and option labels are untrusted. */
@@ -194,6 +209,31 @@ export interface ConflictState {
   route: ConflictRoute;
 }
 
+/** What happened in one minute of the log, by the minute each event was recorded. */
+export interface MinuteActivity {
+  /** Whole minutes since the Unix epoch. */
+  minute: number;
+  /** `claim.opened` events. */
+  claimsOpened: number;
+  /** `train.check` events: one per check result, whatever the result. */
+  checksReported: number;
+  /** Claims carried by a merge that moved main to its candidate. */
+  changesLanded: number;
+}
+
+/** Counts over every applied event, and when the log began and last moved. */
+export interface LogTotals {
+  /** Events a person recorded: invites, confirmations, revocations, filed issues and decisions. */
+  humanActions: number;
+  /**
+   * The earliest `at` of any applied event, or `null` before the first. A late event can carry an
+   * earlier `at` than the event before it in sequence.
+   */
+  earliestAt: number | null;
+  /** The latest `at` of any applied event, or `null` before the first. */
+  lastAt: number | null;
+}
+
 /** Why the fold stopped. A halted board must say so; it never shows a guessed state. */
 export type BoardFault =
   /** The event uses a schema version this board cannot read. */
@@ -237,6 +277,12 @@ export interface BoardState {
   intents: Readonly<Record<IntentId, IntentState>>;
   /** In log order. */
   conflicts: readonly ConflictState[];
+  totals: LogTotals;
+  /**
+   * Activity in each minute within `ACTIVITY_WINDOW_MINUTES` of the newest event's minute that had
+   * any, ascending. Older minutes are dropped.
+   */
+  recent: readonly MinuteActivity[];
 }
 
 /** The board of a repository whose log has no events yet. */
@@ -255,6 +301,8 @@ export const emptyBoardState = (repo: RepoId): BoardState => ({
   checkRuns: {},
   intents: {},
   conflicts: [],
+  totals: { humanActions: 0, earliestAt: null, lastAt: null },
+  recent: [],
 });
 
 /** The key of an inbox item in `BoardState.inbox`. Item numbers are per agent. */
@@ -285,17 +333,15 @@ export const currentDecisionVersion = (
 ): DecisionVersionState | undefined => own(state.decisions, decisionId)?.versions.at(-1);
 
 /**
- * True only when the claim's work for the decision's current version is on main and proven. All of
- * these must hold for one intent that landed the claim:
- *
- * - the intent landed: main moved to its candidate;
- * - the intent was authorised against the decision's current version;
- * - the latest acceptance result recorded on that exact candidate, for the current version and its
- *   chosen option, is `pass`.
+ * True only when the backend recorded the claim's landed work as adapted to the decision's current
+ * version (`claim.adapted`). The backend records it per claim: the intent landed, the acceptance
+ * check it rests on passed the version's chosen option on the landed commit, and this claim depended
+ * on that version when it landed. The board does not derive it from the intent, whose decisions are
+ * the batch's combined ones.
  *
  * A passing check on a candidate that has not landed, a pass for an older version or another option,
  * and the agent's own acknowledgement all leave the claim not adapted. Superseding the decision
- * removes the badge until the new version's work lands and passes.
+ * removes the badge until the new version's work lands and is recorded adapted.
  */
 export const isClaimAdapted = (
   state: BoardState,
@@ -305,19 +351,9 @@ export const isClaimAdapted = (
   const current = currentDecisionVersion(state, decisionId);
   const claim = own(state.claims, claimId);
   if (current === undefined || claim === undefined) return false;
-  return claim.landings.some((intentId) => {
-    // `landings` holds only intents that moved main to their candidate.
-    const intent = own(state.intents, intentId);
-    if (intent === undefined) return false;
-    const authorised = intent.decisions.some(
-      (ref) => ref.decisionId === decisionId && ref.version === current.version,
-    );
-    return (
-      authorised &&
-      latestAcceptance(state, intent.candidate, decisionId, current.version, current.option) ===
-        "pass"
-    );
-  });
+  return claim.adaptations.some(
+    (ref) => ref.decisionId === decisionId && ref.version === current.version,
+  );
 };
 
 /** One agent's progress on the current version of a decision. */
@@ -425,7 +461,67 @@ const foldInto = (state: BoardState, event: RailheadEvent, draft: FoldDraft): Bo
     if (!(error instanceof LogInconsistency)) throw error;
     return halt(state, { kind: "inconsistent", seq: event.seq, message: error.message });
   }
-  return { ...next, cursor: event.seq, stream: afterApplying(state.stream, event.seq) };
+  return {
+    ...next,
+    cursor: event.seq,
+    stream: afterApplying(state.stream, event.seq),
+    totals: countTotals(state.totals, event),
+    recent: countRecent(state.recent, state.totals.lastAt, event, activityOf(next, event)),
+  };
+};
+
+const countTotals = (totals: LogTotals, event: RailheadEvent): LogTotals => ({
+  humanActions: totals.humanActions + (event.actor.kind === "human" ? 1 : 0),
+  earliestAt: totals.earliestAt === null ? event.at : Math.min(totals.earliestAt, event.at),
+  lastAt: totals.lastAt === null ? event.at : Math.max(totals.lastAt, event.at),
+});
+
+type ActivityCounts = Omit<MinuteActivity, "minute">;
+
+/** What an applied event adds to its minute's activity, or `null` when it adds nothing. */
+const activityOf = (next: BoardState, event: RailheadEvent): ActivityCounts | null => {
+  switch (event.type) {
+    case "claim.opened":
+      return { claimsOpened: 1, checksReported: 0, changesLanded: 0 };
+    case "train.check":
+      return { claimsOpened: 0, checksReported: 1, changesLanded: 0 };
+    case "train.main": {
+      const intent = own(next.intents, event.data.intentId);
+      if (intent?.landing.kind !== "landed") return null;
+      return { claimsOpened: 0, checksReported: 0, changesLanded: intent.claims.length };
+    }
+    default:
+      return null;
+  }
+};
+
+/**
+ * `recent` after an event at `event.at`, given the latest `at` before it. Minutes that fall out of
+ * the window ending at the newest minute are dropped, and an event older than that window adds
+ * nothing.
+ */
+const countRecent = (
+  recent: readonly MinuteActivity[],
+  lastAt: number | null,
+  event: RailheadEvent,
+  counts: ActivityCounts | null,
+): readonly MinuteActivity[] => {
+  const minute = Math.floor(event.at / MINUTE_MS);
+  const newest = lastAt === null ? minute : Math.max(Math.floor(lastAt / MINUTE_MS), minute);
+  const oldest = newest - ACTIVITY_WINDOW_MINUTES + 1;
+  const outdated = recent.length > 0 && (recent[0]?.minute ?? oldest) < oldest;
+  if (counts === null || minute < oldest) {
+    return outdated ? recent.filter((entry) => entry.minute >= oldest) : recent;
+  }
+  const kept = recent.filter((entry) => entry.minute >= oldest && entry.minute !== minute);
+  const prior = recent.find((entry) => entry.minute === minute);
+  const updated: MinuteActivity = {
+    minute,
+    claimsOpened: (prior?.claimsOpened ?? 0) + counts.claimsOpened,
+    checksReported: (prior?.checksReported ?? 0) + counts.checksReported,
+    changesLanded: (prior?.changesLanded ?? 0) + counts.changesLanded,
+  };
+  return [...kept, updated].toSorted((a, b) => a.minute - b.minute);
 };
 
 const DELIVERY_RANK: Record<InboxDelivery, number> = { queued: 0, delivered: 1, acknowledged: 2 };
@@ -490,32 +586,6 @@ const currentGeneration = (claim: ClaimState, generation: number): void =>
     generation === claim.generation,
     `claim ${claim.claimId} is at generation ${claim.generation}, not ${generation}`,
   );
-
-const latestAcceptance = (
-  state: BoardState,
-  candidate: CommitSha,
-  decisionId: DecisionId,
-  version: number,
-  option: string,
-): CheckResult | null => {
-  let latest: CheckEntryState | null = null;
-  for (const run of Object.values(state.checkRuns)) {
-    if (run.candidate !== candidate) continue;
-    for (const entry of run.results) {
-      const { acceptance } = entry;
-      if (
-        acceptance !== null &&
-        acceptance.decision.decisionId === decisionId &&
-        acceptance.decision.version === version &&
-        acceptance.option === option &&
-        (latest === null || entry.seq > latest.seq)
-      ) {
-        latest = entry;
-      }
-    }
-  }
-  return latest?.result ?? null;
-};
 
 const landingOf = (intent: IntentState, outcome: MainOutcome, main: CommitSha): IntentLanding => {
   switch (outcome) {
@@ -611,6 +681,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           pushes: [],
           refusal: null,
           landings: [],
+          adaptations: [],
         }),
       };
     }
@@ -687,6 +758,25 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           generation,
           phase: "working",
           ready: null,
+        }),
+      };
+    }
+    case "claim.adapted": {
+      const { claimId, intentId, decision } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      const intent = known(state.intents, intentId, "intent");
+      check(intent.landing.kind === "landed", `intent ${intentId} did not land`);
+      check(intent.claims.includes(claimId), `intent ${intentId} did not land claim ${claimId}`);
+      knownDecisionVersion(state, decision);
+      const repeated = claim.adaptations.some(
+        (ref) => ref.decisionId === decision.decisionId && ref.version === decision.version,
+      );
+      if (repeated) return state;
+      return {
+        ...state,
+        claims: draft.put(state.claims, claimId, {
+          ...claim,
+          adaptations: draft.append(claim.adaptations, decision),
         }),
       };
     }

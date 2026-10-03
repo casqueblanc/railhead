@@ -252,6 +252,7 @@ describe("events on the wire", () => {
     "claim.reopened": true,
     "claim.expired": true,
     "claim.reassigned": true,
+    "claim.adapted": true,
     "question.asked": true,
     "decision.recorded": true,
     "inbox.queued": true,
@@ -475,8 +476,12 @@ describe("unavailable ports", () => {
     ["artifacts.forkForClaim", () => unavailableArtifacts.forkForClaim("clm_42abcd", sha)],
     ["artifacts.commitExists", () => unavailableArtifacts.commitExists("repo", sha)],
     ["artifacts.token", () => unavailableArtifacts.token("repo", "write", 60_000)],
-    ["artifacts.revokeTokens", () => unavailableArtifacts.revokeTokens("repo")],
-    ["merge.compose", () => unavailableMerge.compose(sha, [pin])],
+    [
+      "artifacts.revokeTokens",
+      () => unavailableArtifacts.revokeTokens("repo", { seq: 0, startedAt: 0 }),
+    ],
+    ["merge.compose", () => unavailableMerge.compose(sha, [pin], "mrg_attempt1")],
+    ["merge.discard", () => unavailableMerge.discard("mrg_attempt1")],
     [
       "checks.start",
       () =>
@@ -490,7 +495,6 @@ describe("unavailable ports", () => {
           createdAt: 1,
         }),
     ],
-    ["train.enqueue", () => unavailableTrain.enqueue(pin)],
     [
       "train.recordCheck",
       () =>

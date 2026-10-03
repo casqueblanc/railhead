@@ -22,6 +22,8 @@
 import type { RpcTarget } from "capnweb";
 import type {
   AgentId,
+  CheckResult,
+  CheckRunId,
   CommitSha,
   DecisionId,
   InviteId,
@@ -29,7 +31,7 @@ import type {
   RailheadEvent,
   RepoId,
   UserId,
-} from "./events";
+} from "./events.ts";
 
 /** Largest event page `readEvents` returns. */
 export const MAX_EVENT_PAGE = 256;
@@ -145,6 +147,50 @@ export interface PendingJoin {
   joinedAt: number;
 }
 
+/** The most bytes of a check run's output `checkDetail` returns, taken from its end. */
+export const MAX_CHECK_DETAIL_LOG_BYTES = 16 * 1024;
+
+/** Where a check run stands, as the backend's checks module recorded it. */
+export type CheckDetailState =
+  /** The candidate edits these protected paths, so nothing ran; a person must approve it. */
+  | { kind: "held"; paths: string[] }
+  /** A sandbox was admitted and the run asked for; no report has arrived. */
+  | { kind: "started"; deadline: number }
+  /** The run reported. */
+  | {
+      kind: "reported";
+      /** The outcome. `error` means the check could not run. */
+      result: CheckResult;
+      /** When the run finished. */
+      finishedAt: number;
+      /**
+       * The end of the run's output, at most `MAX_CHECK_DETAIL_LOG_BYTES` of UTF-8. Untrusted text:
+       * render it as text, never as markup or links.
+       */
+      logTail: string;
+      /** Whether earlier output was left out of `logTail`. */
+      logCut: boolean;
+    };
+
+/** One check run, as the backend recorded it: what ran, on which commit, and what came of it. */
+export interface CheckDetail {
+  /** The run. */
+  checkRunId: CheckRunId;
+  /** The exact commit checked. */
+  candidate: CommitSha;
+  /** The main commit the candidate was composed on, and the definition was read from. */
+  expectedMain: CommitSha;
+  /** SHA-256 of the trusted definition's bytes, 64 lowercase hexadecimal characters. */
+  definitionDigest: string;
+  /**
+   * The shell command the definition on `expectedMain` gave the run, or `null` for a run recorded
+   * before the backend kept commands. Repository content: render it as text.
+   */
+  command: string | null;
+  /** Where it stands. */
+  state: CheckDetailState;
+}
+
 /** The board's side of a subscription. The board passes an `RpcTarget` implementing it. */
 export interface BoardListener extends RpcTarget {
   /**
@@ -181,6 +227,13 @@ export interface BoardApi extends RpcTarget {
   ): Promise<BoardResult<BoardSubscription>>;
   /** The joins waiting for the owner, oldest first. */
   pendingJoins(): Promise<BoardResult<PendingJoin[]>>;
+  /**
+   * What the backend recorded for the check run a `train.check` event names. It fails with
+   * `invalid_request` for a malformed id, and with `not_found` for a run the backend never started
+   * or no longer keeps: it keeps a bounded number of runs, so an old run's detail can be gone while
+   * its event remains.
+   */
+  checkDetail(checkRunId: CheckRunId): Promise<BoardResult<CheckDetail>>;
   /** The owner's passkey actions for this repository. */
   owner(): Promise<OwnerApi>;
 }

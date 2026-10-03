@@ -41,7 +41,7 @@ export const unavailableSessions: SessionsPort = {
   authenticate: refuse("sessions"),
 };
 
-/** Claims while its module is missing: no Git request is authorized. */
+/** Claims while its module is missing: no Git request is authorized, and nothing is owed. */
 export const unavailableClaims: ClaimsPort = {
   activeClaim: refuse("claims"),
   work: refuse("claims"),
@@ -50,8 +50,11 @@ export const unavailableClaims: ClaimsPort = {
   pin: refuse("claims"),
   currentGeneration: () => null,
   workingGeneration: () => null,
+  workingEpisode: () => null,
+  readyPin: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
+  resume: async () => {},
 };
 
 /** Inbox while its module is missing: the ready gate is never clear. */
@@ -76,6 +79,7 @@ export const unavailableDecisions: DecisionsPort = {
   record: refuse("decisions"),
   requirements: refuse("decisions"),
   currentVersions: () => null,
+  currentDecision: () => null,
   transfer: () => {
     throw new UnavailableError("decisions");
   },
@@ -96,6 +100,7 @@ export const unavailableArtifacts: ArtifactsPort = {
 /** Merging while its module is missing. */
 export const unavailableMerge: MergePort = {
   compose: refuse("merge"),
+  discard: refuse("merge"),
 };
 
 /** Checks while their module is missing: nothing runs, so nothing passes. */
@@ -103,16 +108,21 @@ export const unavailableChecks: CheckPort = {
   definitions: refuse("checks"),
   start: refuse("checks"),
   report: refuse("checks"),
+  detail: refuse("checks"),
 };
 
 /**
- * The train while its module is missing: no report is recorded, no attempt is known and nothing is
- * owed, so `resume` does nothing.
+ * The train while its module is missing: no pin is queued, so no ready is recorded, no report is
+ * recorded, no attempt is known and nothing is owed, so `resume` does nothing.
  */
 export const unavailableTrain: TrainPort = {
-  enqueue: refuse("train"),
+  queue: () => {
+    throw new UnavailableError("train");
+  },
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
+  holdsLiveEntry: () => null,
+  armWake: async () => false,
   resume: async () => {},
 };
 

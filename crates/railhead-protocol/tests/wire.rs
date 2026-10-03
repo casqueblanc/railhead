@@ -246,6 +246,43 @@ fn refuses_an_event_recorded_by_the_wrong_kind_of_actor() -> TestResult {
         decode(&reopened)?.payload,
         EventPayload::ClaimReopened(_)
     ));
+
+    Ok(())
+}
+
+#[test]
+fn decodes_an_adaptation_only_from_the_system() -> TestResult {
+    let mut adapted = opened();
+    set(&mut adapted, "/type", json!("claim.adapted"))?;
+    set(
+        &mut adapted,
+        "/data",
+        json!({
+            "claimId": "clm_42abcd", "intentId": "int_merge01",
+            "decision": {"decisionId": "dec_upload1", "version": 1},
+        }),
+    )?;
+    assert!(matches!(
+        decode(&adapted),
+        Err(Error::WrongActor {
+            event_type: "claim.adapted",
+            required: "the system"
+        })
+    ));
+    set(
+        &mut adapted,
+        "/actor",
+        json!({"kind": "system", "id": "sys_adaptation"}),
+    )?;
+    assert!(matches!(
+        decode(&adapted)?.payload,
+        EventPayload::ClaimAdapted(_)
+    ));
+    set(&mut adapted, "/data/intentId", json!("clm_42abcd"))?;
+    assert!(
+        decode(&adapted).is_err(),
+        "a claim id cannot stand in for the intent"
+    );
     Ok(())
 }
 

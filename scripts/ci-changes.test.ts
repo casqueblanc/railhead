@@ -1,21 +1,29 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 const script = join(import.meta.dirname, "ci-changes.mjs");
 
+const JOBS = ["lint", "test", "rust"];
+
 /** Runs the classifier as CI does, with `paths` on stdin, and returns its decision for `job`. */
-function decide(job: string, paths: string[]): { status: number | null; stdout: string } {
-  const result = spawnSync(process.execPath, [script, job], {
+function decide(
+  job: string,
+  paths: string[],
+  event = "pull_request",
+): { status: number | null; stdout: string } {
+  const result = spawnSync(process.execPath, [script, job, event], {
     input: paths.map((path) => `${path}\n`).join(""),
     encoding: "utf8",
   });
   return { status: result.status, stdout: result.stdout };
 }
 
-function runs(job: string, paths: string[]): boolean {
-  const { status, stdout } = decide(job, paths);
+function runs(job: string, paths: string[], event?: string): boolean {
+  const { status, stdout } = decide(job, paths, event);
   assert.equal(status, 0);
   assert.match(stdout, /^run=(?:true|false)\n$/);
   return stdout === "run=true\n";
@@ -67,7 +75,7 @@ test("the Rust gate script runs Rust and lint, and no other script runs Rust", (
 
 test("a workflow, this classifier or an unlisted path runs every job", () => {
   for (const path of [".github/workflows/ci.yml", "scripts/ci-changes.mjs", "newdir/file.txt"]) {
-    for (const job of ["lint", "test", "rust"]) {
+    for (const job of JOBS) {
       assert.equal(runs(job, [path]), true, `${job} ${path}`);
     }
   }
@@ -83,13 +91,69 @@ test("one input among skippable paths runs the job", () => {
 });
 
 test("no changed paths runs nothing", () => {
-  for (const job of ["lint", "test", "rust"]) {
+  for (const job of JOBS) {
     assert.equal(runs(job, []), false, job);
   }
 });
 
+test("a merge group runs every job, whatever it changes", () => {
+  for (const paths of [["docs/demo-seed.md"], ["crates/railhead-cli/src/main.rs"], []]) {
+    for (const job of JOBS) {
+      assert.equal(runs(job, paths, "merge_group"), true, `${job} ${paths.join(" ")}`);
+    }
+  }
+});
+
+test("a push runs every job, whatever it changes", () => {
+  for (const paths of [["README.md"], ["packages/railhead-frontend/src/main.tsx"], []]) {
+    for (const job of JOBS) {
+      assert.equal(runs(job, paths, "push"), true, `${job} ${paths.join(" ")}`);
+    }
+  }
+});
+
+test("a merge group drains a large diff, as the pipefail shell in CI requires", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-changes-"));
+  try {
+    const list = join(dir, "paths.txt");
+    writeFileSync(
+      list,
+      Array.from({ length: 20_000 }, (_, index) => `docs/page-${index}.md\n`).join(""),
+    );
+    const pipeline = (event: string) =>
+      spawnSync(
+        "bash",
+        ["-c", 'set -o pipefail; cat "$1" | node "$2" test "$3"', "_", list, script, event],
+        {
+          encoding: "utf8",
+        },
+      );
+    const queued = pipeline("merge_group");
+    assert.equal(queued.status, 0);
+    assert.equal(queued.stdout, "run=true\n");
+    const pull = pipeline("pull_request");
+    assert.equal(pull.status, 0);
+    assert.equal(pull.stdout, "run=false\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unknown or missing event fails without a decision", () => {
+  for (const args of [
+    ["lint", "workflow_dispatch"],
+    ["test", "toString"],
+    ["rust", "MERGE_GROUP"],
+    ["lint"],
+  ]) {
+    const result = spawnSync(process.execPath, [script, ...args], { input: "", encoding: "utf8" });
+    assert.equal(result.status, 2, args.join(" "));
+    assert.equal(result.stdout, "", args.join(" "));
+  }
+});
+
 test("an unknown or missing job name fails without a decision", () => {
-  for (const args of [["deploy"], ["toString"], []]) {
+  for (const args of [["deploy", "merge_group"], ["toString", "push"], []]) {
     const result = spawnSync(process.execPath, [script, ...args], { input: "", encoding: "utf8" });
     assert.equal(result.status, 2);
     assert.equal(result.stdout, "");

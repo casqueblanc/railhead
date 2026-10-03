@@ -66,9 +66,10 @@ export interface RepoContext {
    * `resume` when it fires, so a module records what it owes in its own tables and asks again from
    * `resume` when its time has not come. The alarm write is issued at once, so a wake asked for
    * inside a transaction commits with that transaction's rows; ask for it as the transaction's last
-   * write.
+   * write. It resolves `true` once storage holds an alarm no later than `at`, or `false` if the
+   * write failed. It never rejects, so a caller that needs no confirmation may ignore it.
    */
-  readonly wake: (at: number) => void;
+  readonly wake: (at: number) => Promise<boolean>;
 }
 
 /** Every module's port, as other modules and the adapters see them. Main's ref is not here. */
@@ -142,24 +143,41 @@ export interface Resumable {
 /** The modules the Repo's alarm resumes, in composition order. */
 export function resumables(ports: RepoPorts): readonly Resumable[] {
   return [
+    { module: "claims", resume: () => ports.claims.resume() },
     { module: "git", resume: () => ports.git.resume() },
     { module: "train", resume: () => ports.train.resume() },
+    { module: "adaptation", resume: () => ports.adaptation.resume() },
   ];
 }
 
+/** How long after a module's resume throws the Repo's alarm runs again. */
+export const RESUME_RETRY_MS = 60_000;
+
 /**
- * Resumes each module in order. A module that throws is logged by name, never with its message,
- * and does not stop the others; each module asks for its own next wake.
+ * Resumes each module in order. Each module asks for its own next wake. A module that throws may
+ * not have asked, so it is logged by name, never with its message, the alarm is asked to run again
+ * `RESUME_RETRY_MS` later, and the others still run.
  */
-export async function resumeAll(repoId: RepoId, modules: readonly Resumable[]): Promise<void> {
+export async function resumeAll(
+  context: Pick<RepoContext, "repoId" | "clock" | "wake">,
+  modules: readonly Resumable[],
+): Promise<void> {
   for (const { module, resume } of modules) {
     try {
       await resume();
     } catch (error) {
       const name = error instanceof Error ? error.name : "unknown";
+      const retryAt = context.clock() + RESUME_RETRY_MS;
       console.error(
-        JSON.stringify({ event: "repo.resume_failed", repo: repoId, module, error: name }),
+        JSON.stringify({
+          event: "repo.resume_failed",
+          repo: context.repoId,
+          module,
+          error: name,
+          retryAt,
+        }),
       );
+      context.wake(retryAt);
     }
   }
 }

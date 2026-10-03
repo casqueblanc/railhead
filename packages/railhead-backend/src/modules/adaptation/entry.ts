@@ -1,10 +1,26 @@
-// Adaptation: recording landed work's adaptation to a newer decision version. No adapter or module calls it yet; its task defines the port's methods here and replaces the
-// factory.
+// Adaptation: whether landed work follows the current version of a decision. The implementation is
+// `createAdaptation` in `src/train/adaptation/`; the train calls `owe` and `recordLanding` when a batch
+// lands, and the Repo's alarm retries pending landings and appends `claim.adapted` through `resume`.
 
 import type { ModuleFactory } from "../../repo/composeRepo";
+import { createAdaptation, type AdaptationPort } from "../../train/adaptation/adaptation";
 
-/** The adaptation module's port. It has no methods until its task adds them. */
-export type AdaptationPort = Readonly<Record<never, never>>;
+export type { AdaptationPort } from "../../train/adaptation/adaptation";
 
 /** Builds the adaptation module of one repository. */
-export const adaptation: ModuleFactory<AdaptationPort> = () => ({});
+export const adaptation: ModuleFactory<AdaptationPort> = (context, ports) =>
+  createAdaptation({
+    storage: context.storage,
+    log: context.log,
+    clock: context.clock,
+    wake: context.wake,
+    readers: () => {
+      const { authorization, decisions, train } = ports();
+      return {
+        intent: (intentId) => authorization.record(intentId),
+        attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
+        currentVersions: (claimId) => decisions.currentVersions(claimId),
+        currentDecision: (decisionId) => decisions.currentDecision(decisionId),
+      };
+    },
+  });

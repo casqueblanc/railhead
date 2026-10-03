@@ -13,6 +13,7 @@ import type {
   MainOutcome,
 } from "../../packages/railhead-shared/src/events";
 import {
+  SYNTH_ADAPTATION,
   SYNTH_GATEWAY,
   SYNTH_OWNER,
   SYNTH_TRAIN,
@@ -180,6 +181,17 @@ export const intend = (
   type: "train.intent",
   actor: SYNTH_TRAIN,
   data: { intentId, expectedMain, candidate, claims, decisions, checkRunId },
+});
+
+/** The backend recording a claim's work landed by an intent as adapted to a decision version. */
+export const adapt = (
+  claimId: ClaimId,
+  intentId: IntentId,
+  decision: DecisionRef,
+): SyntheticStep => ({
+  type: "claim.adapted",
+  actor: SYNTH_ADAPTATION,
+  data: { claimId, intentId, decision },
 });
 
 /** The result of the train's attempt to move main for an intent. */

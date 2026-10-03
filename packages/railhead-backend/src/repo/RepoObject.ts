@@ -17,6 +17,7 @@ import { DurableObject } from "cloudflare:workers";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
 import type {
   ActionChallenge,
+  CheckDetail,
   DemoSeedAction,
   DemoSeedResult,
   DemoSeedState,
@@ -214,6 +215,13 @@ export class Repo extends DurableObject<Env> {
     return ports.identity.pendingJoins();
   }
 
+  /** What the checks module recorded for one check run. */
+  async checkDetail(checkRunId: string): Promise<PortResult<CheckDetail>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.checks.detail(checkRunId);
+  }
+
   /** Prepares an owner action, through the owner module. */
   async prepareOwnerAction(action: OwnerAction): Promise<PortResult<ActionChallenge>> {
     const ports = this.#ports();
@@ -256,14 +264,22 @@ export class Repo extends DurableObject<Env> {
   }
 
   /**
-   * Resumes every module that owes work. Each module asks for its own next wake. If one of those
-   * wakes failed to reach storage, the handler throws so the runtime retries the alarm.
+   * Resumes every module that owes work. Each module asks for its own next wake, and a module that
+   * throws gets a retry wake. If one of those wakes failed to reach storage, the handler throws so
+   * the runtime retries the alarm.
    */
   async alarm(): Promise<void> {
     this.#alarm.fired();
     const installed = this.#installed;
     if (installed === null) return;
-    await resumeAll(installed.summary.repoId, resumables(installed.ports));
+    await resumeAll(
+      {
+        repoId: installed.summary.repoId,
+        clock: Date.now,
+        wake: (at) => this.#alarm.request(at),
+      },
+      resumables(installed.ports),
+    );
     await this.#alarm.settle();
   }
 

@@ -47,17 +47,25 @@ const SYNC = new Map<string, unknown>([
   ["authorization.unsettled", "throws"],
   ["claims.currentGeneration", null],
   ["claims.workingGeneration", null],
+  ["claims.workingEpisode", null],
+  ["claims.readyPin", null],
   ["decisions.currentVersions", null],
+  ["decisions.currentDecision", null],
   ["decisions.transfer", "throws"],
   ["decisions.relied", "throws"],
   ["decisions.obligations", null],
   ["inbox.queue", "throws"],
   ["inbox.readyGateNow", null],
   ["train.attemptOutcome", null],
+  ["train.holdsLiveEntry", null],
+  ["train.queue", "throws"],
 ]);
 
 /** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */
-const RESUMERS = new Set(["train.resume"]);
+const RESUMERS = new Set(["claims.resume", "train.resume"]);
+
+/** The methods that confirm a wake, which report it unconfirmed while their module is missing. */
+const CONFIRMERS = new Set(["train.armWake"]);
 
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {
@@ -76,6 +84,8 @@ describe("unavailable ports", () => {
         if (RESUMERS.has(`${port}.${method}`)) {
           // The alarm's resume owes nothing while the module is missing, so it refuses nothing.
           expect(await result, `${port}.${method}`).toBeUndefined();
+        } else if (CONFIRMERS.has(`${port}.${method}`)) {
+          expect(await result, `${port}.${method}`).toBe(false);
         } else if (result instanceof Promise) {
           expect(await result, `${port}.${method}`).toEqual(unavailable(port));
         } else {
@@ -107,7 +117,7 @@ describe("unavailable ports", () => {
           log,
           clock: () => 0,
           env,
-          wake: () => {},
+          wake: async () => true,
         });
         // A30's fence reads these in the transaction that would write the intent. Each must say
         // unknown (`null`), never a generation or an empty decision list a record could match,
@@ -118,7 +128,9 @@ describe("unavailable ports", () => {
             ports.claims.currentGeneration("clm_claim001"),
             ports.claims.currentGeneration(""),
             ports.claims.workingGeneration("clm_claim001"),
+            ports.claims.workingEpisode("clm_claim001"),
           ],
+          ready: ports.claims.readyPin("clm_claim001"),
           decisions: ports.decisions.currentVersions("clm_claim001"),
         }));
         return {
@@ -130,7 +142,12 @@ describe("unavailable ports", () => {
       },
     );
 
-    expect(read).toEqual({ attempt: null, generations: [null, null, null], decisions: null });
+    expect(read).toEqual({
+      attempt: null,
+      generations: [null, null, null, null],
+      ready: null,
+      decisions: null,
+    });
     expect(appended).toBe(0);
     expect(head).toBe(0);
     expect(authorized).toEqual(unavailable("authorization"));

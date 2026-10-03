@@ -195,7 +195,7 @@ async function withIdentity(
       log,
       clock: () => clock.now,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const build = () =>
       createIdentity(context, {
@@ -353,7 +353,7 @@ describe("joins", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       const log = EventLog.open(state.storage, repoId);
       const identity = createIdentity(
-        { repoId, storage: state.storage, log, clock: Date.now, env, wake: () => {} },
+        { repoId, storage: state.storage, log, clock: Date.now, env, wake: async () => true },
         { origin: auth.join.fields.origin, refusalsPerWindow: 10 },
       );
       const secret = "s".repeat(43);
