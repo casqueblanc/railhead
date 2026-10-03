@@ -43,7 +43,6 @@ const PORTS: [PortName, object][] = [
  */
 const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
-  ["claims.workingGeneration", null],
   ["decisions.currentVersions", null],
   ["decisions.transfer", "throws"],
   ["decisions.relied", "throws"],
@@ -114,7 +113,6 @@ describe("unavailable ports", () => {
           generations: [
             ports.claims.currentGeneration("clm_claim001"),
             ports.claims.currentGeneration(""),
-            ports.claims.workingGeneration("clm_claim001"),
           ],
           decisions: ports.decisions.currentVersions("clm_claim001"),
         }));
@@ -127,7 +125,7 @@ describe("unavailable ports", () => {
       },
     );
 
-    expect(read).toEqual({ attempt: null, generations: [null, null, null], decisions: null });
+    expect(read).toEqual({ attempt: null, generations: [null, null], decisions: null });
     expect(appended).toBe(0);
     expect(head).toBe(0);
     expect(authorized).toEqual(unavailable("authorization"));

@@ -372,46 +372,6 @@ describe("currentGeneration", () => {
   });
 });
 
-describe("workingGeneration", () => {
-  it("reports a working claim's generation, and unknown for an allocating or missing one", async () => {
-    await withClaims(async ({ port, sql }, { fake }) => {
-      await fileIssues(port, 2);
-      const held = claimed(await port.work(agent(1)));
-      fake.failNextFork("lose-response");
-      expect((await port.work(agent(2))).ok).toBe(false);
-      const [intent] = sql
-        .exec<{ claim_id: string }>("SELECT claim_id FROM claims_claims WHERE state = 'allocating'")
-        .toArray()
-        .map((row) => row.claim_id);
-
-      expect(port.workingGeneration(held.claim.claimId)).toBe(1);
-      expect(port.workingGeneration(intent ?? "")).toBeNull();
-      expect(port.workingGeneration("clm_nosuchclaim")).toBeNull();
-      expect(port.workingGeneration("")).toBeNull();
-    });
-  });
-
-  it("reads as unknown once a claim is ready, merged or expired, and follows a new generation", async () => {
-    await withClaims(async ({ port, sql }) => {
-      await fileIssues(port, 1);
-      const held = claimed(await port.work(agent(1)));
-      for (const state of ["ready", "merged", "expired"]) {
-        sql.exec(
-          "UPDATE claims_claims SET state = ? WHERE claim_id = ?",
-          state,
-          held.claim.claimId,
-        );
-        expect(port.workingGeneration(held.claim.claimId), state).toBeNull();
-      }
-      sql.exec(
-        "UPDATE claims_claims SET state = 'working', generation = 2 WHERE claim_id = ?",
-        held.claim.claimId,
-      );
-      expect(port.workingGeneration(held.claim.claimId)).toBe(2);
-    });
-  });
-});
-
 describe("quota", () => {
   it("stops one person's agents at the limit and lets another person's agent claim", async () => {
     await withClaims(

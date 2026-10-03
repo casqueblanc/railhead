@@ -841,7 +841,7 @@ describe("a decision superseded after ready", () => {
     });
   });
 
-  it("fences out a push that lands after ready and reopens only the ready claim, once", async () => {
+  it("refuses a push after ready, keeps the pin when a granted push lands, and reopens once", async () => {
     await withReady(async (setup) => {
       const { claim, fork } = await setup.open();
       setup.push(fork, WORK);
@@ -857,14 +857,15 @@ describe("a decision superseded after ready", () => {
         ok: true,
         value: { fence: { claimId: claim.claimId, generation: 1 } },
       });
-      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
 
       expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
-      // The push granted before the pin lands now. Its fence no longer matches a working claim,
-      // so it is not recorded, and no new push is granted.
+      // The push granted before the pin lands now. It moves the fork's branch but not the pin,
+      // and no new push is granted.
       setup.push(fork, LATER);
-      expect(setup.port.workingGeneration(claim.claimId)).toBeNull();
-      expect(setup.port.currentGeneration(claim.claimId)).toBe(1);
+      expect(await setup.port.pin(claim.claimId)).toEqual({
+        ok: true,
+        value: { claimId: claim.claimId, generation: 1, commit: WORK },
+      });
       expectFailure(await setup.port.authorizeGit(access), "after_ready");
 
       await decide(setup, claim.claimId, 1, first.decisionId);
@@ -875,7 +876,10 @@ describe("a decision superseded after ready", () => {
       // A claim that is already working is not reopened again.
       expect((await setup.port.activeClaim(agent(1))).ok).toBe(true);
       expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
-      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
+      expect(await setup.port.authorizeGit(access)).toMatchObject({
+        ok: true,
+        value: { fence: { claimId: claim.claimId, generation: 1 } },
+      });
       expect(types(setup.events()).filter((type) => type.startsWith("claim."))).toEqual([
         "claim.opened",
         "claim.ready",

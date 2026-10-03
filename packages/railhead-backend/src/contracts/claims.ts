@@ -34,20 +34,16 @@ export interface GitGrant {
   repo: ArtifactsRepoName;
   /** The token scope the gateway mints internally for this request. */
   scope: "read" | "write";
-  /**
-   * For a push, the claim and generation the push is fenced to; `null` for a fetch. The push is
-   * recorded only while `workingGeneration` still equals this generation, so a push that lands
-   * after the claim was marked ready is never recorded.
-   */
+  /** For a push, the claim and generation the push is fenced to; `null` for a fetch. */
   fence: { claimId: ClaimId; generation: number } | null;
 }
 
 /**
  * Issues and claims.
  *
- * `currentGeneration` and `workingGeneration` are fence readers: each is synchronous and reads only
- * the Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body,
- * and what it returns holds until that transaction commits. Read outside a transaction, the result may already be stale.
+ * `currentGeneration` is a fence reader: it is synchronous and reads only the Repo's storage, so a
+ * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
+ * until that transaction commits. Read outside a transaction, the result may already be stale.
  */
 export interface ClaimsPort {
   /** The agent's active claim, or `null`. */
@@ -65,7 +61,11 @@ export interface ClaimsPort {
     claimId: ClaimId,
     request: ReadyRequest,
   ): Promise<PortResult<ReadyResult>>;
-  /** The claim's current pin, for the train. Fails unless the claim is ready. */
+  /**
+   * The claim's current pin, for the train. Fails unless the claim is ready at its recorded decision
+   * versions with a clear inbox gate; a superseded pin reopens the claim and fails with
+   * `decision_superseded`.
+   */
   pin(claimId: ClaimId): Promise<PortResult<ClaimPin>>;
   /**
    * The claim's current ownership generation, or `null` when it is unknown, such as for an unknown
@@ -73,12 +73,6 @@ export interface ClaimsPort {
    * current only if its generation equals this one, and `null` is a refusal.
    */
   currentGeneration(claimId: ClaimId): number | null;
-  /**
-   * The claim's ownership generation while it is working, or `null` once it is anything else, such
-   * as ready, expired or unknown. A fence reader like `currentGeneration`: call it inside the
-   * caller's transaction. A push is recorded only while this equals the push's fence generation.
-   */
-  workingGeneration(claimId: ClaimId): number | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */
