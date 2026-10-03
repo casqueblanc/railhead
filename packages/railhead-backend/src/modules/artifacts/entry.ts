@@ -1,4 +1,7 @@
-// Artifacts: forks, reads and short-lived tokens. Until its task installs the module, every call refuses with `unavailable` and has no effect.
+// Artifacts: forks, reads and short-lived tokens, implemented by `createArtifactsAdapter` in
+// `src/artifacts/`. The Worker has no `ARTIFACTS` binding yet, so this slot still refuses every call
+// with `unavailable` and has no effect. Once the binding is declared, the factory becomes
+// `(context) => createArtifactsAdapter({ ...context, namespace: context.env.ARTIFACTS })`.
 
 import type { ArtifactsPort } from "../../contracts/artifacts";
 import { unavailableArtifacts } from "../../contracts/unavailable";

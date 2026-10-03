@@ -16,10 +16,14 @@ import {
   type AskRequest,
   type ChallengeRequest,
   type ClaimRequest,
+  type ClaimView,
   type InboxDigest,
   type JoinRequest,
   type ReadyRequest,
+  type RepoSegment,
   type SessionRequest,
+  claimRemotePath,
+  upstreamRemotePath,
 } from "@railhead/shared/agent-api";
 import type { ClaimId, QuestionId, RepoId } from "@railhead/shared/events";
 import type { AgentPrincipal } from "../contracts/principals";
@@ -46,6 +50,8 @@ export interface AgentCall {
   command: AgentCommand;
   /** The `Authorization: Bearer` value, unverified. */
   token: string | null;
+  /** The origin the request arrived on. Claim remotes are given on it, never on another host. */
+  origin: string;
 }
 
 /** The response body of an agent route. */
@@ -55,6 +61,10 @@ export type AgentReply = AgentResponse<AgentResults[AgentRouteName]>;
 export interface AgentTarget {
   /** The repository. */
   repoId: RepoId;
+  /** Its organisation segment. */
+  org: RepoSegment;
+  /** Its repository segment. */
+  name: RepoSegment;
   /** Its modules. */
   ports: RepoPorts;
 }
@@ -87,7 +97,7 @@ export async function dispatchAgent(
     case "ack":
     case "ask":
     case "question":
-      return withSession(target, call.token, command);
+      return withSession(target, call, command);
     default:
       return unreachable(command);
   }
@@ -95,7 +105,7 @@ export async function dispatchAgent(
 
 async function withSession(
   target: AgentTarget,
-  token: string | null,
+  { token, origin }: AgentCall,
   command: SessionCommand,
 ): Promise<AgentReply> {
   if (token === null) {
@@ -110,7 +120,7 @@ async function withSession(
   if (agent.kind !== "agent" || agent.repoId !== target.repoId) {
     return refusal(fail("unauthenticated", "The session is not for this repository."));
   }
-  const result = await runSessionCommand(ports, agent, command);
+  const result = await runSessionCommand(ports, agent, command, { ...target, origin });
   if (!result.ok) return refusal(result);
   const digest: PortResult<InboxDigest> = await ports.inbox.digest(agent);
   // Every state-changing session route is idempotent, so a failed digest is reported and the
@@ -123,6 +133,7 @@ async function runSessionCommand(
   ports: RepoPorts,
   agent: AgentPrincipal,
   command: SessionCommand,
+  remotes: Remotes,
 ): Promise<PortResult<AgentResults[AgentRouteName]>> {
   switch (command.route) {
     case "status": {
@@ -130,14 +141,15 @@ async function runSessionCommand(
       if (!view.ok) return view;
       const claim = await ports.claims.activeClaim(agent);
       if (!claim.ok) return claim;
-      return ok({ agent: view.value, claim: claim.value });
+      if (claim.value === null) return ok({ agent: view.value, claim: null });
+      return located(remotes, ok({ agent: view.value, claim: claim.value }));
     }
     case "work":
-      return ports.claims.work(agent);
+      return located(remotes, await ports.claims.work(agent));
     case "claim":
-      return ports.claims.claim(agent, command.body.issueId);
+      return located(remotes, await ports.claims.claim(agent, command.body.issueId));
     case "ready":
-      return ports.claims.ready(agent, command.claimId, command.body);
+      return located(remotes, await ports.claims.ready(agent, command.claimId, command.body));
     case "inbox":
       return ports.inbox.pending(agent, command.limit);
     case "ack":
@@ -149,6 +161,35 @@ async function runSessionCommand(
     default:
       return unreachable(command);
   }
+}
+
+/** Where an agent reaches this repository's Git remotes. */
+interface Remotes {
+  origin: string;
+  org: RepoSegment;
+  name: RepoSegment;
+}
+
+/**
+ * Gives a claim its remote URLs on the origin the agent called. The claims port knows neither the
+ * origin nor the repository's name, so every claim leaving here gets them, replacing whatever the
+ * port set.
+ */
+function located<T extends { claim: ClaimView }>(
+  remotes: Remotes,
+  result: PortResult<T>,
+): PortResult<T> {
+  if (!result.ok) return result;
+  const { claim } = result.value;
+  const { origin, org, name } = remotes;
+  return ok({
+    ...result.value,
+    claim: {
+      ...claim,
+      originUrl: `${origin}${claimRemotePath(org, name, claim.claimId)}`,
+      upstreamUrl: `${origin}${upstreamRemotePath(org, name)}`,
+    },
+  });
 }
 
 function beforeSession(result: PortResult<AgentResults[AgentRouteName]>): AgentReply {
