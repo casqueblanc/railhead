@@ -373,15 +373,16 @@ export function createClaims(
       });
       if (!decided.ok) return decided;
 
-      // The pin's wake was asked for in the transaction, but its alarm write may have failed. A
-      // ready answered with success must leave a drive scheduled, so a failed write refuses it and
-      // the repeat, which finds the entry live, asks again.
-      if (!(await ports().train.armWake())) return unavailable("train");
-
-      // The fork is read only from the pin on, since `authorizeGit` refuses every later push;
-      // revoking its tokens ends a write already granted. A repeat after a failed revocation
-      // returns the same pin and revokes again.
+      // The pin is committed, so both steps below run whatever the other answers. The fork is read
+      // only from the pin on, since `authorizeGit` refuses every later push; revoking its tokens
+      // first ends a write already granted.
       const revoked = await ports().artifacts.revokeTokens(repo);
+      // The pin's wake was asked for in the transaction, but its alarm write may have failed. A
+      // ready answered with success must leave a drive scheduled, so a failed write refuses it.
+      const armed = await ports().train.armWake();
+      // A repeat returns the same pin, revokes again and, finding the entry live, asks for the wake
+      // again.
+      if (!armed) return unavailable("train");
       return revoked.ok ? decided : revoked;
     },
 
