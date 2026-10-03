@@ -27,6 +27,9 @@ pub enum ConfineError {
     /// The file's parent resolves outside the clone.
     #[error("{} resolves outside the clone", .0.display())]
     Outside(PathBuf),
+    /// A file that must be new is already there.
+    #[error("{} already exists", .0.display())]
+    Exists(PathBuf),
     /// The file is larger than [`MAX_FILE_BYTES`].
     #[error("{} is larger than {MAX_FILE_BYTES} bytes", .0.display())]
     TooLarge(PathBuf),
@@ -43,6 +46,7 @@ impl ConfineError {
             Self::BadPath(_) | Self::Symlink(_) | Self::WrongKind(_) | Self::Outside(_) => {
                 "unsafe_path"
             }
+            Self::Exists(_) => "path_exists",
             Self::TooLarge(_) => "file_too_large",
             Self::Io(_) => "write",
         }
@@ -165,6 +169,32 @@ pub fn write(root: &Path, relative: &str, contents: &str) -> Result<(), ConfineE
     Ok(())
 }
 
+/// Creates `relative` under `root` with `contents`, making its directories; refuses when anything
+/// is already at that path, a regular file included.
+///
+/// # Errors
+///
+/// [`ConfineError::Exists`] when the path is taken; otherwise as [`write`].
+pub fn create(root: &Path, relative: &str, contents: &str) -> Result<(), ConfineError> {
+    let Some(path) = walk(root, relative, true)? else {
+        return Err(ConfineError::BadPath(relative.to_owned()));
+    };
+    if kind(&path)?.is_some() {
+        return Err(ConfineError::Exists(path));
+    }
+    check_inside(root, &path)?;
+    // `create_new` also refuses a file, or a link, that appeared since the check.
+    let mut file = match no_follow(OpenOptions::new().write(true).create_new(true)).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(ConfineError::Exists(path));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +211,41 @@ mod tests {
             Some("two\n")
         );
         assert!(is_file(dir.path(), "swarm/agents/a.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn create_writes_a_new_file_and_never_replaces_one() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        create(dir.path(), "swarm/agents/new.txt", "mine\n")?;
+        assert_eq!(
+            read(dir.path(), "swarm/agents/new.txt")?.as_deref(),
+            Some("mine\n")
+        );
+        std::fs::write(dir.path().join("swarm/taken.txt"), "someone else's\n")?;
+        let refused = create(dir.path(), "swarm/taken.txt", "mine\n");
+        assert!(
+            matches!(refused, Err(ConfineError::Exists(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()).err(),
+            Some("path_exists")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("swarm/taken.txt"))?,
+            "someone else's\n"
+        );
+        // Not a directory either, and not a plain-path violation.
+        std::fs::create_dir(dir.path().join("swarm/d"))?;
+        assert!(matches!(
+            create(dir.path(), "swarm/d", "x"),
+            Err(ConfineError::Exists(_))
+        ));
+        assert!(matches!(
+            create(dir.path(), "../x", "x"),
+            Err(ConfineError::BadPath(_))
+        ));
         Ok(())
     }
 
@@ -229,6 +294,10 @@ mod tests {
         ));
         assert!(matches!(
             read(clone.path(), "swarm/round.txt"),
+            Err(ConfineError::Symlink(_))
+        ));
+        assert!(matches!(
+            create(clone.path(), "swarm/round.txt", "edit\n"),
             Err(ConfineError::Symlink(_))
         ));
         assert!(!is_file(clone.path(), "swarm/round.txt"));

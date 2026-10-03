@@ -7,9 +7,15 @@
 //! it redo the edit on the new main and push again. A ready claim that does not land within the
 //! land timeout stops the agent: it still holds the claim, so it cannot take other work.
 //!
-//! A task lands only when the agent reads its claim as `merged`. A claim that leaves the agent's
-//! status without that evidence may have expired, so the agent stops on it instead of counting a
-//! landing.
+//! A task lands only when the agent reads its claim as `merged`. A ready claim that leaves the
+//! agent's status without that evidence may have merged or expired: today's agent wire does not say
+//! which (casqueblanc/railhead#237 adds the closed reason). The agent reports such a task as
+//! unverified, never as a landing, and goes on with its plan, which is what an agent whose claim
+//! merged would do. A claim it reads as `expired` stops it.
+//!
+//! Two edits of the same path count as merged by Git only on evidence Git gives: each was
+//! written on a base that lacked the other's line, and main, read back after the second landed,
+//! holds both.
 //!
 //! A rerun picks up where a stopped run left off. The agent's progress record names the planned
 //! task it was on and that task's claim. When `rh work` hands back a claim an earlier run already
@@ -59,6 +65,10 @@ pub struct Shared {
     /// Landings seen so far, to find same-path pairs Git merged.
     pub landings: Mutex<Landings>,
 }
+
+/// Where a ready claim's outcome is unverified: the issue that adds the closed reason to the
+/// agent wire.
+pub const UNVERIFIED_NEEDS: &str = "casqueblanc/railhead#237";
 
 /// One simulated agent.
 #[derive(Debug)]
@@ -111,13 +121,13 @@ struct Held {
     generation: u64,
     state: ClaimState,
     dir: PathBuf,
-    /// When the claim was made or last reopened: its fork has main as of then.
-    based_at: Instant,
 }
 
 /// What waiting on a ready claim ended with.
 enum Waited {
     Landed,
+    /// It left the status without a closed reason; see [`UNVERIFIED_NEEDS`].
+    Unverified,
     Redo,
 }
 
@@ -130,7 +140,9 @@ enum Polled {
     Redo,
     /// It is still ready.
     Pending,
-    /// It closed without landing, or without evidence that it did.
+    /// It left the status, which does not say whether it merged or expired.
+    Unverified,
+    /// It closed without landing.
     Closed(&'static str),
 }
 
@@ -143,18 +155,23 @@ fn judge(state: Option<ClaimState>) -> Polled {
         Some(ClaimState::Ready) => Polled::Pending,
         Some(ClaimState::Expired) => Polled::Closed("claim_expired"),
         // The status shows only an active claim, so one that left it may have merged or expired.
-        // The agent wire does not yet say which (#237 adds the closed reason); without positive
-        // evidence it is not a landing.
-        None => Polled::Closed("closed_unknown"),
+        // The agent wire does not yet say which (casqueblanc/railhead#237 adds the closed reason);
+        // without positive evidence it is not a landing, and not a failure either.
+        None => Polled::Unverified,
     }
 }
 
-/// A landing, for pairing same-path edits.
-#[derive(Debug, Clone)]
-struct Landing {
-    claim_id: String,
-    path: String,
-    at: Instant,
+/// A landed edit of a shared path, for pairing same-path edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landing {
+    /// The claim that landed it.
+    pub claim_id: String,
+    /// The path it changed.
+    pub path: String,
+    /// The line it wrote, which only this edit writes.
+    pub line: String,
+    /// The path's contents the edit was written on, from the claim's clone.
+    pub base: String,
 }
 
 /// Landings seen in this run.
@@ -162,29 +179,36 @@ struct Landing {
 pub struct Landings(Vec<Landing>);
 
 impl Landings {
-    /// Records a landing of `path`, made on a fork of main as of `based_at`, and returns the
-    /// latest earlier landing of the same path that main did not have then: Git merged the two.
-    fn record(
-        &mut self,
-        claim_id: &str,
-        path: &str,
-        based_at: Instant,
-        at: Instant,
-    ) -> Option<String> {
-        let merged = self
-            .0
-            .iter()
-            .filter(|landing| landing.path == path && landing.claim_id != claim_id)
-            .filter(|landing| landing.at >= based_at)
-            .max_by_key(|landing| landing.at)
-            .map(|landing| landing.claim_id.clone());
-        self.0.push(Landing {
-            claim_id: claim_id.to_owned(),
-            path: path.to_owned(),
-            at,
-        });
+    /// Records `landing` and returns the latest recorded landing of the same path that Git merged
+    /// with it: neither edit's base held the other's line, and `main`, the path's contents on main
+    /// read back after both landed, holds both lines. Without that evidence it returns `None`, an
+    /// edit that built on the other included.
+    fn record(&mut self, landing: Landing, main: &str) -> Option<String> {
+        let merged = holds(main, &landing.line)
+            .then(|| {
+                self.0.iter().rev().find(|earlier| {
+                    earlier.path == landing.path
+                        && earlier.claim_id != landing.claim_id
+                        && holds(main, &earlier.line)
+                        && !holds(&landing.base, &earlier.line)
+                        && !holds(&earlier.base, &landing.line)
+                })
+            })
+            .flatten()
+            .map(|earlier| earlier.claim_id.clone());
+        self.0.push(landing);
         merged
     }
+}
+
+/// Whether `text` has a line that is `line`, or ends with it after a space, as a slot or the
+/// contested line does.
+fn holds(text: &str, line: &str) -> bool {
+    text.lines().any(|existing| {
+        existing
+            .strip_suffix(line)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with(' '))
+    })
 }
 
 impl Agent {
@@ -257,7 +281,8 @@ impl Run<'_> {
             match judge(state) {
                 // Still held: `rh work` hands it back.
                 Polled::Pending | Polled::Redo => {}
-                Polled::Landed => next = self.landed_meanwhile(saved, claim_id).await?,
+                Polled::Landed => next = self.closed_meanwhile(saved, claim_id, true).await?,
+                Polled::Unverified => next = self.closed_meanwhile(saved, claim_id, false).await?,
                 Polled::Closed(code) => {
                     return Err(self.fail(Step::Claim, code.to_owned()).await);
                 }
@@ -294,8 +319,8 @@ impl Run<'_> {
         .await;
         let Some(saved) = saved else {
             // No record says which planned task it carries, so it cannot be redone.
-            return match self.wait(&held, None, TaskClass::Adopted, None).await? {
-                Waited::Landed => Ok(next),
+            return match self.wait(&held, None, TaskClass::Adopted).await? {
+                Waited::Landed | Waited::Unverified => Ok(next),
                 Waited::Redo => Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await),
             };
         };
@@ -312,9 +337,14 @@ impl Run<'_> {
         Ok(next)
     }
 
-    /// Records the landing of an earlier run's claim that merged while no run watched it, and
-    /// returns the planned task to go on with.
-    async fn landed_meanwhile(&self, saved: &Progress, claim_id: &str) -> Outcome<u32> {
+    /// Records the outcome of an earlier run's claim that closed while no run watched it, a landing
+    /// when it was read as `merged`, and returns the planned task to go on with.
+    async fn closed_meanwhile(
+        &self,
+        saved: &Progress,
+        claim_id: &str,
+        merged: bool,
+    ) -> Outcome<u32> {
         let Some(edit) = self.agent.edits.get(task_index(saved.round)).copied() else {
             return Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await);
         };
@@ -324,15 +354,20 @@ impl Run<'_> {
             round: Some(saved.round),
         })
         .await;
-        self.emit(Event::Landed {
-            agent: self.name(),
-            claim_id: claim_id.to_owned(),
-            class: if saved.scaffold {
-                TaskClass::Scaffold
-            } else {
-                TaskClass::from(edit.class)
-            },
-            ready_to_landed_ms: None,
+        let class = if saved.scaffold {
+            TaskClass::Scaffold
+        } else {
+            TaskClass::from(edit.class)
+        };
+        self.emit(if merged {
+            Event::Landed {
+                agent: self.name(),
+                claim_id: claim_id.to_owned(),
+                class,
+                ready_to_landed_ms: None,
+            }
+        } else {
+            self.unverified(claim_id, class)
         })
         .await;
         if saved.scaffold {
@@ -426,7 +461,6 @@ impl Run<'_> {
             generation: claim.generation.get(),
             state: claim.state,
             dir: clone.dir,
-            based_at: Instant::now(),
         })
     }
 
@@ -441,16 +475,23 @@ impl Run<'_> {
         );
         let mut redos = 0;
         loop {
-            let ready_at = if pinned {
+            let (ready_at, base) = if pinned {
                 pinned = false;
-                None
+                (None, None)
             } else {
-                Some(self.pin(&held, edit, redos > 0, class, &path).await?)
+                let (ready_at, base) = self.pin(&held, edit, redos > 0, class, &path).await?;
+                (Some(ready_at), base)
             };
-            // Only planned edits pair: every scaffold is the same bytes.
-            let pairs = edit.map(|_| path.as_str());
-            match self.wait(&held, ready_at, class, pairs).await? {
-                Waited::Landed => return Ok(()),
+            match self.wait(&held, ready_at, class).await? {
+                Waited::Landed => {
+                    // Only shared edits pair: every scaffold is the same bytes, and an adopted
+                    // pin's base is unknown.
+                    if let (Some(edit), Some(base)) = (edit, base) {
+                        self.pair(&held, edit, &path, base).await?;
+                    }
+                    return Ok(());
+                }
+                Waited::Unverified => return Ok(()),
                 Waited::Redo => {}
             }
             redos += 1;
@@ -461,7 +502,8 @@ impl Run<'_> {
         }
     }
 
-    /// Writes, commits, pushes and pins the edit, and returns when it was pinned.
+    /// Writes, commits, pushes and pins the edit, and returns when it was pinned and the base the
+    /// edit rewrote, for a shared edit.
     async fn pin(
         &self,
         held: &Held,
@@ -469,9 +511,9 @@ impl Run<'_> {
         force: bool,
         class: TaskClass,
         path: &str,
-    ) -> Outcome<Instant> {
+    ) -> Outcome<(Instant, Option<String>)> {
         self.state(AgentState::Editing).await;
-        self.write(&held.dir, edit).await?;
+        let base = self.write(&held.dir, edit).await?;
         let commit = self.commit(held, edit, force).await?;
         self.emit(Event::Pushed {
             agent: self.name(),
@@ -488,37 +530,43 @@ impl Run<'_> {
             commit,
         })
         .await;
-        Ok(Instant::now())
+        Ok((Instant::now(), base))
     }
 
-    /// Writes the edit, or every missing scaffold file, into the clone.
-    async fn write(&self, dir: &Path, edit: Option<Edit>) -> Outcome<()> {
+    /// Writes the edit, or every missing scaffold file, into the clone, and returns the contents
+    /// a shared edit rewrote. A disjoint edit creates its file and refuses one already there.
+    async fn write(&self, dir: &Path, edit: Option<Edit>) -> Outcome<Option<String>> {
+        let name = &self.agent.env.name;
         let written = match edit {
             None => scaffold()
                 .iter()
                 .filter(|(path, _)| !confined::is_file(dir, path))
                 .try_for_each(|(path, contents)| {
                     confined::write(dir, path, contents).map_err(|error| error.code())
-                }),
+                })
+                .map(|()| None),
+            Some(edit) if !edit.needs_scaffold() => edit
+                .apply(self.agent.slot, name, None)
+                .map_err(apply_code)
+                .and_then(|contents| {
+                    confined::create(dir, &edit.path(name), &contents).map_err(|error| error.code())
+                })
+                .map(|()| None),
             Some(edit) => {
-                let path = edit.path(&self.agent.env.name);
-                match confined::read(dir, &path) {
-                    Err(error) => Err(error.code()),
-                    Ok(current) => {
-                        match edit.apply(self.agent.slot, &self.agent.env.name, current.as_deref())
-                        {
-                            Ok(contents) => {
-                                confined::write(dir, &path, &contents).map_err(|error| error.code())
-                            }
-                            Err(ApplyError::NoScaffold) => Err("no_scaffold"),
-                            Err(ApplyError::Unrecognised) => Err("unrecognised_file"),
-                        }
-                    }
-                }
+                let path = edit.path(name);
+                confined::read(dir, &path)
+                    .map_err(|error| error.code())
+                    .and_then(|current| {
+                        let contents = edit
+                            .apply(self.agent.slot, name, current.as_deref())
+                            .map_err(apply_code)?;
+                        confined::write(dir, &path, &contents).map_err(|error| error.code())?;
+                        Ok(current)
+                    })
             }
         };
         match written {
-            Ok(()) => Ok(()),
+            Ok(base) => Ok(base),
             Err(code) => Err(self.fail(Step::Edit, code.to_owned()).await),
         }
     }
@@ -653,7 +701,6 @@ impl Run<'_> {
         held: &Held,
         ready_at: Option<Instant>,
         class: TaskClass,
-        path: Option<&str>,
     ) -> Outcome<Waited> {
         self.state(AgentState::Waiting).await;
         let bounds = &self.shared.bounds;
@@ -698,8 +745,18 @@ impl Run<'_> {
                 .map(|claim| claim.state);
             match judge(state) {
                 Polled::Landed => {
-                    self.landed(held, ready_at, class, path).await;
+                    self.emit(Event::Landed {
+                        agent: self.name(),
+                        claim_id: held.claim_id.clone(),
+                        class,
+                        ready_to_landed_ms: ready_at.map(|at| millis(at.elapsed())),
+                    })
+                    .await;
                     return Ok(Waited::Landed);
+                }
+                Polled::Unverified => {
+                    self.emit(self.unverified(&held.claim_id, class)).await;
+                    return Ok(Waited::Unverified);
                 }
                 Polled::Redo => return Ok(Waited::Redo),
                 Polled::Pending => {}
@@ -710,28 +767,39 @@ impl Run<'_> {
         }
     }
 
-    async fn landed(
-        &self,
-        held: &Held,
-        ready_at: Option<Instant>,
-        class: TaskClass,
-        path: Option<&str>,
-    ) {
-        let now = Instant::now();
-        self.emit(Event::Landed {
+    fn unverified(&self, claim_id: &str, class: TaskClass) -> Event {
+        Event::Unverified {
             agent: self.name(),
-            claim_id: held.claim_id.clone(),
+            claim_id: claim_id.to_owned(),
             class,
-            ready_to_landed_ms: ready_at.map(|at| millis(now.duration_since(at))),
-        })
-        .await;
-        let Some(path) = path else { return };
+            needs: UNVERIFIED_NEEDS,
+        }
+    }
+
+    /// Reads `path` back from main after the shared `edit` written on `base` landed, and reports
+    /// the earlier landing Git merged it with, if main shows one (see [`Landings::record`]).
+    async fn pair(&self, held: &Held, edit: Edit, path: &str, base: String) -> Outcome<()> {
+        let (runner, env, dir) = (&self.shared.runner, &self.agent.env, &held.dir);
+        let fetch = ["fetch", "--quiet", "upstream"];
+        self.retrying(Step::Verify, || runner.git_text(env, dir, "fetch", &fetch))
+            .await?;
+        let object = format!("upstream/main:{path}");
+        let show = ["show", object.as_str()];
+        let main = self
+            .retrying(Step::Verify, || runner.git_text(env, dir, "show", &show))
+            .await?;
+        let landing = Landing {
+            claim_id: held.claim_id.clone(),
+            path: path.to_owned(),
+            line: edit.line(&self.agent.env.name),
+            base,
+        };
         let merged = self
             .shared
             .landings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(&held.claim_id, path, held.based_at, now);
+            .record(landing, &main);
         if let Some(first) = merged {
             self.emit(Event::ConflictAutoMerged {
                 path: path.to_owned(),
@@ -739,6 +807,7 @@ impl Run<'_> {
             })
             .await;
         }
+        Ok(())
     }
 
     /// Takes the reopened claim back with `rh work` and resets the clone to the new main.
@@ -819,6 +888,15 @@ fn backoff(tries: u32, asked: Duration, poll: Duration) -> Duration {
     asked.max(doubled).min(MAX_BACKOFF)
 }
 
+/// The code a stopped agent reports when an edit cannot be applied.
+fn apply_code(error: ApplyError) -> &'static str {
+    match error {
+        ApplyError::NoScaffold => "no_scaffold",
+        ApplyError::Unrecognised => "unrecognised_file",
+        ApplyError::Exists => "path_exists",
+    }
+}
+
 /// A planned task's index into the agent's edits.
 fn task_index(round: u32) -> usize {
     usize::try_from(round).unwrap_or(usize::MAX)
@@ -845,26 +923,107 @@ fn is_repo_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    const A: &str = "swarm-00 round 0 000000000000000a";
+    const B: &str = "swarm-01 round 0 000000000000000b";
+    const BASE: &str = "slot 00: open\nslot 01: open\n";
+
+    fn landing(claim_id: &str, path: &str, line: &str, base: &str) -> Landing {
+        Landing {
+            claim_id: claim_id.to_owned(),
+            path: path.to_owned(),
+            line: line.to_owned(),
+            base: base.to_owned(),
+        }
+    }
+
     #[test]
-    fn a_landing_pairs_with_one_its_base_lacked() {
-        let start = Instant::now();
-        let later = |ms| start + Duration::from_millis(ms);
+    fn concurrent_edits_main_holds_together_count_as_merged() {
         let mut landings = Landings::default();
-        // A lands at 10; B was based at 5 and lands at 20: its fork lacked A's change.
-        assert_eq!(landings.record("clm_aaaaaa", "f", start, later(10)), None);
+        let after_a = format!("slot 00: {A}\nslot 01: open\n");
+        let both = format!("slot 00: {A}\nslot 01: {B}\n");
         assert_eq!(
-            landings.record("clm_bbbbbb", "f", later(5), later(20)),
-            Some("clm_aaaaaa".to_owned())
-        );
-        // C was based at 25, after both landed: nothing to merge.
-        assert_eq!(
-            landings.record("clm_cccccc", "f", later(25), later(30)),
+            landings.record(landing("clm_aaaaaa", "f", A, BASE), &after_a),
             None
         );
-        // Another path never pairs.
-        assert_eq!(landings.record("clm_dddddd", "g", start, later(40)), None);
-        // A redo landing of the same claim never pairs with itself.
-        assert_eq!(landings.record("clm_dddddd", "g", start, later(50)), None);
+        // B was written on a base without A's line, and main holds both: Git merged them.
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, BASE), &both),
+            Some("clm_aaaaaa".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_edit_that_built_on_the_other_never_counts_whatever_the_order_seen() {
+        let after_a = format!("slot 00: {A}\nslot 01: open\n");
+        let both = format!("slot 00: {A}\nslot 01: {B}\n");
+        // A landed; B forked after it, so B's base already held A's line. B's agent saw its
+        // landing first and A's agent saw its own late: neither order makes it a merge.
+        let mut landings = Landings::default();
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, &after_a), &both),
+            None
+        );
+        assert_eq!(
+            landings.record(landing("clm_aaaaaa", "f", A, BASE), &both),
+            None
+        );
+        let mut landings = Landings::default();
+        assert_eq!(
+            landings.record(landing("clm_aaaaaa", "f", A, BASE), &both),
+            None
+        );
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, &after_a), &both),
+            None
+        );
+    }
+
+    #[test]
+    fn a_merge_main_does_not_show_never_counts() {
+        let mut landings = Landings::default();
+        let after_a = format!("slot 00: {A}\nslot 01: open\n");
+        assert_eq!(
+            landings.record(landing("clm_aaaaaa", "f", A, BASE), &after_a),
+            None
+        );
+        // A's line was rewritten before B read main back: no evidence both landed together.
+        let rewritten = format!("slot 00: swarm-00 round 1 00000000000000aa\nslot 01: {B}\n");
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, BASE), &rewritten),
+            None
+        );
+        // Main without the landing's own line: nothing to pair.
+        assert_eq!(
+            landings.record(
+                landing("clm_cccccc", "f", "swarm-02 round 0 c", BASE),
+                &after_a
+            ),
+            None
+        );
+        // Another path, or the same claim landing again, never pairs.
+        let both = format!("slot 00: {A}\nslot 01: {B}\n");
+        assert_eq!(
+            landings.record(landing("clm_dddddd", "g", B, BASE), &both),
+            None
+        );
+        assert_eq!(
+            landings.record(landing("clm_aaaaaa", "f", A, BASE), &after_a),
+            None
+        );
+    }
+
+    #[test]
+    fn a_line_is_held_only_whole() {
+        assert!(holds(&format!("slot 00: {A}\n"), A));
+        assert!(holds(&format!("{A}\n"), A));
+        assert!(!holds("slot 00: open\n", A));
+        // A longer round or another agent's name is another line.
+        assert!(!holds(
+            "swarm-00 round 10 000000000000000a\n",
+            "round 0 000000000000000a"
+        ));
+        assert!(!holds("xswarm-00 round 0 000000000000000a\n", A));
+        assert!(!holds("", A));
     }
 
     #[test]
@@ -876,8 +1035,8 @@ mod tests {
             judge(Some(ClaimState::Expired)),
             Polled::Closed("claim_expired")
         );
-        // Gone from the status: merged or expired, the agent cannot tell.
-        assert_eq!(judge(None), Polled::Closed("closed_unknown"));
+        // Gone from the status: merged or expired, the agent cannot tell (#237).
+        assert_eq!(judge(None), Polled::Unverified);
     }
 
     #[test]

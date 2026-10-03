@@ -345,6 +345,23 @@ impl Runner {
         action: &'static str,
         args: &[&str],
     ) -> Result<String, Error> {
+        let text = self.git_text(agent, dir, action, args).await?;
+        Ok(text.lines().next().unwrap_or_default().to_owned())
+    }
+
+    /// Runs `git <args>` in `dir` as the agent and returns all its output, at most
+    /// [`MAX_OUTPUT_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when Git fails, otherwise as [`Error`].
+    pub async fn git_text(
+        &self,
+        agent: &AgentEnv,
+        dir: &Path,
+        action: &'static str,
+        args: &[&str],
+    ) -> Result<String, Error> {
         let mut command = Command::new("git");
         command
             .args(args)
@@ -369,11 +386,7 @@ impl Runner {
         if !output.success {
             return Err(Error::Git(action));
         }
-        Ok(String::from_utf8_lossy(&output.bytes)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned())
+        Ok(String::from_utf8_lossy(&output.bytes).into_owned())
     }
 
     async fn output(

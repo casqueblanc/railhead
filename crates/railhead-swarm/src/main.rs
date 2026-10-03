@@ -17,9 +17,10 @@
 //! `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a second run on the same
 //! homes refuses to start.
 //!
-//! The exit code is 0 only when every agent landed every planned task; 1 when the run ended with
-//! a task not landed, an agent failed or stalled, or the run timed out; 130 on Ctrl-C; 2 when the
-//! run could not start.
+//! The exit code is 0 only when every agent finished every planned task; 1 when an agent failed or
+//! stalled, or the run timed out; 130 on Ctrl-C; 2 when the run could not start. A task whose claim
+//! closed without a closed reason is reported as unverified, not as a failure, until
+//! casqueblanc/railhead#237 adds that reason to the agent wire.
 //!
 //! ```text
 //! railhead-swarm --scenario crates/railhead-swarm/scenarios/local.json \

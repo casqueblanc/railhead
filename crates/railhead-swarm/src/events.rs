@@ -7,9 +7,11 @@
 //!
 //! The agent wire shows an agent its own claim and inbox, not the train, so batches and parked
 //! pairs are not events here. "Landed" needs positive evidence: the agent read its claim as
-//! `merged`. A ready claim that leaves the agent's status without that evidence may have expired,
-//! so it is a failure (`closed_unknown`), never a landing. "Auto-merged" is derived: two edits of
-//! the same path landed, the second on a base that did not have the first.
+//! `merged`. A ready claim that leaves the agent's status without that evidence may have merged or
+//! expired, and today's agent wire does not say which, so it is "unverified" until
+//! casqueblanc/railhead#237 adds the closed reason: never a landing, and not a failure. "Auto-merged"
+//! needs Git's evidence: two edits of the same path landed, each written on a base that lacked the
+//! other's line, and main read back afterwards holds both.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -67,7 +69,7 @@ pub enum AgentState {
     Waiting,
     /// Redoing the edit on the new main.
     Redoing,
-    /// Every planned task landed.
+    /// Every planned task landed or closed unverified.
     Done,
     /// The agent gave up; a `failed` or `stalled` event says why.
     Stopped,
@@ -93,6 +95,8 @@ pub enum Step {
     Inbox,
     /// Fetching main for a redo.
     Redo,
+    /// Reading main back after a landing.
+    Verify,
     /// Saving the agent's progress record.
     Progress,
 }
@@ -181,11 +185,24 @@ pub enum Event {
         /// whose `rh ready` this run did not see.
         ready_to_landed_ms: Option<u64>,
     },
-    /// Two claims changed the same path and both landed: Git merged them.
+    /// A pinned claim left the agent's status without a closed reason, so whether it merged or
+    /// expired is unknown. Not a landing, and not a failure.
+    Unverified {
+        /// The agent.
+        agent: String,
+        /// The claim.
+        claim_id: String,
+        /// What it delivers.
+        class: TaskClass,
+        /// The issue that adds the closed reason to the agent wire.
+        needs: &'static str,
+    },
+    /// Two claims changed the same path from bases that lacked each other's edit, and main holds
+    /// both: Git merged them.
     ConflictAutoMerged {
         /// The path.
         path: String,
-        /// The claim that landed first, then the one merged onto it.
+        /// The claim recorded as landed first, then the other.
         claims: [String; 2],
     },
     /// The backend routed a conflict to the agent.
@@ -279,6 +296,9 @@ pub struct Summary {
     pub readies: u64,
     /// Commits landed.
     pub landings: u64,
+    /// Pinned claims that closed without a closed reason, which may have landed or expired; see
+    /// [`Event::Unverified`].
+    pub unverified: u64,
     /// Same-path pairs Git merged.
     pub auto_merged_overlaps: u64,
     /// Conflicts the backend routed to an agent.
@@ -289,15 +309,16 @@ pub struct Summary {
     pub stalls: u64,
     /// Steps that failed for good.
     pub failures: u64,
-    /// Agents that landed every planned task.
+    /// Agents that finished every planned task, landed or unverified.
     pub agents_done: u64,
     /// Ready→landed latency.
     pub ready_to_landed: Latency,
 }
 
 impl Summary {
-    /// Whether the run did all it was asked: it completed, all `agents` landed every planned
-    /// task, and nothing failed or stalled.
+    /// Whether the run did all it was asked: it completed, all `agents` finished every planned
+    /// task, and nothing failed or stalled. An unverified task is not a failure: the agent wire
+    /// cannot tell it apart from a landing yet.
     #[must_use]
     pub fn succeeded(&self, agents: u32) -> bool {
         self.stopped_by == StopReason::Completed
@@ -319,6 +340,7 @@ pub struct Tally {
     pushes: u64,
     readies: u64,
     landings: u64,
+    unverified: u64,
     auto_merged: u64,
     routed: u64,
     redos: u64,
@@ -339,6 +361,7 @@ impl Tally {
                 self.latencies.extend(*ready_to_landed_ms);
                 &mut self.landings
             }
+            Event::Unverified { .. } => &mut self.unverified,
             Event::ConflictAutoMerged { .. } => &mut self.auto_merged,
             Event::ConflictRouted { .. } => &mut self.routed,
             Event::Redo { .. } => &mut self.redos,
@@ -369,6 +392,7 @@ impl Tally {
             pushes: self.pushes,
             readies: self.readies,
             landings: self.landings,
+            unverified: self.unverified,
             auto_merged_overlaps: self.auto_merged,
             routed_conflicts: self.routed,
             redos: self.redos,
@@ -617,6 +641,19 @@ mod tests {
         ];
         assert!(!summary_of(&stalled, StopReason::Completed).succeeded(1));
         assert!(!summary_of(&done, StopReason::TimedOut).succeeded(2));
+        // Unverified tasks alone do not fail a run, and are counted apart from landings.
+        let unverified = Event::Unverified {
+            agent: "swarm-00".to_owned(),
+            claim_id: "clm_abcdef".to_owned(),
+            class: TaskClass::Disjoint,
+            needs: "casqueblanc/railhead#237",
+        };
+        let summary = summary_of(
+            &[unverified, state(AgentState::Done)],
+            StopReason::Completed,
+        );
+        assert!(summary.succeeded(1));
+        assert_eq!((summary.unverified, summary.landings), (1, 0));
         assert!(!summary_of(&done, StopReason::Interrupted).succeeded(2));
     }
 }

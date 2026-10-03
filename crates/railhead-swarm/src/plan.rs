@@ -28,7 +28,8 @@ const SLOT_GAP: &str = "--\n--\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EditClass {
-    /// A file of the agent's own: merges with no conflict.
+    /// A new file of the agent's own, named by the agent, round and seed: merges with no
+    /// conflict.
     Disjoint,
     /// The agent's own slot line of [`SHARED_PATH`]: Git merges it with other slots.
     SameFileHunks,
@@ -49,6 +50,8 @@ impl fmt::Display for EditClass {
 /// One planned edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edit {
+    /// The plan's seed, which names a disjoint edit's file.
+    pub seed: u64,
     /// The round, from 0.
     pub round: u32,
     /// What it changes.
@@ -62,7 +65,10 @@ impl Edit {
     #[must_use]
     pub fn path(&self, agent: &str) -> String {
         match self.class {
-            EditClass::Disjoint => format!("swarm/agents/{agent}/round-{:03}.txt", self.round),
+            EditClass::Disjoint => format!(
+                "swarm/agents/{agent}/seed-{}-round-{:03}.txt",
+                self.seed, self.round
+            ),
             EditClass::SameFileHunks => SHARED_PATH.to_owned(),
             EditClass::Overlapping => CONTESTED_PATH.to_owned(),
         }
@@ -77,8 +83,9 @@ impl Edit {
         }
     }
 
-    /// The line the edit writes.
-    fn line(&self, agent: &str) -> String {
+    /// The line the edit writes, which no other agent, round or token writes.
+    #[must_use]
+    pub fn line(&self, agent: &str) -> String {
         format!("{agent} round {} {:016x}", self.round, self.token)
     }
 
@@ -87,7 +94,8 @@ impl Edit {
     /// # Errors
     ///
     /// [`ApplyError::NoScaffold`] when a shared file is missing, [`ApplyError::Unrecognised`] when
-    /// it exists but has no line for the edit, which the driver never overwrites.
+    /// it exists but has no line for the edit, and [`ApplyError::Exists`] when a disjoint edit's
+    /// new file is already there: the driver never overwrites a file it did not recognise.
     pub fn apply(
         &self,
         slot: u32,
@@ -96,7 +104,12 @@ impl Edit {
     ) -> Result<String, ApplyError> {
         let line = self.line(agent);
         let (current, prefix) = match self.class {
-            EditClass::Disjoint => return Ok(format!("{line}\n")),
+            EditClass::Disjoint => {
+                return match current {
+                    None => Ok(format!("{line}\n")),
+                    Some(_) => Err(ApplyError::Exists),
+                };
+            }
             EditClass::SameFileHunks => (current, format!("slot {slot:02}: ")),
             EditClass::Overlapping => (current, "contested: ".to_owned()),
         };
@@ -130,6 +143,9 @@ pub enum ApplyError {
     /// The shared file holds no line the edit may rewrite.
     #[error("the shared file was changed by something other than the swarm")]
     Unrecognised,
+    /// A disjoint edit's file already exists.
+    #[error("the file a disjoint edit creates already exists")]
+    Exists,
 }
 
 /// The scaffold files with their contents, the same bytes for every agent and every run.
@@ -175,6 +191,7 @@ impl Plan {
                             EditClass::Overlapping
                         };
                         Edit {
+                            seed,
                             round,
                             class,
                             token: rng.next(),
@@ -289,6 +306,7 @@ mod tests {
 
     fn edit(class: EditClass) -> Edit {
         Edit {
+            seed: 211,
             round: 3,
             class,
             token: 0xabc,
@@ -334,12 +352,34 @@ mod tests {
     fn a_disjoint_edit_writes_a_file_of_its_own() -> anyhow::Result<()> {
         let edit = edit(EditClass::Disjoint);
         assert!(!edit.needs_scaffold());
-        assert_eq!(edit.path("swarm-00"), "swarm/agents/swarm-00/round-003.txt");
+        assert_eq!(
+            edit.path("swarm-00"),
+            "swarm/agents/swarm-00/seed-211-round-003.txt"
+        );
         assert_eq!(
             edit.apply(0, "swarm-00", None)?,
             "swarm-00 round 3 0000000000000abc\n"
         );
+        // Another seed names another file.
+        let reseeded = Edit { seed: 212, ..edit };
+        assert_ne!(reseeded.path("swarm-00"), edit.path("swarm-00"));
         Ok(())
+    }
+
+    #[test]
+    fn a_disjoint_edit_never_replaces_an_existing_file() {
+        let edit = edit(EditClass::Disjoint);
+        for current in [
+            "someone else's file\n",
+            "",
+            "swarm-00 round 3 0000000000000abc\n",
+        ] {
+            assert_eq!(
+                edit.apply(0, "swarm-00", Some(current)),
+                Err(ApplyError::Exists),
+                "{current:?}"
+            );
+        }
     }
 
     #[test]

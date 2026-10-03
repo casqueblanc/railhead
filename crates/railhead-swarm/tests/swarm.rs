@@ -6,7 +6,8 @@
 //! A clean merge moves main; a conflict reopens the claim at the next generation and routes a
 //! `conflict` inbox item to its agent. By default the agent's status keeps showing its last claim
 //! once it merged, the positive evidence the driver needs to count a landing; the real backend
-//! does not show it yet (#237), and [`Status::HidesClosed`] reproduces that. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
+//! does not show it yet (#237), and [`Status::HidesClosed`] reproduces that: the driver reports
+//! such a task as unverified. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
 //! the origin's `/git/` URLs, so every remote keeps the address the backend named.
 //!
 //! The agents and the backend are both simulated; nothing here measures Railhead itself.
@@ -802,6 +803,11 @@ fn run(command: &mut Command) -> anyhow::Result<Run> {
     })
 }
 
+/// The file a disjoint edit of the test scenario (seed 211) creates.
+fn disjoint_path(agent: &str, round: u32) -> String {
+    format!("swarm/agents/{agent}/seed-211-round-{round:03}.txt")
+}
+
 fn mix(disjoint: u32, hunks: u32, overlapping: u32) -> Value {
     json!({"disjoint": disjoint, "sameFileHunks": hunks, "overlapping": overlapping})
 }
@@ -824,10 +830,7 @@ async fn disjoint_edits_land_without_conflict() -> anyhow::Result<()> {
             "{agent}"
         );
         assert_eq!(
-            world
-                .main_file(&format!("swarm/agents/{agent}/round-000.txt"))?
-                .split(' ')
-                .next(),
+            world.main_file(&disjoint_path(agent, 0))?.split(' ').next(),
             Some(agent)
         );
     }
@@ -886,6 +889,22 @@ async fn same_file_hunks_land_the_scaffold_then_merge_automatically() -> anyhow:
         merged.first().and_then(|e| e.get("path")),
         Some(&json!("swarm/shared.txt"))
     );
+    // The pair is the two hunk edits, each written on a base without the other's line.
+    let mut hunks: Vec<&Value> = run
+        .of_type("pushed")
+        .into_iter()
+        .filter(|e| e.get("class") == Some(&json!("sameFileHunks")))
+        .filter_map(|e| e.get("claimId"))
+        .collect();
+    hunks.sort_by_key(|id| id.as_str().map(str::to_owned));
+    let mut paired: Vec<&Value> = merged
+        .first()
+        .and_then(|e| e.get("claims"))
+        .and_then(Value::as_array)
+        .map(|claims| claims.iter().collect())
+        .unwrap_or_default();
+    paired.sort_by_key(|id| id.as_str().map(str::to_owned));
+    assert_eq!(paired, hunks);
     // Main holds both agents' slots: Git merged the two hunks.
     let shared = world.main_file("swarm/shared.txt")?;
     assert!(shared.contains("slot 00: swarm-00 round 0 "), "{shared}");
@@ -982,24 +1001,47 @@ async fn a_home_joined_to_another_repository_starts_nothing() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn a_claim_that_closes_without_evidence_is_not_a_landing() -> anyhow::Result<()> {
+async fn a_claim_that_closes_without_evidence_is_unverified_not_a_landing() -> anyhow::Result<()> {
     // The fake lands the claim but, like today's backend, drops it from the status.
     let world = world_with(1, 1, false, Status::HidesClosed).await?;
-    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let scenario = world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     let run = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(run.code, Some(1));
+    // Unverified is not a failure: the agent goes on with its plan and the run exits 0.
+    assert_eq!(run.code, Some(0), "{:?}", run.of_type("failed"));
     assert_eq!(
         run.steps_of("swarm-00"),
-        ["claimed", "pushed", "ready", "failed"]
+        [
+            "claimed",
+            "pushed",
+            "ready",
+            "unverified",
+            "claimed",
+            "pushed",
+            "ready",
+            "unverified"
+        ]
     );
-    let failed = run.of_type("failed");
+    for unverified in run.of_type("unverified") {
+        assert_eq!(
+            unverified.get("needs"),
+            Some(&json!("casqueblanc/railhead#237"))
+        );
+        assert_eq!(unverified.get("class"), Some(&json!("disjoint")));
+    }
     assert_eq!(
-        failed.first().and_then(|e| e.get("code")),
-        Some(&json!("closed_unknown"))
+        (
+            run.total("landings"),
+            run.total("unverified"),
+            run.total("failures"),
+            run.total("agentsDone")
+        ),
+        (Some(0), Some(2), Some(0), Some(1))
     );
-    assert_eq!(
-        (run.total("landings"), run.total("agentsDone")),
-        (Some(0), Some(0))
+    // The fake did land both, but the agent had no evidence of it, so neither counts.
+    assert!(
+        world
+            .main_file(&disjoint_path("swarm-00", 1))?
+            .starts_with("swarm-00 ")
     );
     assert_eq!(
         run.summary()?.pointer("/readyToLanded/samples"),
@@ -1010,25 +1052,23 @@ async fn a_claim_that_closes_without_evidence_is_not_a_landing() -> anyhow::Resu
 
 #[tokio::test]
 async fn a_ready_claim_that_expires_between_polls_is_not_a_landing() -> anyhow::Result<()> {
-    // A wave of 2 with one agent never lands; the ready claim expires on the second poll.
+    // A wave of 2 with one agent never lands; the ready claim expires on the second poll and
+    // leaves the status, which cannot say so until #237: it is unverified, never landed.
     let world = world_with(1, 2, false, Status::ExpiresReady).await?;
     let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     let run = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(run.code, Some(1));
+    assert_eq!(run.code, Some(0), "{:?}", run.of_type("failed"));
     assert_eq!(
         run.steps_of("swarm-00"),
-        ["claimed", "pushed", "ready", "failed"]
+        ["claimed", "pushed", "ready", "unverified"]
     );
     assert_eq!(
-        run.of_type("failed").first().and_then(|e| e.get("code")),
-        Some(&json!("closed_unknown"))
+        (run.total("landings"), run.total("unverified")),
+        (Some(0), Some(1))
     );
-    assert_eq!(run.total("landings"), Some(0));
     assert_eq!(world.state().ready_polls, 2);
     assert!(
-        world
-            .main_file("swarm/agents/swarm-00/round-000.txt")
-            .is_err(),
+        world.main_file(&disjoint_path("swarm-00", 0)).is_err(),
         "main changed although nothing landed"
     );
     Ok(())
@@ -1221,10 +1261,10 @@ fn assert_resumed(world: &World, rerun: &Run, pinned: &str) -> anyhow::Result<()
     // Round 0 was not delivered twice: two claims in all, both merged.
     let states: Vec<ClaimState> = world.state().claims.iter().map(|c| c.state).collect();
     assert_eq!(states, [ClaimState::Merged, ClaimState::Merged]);
-    for round in ["round-000", "round-001"] {
+    for round in [0, 1] {
         assert!(
             world
-                .main_file(&format!("swarm/agents/swarm-00/{round}.txt"))?
+                .main_file(&disjoint_path("swarm-00", round))?
                 .starts_with("swarm-00 ")
         );
     }
@@ -1278,20 +1318,41 @@ async fn a_pin_that_merged_between_runs_is_recorded_not_redone() -> anyhow::Resu
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_pin_that_closed_between_runs_without_evidence_stops_the_rerun() -> anyhow::Result<()> {
+async fn a_pin_that_closed_between_runs_without_evidence_is_unverified_not_redone()
+-> anyhow::Result<()> {
     let world = world_with(1, 1, false, Status::HidesClosed).await?;
-    let (scenario, _) = interrupt_after_the_first_pin(&world)?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
     world.state().paused = false;
     let rerun = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(rerun.code, Some(1));
-    assert_eq!(rerun.steps_of("swarm-00"), ["failed"]);
+    assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
     assert_eq!(
-        rerun.of_type("failed").first().and_then(|e| e.get("code")),
-        Some(&json!("closed_unknown"))
+        rerun.steps_of("swarm-00"),
+        [
+            "adopted",
+            "unverified",
+            "claimed",
+            "pushed",
+            "ready",
+            "unverified"
+        ]
     );
-    // Nothing was claimed or delivered again.
-    assert_eq!(world.state().claims.len(), 1);
-    assert_eq!(rerun.total("pushes"), Some(0));
+    assert_eq!(
+        rerun
+            .of_type("unverified")
+            .first()
+            .and_then(|e| e.get("claimId")),
+        Some(&json!(pinned))
+    );
+    // Round 0 was not delivered again: one new claim, for round 1.
+    assert_eq!(world.state().claims.len(), 2);
+    assert_eq!(
+        (
+            rerun.total("pushes"),
+            rerun.total("landings"),
+            rerun.total("unverified")
+        ),
+        (Some(1), Some(0), Some(2))
+    );
     Ok(())
 }
 
@@ -1406,7 +1467,7 @@ async fn a_planted_symlink_never_redirects_an_edit_outside_the_clone() -> anyhow
     // Repository content links the agent's first planned file to a file outside any clone.
     let seed = world.dir.path().join("seed");
     fs::create_dir_all(seed.join("swarm/agents/swarm-00"))?;
-    std::os::unix::fs::symlink(&sentinel, seed.join("swarm/agents/swarm-00/round-000.txt"))?;
+    std::os::unix::fs::symlink(&sentinel, seed.join(disjoint_path("swarm-00", 0)))?;
     git(&seed, &["add", "--all"])?;
     git(&seed, &["commit", "--quiet", "-m", "plant a link"])?;
     let main = world.fake.main_repo();
@@ -1426,5 +1487,67 @@ async fn a_planted_symlink_never_redirects_an_edit_outside_the_clone() -> anyhow
     assert_eq!(fs::read_to_string(&sentinel)?, "untouched\n");
     assert_eq!(run.total("pushes"), Some(0));
     assert!(world.work_is_empty()?, "the run left clones behind");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_disjoint_edit_never_replaces_a_file_already_on_main() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    // Someone else's file already sits where the agent's first disjoint edit would go.
+    let taken = disjoint_path("swarm-00", 0);
+    let seed = world.dir.path().join("seed");
+    fs::create_dir_all(seed.join("swarm/agents/swarm-00"))?;
+    fs::write(seed.join(&taken), "someone else's notes\n")?;
+    git(&seed, &["add", "--all"])?;
+    git(&seed, &["commit", "--quiet", "-m", "an unrelated file"])?;
+    let main = world.fake.main_repo();
+    git(
+        &seed,
+        &["push", "--quiet", &main.display().to_string(), "main"],
+    )?;
+    let before = git(&main, &["rev-parse", "refs/heads/main"])?;
+
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.steps_of("swarm-00"), ["claimed", "failed"]);
+    let failed = run.of_type("failed");
+    assert_eq!(
+        failed.first().map(|e| (e.get("step"), e.get("code"))),
+        Some((Some(&json!("edit")), Some(&json!("path_exists"))))
+    );
+    // Nothing was pushed, and the file and main are as they were.
+    assert_eq!(run.total("pushes"), Some(0));
+    let claim = world.state().claims.first().map(|claim| claim.id.clone());
+    let fork = world.fake.fork(&claim.unwrap_or_default());
+    assert_eq!(git(&fork, &["rev-parse", "refs/heads/main"])?, before);
+    assert_eq!(world.main_file(&taken)?, "someone else's notes");
+    assert_eq!(git(&main, &["rev-parse", "refs/heads/main"])?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sequential_same_file_edits_are_not_counted_as_auto_merged() -> anyhow::Result<()> {
+    // A wave of 1 hands out the next claim only after the last one landed, so each agent's base
+    // already holds the edit before it: nothing for Git to merge, whatever order the agents see
+    // their landings in.
+    let world = world(2, 1, true).await?;
+    let bounds = json!({"retries": 10, "commandTimeoutSecs": 60, "landTimeoutSecs": 60,
+        "runTimeoutSecs": 120, "pollMs": 50});
+    let scenario = world.scenario(2, "casqueblanc/demo", &mix(0, 1, 0), &bounds)?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(0), "{:?}", run.of_type("failed"));
+    let shared = world.main_file("swarm/shared.txt")?;
+    assert!(shared.contains("slot 00: swarm-00 round 0 "), "{shared}");
+    assert!(shared.contains("slot 01: swarm-01 round 0 "), "{shared}");
+    assert_eq!(
+        (
+            run.total("landings"),
+            run.total("autoMergedOverlaps"),
+            run.total("routedConflicts")
+        ),
+        (Some(2), Some(0), Some(0))
+    );
+    assert_eq!(run.of_type("conflictAutoMerged").len(), 0);
     Ok(())
 }
