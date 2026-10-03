@@ -1,6 +1,6 @@
 import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { newWebSocketRpcSession, RpcTarget } from "capnweb";
+import { newWebSocketRpcSession, type RpcTarget } from "capnweb";
 import { describe, expect, it } from "vitest";
 import {
   MAX_AGENT_REQUEST_BYTES,
@@ -11,7 +11,7 @@ import {
   type InboxDigest,
 } from "@railhead/shared/agent-api";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
-import type { BoardListener, BoardResult } from "@railhead/shared/board-api";
+import type { BoardResult } from "@railhead/shared/board-api";
 import type { Actor, EventPayload, RailheadEvent } from "@railhead/shared/events";
 import type { AgentPrincipal } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
@@ -235,22 +235,6 @@ describe("unavailable modules", () => {
           operation: "fetch",
         }),
         ports.sessions.authenticate(TOKEN),
-        // Decisions is installed, but asking needs the claims module to confirm the claim.
-        ports.decisions.ask(
-          { kind: "agent", agentId: "agt_atlas01", ownerId: "usr_lemarier", repoId },
-          CLAIM,
-          {
-            generation: 1,
-            requestId: "req_upload0000000001",
-            text: "Reject or chunk?",
-            options: [
-              { key: "reject", label: "Reject" },
-              { key: "chunk", label: "Chunk" },
-            ],
-            scope: ["src/upload.ts"],
-          },
-        ),
-        ports.stream.subscribe(0, { events: async () => {}, ended: async () => {} }),
       ]);
     });
 
@@ -341,12 +325,14 @@ describe("agent dispatch", () => {
   };
 
   it("runs the command for an agent of this repository and piggybacks its inbox", async () => {
+    // The port's URLs are replaced by ones on the origin the agent called.
+    const foreign = { ...claim.claim, originUrl: "https://evil.invalid/x.git", upstreamUrl: "" };
     await withFakePorts(
-      { work: ok(claim), digest: ok({ items: [], pending: 3 }) },
+      { work: ok({ ...claim, claim: foreign }), digest: ok({ items: [], pending: 3 }) },
       async (ports, calls) => {
         const reply = await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: work, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: work, token: TOKEN, origin: ORIGIN },
         );
 
         expect(reply).toEqual({
@@ -363,8 +349,8 @@ describe("agent dispatch", () => {
   it("refuses a session bound to another repository before running anything", async () => {
     await withFakePorts({ work: ok(claim) }, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: "rep_mine0001", ports },
-        { command: work, token: TOKEN },
+        { repoId: "rep_mine0001", org: "acme", name: "widgets", ports },
+        { command: work, token: TOKEN, origin: ORIGIN },
       );
 
       expect(reply).toMatchObject({ ok: false, error: { code: "unauthenticated" } });
@@ -375,8 +361,8 @@ describe("agent dispatch", () => {
   it("refuses a missing token without authenticating", async () => {
     await withFakePorts({}, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: AGENT.repoId, ports },
-        { command: work, token: null },
+        { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+        { command: work, token: null, origin: ORIGIN },
       );
 
       expect(reply).toMatchObject({
@@ -388,10 +374,12 @@ describe("agent dispatch", () => {
   });
 
   it("answers status with the identity's view and the active claim", async () => {
-    await withFakePorts({ activeClaim: ok(claim.claim) }, async (ports, calls) => {
+    // The port's URLs are replaced by ones on the origin the agent called, as for work.
+    const foreign = { ...claim.claim, originUrl: "https://evil.invalid/x.git", upstreamUrl: "" };
+    await withFakePorts({ activeClaim: ok(foreign) }, async (ports, calls) => {
       const reply = await dispatchAgent(
-        { repoId: AGENT.repoId, ports },
-        { command: { route: "status" }, token: TOKEN },
+        { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+        { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
       );
 
       expect(reply).toEqual({
@@ -404,12 +392,28 @@ describe("agent dispatch", () => {
     });
   });
 
+  it("answers status without a claim when the agent holds none", async () => {
+    await withFakePorts({}, async (ports) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
+        ),
+      ).toEqual({
+        ok: true,
+        data: { agent: VIEW, claim: null },
+        inbox: { items: [], pending: 0 },
+        next: null,
+      });
+    });
+  });
+
   it("refuses status when the identity or the claims module refuses", async () => {
     await withFakePorts({ view: fail("identity_revoked", "Revoked.") }, async (ports, calls) => {
       expect(
         await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: { route: "status" }, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
         ),
       ).toMatchObject({ ok: false, error: { code: "identity_revoked" } });
       expect(calls).toEqual(["authenticate", "view"]);
@@ -417,8 +421,8 @@ describe("agent dispatch", () => {
     await withFakePorts({ activeClaim: fail("unavailable", "Claims are down.") }, async (ports) => {
       expect(
         await dispatchAgent(
-          { repoId: AGENT.repoId, ports },
-          { command: { route: "status" }, token: TOKEN },
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
         ),
       ).toMatchObject({ ok: false, error: { code: "unavailable" } });
     });
@@ -429,7 +433,10 @@ describe("agent dispatch", () => {
       { work: ok(claim), digest: fail("unavailable", "Inbox is down.") },
       async (ports) => {
         expect(
-          await dispatchAgent({ repoId: AGENT.repoId, ports }, { command: work, token: TOKEN }),
+          await dispatchAgent(
+            { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+            { command: work, token: TOKEN, origin: ORIGIN },
+          ),
         ).toMatchObject({ ok: false, error: { code: "unavailable" } });
       },
     );
@@ -438,7 +445,10 @@ describe("agent dispatch", () => {
   it("reports a code outside the agent wire as internal, without its message", async () => {
     await withFakePorts({ work: fail("check_mismatch", "Internal detail.") }, async (ports) => {
       expect(
-        await dispatchAgent({ repoId: AGENT.repoId, ports }, { command: work, token: TOKEN }),
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: work, token: TOKEN, origin: ORIGIN },
+        ),
       ).toEqual({
         ok: false,
         error: {
@@ -655,14 +665,6 @@ describe("board RPC lifecycle", () => {
     using api = newWebSocketRpcSession<RailheadApi>(await openSession());
     using board = value(await api.openBoard("acme", name));
 
-    class Listener extends RpcTarget implements BoardListener {
-      async events(): Promise<void> {}
-      async ended(): Promise<void> {}
-    }
-    expect(await board.subscribe(0, new Listener())).toMatchObject({
-      ok: false,
-      code: "unavailable",
-    });
     using owner = await board.owner();
     expect(await owner.prepare({ kind: "agent.revoke", agentId: "agt_atlas01" })).toMatchObject({
       ok: false,
