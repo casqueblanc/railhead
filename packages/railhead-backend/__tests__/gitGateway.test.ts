@@ -2664,6 +2664,46 @@ describe("a push left pending", () => {
     });
   });
 
+  it("records nothing for a push whose fork read overlaps a later push that made the same move", async () => {
+    await withGateway(async (world) => {
+      const moved = "b".repeat(40);
+      const feature = `${HEAD} ${moved} refs/heads/feature`;
+      // Git refused this push, but its response was lost.
+      world.fork = [[HEAD, "refs/heads/feature"]];
+      world.respond = () => Promise.reject(new Error("connection reset"));
+      await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([feature])),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(world.pending()).toHaveLength(1);
+
+      // While the alarm reads the fork back, a later push makes the same move and is recorded.
+      let later: Response | null = null;
+      world.respond = async () => {
+        world.respond = () =>
+          gitResponse(
+            "git-receive-pack",
+            "result",
+            sideBand(`${pkt("unpack ok\n")}${pkt("ok refs/heads/feature\n")}0000`),
+          );
+        later = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody([feature])),
+          FORK,
+          "/git-receive-pack",
+        );
+        return advertisement([[moved, "refs/heads/feature"]]);
+      };
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(later).not.toBeNull();
+      // Only the later push's own record stands.
+      expect(pushedEvents(world)).toHaveLength(1);
+      expect(world.pending()).toEqual([]);
+      expect(logged.at(-1)).toBe(unrecorded("outcome_unknown", "later_push"));
+    });
+  });
+
   it("records nothing when the fork could not be read before release", async () => {
     await withGateway(async (world) => {
       world.fork = null;

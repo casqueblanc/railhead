@@ -505,7 +505,7 @@ class GitGateway implements GitPort {
           ? "later_push"
           : null;
     if (prior === null || unproven !== null) {
-      if (this.#settle(row.id, row.agent_id, fence, []) !== "settled") {
+      if (this.#settle(row.id, row.agent_id, fence, [], null) !== "settled") {
         logUnrecorded(fence, "outcome_unknown", unproven ?? "unobserved");
       }
       return;
@@ -522,7 +522,12 @@ class GitGateway implements GitPort {
     const applied = updates.filter(
       (update) => prior.get(update.ref) === update.from && refs.get(update.ref) === update.to,
     );
-    const outcome = this.#settle(row.id, row.agent_id, fence, applied);
+    // Another push released while the fork was read could have made that move; the count is checked
+    // again in the transaction that records it.
+    const outcome = this.#settle(row.id, row.agent_id, fence, applied, {
+      repo: row.repo,
+      release: row.release,
+    });
     switch (outcome) {
       case "recorded":
         logPush("git_push_reconciled", fence, {
@@ -532,6 +537,9 @@ class GitGateway implements GitPort {
         return;
       case "claim_changed":
         if (applied.length > 0) logUnrecorded(fence, "claim_changed");
+        return;
+      case "later_push":
+        logUnrecorded(fence, "outcome_unknown", "later_push");
         return;
       case "settled":
         return;
@@ -901,7 +909,7 @@ class GitGateway implements GitPort {
     const pushed = head.updates.filter((update) => updated.has(update.ref)).flatMap(pushedRef);
     for (let attempt = 1; ; attempt += 1) {
       try {
-        const outcome = this.#settle(pending, principal.agentId, fence, pushed);
+        const outcome = this.#settle(pending, principal.agentId, fence, pushed, null);
         if (outcome === "claim_changed" && pushed.length > 0) logUnrecorded(fence, "claim_changed");
         return;
       } catch (error) {
@@ -915,15 +923,17 @@ class GitGateway implements GitPort {
 
   /**
    * Settles the pending push `pending` in one transaction: appends `pushed` if the claim is still
-   * working at the fence's generation, and deletes the row either way. Nothing is written once the
-   * row is gone, since whoever settled it first wrote its record.
+   * working at the fence's generation and, when `last` is given, its fork has had no push released
+   * after `last.release`; it deletes the row either way. Nothing is written once the row is gone,
+   * since whoever settled it first wrote its record.
    */
   #settle(
     pending: number,
     agentId: string,
     fence: Fence,
     pushed: readonly PushedRef[],
-  ): "recorded" | "claim_changed" | "settled" {
+    last: { readonly repo: string; readonly release: number } | null,
+  ): "recorded" | "claim_changed" | "later_push" | "settled" {
     const { sql } = this.#context.storage;
     return this.#context.log.transaction((tx) => {
       const deleted = sql.exec("DELETE FROM git_pending_push WHERE id = ?", pending).rowsWritten;
@@ -931,6 +941,7 @@ class GitGateway implements GitPort {
       if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
         return "claim_changed";
       }
+      if (last !== null && this.#released(last.repo) !== last.release) return "later_push";
       for (const update of pushed) {
         tx.append(
           { kind: "agent", id: agentId },
