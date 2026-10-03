@@ -1,6 +1,6 @@
 // SYNTHETIC. Hand-written event logs for developing and testing the board. None of them is a
-// captured run, and none may be presented as one: the board marks only a captured log as a replay
-// of a real run. Every identifier carries `synth` so a synthetic log is recognisable on sight.
+// captured run, and none may be presented as one. Every identifier carries `synth` so a synthetic
+// log is recognisable on sight.
 
 // The fixtures sit outside any package, so they reach the shared types by path.
 import {
