@@ -73,7 +73,7 @@ fn refuses_unknown_tags_and_enum_values() -> TestResult {
 }
 
 #[test]
-fn decodes_each_reopen_reason_and_refuses_another_or_none() -> TestResult {
+fn decodes_each_reopen_reason_and_refuses_another() -> TestResult {
     let reopened = |reason: Option<&str>| {
         let mut data = json!({"claimId": "clm_42abcd", "generation": 1, "decisions": []});
         if let (Some(reason), Some(fields)) = (reason, data.as_object_mut()) {
@@ -100,7 +100,21 @@ fn decodes_each_reopen_reason_and_refuses_another_or_none() -> TestResult {
         decode(&reopened(Some("lost_race"))),
         Err(Error::Json { .. })
     ));
-    assert!(matches!(decode(&reopened(None)), Err(Error::Json { .. })));
+    assert!(matches!(
+        decode(&reopened(Some(""))),
+        Err(Error::Json { .. })
+    ));
+    // A version 1 event recorded before reasons existed has none: a superseded decision was the
+    // only cause then.
+    match decode(&reopened(None))?.payload {
+        EventPayload::ClaimReopened(data) => {
+            assert_eq!(data.reason, ReopenReason::DecisionSuperseded);
+        }
+        other => return Err(format!("a reasonless reopen decoded as {other:?}").into()),
+    }
+    let mut null_reason = reopened(Some("lost_conflict"));
+    set(&mut null_reason, "/data/reason", Value::Null)?;
+    assert!(matches!(decode(&null_reason), Err(Error::Json { .. })));
     Ok(())
 }
 

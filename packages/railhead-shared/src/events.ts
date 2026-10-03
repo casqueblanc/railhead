@@ -148,6 +148,13 @@ export type ReopenReason =
   /** The train's check failed on the pin. */
   | "check_failed";
 
+/**
+ * The reason a reader assigns to a schema version 1 `claim.reopened` that has no `reason`: such an
+ * event was recorded before reasons existed, when a superseded decision was the only cause. Writers
+ * always record a reason.
+ */
+export const REOPEN_REASON_BEFORE_REASONS: ReopenReason = "decision_superseded";
+
 /** What an inbox entry asks of the agent. */
 export type InboxEntry =
   /** A decision in the claim's scope was recorded or superseded. */

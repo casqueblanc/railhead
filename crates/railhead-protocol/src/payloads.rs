@@ -207,7 +207,9 @@ pub struct ClaimReopened {
     pub claim_id: String,
     /// The ownership generation.
     pub generation: SafeInteger,
-    /// Why the work must be redone.
+    /// Why the work must be redone. An event recorded before reasons existed has none and reads
+    /// as [`ReopenReason::BEFORE_REASONS`].
+    #[serde(default = "ReopenReason::before_reasons")]
     pub reason: ReopenReason,
     /// The current decision versions the work must now follow.
     pub decisions: Vec<DecisionRef>,

@@ -77,6 +77,16 @@ pub enum ReopenReason {
     CheckFailed,
 }
 
+impl ReopenReason {
+    /// The reason of a schema version 1 `claim.reopened` that has none: it was recorded before
+    /// reasons existed, when a superseded decision was the only cause.
+    pub const BEFORE_REASONS: Self = Self::DecisionSuperseded;
+
+    pub(crate) const fn before_reasons() -> Self {
+        Self::BEFORE_REASONS
+    }
+}
+
 /// What an inbox entry asks of the agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(

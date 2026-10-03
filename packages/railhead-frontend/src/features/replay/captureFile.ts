@@ -38,6 +38,7 @@
 import type { BoardErrorCode } from "@railhead/shared/board-api";
 import {
   EVENT_SCHEMA_VERSION,
+  REOPEN_REASON_BEFORE_REASONS,
   validateEvent,
   type Actor,
   type DecisionRef,
@@ -748,7 +749,10 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
         data: {
           claimId: string(d, "claimId", p),
           generation: integer(d, "generation", p),
-          reason: oneOf(d, "reason", p, ["lost_conflict", "decision_superseded", "check_failed"]),
+          reason:
+            d["reason"] === undefined
+              ? REOPEN_REASON_BEFORE_REASONS
+              : oneOf(d, "reason", p, ["lost_conflict", "decision_superseded", "check_failed"]),
           decisions: list(d, "decisions", p, readDecisionRef),
         },
       };

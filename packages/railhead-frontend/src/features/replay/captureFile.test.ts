@@ -759,9 +759,19 @@ describe("parseCapture", () => {
     expect(result.ok && result.capture.events).toEqual([...issues(3), reopened]);
   });
 
+  it("reads a version 1 reopen recorded before reasons as a superseded decision", () => {
+    const { reason: _, ...before } = reopened.data;
+    const events = [...issues(3), { ...reopened, data: before }];
+    const result = parseCapture(fileOf({ events, head: 4 }));
+    expect(result.ok && result.capture.events).toEqual([
+      ...issues(3),
+      { ...reopened, data: { ...reopened.data, reason: "decision_superseded" } },
+    ]);
+  });
+
   it.each([
     ["an unknown reopen reason", "lost_race"],
-    ["a missing reopen reason", undefined],
+    ["a null reopen reason", null],
   ])("refuses %s", (_, reason) => {
     const events = [...issues(3), { ...reopened, data: { ...reopened.data, reason } }];
     expect(parsedError(fileOf({ events, head: 4 }))).toEqual({
