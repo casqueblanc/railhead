@@ -710,7 +710,7 @@ export function createTrain(
           settleEntry(sql, pin, "landed", null, now);
         }
       }
-      requeueFront(sql, unchecked.map(fresh), now);
+      requeueFront(sql, unchecked.map(asFreshWork), now);
       settleBatch(sql, batch.batchId, { state: "landed" }, now);
       promoteDeferred(sql, now);
     });
@@ -748,7 +748,7 @@ export function createTrain(
     const returned: Returned[] = [];
     for (const entry of entries) {
       if (renewed(entry)) {
-        returned.push(fresh(entry));
+        returned.push(asFreshWork(entry));
       } else if (definitive && entries.length === 1) {
         settleEntry(sql, entry.pin, "dropped", dropFor(failure), now);
       } else if (definitive) {
@@ -800,7 +800,7 @@ export function createTrain(
         sql,
         entries
           .filter((entry) => !parked(entry))
-          .map((entry) => (renewed(entry) ? fresh(entry) : entry)),
+          .map((entry) => (renewed(entry) ? asFreshWork(entry) : entry)),
         now,
       );
       promoteDeferred(sql, now);
@@ -1079,7 +1079,7 @@ function renewed(entry: QueueEntry): boolean {
 }
 
 /** A renewed entry returned to the queue as fresh work for its newer episode. */
-function fresh(entry: QueueEntry): Returned {
+function asFreshWork(entry: QueueEntry): Returned {
   return { pin: entry.pin, isolate: false, retries: 0 };
 }
 
