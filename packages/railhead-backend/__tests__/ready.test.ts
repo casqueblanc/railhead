@@ -190,9 +190,9 @@ describe("ready", () => {
 
       const again = await setup.port.ready(agent(1), claim.claimId, request(WORK));
 
-      expect(first.ok && again.ok && again.value).toEqual(
-        first.ok && { ...first.value, repeated: true },
-      );
+      expect(first).toMatchObject({ ok: true, value: { repeated: false } });
+      if (!first.ok) throw new Error("the first ready was refused");
+      expect(again).toEqual(ok({ ...first.value, repeated: true }));
       expect(setup.log.head()).toBe(head);
     });
   });
