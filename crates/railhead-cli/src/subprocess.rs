@@ -314,6 +314,51 @@ mod tests {
         Ok(())
     }
 
+    /// Long enough for a loaded machine to start a shell and its background process, so a test
+    /// through [`run`], whose deadline counts the start, sees them running before it.
+    const STARTUP: Duration = Duration::from_secs(5);
+
+    /// Runs `script` through [`run`] with [`STARTUP`] as its limit, expecting it stopped at the
+    /// deadline, and returns the process id it recorded in `grandchild`.
+    fn timed_out_through_run(script: &str, grandchild: &Path) -> anyhow::Result<i32> {
+        let started = Instant::now();
+        let error = run(&mut sh(script), STARTUP, true).err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(error, Some(RunError::TimedOut(stopped)) if stopped == STARTUP),
+            "{error:?}"
+        );
+        assert!(elapsed >= STARTUP, "stopped early: {elapsed:?}");
+        assert!(elapsed < STARTUP + PATIENCE, "{elapsed:?}");
+        pid(grandchild)
+    }
+
+    #[test]
+    fn run_stops_a_child_past_its_deadline_with_its_own_children() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let child = dir.path().join("child");
+        let grandchild = dir.path().join("grandchild");
+        let script = format!(
+            "echo $$ > '{}'; {} wait",
+            child.display(),
+            stubborn(&grandchild)
+        );
+        let recorded = timed_out_through_run(&script, &grandchild)?;
+        for pid in [pid(&child)?, recorded] {
+            assert!(!alive(pid), "process {pid} outlived the deadline");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_stops_a_descendant_holding_stdout_past_the_deadline() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let grandchild = dir.path().join("grandchild");
+        let recorded = timed_out_through_run(&stubborn(&grandchild), &grandchild)?;
+        assert!(!alive(recorded), "process {recorded} outlived the deadline");
+        Ok(())
+    }
+
     #[test]
     fn a_child_is_stopped_when_its_start_fails() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
