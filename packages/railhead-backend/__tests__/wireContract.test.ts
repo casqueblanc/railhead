@@ -491,7 +491,7 @@ describe("unavailable ports", () => {
           attemptId: "chk_run0001",
           expectedMain: sha,
           candidate: sha,
-          pins: [pin],
+          pins: [{ ...pin, episode: 1 }],
           definition: { name: "test", source: sha, digest: "0".repeat(64), acceptance: null },
           decisions: [],
           createdAt: 1,

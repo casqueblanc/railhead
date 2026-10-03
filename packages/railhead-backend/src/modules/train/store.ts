@@ -20,7 +20,9 @@
 // episode is unchanged, so a ready episode queued during the drive's reads is kept. A batched entry
 // also records in `batched_episode` the episode its batch was formed for. A re-ready of the batched
 // commit raises `episode` past it, and the batch's result then belongs to the older episode only:
-// the entry goes back to the queue as fresh work rather than taking that result.
+// the entry goes back to the queue as fresh work rather than taking that result. The batch's pins
+// carry the same episodes, so its check attempt and merge intent name the episodes they cover, and
+// the merge fence refuses to authorize or publish them once a claim is in a later episode.
 //
 // `train_conflicts` holds one row per conflicting pair the train parked, keyed by the batch whose
 // merge found it. While its state is `asking`, the train owes the owner a question about the pair,
@@ -49,7 +51,7 @@ import type {
   DecisionId,
   DecisionRef,
 } from "@railhead/shared/events";
-import type { ClaimPin } from "../../contracts/claims";
+import type { ClaimPin, EpisodePin } from "../../contracts/claims";
 import { MERGE_PUSH_WINDOW_MS, type CheckDefinition } from "../../contracts/train";
 import type { RepoStorage } from "../../repo/storage";
 import { migrate } from "../../repo/storage";
@@ -241,8 +243,8 @@ export interface BatchRecord {
   state: BatchState;
   /** The main commit it is composed on. */
   expectedMain: CommitSha;
-  /** Its pins, in merge order. */
-  pins: ClaimPin[];
+  /** Its pins, in merge order, each with the ready episode its entry held when it was formed. */
+  pins: EpisodePin[];
   /** The decision versions required when it was formed. */
   decisions: DecisionRef[];
   /** The trusted check definition, read from `expectedMain`. */
@@ -557,7 +559,7 @@ export function insertBatch(
   sql: SqlStorage,
   batch: {
     expectedMain: CommitSha;
-    pins: ClaimPin[];
+    pins: EpisodePin[];
     decisions: DecisionRef[];
     definition: CheckDefinition;
   },
@@ -579,8 +581,9 @@ export function insertBatch(
   if (row === undefined) throw new Error("the batch insert returned no row");
   for (const pin of batch.pins) {
     sql.exec(
-      `UPDATE train_queue SET state = 'batched', batched_episode = episode, updated_at = ?
+      `UPDATE train_queue SET state = 'batched', batched_episode = ?, updated_at = ?
        WHERE claim_id = ? AND generation = ?`,
+      pin.episode,
       now,
       pin.claimId,
       pin.generation,
@@ -1124,7 +1127,10 @@ function toEntry(row: QueueRow): QueueEntry {
 
 // Rows are written only by this module, so the JSON columns hold what it serialized.
 function toBatch(row: BatchRow): BatchRecord {
-  const pins: ClaimPin[] = JSON.parse(row.pins);
+  // A batch formed before pins carried their episode has none. Episodes start at 1, so 0 matches
+  // no claim and the fence refuses the batch, which goes back to the queue.
+  const stored: (ClaimPin & { episode?: number })[] = JSON.parse(row.pins);
+  const pins = stored.map((pin) => ({ ...pin, episode: pin.episode ?? 0 }));
   const decisions: DecisionRef[] = JSON.parse(row.decisions);
   const definition: CheckDefinition = JSON.parse(row.definition);
   return {

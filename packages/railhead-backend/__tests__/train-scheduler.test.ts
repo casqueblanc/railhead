@@ -396,6 +396,11 @@ function report(attempt: CheckAttempt, result: CheckReport["result"]): CheckRepo
   };
 }
 
+/** An attempt's pins without the ready episodes they are fenced to. */
+function pinsOf(attempt: { pins: readonly ClaimPin[] } | undefined): ClaimPin[] | undefined {
+  return attempt?.pins.map(({ claimId, generation, commit }) => ({ claimId, generation, commit }));
+}
+
 function lastStarted(fakes: Fakes): CheckAttempt {
   const attempt = fakes.started.at(-1);
   if (attempt === undefined) throw new Error("no check was started");
@@ -734,11 +739,11 @@ describe("train failures", () => {
       fakes.head = () => ok(fakes.main);
       await train.drive();
       const shared = lastStarted(fakes);
-      expect(shared.pins).toEqual([pin(1), pin(2)]);
+      expect(pinsOf(shared)).toEqual([pin(1), pin(2)]);
 
       await train.recordCheck(report(shared, "fail"));
       const alone = lastStarted(fakes);
-      expect(alone.pins).toEqual([pin(1)]);
+      expect(pinsOf(alone)).toEqual([pin(1)]);
       expect(alone.candidate).toBe(candidateOf(MAIN, [pin(1)]));
       expect(fakes.authorized).toEqual([]);
       expect(train.batches(64).at(-1)).toMatchObject({ failure: "check_fail" });
@@ -756,7 +761,7 @@ describe("train failures", () => {
         reason: "check_failed",
       });
       const second = lastStarted(fakes);
-      expect(second.pins).toEqual([pin(2)]);
+      expect(pinsOf(second)).toEqual([pin(2)]);
       await train.recordCheck(report(second, "pass"));
       expect(fakes.main).toBe(candidateOf(MAIN, [pin(2)]));
     }, fakes);
@@ -815,7 +820,7 @@ describe("train failures", () => {
         "clm_claim002@1": "batched",
         "clm_claim003@1": "parked",
       });
-      expect(lastStarted(fakes).pins).toEqual([pin(2)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(2)]);
       expect(train.entries(64).find((e) => e.state === "parked")).toMatchObject({
         reason: "conflict",
       });
@@ -1328,7 +1333,7 @@ describe("train boundaries", () => {
 
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       expect(await train.drive()).toMatchObject({ kind: "checking" });
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1)]);
     }, fakes);
   });
   it("starts nothing unless main holds exactly one valid trusted definition", async () => {
@@ -1372,7 +1377,7 @@ describe("train boundaries", () => {
       expect(train.entries(1)[0]).toMatchObject({ state: "dropped", reason: "pin_changed" });
       expect(fakes.composeCalls).toEqual([]);
       expect(await train.enqueue(pin(1, 2))).toEqual(ok({ queued: true }));
-      expect(lastStarted(fakes).pins).toEqual([pin(1, 2)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1, 2)]);
     }, fakes);
   });
 
@@ -1451,7 +1456,7 @@ describe("train wake", () => {
       advance(WAKE_BASE_MS);
       await train.resume();
       const attempt = lastStarted(fakes);
-      expect(attempt.pins).toEqual([pin(1)]);
+      expect(pinsOf(attempt)).toEqual([pin(1)]);
       // Waiting for the runner's report owes a drive at the attempt's deadline.
       const [checking] = train.batches(1);
       expect(checking?.checkDeadline).toBe(attempt.createdAt + 1 + CHECK_DEADLINE_MS);
@@ -1499,7 +1504,7 @@ describe("train wake", () => {
       // The work stayed in storage: the next call composes the same batch again.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
       expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1)]);
       expect(train.batches(64)).toMatchObject([
         { batchId: 1, state: "checking", checkStarted: true },
       ]);
@@ -1559,7 +1564,7 @@ describe("train wake", () => {
       advance(DRIVE_LEASE_MS);
       await again.resume();
       const resumed = lastStarted(fakes);
-      expect(resumed.pins).toEqual([pin(1)]);
+      expect(pinsOf(resumed)).toEqual([pin(1)]);
       expect(again.batches(1)).toMatchObject([
         { batchId: 2, state: "checking", checkStarted: true },
       ]);
@@ -1666,7 +1671,7 @@ describe("train wake", () => {
       expect(fakes.composeCalls).toEqual([]);
 
       await again.resume();
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1)]);
       // Now the train waits for the report until the attempt's deadline.
       expect(owed(sql)).toEqual({ dueAt: again.batches(1)[0]?.checkDeadline, failures: 0 });
     }, fakes);
@@ -1688,7 +1693,7 @@ describe("train wake", () => {
       // The second pass lands the first batch and waits on the second batch's start.
       await vi.waitFor(() => expect(gates).toHaveLength(2));
       const second = lastStarted(fakes);
-      expect(second.pins).toEqual([pin(2)]);
+      expect(pinsOf(second)).toEqual([pin(2)]);
       calls.push(train.recordCheck(report(second, "pass")));
       gates[1]?.();
       await Promise.all(calls);
@@ -1731,7 +1736,7 @@ describe("train check deadline", () => {
       await again.resume();
       const fresh = lastStarted(fakes);
       expect(fresh.attemptId).not.toBe(silent.attemptId);
-      expect(fresh.pins).toEqual([pin(1)]);
+      expect(pinsOf(fresh)).toEqual([pin(1)]);
       expect(again.batches(2).map((b) => [b.state, b.failure])).toEqual([
         ["checking", null],
         ["failed", "check_timeout"],
@@ -1792,7 +1797,7 @@ describe("train check deadline", () => {
         "retries_exhausted",
       );
       const last = lastStarted(fakes);
-      expect(last.pins).toEqual([pin(2)]);
+      expect(pinsOf(last)).toEqual([pin(2)]);
       expect(await train.recordCheck(report(last, "pass"))).toEqual(ok(last));
       expect(states(train)).toEqual({ "clm_claim001@1": "dropped", "clm_claim002@1": "landed" });
       expect(fakes.authorized).toEqual([last.attemptId]);
@@ -1816,7 +1821,7 @@ describe("train held checks", () => {
       await train.enqueue(pin(2));
       fakes.head = () => ok(fakes.main);
       expect(await train.drive()).toMatchObject({ kind: "blocked", reason: "check_held" });
-      expect(lastStarted(fakes).pins).toEqual([offender, pin(2)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([offender, pin(2)]);
       // A later pin queues behind the held batch.
       fakes.ready(pin(3));
       await train.enqueue(pin(3));
@@ -1824,7 +1829,7 @@ describe("train held checks", () => {
       // Past the deadline the shared batch splits; the offender, first, is held again alone.
       advance(owed(sql).dueAt - now());
       await train.resume();
-      expect(lastStarted(fakes).pins).toEqual([offender]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([offender]);
       expect(states(train)).toMatchObject({
         "clm_claim002@1": "queued",
         "clm_claim003@1": "queued",
@@ -1834,10 +1839,10 @@ describe("train held checks", () => {
       advance(owed(sql).dueAt - now());
       await train.resume();
       const innocent = lastStarted(fakes);
-      expect(innocent.pins).toEqual([pin(2)]);
+      expect(pinsOf(innocent)).toEqual([pin(2)]);
       expect(await train.recordCheck(report(innocent, "pass"))).toEqual(ok(innocent));
       const later = lastStarted(fakes);
-      expect(later.pins).toEqual([pin(3)]);
+      expect(pinsOf(later)).toEqual([pin(3)]);
       expect(await train.recordCheck(report(later, "pass"))).toEqual(ok(later));
 
       expect(fakes.main).toBe(later.candidate);
@@ -1878,7 +1883,7 @@ describe("train held checks", () => {
       fakes.ready(pushed);
       expect(await train.enqueue(pushed)).toEqual(ok({ queued: true }));
       const fresh = lastStarted(fakes);
-      expect(fresh.pins).toEqual([pushed]);
+      expect(pinsOf(fresh)).toEqual([pushed]);
       expect(await train.recordCheck(report(fresh, "pass"))).toEqual(ok(fresh));
       expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim001@2": "landed" });
     }, fakes);
@@ -1898,7 +1903,7 @@ describe("train held checks", () => {
 
       expect(train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_held"]);
       expect(fakes.started).toHaveLength(2);
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1)]);
       expect(train.entries(1)[0]).toMatchObject({ state: "batched", retries: 0, reason: null });
     }, fakes);
   });
@@ -1940,7 +1945,7 @@ describe("train hung ports", () => {
       expect(await train.recordCheck(report(attempt, "pass"))).toEqual(ok(attempt));
       expect(fakes.main).toBe(attempt.candidate);
       expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
-      expect(lastStarted(fakes).pins).toEqual([pin(2)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(2)]);
       const batches = train.batches(64);
       const wake = readWake(sql);
       const calls = fakes.started.length;
@@ -2169,7 +2174,7 @@ describe("train ready episodes", () => {
       await train.recordCheck(report(first, "pass"));
 
       expect(train.batches(2).map((batch) => batch.state)).toEqual(["checking", "landed"]);
-      expect(lastStarted(fakes).pins).toEqual([newer]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([newer]);
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", nextCommit: null });
       // A landed commit is not work again: a new episode must bring a new commit.
       await train.recordCheck(report(lastStarted(fakes), "pass"));
@@ -2256,7 +2261,7 @@ describe("train ready episodes", () => {
       await train.drive();
       expect(fakes.composeCalls).toHaveLength(MAX_RETRIES + 2);
       expect(train.entries(1)[0]).toMatchObject({ state: "batched", episode: 2, retries: 1 });
-      expect(lastStarted(fakes).pins).toEqual([pin(1)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1)]);
 
       await train.recordCheck(report(lastStarted(fakes), "pass"));
       expect(train.entries(1)[0]).toMatchObject({ state: "landed", reason: null });
@@ -2277,7 +2282,7 @@ describe("train ready episodes", () => {
       await train.recordCheck(report(first, "fail"));
 
       expect(train.batches(2).map((batch) => batch.failure)).toEqual([null, "check_fail"]);
-      expect(lastStarted(fakes).pins).toEqual([newer]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([newer]);
       expect(train.entries(1)[0]).toMatchObject({ pin: newer, state: "batched", retries: 0 });
     }, fakes);
   });
@@ -2354,7 +2359,7 @@ describe("train ready episodes", () => {
         { state: "failed", failure: "conflict" },
       ]);
       expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "batched" });
-      expect(lastStarted(fakes).pins).toEqual([pin(1), pin(2)]);
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1), pin(2)]);
     }, fakes);
   });
 
@@ -2387,7 +2392,7 @@ describe("train ready episodes", () => {
       expect(train.conflicts(8)).toEqual([]);
       expect(events().map((event) => event.type)).not.toContain("train.conflict");
       expect(states(train)).toEqual({ "clm_claim001@1": "batched", "clm_claim002@1": "batched" });
-      expect(lastStarted(fakes).pins).toEqual(expect.arrayContaining([redone, pin(2)]));
+      expect(pinsOf(lastStarted(fakes))).toEqual(expect.arrayContaining([redone, pin(2)]));
     }, fakes);
   });
 

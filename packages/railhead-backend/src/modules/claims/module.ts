@@ -29,6 +29,10 @@
 // push, the train's `pin` or a status read, returns it to working, clears the pin and appends
 // `claim.reopened`. The holder then pushes and marks the work ready again under the new versions,
 // once it has acknowledged them. While the versions are unknown, the pin stays and is refused.
+// Another module that decides a pin's work must be redone, such as the train for a pin that lost a
+// conflict, reopens it with `reopen` inside its own transaction, fenced to the pin and its episode,
+// and the event names that reason. Either way the holder's next `ready` is a new episode, which the
+// train queues again, whether the earlier episode's entry was parked, dropped or still queued.
 //
 // A refusal the agent sees is recorded as `claim.refused` only when it differs from the claim's
 // last recorded refusal, so an agent that repeats a refused `ready` does not grow the log.
@@ -91,6 +95,7 @@ import {
   type DecisionRef,
   type IssueId,
   type RefusalReason,
+  type ReopenReason,
 } from "@railhead/shared/events";
 import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName, mintCutoff } from "../../artifacts/adapter";
 import type { MintCutoff, TokenRevocation } from "../../contracts/artifacts";
@@ -482,7 +487,22 @@ export function createClaims(
     const decisions = ports().decisions.currentVersions(row.claimId);
     if (decisions === null) return row;
     if (row.readyDecisions !== null && sameVersions(row.readyDecisions, decisions)) return row;
-    if (!reopenReady(tx.sql, row.claimId, row.generation, clock() + CLAIM_LEASE_MS)) {
+    return reopenAs(tx, row, "decision_superseded", decisions);
+  };
+
+  /**
+   * Returns `row`, a ready claim read in the caller's transaction, to working for `reason`,
+   * appending `claim.reopened` with `decisions`, its current versions, and answers the claim as it
+   * now stands. Runs in the caller's transaction.
+   */
+  const reopenAs = (
+    tx: EventTransaction,
+    row: ClaimRow,
+    reason: ReopenReason,
+    decisions: readonly DecisionRef[],
+  ): ClaimRow => {
+    const lease = clock() + CLAIM_LEASE_MS;
+    if (!reopenReady(tx.sql, row.claimId, row.generation, row.episode, lease)) {
       throw new Error("a ready claim read in this transaction could not be reopened");
     }
     tx.append(CLAIMS_ACTOR, {
@@ -490,9 +510,11 @@ export function createClaims(
       data: {
         claimId: row.claimId,
         generation: row.generation,
+        reason,
         decisions: decisions.map(({ decisionId, version }) => ({ decisionId, version })),
       },
     });
+    // The reopened claim is a lease again, which must lapse even if its holder never calls.
     wakeForDeadline(tx.sql);
     const reopened = claimById(tx.sql, row.claimId);
     if (reopened === null) throw new Error("a reopened claim cannot be read back");
@@ -851,6 +873,22 @@ export function createClaims(
         episode: row.episode,
         decisions: row.readyDecisions,
       };
+    },
+
+    reopen(tx, pin, episode, reason) {
+      const row = claimById(tx.sql, pin.claimId);
+      if (
+        row?.state !== "ready" ||
+        row.generation !== pin.generation ||
+        row.episode !== episode ||
+        row.readyCommit !== pin.commit
+      ) {
+        return false;
+      }
+      const decisions = ports().decisions.currentVersions(pin.claimId);
+      if (decisions === null) throw new UnavailableError("decisions");
+      reopenAs(tx, row, reason, decisions);
+      return true;
     },
 
     async authorizeGit(access) {

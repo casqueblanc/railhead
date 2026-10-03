@@ -21,7 +21,7 @@ import {
   type DecisionRef,
   type IntentId,
 } from "@railhead/shared/events";
-import type { ClaimPin, ReadyPin } from "../contracts/claims";
+import type { ClaimPin, EpisodePin, ReadyPin } from "../contracts/claims";
 import type { ReadyGate } from "../contracts/inbox";
 import { sameVersions } from "../modules/claims/module";
 import { fail, ok, type PortFailure, type PortResult } from "../contracts/result";
@@ -171,10 +171,11 @@ function authorize(
       intentId: newIntentId(),
       expectedMain: attempt.expectedMain,
       candidate: attempt.candidate,
-      pins: attempt.pins.map(({ claimId, generation, commit }) => ({
+      pins: attempt.pins.map(({ claimId, generation, commit, episode }) => ({
         claimId,
         generation,
         commit,
+        episode,
       })),
       decisions,
       checkAttemptId: attempt.attemptId,
@@ -278,15 +279,17 @@ export type FenceReaders = Pick<
 /**
  * The fence a merge rests on, shared by the train, authorization and the main writer so the rule
  * has one copy. Every pin's claim must still be at its pinned generation, with every inbox item
- * affecting it acknowledged, and still ready with exactly that commit, recorded under the decision
- * versions current now; every decision the pins must satisfy now must be at the version in
- * `required`, with no two pins reporting different versions of one decision; and `acceptance`, the
- * decision a passing acceptance check proves, must be among them. Returns the decision versions current now. Reads only: call it inside the transaction whose
- * write relies on its answer.
+ * affecting it acknowledged, and still ready with exactly that commit in the pin's ready episode,
+ * recorded under the decision versions current now; every decision the pins must satisfy now must
+ * be at the version in `required`, with no two pins reporting different versions of one decision;
+ * and `acceptance`, the decision a passing acceptance check proves, must be among them. A claim
+ * reopened and readied again with the same commit is a new episode, so a check of the earlier one
+ * never lets it through. Returns the decision versions current now. Reads only: call it inside
+ * the transaction whose write relies on its answer.
  */
 export function checkFence(
   readers: FenceReaders,
-  pins: readonly ClaimPin[],
+  pins: readonly EpisodePin[],
   required: readonly DecisionRef[],
   acceptance: DecisionRef | null,
 ): PortResult<DecisionRef[]> {
@@ -303,6 +306,9 @@ export function checkFence(
     const ready = readers.readyPin(pin.claimId);
     if (ready === null || ready.pin.commit !== pin.commit) {
       return superseded("A claim is no longer ready with this commit.");
+    }
+    if (ready.episode !== pin.episode) {
+      return superseded("A claim was readied again since its pin was checked.");
     }
     if (!sameVersions(ready.decisions, refs)) {
       return superseded("A decision changed since the claim was marked ready.");
@@ -396,7 +402,7 @@ function toRecord(row: IntentRow): MergeIntentRecord {
   };
 }
 
-function parsePins(text: string): ClaimPin[] {
+function parsePins(text: string): EpisodePin[] {
   const value: unknown = JSON.parse(text);
   if (!Array.isArray(value)) throw corrupt("pins");
   return value.map((item: unknown) => {
@@ -406,11 +412,15 @@ function parsePins(text: string): ClaimPin[] {
       !isId("claim", item.claimId) ||
       typeof item.generation !== "number" ||
       typeof item.commit !== "string" ||
-      !isCommitSha(item.commit)
+      !isCommitSha(item.commit) ||
+      (item.episode !== undefined && typeof item.episode !== "number")
     ) {
       throw corrupt("pins");
     }
-    return { claimId: item.claimId, generation: item.generation, commit: item.commit };
+    // An intent authorized before pins carried their episode has none. Episodes start at 1, so 0
+    // matches no claim and the fence refuses to publish it.
+    const episode = typeof item.episode === "number" ? item.episode : 0;
+    return { claimId: item.claimId, generation: item.generation, commit: item.commit, episode };
   });
 }
 
