@@ -440,6 +440,62 @@ function gateway(fence: () => SandboxFence, clock: () => number) {
   };
 }
 
+describe("sandbox fence admission", () => {
+  const OTHER: SandboxPolicy = { ...POLICY, read: ["other-repo"], write: null };
+
+  it("accepts a repeat start under the same policy and refuses one that would replace it", async () => {
+    await withFence(async ({ fence, fake }) => {
+      await fence.start(POLICY, DEADLINE);
+      await fence.start(POLICY, DEADLINE);
+
+      expect(await refusal(fence.start(OTHER, DEADLINE))).toBe("mismatch");
+      // The incarnation keeps the grant it was admitted under, and still runs.
+      expect(fake.grants).toEqual([
+        { policy: POLICY, expiresAt: DEADLINE },
+        { policy: POLICY, expiresAt: DEADLINE },
+      ]);
+      expect(fence.grantCurrent(DEADLINE)).toBe(true);
+      expect(fake.running).toBe(true);
+      await fence.exec({ command: "true", timeoutMs: 1_000 });
+    });
+  });
+
+  it("joins only the live incarnation under its own policy and deadline, starting nothing", async () => {
+    await withFence(async ({ fence, fake }) => {
+      await fence.start(POLICY, DEADLINE);
+      const commands = fake.commands.length;
+
+      await fence.join(POLICY, DEADLINE);
+      expect(await refusal(fence.join(OTHER, DEADLINE))).toBe("mismatch");
+      expect(await refusal(fence.join(POLICY, DEADLINE + 1))).toBe("mismatch");
+
+      expect(fake.grants).toHaveLength(1);
+      expect(fake.commands).toHaveLength(commands);
+      expect(fence.grantCurrent(DEADLINE)).toBe(true);
+    });
+  });
+
+  it("refuses to join a sandbox never started, and retires the name for any later start", async () => {
+    await withFence(async ({ fence, fake, phase }) => {
+      expect(await refusal(fence.join(POLICY, DEADLINE))).toBe("not_started");
+
+      expect(fake.grants).toEqual([]);
+      expect(fake.commands).toEqual([]);
+      expect(phase()).toBe("retired");
+      expect(await refusal(fence.start(POLICY, DEADLINE))).toBe("retired");
+    });
+  });
+
+  it("refuses to join a retired incarnation", async () => {
+    await withFence(async ({ fence }) => {
+      await fence.start(POLICY, DEADLINE);
+      await fence.retire();
+
+      expect(await refusal(fence.join(POLICY, DEADLINE))).toBe("retired");
+    });
+  });
+});
+
 describe("sandbox fence disposal", () => {
   it("is disposable only once retired and past the deadline, never while live", async () => {
     await withFence(async ({ fence, fake, advance, forget, reopen }) => {

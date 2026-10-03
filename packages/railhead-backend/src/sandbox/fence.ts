@@ -53,7 +53,7 @@
 import { MAX_SANDBOX_LIFETIME_MS } from "./admission";
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
 import type { BoundedOutput } from "./output";
-import type { SandboxGrant, SandboxPolicy } from "./policy";
+import { parseSandboxPolicy, type SandboxGrant, type SandboxPolicy } from "./policy";
 
 /** The command that confirms a started container answers. */
 export const START_PROBE = "git --version";
@@ -96,12 +96,8 @@ export function teardownRetryDelay(attempts: number): number {
 
 /** Why the fence refused an operation. */
 export type FenceRefusal =
-  | "retired"
-  | "expired"
-  | "not_started"
-  | "probe_failed"
-  | "timed_out"
-  | "unsettled";
+  /** A start or join named another policy or deadline than the live incarnation's. */
+  "mismatch" | "retired" | "expired" | "not_started" | "probe_failed" | "timed_out" | "unsettled";
 
 /**
  * A refused or failed operation. A start or command left nothing running; `unsettled`, from
@@ -123,7 +119,7 @@ export class SandboxFenceError extends Error {
  * `retiring` means a destroy is not yet confirmed, `retired` that the last one succeeded.
  */
 type FenceState =
-  | { phase: "live"; deadline: number }
+  | { phase: "live"; deadline: number; policy: SandboxPolicy }
   | { phase: "retiring"; deadline: number; attempts: number }
   | { phase: "retired"; deadline: number };
 
@@ -155,14 +151,22 @@ export class SandboxFence {
     this.#settleMs = settleMs;
   }
 
-  /** Starts the incarnation under `policy` until `deadline` and confirms it answers. */
+  /**
+   * Starts the incarnation under `policy` until `deadline` and confirms it answers. A repeat for the
+   * live incarnation must name the same policy and deadline; one that names another is refused with
+   * `mismatch` and changes nothing, so no caller can replace the grant the sandbox was admitted
+   * under.
+   */
   start(policy: SandboxPolicy, deadline: number): Promise<void> {
     return this.#track(async () => {
       const state = this.#read();
       if (state !== null && state.phase !== "live") throw new SandboxFenceError("retired");
       if (state !== null && state.deadline !== deadline) throw new SandboxFenceError("retired");
+      if (state !== null && !samePolicy(state.policy, policy)) {
+        throw new SandboxFenceError("mismatch");
+      }
       if (this.#clock() >= deadline) return this.#expireFrom(deadline);
-      this.#write({ phase: "live", deadline });
+      this.#write({ phase: "live", deadline, policy });
       try {
         await this.#container.wake(deadline);
         await this.#container.route({ policy, expiresAt: deadline });
@@ -173,6 +177,28 @@ export class SandboxFence {
       } catch (error) {
         return this.#failClosed(deadline, error);
       }
+    });
+  }
+
+  /**
+   * Admits a caller to the incarnation a start already made live, under the same `policy` and
+   * `deadline`; it starts, routes and runs nothing itself. Only the sandbox module's admission
+   * starts an incarnation, so a caller naming a sandbox that was never admitted is refused with
+   * `not_started`, and the name is retired so no later start can use it. A join that names another
+   * policy or deadline is refused with `mismatch` and leaves the live incarnation as it was.
+   */
+  join(policy: SandboxPolicy, deadline: number): Promise<void> {
+    return this.#track(async () => {
+      const state = this.#read();
+      if (state === null) {
+        await this.#destroy(Math.min(deadline, this.#clock() + MAX_SANDBOX_LIFETIME_MS));
+        throw new SandboxFenceError("not_started");
+      }
+      if (state.phase !== "live") throw new SandboxFenceError("retired");
+      if (state.deadline !== deadline || !samePolicy(state.policy, policy)) {
+        throw new SandboxFenceError("mismatch");
+      }
+      if (this.#clock() >= deadline) return this.#expireFrom(deadline);
     });
   }
 
@@ -508,8 +534,11 @@ export class SandboxFence {
       typeof value.deadline === "number"
     ) {
       const { deadline } = value;
-      if (value.phase === "live" || value.phase === "retired")
-        return { phase: value.phase, deadline };
+      if (value.phase === "live" && "policy" in value) {
+        const policy = parseSandboxPolicy(value.policy);
+        if (policy !== null) return { phase: "live", deadline, policy };
+      }
+      if (value.phase === "retired") return { phase: "retired", deadline };
       if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
         return { phase: "retiring", deadline, attempts: value.attempts };
       }
@@ -523,3 +552,10 @@ export class SandboxFence {
 }
 
 function noop(): void {}
+
+// Whether two policies grant the same access. Each is parsed again, since a policy may arrive over
+// RPC; parsed policies have one field order, so equal ones serialize alike.
+function samePolicy(left: unknown, right: unknown): boolean {
+  const parsed = parseSandboxPolicy(left);
+  return parsed !== null && JSON.stringify(parsed) === JSON.stringify(parseSandboxPolicy(right));
+}

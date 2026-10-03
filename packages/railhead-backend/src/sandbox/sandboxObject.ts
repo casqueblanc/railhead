@@ -47,6 +47,9 @@ const IDLE_BACKSTOP = "45m";
  */
 const SESSIONLESS = "__DISABLE_SESSION__";
 
+/** The pause before a new round of deletion retries, once a round has failed. */
+export const DISPOSAL_SWEEP_MS = 24 * 60 * 60_000;
+
 /** How many storage deletions in a row failed, kept until one succeeds. */
 const DISPOSAL_FAILURES = "railhead:disposal-failures";
 
@@ -90,6 +93,14 @@ export class RailheadSandbox extends Sandbox<Env> {
     await this.#fence.start(policy, deadline);
   }
 
+  /**
+   * Admits the patched CI runner to the incarnation the sandbox module's admission started, under
+   * the same policy and deadline. It never starts one: a sandbox that was not admitted refuses.
+   */
+  async railheadJoin(policy: SandboxPolicy, deadline: number): Promise<void> {
+    await this.#fence.join(policy, deadline);
+  }
+
   /** Runs one command in the incarnation, cut to its remaining lifetime. */
   async railheadExec(command: SandboxCommand): Promise<BoundedOutput> {
     return this.#fence.exec(command);
@@ -117,7 +128,9 @@ export class RailheadSandbox extends Sandbox<Env> {
    * table after each callback. `deleteAll` removes the alarm with the data in one step on SQLite
    * storage, so no partial state is left for a later alarm to finish. A deletion that fails leaves
    * the record in place and schedules another alarm, backing off like a teardown, up to
-   * `MAX_TEARDOWN_ATTEMPTS` in a row. An object revived after its deletion, such as by a late
+   * `MAX_TEARDOWN_ATTEMPTS` in a row; after that it tries again every `DISPOSAL_SWEEP_MS`, starting
+   * a new round each time, so a lasting storage fault delays the deletion but never ends it. An
+   * object revived after its deletion, such as by a late
    * release or start, records its retirement again and is deleted again past that deadline.
    */
   override async alarm(alarmProps?: AlarmInvocationInfo): Promise<void> {
@@ -127,9 +140,13 @@ export class RailheadSandbox extends Sandbox<Env> {
       await this.ctx.storage.deleteAll();
     } catch (error) {
       const failures = disposalFailures(this.ctx.storage.kv.get(DISPOSAL_FAILURES)) + 1;
-      this.ctx.storage.kv.put(DISPOSAL_FAILURES, failures);
       if (failures < MAX_TEARDOWN_ATTEMPTS) {
+        this.ctx.storage.kv.put(DISPOSAL_FAILURES, failures);
         await this.ctx.storage.setAlarm(Date.now() + teardownRetryDelay(failures));
+      } else {
+        // The quick retries are spent: start a new round after a long pause rather than stop.
+        this.ctx.storage.kv.delete(DISPOSAL_FAILURES);
+        await this.ctx.storage.setAlarm(Date.now() + DISPOSAL_SWEEP_MS);
       }
       console.error(
         JSON.stringify({
