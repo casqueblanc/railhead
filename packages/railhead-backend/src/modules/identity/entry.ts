@@ -20,7 +20,12 @@ import {
 import { INVITE_TTL_MS, type PendingJoin } from "@railhead/shared/board-api";
 import type { Actor, AgentId } from "@railhead/shared/events";
 import { relyingParty } from "../../auth/passkeyVerifier";
-import { confirmationCode, parsePublicKey, verifySshSig } from "../../auth/sshsig";
+import {
+  confirmationCode,
+  parsePublicKey,
+  verifySshSig,
+  type Ed25519PublicKey,
+} from "../../auth/sshsig";
 import type { AgentCredential, AgentStanding, IdentityPort } from "../../contracts/identity";
 import type { GrantFor } from "../../contracts/principals";
 import { fail, ok, type PortResult } from "../../contracts/result";
@@ -36,9 +41,10 @@ export const MAX_OPEN_INVITES = 16;
 export const MAX_AGENTS = 64;
 
 /**
- * Most refused joins one repository answers per `JOIN_WINDOW_MS`. Past it every join, valid or
- * not, is `rate_limited` until the window ends, which bounds the signature checks a stranger can
- * cause.
+ * Most refused signature checks one invite answers per `JOIN_WINDOW_MS`. Past it every join that
+ * presents that invite's secret is `rate_limited` until the window ends. Only a caller holding the
+ * secret reaches a signature check, so the budget is per invite: requests naming an unknown invite
+ * or a wrong secret are refused before any signature check and spend no invite's budget.
  */
 export const MAX_JOIN_REFUSALS_PER_WINDOW = 30;
 
@@ -80,7 +86,7 @@ const MIGRATIONS: readonly string[] = [
 export interface IdentityDependencies {
   /** The instance's origin, `https://<host>`, or `undefined` when the host is not configured. */
   readonly origin: string | undefined;
-  /** Refused joins allowed per window. */
+  /** Refused signature checks allowed per invite and window. */
   readonly refusalsPerWindow: number;
 }
 
@@ -112,10 +118,12 @@ export function createIdentity(
   migrate(context.storage, IDENTITY_OWNER, MIGRATIONS);
   const { storage, log, clock, repoId } = context;
   const sql = storage.sql;
-  // Only refusals count, so agents polling their own pending join are never limited. Held in
-  // memory, so a refused attempt leaves nothing in storage; it resets when the Repo restarts, which
-  // bounds a burst rather than a long-run rate.
-  let refusals = { start: 0, count: 0 };
+  // Refused signature checks per invite. Only refusals count, so agents polling their own pending
+  // join are never limited. An entry exists only for an invite whose secret was presented, and
+  // `join` drops entries whose window ended, so the map holds at most the invites used within one
+  // window. Held in memory, so a refused attempt leaves nothing in storage; it resets when the Repo
+  // restarts, which bounds a burst rather than a long-run rate.
+  const refusals = new Map<string, { start: number; count: number }>();
 
   async function attemptJoin(request: JoinRequest): Promise<PortResult<JoinResult>> {
     const key = parsePublicKey(request.publicKey);
@@ -131,10 +139,41 @@ export function createIdentity(
     if (invite === undefined) return refused();
     const presented = await sha256(new TextEncoder().encode(request.inviteSecret));
     if (!equalBytes(presented, new Uint8Array(invite.secret_hash))) return refused();
+    // A consumed invite resumes only its own key, so any other key is refused unchecked.
+    if (invite.agent_id !== null && readAgent(invite.agent_id)?.public_key !== publicKey) {
+      return refused();
+    }
 
     const { origin } = dependencies;
     const names = repoNames();
     if (origin === undefined || names === null) return misconfigured();
+
+    const now = clock();
+    for (const [inviteId, window] of refusals) {
+      if (now - window.start >= JOIN_WINDOW_MS) refusals.delete(inviteId);
+    }
+    const window = refusals.get(request.inviteId) ?? { start: now, count: 0 };
+    refusals.set(request.inviteId, window);
+    if (window.count >= dependencies.refusalsPerWindow) {
+      return fail("rate_limited", "Too many refused joins; wait a minute and try again.");
+    }
+    // Reserve a slot before awaiting the signature check, so concurrent attempts cannot all pass;
+    // give it back unless the attempt was refused.
+    window.count += 1;
+    const result = await enroll(request, key, publicKey, invite.agent_id, origin, names);
+    if (result.ok || result.code !== "join_refused") window.count -= 1;
+    return result;
+  }
+
+  /** Checks the request's signature, then records or resumes the enrollment of its key. */
+  async function enroll(
+    request: JoinRequest,
+    key: Ed25519PublicKey,
+    publicKey: string,
+    consumedBy: AgentId | null,
+    origin: string,
+    names: { org: string; name: string },
+  ): Promise<PortResult<JoinResult>> {
     const message = joinMessage({
       origin,
       org: names.org,
@@ -150,7 +189,7 @@ export function createIdentity(
     if (!verdict.ok) return refused();
 
     // A join that arrived second, or a retry after a lost response, finds the invite consumed.
-    if (invite.agent_id !== null) return resume(invite.agent_id, publicKey);
+    if (consumedBy !== null) return resume(consumedBy, publicKey);
     const code = await confirmationCode(key, request.inviteId);
     if (code === undefined) return refused();
     const keyFingerprint = `SHA256:${base64(await sha256(key.blob)).replace(/=+$/, "")}`;
@@ -209,20 +248,7 @@ export function createIdentity(
   }
 
   return {
-    async join(request) {
-      const now = clock();
-      if (now - refusals.start >= JOIN_WINDOW_MS) refusals = { start: now, count: 0 };
-      if (refusals.count >= dependencies.refusalsPerWindow) {
-        return fail("rate_limited", "Too many refused joins; wait a minute and try again.");
-      }
-      // Reserve a slot before the first await, so concurrent attempts cannot all pass the check;
-      // give it back unless the attempt was refused.
-      const window = refusals;
-      window.count += 1;
-      const result = await attemptJoin(request);
-      if (result.ok || result.code !== "join_refused") window.count -= 1;
-      return result;
-    },
+    join: attemptJoin,
 
     async createInvite(grant) {
       if (grant.repoId !== repoId) return stale();

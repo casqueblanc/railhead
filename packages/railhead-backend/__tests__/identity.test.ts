@@ -25,6 +25,7 @@ import type { PortResult } from "../src/contracts/result";
 import {
   createIdentity,
   JOIN_POLL_MS,
+  JOIN_WINDOW_MS,
   MAX_AGENTS,
   MAX_OPEN_INVITES,
 } from "../src/modules/identity/entry";
@@ -115,6 +116,11 @@ function parseInvite(url: string): { inviteId: string; inviteSecret: string } {
   const [, , , , inviteId, inviteSecret] = INVITE_URL.exec(url) ?? [];
   if (inviteId === undefined || inviteSecret === undefined) throw new Error("not an invite URL");
   return { inviteId, inviteSecret };
+}
+
+/** The invite a join request presents. */
+function parsedOf(request: JoinRequest): { inviteId: string; inviteSecret: string } {
+  return { inviteId: request.inviteId, inviteSecret: request.inviteSecret };
 }
 
 async function joinRequest(
@@ -471,48 +477,92 @@ describe("joins", () => {
     });
   });
 
-  it("rate limits joins after too many refusals in a window, without storing anything", async () => {
+  it("refuses unknown invites and wrong secrets without spending any invite's budget", async () => {
     await withIdentity(
-      async ({ identity, repo, invite, clock, rows }) => {
-        // An agent polling its own pending join is never limited.
+      async ({ identity, repo, invite, rows }) => {
         const poller = await joinRequest(await AgentKey.create(), await invite("poller"), repo);
         for (let i = 0; i < 10; i += 1) value(await identity.join(poller));
 
         const ticket = await invite();
         const key = await AgentKey.create();
-        for (let i = 0; i < 3; i += 1) {
+        const valid = await joinRequest(key, ticket, repo);
+        // A stranger without a secret is refused every time and never reaches a signature check.
+        for (let i = 0; i < 20; i += 1) {
+          expect(await identity.join({ ...valid, inviteId: "inv_unknown01" })).toMatchObject({
+            code: "join_refused",
+          });
           expect(
-            await identity.join({
-              ...(await joinRequest(key, ticket, repo)),
-              inviteId: "inv_unknown01",
-            }),
+            await identity.join({ ...valid, inviteSecret: flipLast(ticket.inviteSecret) }),
           ).toMatchObject({ code: "join_refused" });
         }
-        const valid = await joinRequest(key, ticket, repo);
-        expect(await identity.join(valid)).toMatchObject({ ok: false, code: "rate_limited" });
-        expect(await identity.join(poller)).toMatchObject({ ok: false, code: "rate_limited" });
-        expect(rows("identity_agent")).toBe(1);
-        clock.now += 60_000;
+        // Other keys on a consumed invite are refused before their signature is checked.
+        for (let i = 0; i < 5; i += 1) {
+          const stranger = await joinRequest(await AgentKey.create(), parsedOf(poller), repo);
+          expect(await identity.join(stranger)).toMatchObject({ code: "join_refused" });
+        }
         value(await identity.join(valid));
+        value(await identity.join(poller));
+        expect(rows("identity_agent")).toBe(2);
       },
       { refusalsPerWindow: 3 },
     );
   });
 
-  it("counts concurrent refused joins before checking any of them", async () => {
+  it("limits refused proofs per invite, leaving other invites and resumes alone", async () => {
+    await withIdentity(
+      async ({ identity, repo, invite, clock, rows }) => {
+        const poller = await joinRequest(await AgentKey.create(), await invite("poller"), repo);
+        value(await identity.join(poller));
+        const abused = await invite("abused");
+        const other = await invite("other");
+        const key = await AgentKey.create();
+        const forged = await joinRequest(key, abused, repo, { signer: await AgentKey.create() });
+        const start = clock.now;
+        for (let i = 0; i < 3; i += 1) {
+          expect(await identity.join(forged)).toMatchObject({ code: "join_refused" });
+        }
+        expect(await identity.join(forged)).toMatchObject({ ok: false, code: "rate_limited" });
+        // The limited invite refuses even its valid proof until its window ends.
+        const valid = await joinRequest(key, abused, repo);
+        expect(await identity.join(valid)).toMatchObject({ ok: false, code: "rate_limited" });
+
+        // Another invite enrolls and an enrolled key resumes while the abused invite is limited.
+        value(await identity.join(await joinRequest(await AgentKey.create(), other, repo)));
+        value(await identity.join(poller));
+
+        clock.now = start + JOIN_WINDOW_MS - 1;
+        expect(await identity.join(valid)).toMatchObject({ ok: false, code: "rate_limited" });
+        clock.now = start + JOIN_WINDOW_MS;
+        value(await identity.join(valid));
+        expect(rows("identity_agent")).toBe(3);
+      },
+      { refusalsPerWindow: 3 },
+    );
+  });
+
+  it("counts concurrent refused proofs before checking any, without limiting others", async () => {
     await withIdentity(
       async ({ identity, repo, invite, rows }) => {
-        const ticket = await invite();
-        const key = await AgentKey.create();
-        const bad = {
-          ...(await joinRequest(key, ticket, repo)),
-          inviteSecret: flipLast(ticket.inviteSecret),
-        };
-        const results = await Promise.all(Array.from({ length: 8 }, () => identity.join(bad)));
+        const poller = await joinRequest(await AgentKey.create(), await invite("poller"), repo);
+        value(await identity.join(poller));
+        const abused = await invite("abused");
+        const forged = await joinRequest(await AgentKey.create(), abused, repo, {
+          signer: await AgentKey.create(),
+        });
+        const fresh = await joinRequest(await AgentKey.create(), await invite("other"), repo);
+        const unknown = { ...fresh, inviteId: "inv_unknown01" };
+        const results = await Promise.all([
+          ...Array.from({ length: 8 }, () => identity.join(forged)),
+          ...Array.from({ length: 8 }, () => identity.join(unknown)),
+          identity.join(fresh),
+          identity.join(poller),
+        ]);
         const outcomes = results.map((r) => (r.ok ? "ok" : r.code));
-        expect(outcomes.filter((code) => code === "join_refused")).toHaveLength(3);
-        expect(outcomes.filter((code) => code === "rate_limited")).toHaveLength(5);
-        expect(rows("identity_agent")).toBe(0);
+        expect(outcomes.slice(0, 8).filter((code) => code === "join_refused")).toHaveLength(3);
+        expect(outcomes.slice(0, 8).filter((code) => code === "rate_limited")).toHaveLength(5);
+        expect(outcomes.slice(8, 16)).toEqual(Array.from({ length: 8 }, () => "join_refused"));
+        expect(outcomes.slice(16)).toEqual(["ok", "ok"]);
+        expect(rows("identity_agent")).toBe(2);
       },
       { refusalsPerWindow: 3 },
     );

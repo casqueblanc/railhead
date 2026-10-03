@@ -20,8 +20,8 @@ export interface IdentityPort {
   /**
    * Registers the request's key with its invite, or resumes the enrollment that key already holds.
    * A consumed invite never enrolls a second key. Every refusal stores nothing: a bad invite,
-   * secret, key or proof is `join_refused`, too many of those in a short time are `rate_limited`,
-   * and the key of a revoked agent is `identity_revoked`.
+   * secret, key or proof is `join_refused`, too many refused proofs for one invite in a short time
+   * make that invite `rate_limited`, and the key of a revoked agent is `identity_revoked`.
    */
   join(request: JoinRequest): Promise<PortResult<JoinResult>>;
   /** Creates a single-use invite. The returned URL carries the secret; only its hash is stored. */
