@@ -34,10 +34,19 @@ const worker = defineRailheadWorker({
     SANDBOX: { type: "durable-object", worker: "railhead", exportName: "RailheadSandbox" },
     // Git storage. Tokens minted from it stay in the Worker; a sandbox never receives one.
     ARTIFACTS: bindings.artifacts({ namespace: "railhead" }),
+    // The instance owner's one Durable Object: the enrolled passkey and its bootstrap. Private, like
+    // `REPO`; each Repo's owner module reads the credential through it.
+    OWNER: { type: "durable-object", worker: "railhead", exportName: "Owner" },
+    // The passkey relying party: the exact host of this instance's fixed origin. The development
+    // instance's; the submission instance sets `railhead.dev` at deploy.
+    RELYING_PARTY_HOST: { type: "text", value: "railhead.mashin.workers.dev" },
+    // The one-time token that opens enrollment of the first owner passkey, set by the operator.
+    OWNER_BOOTSTRAP_TOKEN: bindings.secret(),
   },
   exports: {
     Repo: { type: "durable-object", storage: "sqlite" },
     RailheadSandbox: { type: "durable-object", storage: "sqlite", container: sandbox },
+    Owner: { type: "durable-object", storage: "sqlite" },
   },
   assets: {
     notFoundHandling: "single-page-application",
