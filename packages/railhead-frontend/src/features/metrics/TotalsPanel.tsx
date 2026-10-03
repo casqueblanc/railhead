@@ -57,7 +57,7 @@ const TotalsBody = ({ view }: { view: FeedView }) => {
             size="sm"
             icon={<ChartBarIcon size={32} aria-hidden="true" />}
             title="Nothing counted yet"
-            description="Totals appear once the repository records its first event."
+            description={emptyReason(view.kind)}
           />
         );
       }
@@ -74,6 +74,21 @@ const TotalsBody = ({ view }: { view: FeedView }) => {
     }
     default:
       return unreachable(view);
+  }
+};
+
+/** Why no event is counted: a board stopped before its first event says so, not that none exist. */
+const emptyReason = (kind: "halted" | "stale" | "recovered" | "live") => {
+  switch (kind) {
+    case "halted":
+      return "The board stopped at the log's first event, so nothing could be counted.";
+    case "stale":
+      return "The board is not live and has applied no event yet.";
+    case "recovered":
+    case "live":
+      return "Totals appear once the repository records its first event.";
+    default:
+      return unreachable(kind);
   }
 };
 

@@ -104,6 +104,23 @@ describe("TotalsPanel", () => {
     expect(counts()).toEqual([]);
   });
 
+  it("says why nothing is counted when the board halts or misses its first events", async () => {
+    const [first] = checkBeforeLand.events;
+    if (first === undefined) throw new Error("fixture has no events");
+    const halted = foldEvents(emptyBoardState(SYNTH_REPO), [{ ...first, v: 2 }]);
+    expect(halted.cursor).toBe(0);
+    await render({ kind: "board", board: halted, connection: "live", recovered: false });
+    expect(text()).toContain("The board stopped at the log's first event");
+    expect(text()).not.toContain("Totals appear once");
+    expect(counts()).toEqual([]);
+
+    const gapped = foldEvents(emptyBoardState(SYNTH_REPO), checkBeforeLand.events.slice(2));
+    expect(gapped.cursor).toBe(0);
+    await render({ kind: "board", board: gapped, connection: "live", recovered: false });
+    expect(text()).toContain("The board is not live and has applied no event yet.");
+    expect(counts()).toEqual([]);
+  });
+
   it("shows loading and a failed load without any count", async () => {
     await render({ kind: "loading" });
     expect(container.querySelector("section")?.getAttribute("aria-busy")).toBe("true");
