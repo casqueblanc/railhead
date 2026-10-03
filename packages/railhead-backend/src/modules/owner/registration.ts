@@ -6,7 +6,6 @@
 import type { PasskeyRegistration } from "@railhead/shared/board-api";
 import {
   MAX_CLIENT_DATA_BYTES,
-  MAX_COSE_KEY_BYTES,
   MAX_CREDENTIAL_ID_BYTES,
   type RelyingParty,
 } from "../../auth/passkeyVerifier";
@@ -32,7 +31,10 @@ const CREDENTIAL_ID_OFFSET = 55;
 export interface RegisteredCredential {
   /** The credential id, base64url without padding. */
   readonly credentialId: string;
-  /** The credential's ES256 COSE key, exactly as the authenticator encoded it. */
+  /**
+   * The credential's ES256 COSE key, re-encoded in CBOR's shortest form so the assertion verifier,
+   * which reads only that form, can read it whatever lengths the authenticator chose.
+   */
   readonly publicKey: Uint8Array;
   /** The authenticator's signature counter at registration. */
   readonly signCount: number;
@@ -148,19 +150,27 @@ export async function verifyRegistration(input: RegistrationInput): Promise<Regi
       return refuse("malformed");
     }
   }
-  const publicKey = authData.slice(keyOffset, key.end);
-  if (publicKey.length > MAX_COSE_KEY_BYTES || !(await isEs256Key(key.value))) {
-    return refuse("key-unsupported");
-  }
+  const point = await es256Point(key.value);
+  if (point === undefined) return refuse("key-unsupported");
   return {
     ok: true,
-    credential: { credentialId: registration.credentialId, publicKey, signCount },
+    credential: {
+      credentialId: registration.credentialId,
+      publicKey: encodeEs256Key(point),
+      signCount,
+    },
   };
 }
 
-/** Whether `value` is an ES256 COSE_Key (RFC 9053) whose point is on P-256. */
-async function isEs256Key(value: unknown): Promise<boolean> {
-  if (!(value instanceof Map) || value.size !== 5) return false;
+/** The coordinates of an ES256 P-256 public key, 32 bytes each. */
+interface Es256Point {
+  readonly x: Uint8Array;
+  readonly y: Uint8Array;
+}
+
+/** The point of `value` when it is an ES256 COSE_Key (RFC 9053) on P-256, else `undefined`. */
+async function es256Point(value: unknown): Promise<Es256Point | undefined> {
+  if (!(value instanceof Map) || value.size !== 5) return undefined;
   const x: unknown = value.get(-2);
   const y: unknown = value.get(-3);
   if (
@@ -172,7 +182,7 @@ async function isEs256Key(value: unknown): Promise<boolean> {
     !(y instanceof Uint8Array) ||
     y.length !== 32
   ) {
-    return false;
+    return undefined;
   }
   const raw = new Uint8Array(65);
   raw[0] = 0x04;
@@ -182,12 +192,34 @@ async function isEs256Key(value: unknown): Promise<boolean> {
     await crypto.subtle.importKey("raw", raw, { name: "ECDSA", namedCurve: "P-256" }, false, [
       "verify",
     ]);
-    return true;
+    return { x, y };
   } catch (error) {
     // A point that is not on the curve is refused by WebCrypto with a DataError.
-    if (error instanceof DOMException) return false;
+    if (error instanceof DOMException) return undefined;
     throw error;
   }
+}
+
+/** Encodes `point` as the five-entry ES256 COSE_Key, every head in its shortest form. */
+function encodeEs256Key({ x, y }: Es256Point): Uint8Array {
+  // {1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x, -3: y}
+  return Uint8Array.from([
+    0xa5,
+    0x01,
+    0x02,
+    0x03,
+    0x26,
+    0x20,
+    0x01,
+    0x21,
+    0x58,
+    0x20,
+    ...x,
+    0x22,
+    0x58,
+    0x20,
+    ...y,
+  ]);
 }
 
 function parseJsonObject(bytes: Uint8Array): Record<string, unknown> | undefined {

@@ -85,6 +85,8 @@ interface RegisterOptions {
   /** The COSE algorithm byte: 0x26 is ES256 (-7), 0x27 is EdDSA (-8). */
   alg?: number;
   reportedId?: string;
+  /** Encode the COSE key with every CBOR head one size longer than needed, as CBOR permits. */
+  longHeads?: boolean;
 }
 
 interface AssertOptions {
@@ -131,23 +133,25 @@ class Authenticator {
         crossOrigin: false,
       }),
     );
-    const cose = [
-      0xa5,
-      0x01,
-      0x02,
-      0x03,
-      options.alg ?? 0x26,
-      0x20,
-      0x01,
-      0x21,
-      0x58,
-      32,
-      ...this.x,
-      0x22,
-      0x58,
-      32,
-      ...this.y,
-    ];
+    const cose = options.longHeads
+      ? [184, 5, 24, 1, 24, 2, 24, 3, 56, 6, 56, 0, 24, 1, 56, 1, 89, 0, 32, ...this.x, 56, 2, 89, 0, 32, ...this.y]
+      : [
+          0xa5,
+          0x01,
+          0x02,
+          0x03,
+          options.alg ?? 0x26,
+          0x20,
+          0x01,
+          0x21,
+          0x58,
+          32,
+          ...this.x,
+          0x22,
+          0x58,
+          32,
+          ...this.y,
+        ];
     const authData = Uint8Array.from([
       ...(await sha256(enc.encode(HOST))),
       options.flags ?? 0x45,
@@ -242,6 +246,7 @@ function withInstance<T>(
 async function enroll(
   stub: DurableObjectStub<Owner>,
   auth: Authenticator,
+  options: RegisterOptions = {},
 ): Promise<{ userId: string; userHandle: string }> {
   return runInDurableObject(stub, async (_instance, state) => {
     const owner = new InstanceOwner(state.storage, {
@@ -253,7 +258,7 @@ async function enroll(
     const { ownerId } = value(
       await owner.completeEnrollment(
         challenge.challengeId,
-        await auth.register(challenge.challenge),
+        await auth.register(challenge.challenge, options),
       ),
     );
     return { userId: ownerId, userHandle: challenge.userHandle };
@@ -301,6 +306,23 @@ describe("owner enrollment", () => {
       expect(enrollmentRows(state)).toBe(0);
       expect(credentialRows(state)).toBe(1);
     });
+  });
+
+  it("stores the COSE key in its shortest encoding, however the authenticator encoded it", async () => {
+    const auth = await Authenticator.create();
+    const shortest = Uint8Array.from([165, 1, 2, 3, 38, 32, 1, 33, 88, 32, ...auth.x, 34, 88, 32, ...auth.y]);
+    for (const longHeads of [false, true]) {
+      await withInstance(async (owner) => {
+        const challenge = value(await owner.prepareEnrollment(TOKEN));
+        value(
+          await owner.completeEnrollment(
+            challenge.challengeId,
+            await auth.register(challenge.challenge, { longHeads }),
+          ),
+        );
+        expect(owner.credential()?.credential.publicKey).toEqual(shortest);
+      });
+    }
   });
 
   it("refuses a second ceremony opened before the first completed", async () => {
@@ -462,10 +484,15 @@ async function withRepoOwner(
     grant: HumanGrant,
     log: EventLog,
   ) => Promise<PortResult<{ agentId: string }>> = async () => ok({ agentId: "agt_atlas01" }),
+  registerOptions: RegisterOptions = {},
 ): Promise<void> {
   const auth = await Authenticator.create();
   const ownerName = unique("owner-");
-  const { userId, userHandle } = await enroll(env.OWNER.getByName(ownerName), auth);
+  const { userId, userHandle } = await enroll(
+    env.OWNER.getByName(ownerName),
+    auth,
+    registerOptions,
+  );
   const name = unique("r");
   const repo: DurableObjectStub<Repo> = env.REPO.getByName(repoObjectName("acme", name));
   const { repoId } = value(await repo.initialize("acme", name));
@@ -540,6 +567,22 @@ describe("owner actions", () => {
         code: "proof_expired",
       });
     });
+  });
+
+  it("performs with a passkey whose enrolled COSE key used longer CBOR heads", async () => {
+    await withRepoOwner(
+      async ({ owner, auth, userHandle, grants }) => {
+        const challenge = value(await owner.prepare(REVOKE));
+        const assertion = await auth.assert(challenge.challenge, userHandle);
+        expect(await owner.perform(challenge.challengeId, assertion)).toEqual({
+          ok: true,
+          value: { kind: "agent.revoke", agentId: "agt_atlas01" },
+        });
+        expect(grants).toHaveLength(1);
+      },
+      undefined,
+      { longHeads: true },
+    );
   });
 
   it("refuses a proof signed for another action and leaves both challenges unused", async () => {
