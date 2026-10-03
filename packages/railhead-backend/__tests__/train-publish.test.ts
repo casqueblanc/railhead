@@ -154,7 +154,7 @@ function withRepo<R>(
       log,
       clock: () => (now += 1),
       env,
-      wake: () => undefined,
+      wake: async () => true,
     };
     const current = new Map(pins.map((p) => [p.claimId, p]));
     const currentGeneration = (claimId: string): number | null =>

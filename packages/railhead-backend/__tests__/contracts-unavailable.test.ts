@@ -64,6 +64,9 @@ const SYNC = new Map<string, unknown>([
 /** The methods the Repo's alarm calls, which resolve with nothing while their module is missing. */
 const RESUMERS = new Set(["train.resume"]);
 
+/** The methods that confirm a wake, which report it unconfirmed while their module is missing. */
+const CONFIRMERS = new Set(["train.armWake"]);
+
 describe("unavailable ports", () => {
   it("refuse every async method with their own port's unavailable and report nothing from readers", async () => {
     const sync = new Map<string, unknown>();
@@ -81,6 +84,8 @@ describe("unavailable ports", () => {
         if (RESUMERS.has(`${port}.${method}`)) {
           // The alarm's resume owes nothing while the module is missing, so it refuses nothing.
           expect(await result, `${port}.${method}`).toBeUndefined();
+        } else if (CONFIRMERS.has(`${port}.${method}`)) {
+          expect(await result, `${port}.${method}`).toBe(false);
         } else if (result instanceof Promise) {
           expect(await result, `${port}.${method}`).toEqual(unavailable(port));
         } else {
@@ -112,7 +117,7 @@ describe("unavailable ports", () => {
           log,
           clock: () => 0,
           env,
-          wake: () => {},
+          wake: async () => true,
         });
         // A30's fence reads these in the transaction that would write the intent. Each must say
         // unknown (`null`), never a generation or an empty decision list a record could match,

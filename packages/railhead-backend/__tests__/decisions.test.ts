@@ -108,7 +108,7 @@ async function withDecisions<R>(
   const { stub, repoId } = repo ?? (await freshRepo());
   return runInDurableObject(stub, async (_instance, state) => {
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
+    const context = { repoId, storage: state.storage, log, clock, env, wake: async () => true };
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let active: PortResult<ClaimView | null> = ok(claimView());

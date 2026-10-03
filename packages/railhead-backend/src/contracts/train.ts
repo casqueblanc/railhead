@@ -238,6 +238,14 @@ export interface TrainPort {
    */
   holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
   /**
+   * Asks the Repo's alarm again for the wake the train owes, and resolves whether storage holds it:
+   * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is
+   * missing. A wake whose retries ran out owes no alarm. The claims module awaits it once `ready`
+   * commits, so a `ready` answered with success never leaves its pin without a scheduled drive, and
+   * a `ready` repeated after a failed write asks again. It writes nothing, so a repeat is harmless.
+   */
+  armWake(): Promise<boolean>;
+  /**
    * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
    * for the next wake itself. It never throws for a port's failure.
    */

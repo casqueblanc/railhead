@@ -88,7 +88,7 @@ function withReady<T>(
       log,
       clock: fake.clock,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const base = composeRepo(context);
     const artifacts = world.artifacts
