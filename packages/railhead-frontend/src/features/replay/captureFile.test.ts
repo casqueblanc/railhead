@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Actor, RailheadEvent } from "@railhead/shared/events";
+import { MAX_TITLE_LENGTH, type Actor, type RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
@@ -473,8 +473,41 @@ describe("captureLog redaction", () => {
   });
 
   it.each([
-    ["prose that mentions a bearer", "the bearer of the token is the agent"],
-    ["a short Bearer value", "Bearer abc"],
+    ["a Bearer value", "Bearer abc123", "Bearer abc123", "[redacted]"],
+    ["an Authorization value", "Authorization: abc123", "abc123", "Authorization: [redacted]"],
+    [
+      "a URL password",
+      "clone https://user:secret@host/demo.git",
+      "secret",
+      "clone https://[redacted]@host/demo.git",
+    ],
+    ["a one-character Bearer value", "token Bearer Q end", "Bearer Q", "token [redacted] end"],
+    [
+      "a one-character Authorization value",
+      "Authorization=Q",
+      "Authorization=Q",
+      "Authorization=[redacted]",
+    ],
+    ["a one-character URL password", "https://u:Q@host", ":Q@", "https://[redacted]@host"],
+  ])("keeps %s out of the written file", async (_label, body, credential, expected) => {
+    const result = await capturedEvents([withBody(body)]);
+    expect(result.capture.events).toEqual([withBody(expected)]);
+    expect(result.redacted).toBe(1);
+    const written = serializeCapture(result.capture);
+    if (!written.ok) throw new Error(`serialize failed: ${written.error.kind}`);
+    expect(written.text).not.toContain(credential);
+  });
+
+  it("redacts the word after Bearer or Basic in prose too", async () => {
+    const result = await capturedEvents([withBody("the bearer of a basic test")]);
+    expect(result.capture.events).toEqual([withBody("the [redacted] a [redacted]")]);
+    expect(result.redacted).toBe(2);
+  });
+
+  it.each([
+    ["Bearer with no value", "ends with Bearer"],
+    ["an empty Authorization value", 'Authorization: ""'],
+    ["a URL with a user and no password", "https://user@railhead.example/demo"],
     ["a URL without a password", "https://railhead.example/demo/upload-app"],
     ["a JWT-like string too short to be a token", "eyJabc.def.ghi"],
   ])("copies %s unchanged", async (_label, body) => {
@@ -483,9 +516,18 @@ describe("captureLog redaction", () => {
     expect(result.redacted).toBe(0);
   });
 
-  it("never lengthens text: the shortest match is as long as the replacement", async () => {
-    const result = await capturedEvents([withBody("Bearer 12345678")]);
-    expect(result.capture.events).toEqual([withBody("[redacted]")]);
+  it("refuses a capture whose redaction lengthens a field past its bound", async () => {
+    const title = `${"x".repeat(MAX_TITLE_LENGTH - " Bearer Q".length)} Bearer Q`;
+    const filed: RailheadEvent = { ...issue(1), data: { ...issue(1).data, title } };
+    const result = await captureLog(fakeReader([filed]).reader, SOURCE, NO_DEADLINE);
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "invalid_event",
+        seq: 1,
+        message: `title is longer than ${MAX_TITLE_LENGTH} characters`,
+      },
+    });
   });
 
   it("redacts a credential in every string field the written file holds", async () => {

@@ -268,7 +268,7 @@ export const captureLog = async (
   };
   // Every string the file will hold passes through `redact`, whatever field it is in: the reviver
   // visits each string in the serialized capture, and reading the result back copies and checks it
-  // as a file being opened is.
+  // as a file being opened is, so a field the redaction lengthened past its bound fails the capture.
   const redactedValue: unknown = JSON.parse(JSON.stringify(capture), (_key, value: unknown) =>
     typeof value === "string" ? redact(value) : value,
   );
@@ -277,23 +277,22 @@ export const captureLog = async (
 };
 
 /**
- * The secret shapes `captureLog` redacts, each with its replacement. Every pattern matches at least
- * as many characters as its replacement has, so redacting never lengthens text past an event's
- * bounds.
+ * The secret shapes `captureLog` redacts, each with its replacement. In a credential context
+ * (`Bearer`, `Basic`, an `Authorization` value or a URL password) every nonempty value is redacted
+ * whatever its length, so prose such as "basic setup" loses its next word too. A replacement can be
+ * longer than what it replaces, so `captureLog` checks the redacted capture against the event and
+ * file bounds and refuses one that no longer fits rather than writing the credential.
  */
 const SECRET_SHAPES: readonly (readonly [RegExp, (match: string[]) => string])[] = [
   // Railhead session tokens are JWTs: `<header>.<claims>.<mac>`, the header always `{"alg":...`.
   [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, () => REDACTED],
   // Artifacts repository tokens, which a write remote carries.
   [/art_v1_[A-Za-z0-9]{16,}(?:\?expires=\d+)?/g, () => REDACTED],
-  [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, () => REDACTED],
-  // The header name stays readable; a value of ten or more characters keeps the length bound.
-  [
-    /\b(Authorization\s*[:=]\s*"?)[A-Za-z0-9._~+/=-]{10,}/gi,
-    ([, name]) => `${name ?? ""}${REDACTED}`,
-  ],
+  [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, () => REDACTED],
+  // The header name stays readable.
+  [/\b(Authorization\s*[:=]\s*"?)[A-Za-z0-9._~+/=-]+/gi, ([, name]) => `${name ?? ""}${REDACTED}`],
   // `https://<user>:<password>@host`, as a Git remote with a session token or write token is.
-  [/\b(https?:\/\/)[^\s/@:]+:[^\s/@[\]]{8,}@/gi, ([, scheme]) => `${scheme ?? ""}${REDACTED}@`],
+  [/\b(https?:\/\/)[^\s/@:]+:[^\s/@[\]]+@/gi, ([, scheme]) => `${scheme ?? ""}${REDACTED}@`],
 ];
 
 const REDACTED = "[redacted]";
