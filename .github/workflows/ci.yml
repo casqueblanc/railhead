@@ -132,6 +132,7 @@ jobs:
         if: steps.changes.outputs.run != 'false'
         working-directory: packages/railhead-backend
         env:
+          CLOUDFLARE_ACCOUNT_ID: placeholder
           SESSION_SIGNING_SECRET: placeholder
           OWNER_BOOTSTRAP_TOKEN: placeholder
         run: |

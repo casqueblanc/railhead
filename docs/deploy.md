@@ -8,12 +8,12 @@ The workflow runs only when started by hand. CI's **Build and test** job instead
 
 Set these in the repository's `qualification` environment (**Settings → Environments → qualification → Environment secrets**). The workflow fails before deploying when any of them is missing or empty, and names the missing ones.
 
-| Secret                   | What it is                                                                                                      |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `CLOUDFLARE_API_TOKEN`   | The API token Wrangler deploys with (permissions below).                                                        |
-| `CLOUDFLARE_ACCOUNT_ID`  | The Cloudflare account that holds the Worker.                                                                   |
-| `SESSION_SIGNING_SECRET` | Worker secret: at least 32 random characters. Agent login keys derive from it; replacing it ends every session. |
-| `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: the one-time token that opens enrollment of the first owner passkey.                             |
+| Secret                   | What it is                                                                                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLOUDFLARE_API_TOKEN`   | The API token Wrangler deploys with (permissions below).                                                                                                            |
+| `CLOUDFLARE_ACCOUNT_ID`  | The Cloudflare account that holds the Worker. Wrangler deploys to it, and it is also a Worker secret: check sandboxes fetch from that account's Artifacts Git host. |
+| `SESSION_SIGNING_SECRET` | Worker secret: at least 32 random characters. Agent login keys derive from it; replacing it ends every session.                                                     |
+| `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: the one-time token that opens enrollment of the first owner passkey.                                                                                 |
 
 The Worker secrets are exactly the `secrets.required` list in `packages/railhead-backend/cloudflare.config.ts`. A secret added there must also be added to the environment and to the deploy step's `env` in the workflow; until it is, the deploy fails naming it, and CI's dry run fails until its placeholder is added too.
 
@@ -26,7 +26,9 @@ Create an account API token for the account above with:
 - Workers Scripts: Edit
 - Containers: Edit
 - Artifacts, with write access
-- Workers R2 Storage: Edit, once the checks that use R2 land
+- Workers R2 Storage: Edit
+
+The deploy also creates what the config declares and the account does not have yet. The sandbox container application and the `railhead-checks` Workflow come with the Worker. For the `railhead-check-backups` R2 bucket, Wrangler 4.145's deploy creates a bucket with that name when none exists; that reading comes from Wrangler's source, not from a deploy run. Which token permission the Workflow needs has not been checked.
 
 If the token lacks a permission, the deploy step fails with Cloudflare's error for the request that needed it.
 
