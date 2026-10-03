@@ -36,7 +36,7 @@ import {
   writeWake,
   type PendingWake,
 } from "../src/modules/train/store";
-import { unavailableClaims } from "../src/contracts/unavailable";
+import { unavailableChecks, unavailableClaims } from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
@@ -162,6 +162,8 @@ class Fakes {
           if (this.startGate !== null) await this.startGate();
           return this.start(attempt);
         },
+        // Reports reach the train through `recordCheck` in these tests.
+        report: unavailableChecks.report,
       },
       authorization: {
         authorize: async (attemptId) => {
@@ -1238,6 +1240,91 @@ describe("train check deadline", () => {
       expect(await train.recordCheck(report(last, "pass"))).toEqual(ok(last));
       expect(states(train)).toEqual({ "clm_claim001@1": "dropped", "clm_claim002@1": "landed" });
       expect(fakes.authorized).toEqual([last.attemptId]);
+    }, fakes);
+  });
+});
+
+describe("train held checks", () => {
+  it("splits a held shared batch, parks the pin held alone and moves the pins behind it", async () => {
+    const fakes = new Fakes();
+    const offender = pin(1);
+    // The check port holds every candidate that carries the offender's change.
+    fakes.start = (attempt) =>
+      attempt.pins.some((p) => p.claimId === offender.claimId)
+        ? fail("check_held", "The candidate edits protected check paths.")
+        : ok({ attemptId: attempt.attemptId });
+    fakes.head = () => fail("unavailable", "Not yet.");
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(offender, pin(2));
+      await train.enqueue(offender);
+      await train.enqueue(pin(2));
+      fakes.head = () => ok(fakes.main);
+      expect(await train.drive()).toMatchObject({ kind: "blocked", reason: "check_held" });
+      expect(lastStarted(fakes).pins).toEqual([offender, pin(2)]);
+      // A later pin queues behind the held batch.
+      fakes.ready(pin(3));
+      await train.enqueue(pin(3));
+
+      // Past the deadline the shared batch splits; the offender, first, is held again alone.
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      expect(lastStarted(fakes).pins).toEqual([offender]);
+      expect(states(train)).toMatchObject({
+        "clm_claim002@1": "queued",
+        "clm_claim003@1": "queued",
+      });
+
+      // Held alone past its deadline, the offender is parked and the innocent pin checks alone.
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      const innocent = lastStarted(fakes);
+      expect(innocent.pins).toEqual([pin(2)]);
+      expect(await train.recordCheck(report(innocent, "pass"))).toEqual(ok(innocent));
+      const later = lastStarted(fakes);
+      expect(later.pins).toEqual([pin(3)]);
+      expect(await train.recordCheck(report(later, "pass"))).toEqual(ok(later));
+
+      expect(fakes.main).toBe(later.candidate);
+      expect(states(train)).toEqual({
+        "clm_claim001@1": "parked",
+        "clm_claim002@1": "landed",
+        "clm_claim003@1": "landed",
+      });
+      expect(train.entries(64).find((e) => e.pin.claimId === offender.claimId)).toMatchObject({
+        pin: offender,
+        retries: 0,
+        reason: "check_held",
+      });
+      // Nothing is left to drive: the parked pin owes no wake.
+      expect(readWake(sql)).toBeNull();
+    }, fakes);
+  });
+
+  it("checks a held claim again once a new push enqueues its next generation", async () => {
+    const fakes = new Fakes();
+    const held = pin(1);
+    const pushed = pin(1, 2, sha("9"));
+    fakes.start = (attempt) =>
+      attempt.pins.some((p) => p.claimId === held.claimId && p.generation === held.generation)
+        ? fail("check_held", "The candidate edits protected check paths.")
+        : ok({ attemptId: attempt.attemptId });
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(held);
+      await train.enqueue(held);
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked" });
+
+      // The parked generation is never driven again on its own.
+      await train.resume();
+      expect(fakes.started.filter((a) => a.pins.some((p) => p.generation === 1))).toHaveLength(1);
+
+      fakes.ready(pushed);
+      expect(await train.enqueue(pushed)).toEqual(ok({ queued: true }));
+      const fresh = lastStarted(fakes);
+      expect(fresh.pins).toEqual([pushed]);
+      expect(await train.recordCheck(report(fresh, "pass"))).toEqual(ok(fresh));
+      expect(states(train)).toEqual({ "clm_claim001@1": "parked", "clm_claim001@2": "landed" });
     }, fakes);
   });
 });

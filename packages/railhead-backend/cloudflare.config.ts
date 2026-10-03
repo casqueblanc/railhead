@@ -34,6 +34,23 @@ const worker = defineRailheadWorker({
     SANDBOX: { type: "durable-object", worker: "railhead", exportName: "RailheadSandbox" },
     // Git storage. Tokens minted from it stay in the Worker; a sandbox never receives one.
     ARTIFACTS: bindings.artifacts({ namespace: "railhead" }),
+    // The namespace above, for the Git remotes a check sandbox fetches from.
+    ARTIFACTS_NAMESPACE: { type: "text", value: "railhead" },
+    // The account the Artifacts Git host belongs to, `<id>.artifacts.cloudflare.net`. Set by the
+    // operator at deploy; without it no check runs.
+    CLOUDFLARE_ACCOUNT_ID: bindings.secret(),
+    // One Workflow instance per check attempt, named by the attempt. Only the checks module starts
+    // one (src/checks/port.ts).
+    CHECKS: {
+      type: "workflow",
+      name: "railhead-checks",
+      worker: "railhead",
+      exportName: "CheckWorkflow",
+    },
+    // Workspace backups of check runs, written through the binding from outside the container. The
+    // operator creates the bucket; both names must match it.
+    BACKUP_BUCKET: bindings.r2({ name: "railhead-check-backups" }),
+    BACKUP_BUCKET_NAME: { type: "text", value: "railhead-check-backups" },
     // The instance owner's one Durable Object: the enrolled passkey and its bootstrap. Private, like
     // `REPO`; each Repo's owner module reads the credential through it.
     OWNER: { type: "durable-object", worker: "railhead", exportName: "Owner" },
@@ -51,6 +68,7 @@ const worker = defineRailheadWorker({
     Repo: { type: "durable-object", storage: "sqlite" },
     RailheadSandbox: { type: "durable-object", storage: "sqlite", container: sandbox },
     Owner: { type: "durable-object", storage: "sqlite" },
+    CheckWorkflow: { type: "workflow", name: "railhead-checks" },
   },
   assets: {
     notFoundHandling: "single-page-application",

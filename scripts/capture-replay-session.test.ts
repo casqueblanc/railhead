@@ -1,0 +1,398 @@
+// The capture script end to end: a real Cap'n Web session over a WebSocket to an in-process board
+// endpoint serving a populated log, the file it writes, and that file opened by the replay page's
+// own `openReplay`. The endpoint stands in for the backend; this is evidence for the script, not a
+// capture of a deployed run.
+
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { registerHooks } from "node:module";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
+import { test } from "node:test";
+import { pathToFileURL } from "node:url";
+import { RpcSession, RpcTarget, type RpcTransport } from "capnweb";
+import { WebSocketServer, type WebSocket } from "ws";
+
+const root = join(import.meta.dirname, "..");
+const script = join(import.meta.dirname, "capture-replay.mjs");
+
+// The board's modules import their siblings without an extension, as Vite resolves them. `node`
+// needs the extension, so this test supplies it.
+registerHooks({
+  resolve: (specifier, context, nextResolve) => {
+    try {
+      return nextResolve(specifier, context);
+    } catch (error) {
+      if (specifier.startsWith(".") && extname(specifier) === "") {
+        return nextResolve(`${specifier}.ts`, context);
+      }
+      throw error;
+    }
+  },
+});
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+/** A module of the board, loaded by path so this package's type check does not compile it. */
+const load = async (path: string): Promise<Record<string, unknown>> => {
+  const loaded: unknown = await import(pathToFileURL(join(root, path)).href);
+  assert.ok(isRecord(loaded));
+  return loaded;
+};
+
+const { API_PATH } = await load("packages/railhead-shared/src/api.ts");
+assert.equal(typeof API_PATH, "string");
+
+const callable = (value: unknown) => {
+  if (typeof value !== "function") throw new Error("not a function");
+  return (...args: unknown[]): unknown => Reflect.apply(value, undefined, args);
+};
+
+/** Text a hostile endpoint sends: a terminal escape sequence and a would-be secret. */
+const HOSTILE = "\u001b]0;pwned\u0007s3cr3t-text";
+
+/** Fewer events per page than the client asks for, so the capture must page. */
+const SERVED_PAGE = 7;
+
+/** A Cap'n Web transport over a `ws` server socket. */
+const transportOf = (socket: WebSocket): RpcTransport => {
+  const inbox: string[] = [];
+  const waiting: { resolve: (message: string) => void; reject: (error: Error) => void }[] = [];
+  let closed: Error | null = null;
+  socket.on("message", (data, isBinary) => {
+    const message = isBinary ? "" : String(data);
+    const next = waiting.shift();
+    if (next === undefined) inbox.push(message);
+    else next.resolve(message);
+  });
+  socket.on("close", () => {
+    closed = new Error("socket closed");
+    for (const next of waiting.splice(0)) next.reject(closed);
+  });
+  return {
+    send: (message) => socket.send(message),
+    receive: () => {
+      const message = inbox.shift();
+      if (message !== undefined) return Promise.resolve(message);
+      if (closed !== null) return Promise.reject(closed);
+      return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+    },
+    abort: () => socket.close(),
+  };
+};
+
+/** The history the endpoint serves its log under. */
+const HISTORY = "0123456789abcdef0123456789abcdef";
+
+/**
+ * Serves `log` as repository demo/upload-app, as the backend's `openBoard` and `readEvents` do.
+ * `refuseOpenWith` and `refuseReadWith` make every `openBoard` or `readEvents` call fail with that
+ * code, as a hostile endpoint might. `resetTo` replaces the log with a new history after the first
+ * page, as an owner's reset does; like the backend, a read that names the old history then fails
+ * with `cursor_ahead`.
+ */
+const startBoard = async (
+  repo: string,
+  initial: readonly unknown[],
+  options: {
+    refuseOpenWith?: unknown;
+    refuseReadWith?: unknown;
+    resetTo?: readonly unknown[];
+  } = {},
+) => {
+  const pages: number[] = [];
+  const histories: (string | undefined)[] = [];
+  let log = initial;
+  let history = HISTORY;
+  class Board extends RpcTarget {
+    readEvents(cursor: number, limit: number, asked?: string) {
+      histories.push(asked);
+      if (options.refuseReadWith !== undefined) {
+        return { ok: false, code: options.refuseReadWith, message: HOSTILE };
+      }
+      if (asked !== undefined && asked !== history) {
+        return { ok: false, code: "cursor_ahead", message: HOSTILE };
+      }
+      const events = log.slice(cursor, cursor + Math.min(limit, SERVED_PAGE));
+      pages.push(cursor);
+      const value = { repo, events, cursor: cursor + events.length, head: log.length, history };
+      if (options.resetTo !== undefined && pages.length === 1) {
+        log = options.resetTo;
+        history = "fedcba9876543210fedcba9876543210";
+      }
+      return { ok: true, value };
+    }
+  }
+  class Api extends RpcTarget {
+    openBoard(org: string, name: string) {
+      if (options.refuseOpenWith !== undefined) {
+        return { ok: false, code: options.refuseOpenWith, message: HOSTILE };
+      }
+      return org === "demo" && name === "upload-app"
+        ? { ok: true, value: new Board() }
+        : { ok: false, code: "not_found", message: HOSTILE };
+    }
+  }
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: String(API_PATH) });
+  const sessions: RpcSession[] = [];
+  server.on("connection", (socket) => {
+    sessions.push(new RpcSession(transportOf(socket), new Api()));
+  });
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  const address = server.address();
+  assert.ok(isRecord(address) && typeof address.port === "number");
+  return {
+    port: address.port,
+    pages,
+    histories,
+    close: () => {
+      for (const client of server.clients) client.terminate();
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+};
+
+const runScript = (args: readonly string[]) =>
+  new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    execFile(process.execPath, [script, ...args], { timeout: 20_000 }, (error, _out, stderr) =>
+      resolve({
+        code: error === null ? 0 : typeof error.code === "number" ? error.code : null,
+        stderr,
+      }),
+    );
+  });
+
+test("captures a served log into a file the replay page opens to the same board", async () => {
+  const { decisionReversal } = await load("fixtures/board/decisionReversal.ts");
+  assert.ok(isRecord(decisionReversal) && Array.isArray(decisionReversal.events));
+  const events: unknown[] = decisionReversal.events;
+  const first = events[0];
+  assert.ok(isRecord(first) && typeof first.repo === "string");
+  const repo = first.repo;
+  // A field the event contract never defined, standing in for anything the backend might add.
+  const served = events.map((event) => ({
+    ...(isRecord(event) ? event : {}),
+    token: "s3cr3t-field",
+  }));
+
+  const board = await startBoard(repo, served);
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const before = Date.now();
+    const result = await runScript([
+      "--origin",
+      `http://capture:s3cr3t-pass@127.0.0.1:${board.port}/ignored?token=s3cr3t-query`,
+      "--repo",
+      "demo/upload-app",
+      "--out",
+      out,
+    ]);
+    const after = Date.now();
+    const origin = `http://127.0.0.1:${board.port}`;
+    assert.equal(
+      result.stderr,
+      `captured ${events.length} events of demo/upload-app from ${origin} into ${out}\n`,
+    );
+    assert.equal(result.code, 0);
+    assert.equal(board.pages.length, Math.ceil(events.length / SERVED_PAGE));
+    assert.deepEqual(board.histories, [
+      undefined,
+      ...Array.from({ length: board.pages.length - 1 }, () => HISTORY),
+    ]);
+    assert.deepEqual(readdirSync(dir), ["run.json"]);
+
+    const text = readFileSync(out, "utf8");
+    assert.doesNotMatch(text, /s3cr3t|capture:/);
+    const file: unknown = JSON.parse(text);
+    assert.ok(isRecord(file) && isRecord(file.source));
+    const { capturedAt } = file.source;
+    assert.ok(typeof capturedAt === "number" && capturedAt >= before && capturedAt <= after);
+    assert.deepEqual(file, {
+      format: "railhead.replay",
+      version: 1,
+      source: { kind: "captured", origin, org: "demo", name: "upload-app", capturedAt },
+      repo,
+      history: HISTORY,
+      head: events.length,
+      events,
+    });
+
+    const { openReplay } = await load(
+      "packages/railhead-frontend/src/features/replay/replayLog.ts",
+    );
+    const { emptyBoardState, foldEvents } = await load(
+      "packages/railhead-frontend/src/features/board/boardState.ts",
+    );
+    const opened = callable(openReplay)(text);
+    assert.ok(isRecord(opened) && opened.ok === true && isRecord(opened.replay));
+    assert.deepEqual(
+      opened.replay.final,
+      callable(foldEvents)(callable(emptyBoardState)(repo), events),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+test("reports the backend's refusal to open the repository and writes nothing", async () => {
+  const board = await startBoard("rep_synthrepo", []);
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const result = await runScript([
+      "--origin",
+      `http://127.0.0.1:${board.port}`,
+      "--repo",
+      "demo/other-app",
+      "--out",
+      out,
+    ]);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      "capture-replay: the backend refused to open demo/other-app (not_found)\n",
+    );
+    assert.deepEqual(readdirSync(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+for (const [label, refusal, expected] of [
+  [
+    "opening",
+    { refuseOpenWith: HOSTILE },
+    "capture-replay: the backend refused to open demo/upload-app (unknown error)\n",
+  ],
+  [
+    "reading",
+    { refuseReadWith: HOSTILE },
+    "capture-replay: The backend refused to read the log (unknown error).\n",
+  ],
+  [
+    "reading with a known code",
+    { refuseReadWith: "internal" },
+    "capture-replay: The backend refused to read the log (internal).\n",
+  ],
+  [
+    "reading with a code added later",
+    { refuseReadWith: "busy" },
+    "capture-replay: The backend refused to read the log (busy).\n",
+  ],
+] as const) {
+  test(`prints only a known code when the backend refuses ${label}`, async () => {
+    const board = await startBoard("rep_synthrepo", [], refusal);
+    const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+    try {
+      const out = join(dir, "run.json");
+      const result = await runScript([
+        "--origin",
+        `http://127.0.0.1:${board.port}`,
+        "--repo",
+        "demo/upload-app",
+        "--out",
+        out,
+      ]);
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, expected);
+      assert.deepEqual(readdirSync(dir), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      await board.close();
+    }
+  });
+}
+
+test("refuses a capture when the repository is reset between pages, and writes nothing", async () => {
+  const { issues } = await syntheticIssues();
+  // The new history's log is longer than the old one, so a capture that ignored the history would
+  // read a gapless suffix of it after the old log's first page.
+  const board = await startBoard("rep_synthrepo", issues(SERVED_PAGE + 3), {
+    resetTo: issues(SERVED_PAGE * 3),
+  });
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const result = await runScript([
+      "--origin",
+      `http://127.0.0.1:${board.port}`,
+      "--repo",
+      "demo/upload-app",
+      "--out",
+      out,
+    ]);
+    assert.equal(result.code, 1);
+    assert.equal(
+      result.stderr,
+      "capture-replay: The repository was reset while the capture read it; capture it again.\n",
+    );
+    assert.deepEqual(board.histories, [undefined, HISTORY]);
+    assert.deepEqual(readdirSync(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+test("redacts a session token pasted into an issue body and says how many it redacted", async () => {
+  const { issues } = await syntheticIssues();
+  const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZ3RfeCJ9.c2lnbmF0dXJlLWJ5dGVz";
+  const [first, second] = issues(2);
+  assert.ok(isRecord(first) && isRecord(first.data) && second !== undefined);
+  const leaked = { ...first, data: { ...first.data, body: `rh push failed with ${token}` } };
+  const board = await startBoard("rep_synthrepo", [leaked, second]);
+  const dir = mkdtempSync(join(tmpdir(), "capture-replay-session-"));
+  try {
+    const out = join(dir, "run.json");
+    const result = await runScript([
+      "--origin",
+      `http://127.0.0.1:${board.port}`,
+      "--repo",
+      "demo/upload-app",
+      "--out",
+      out,
+    ]);
+    assert.equal(result.code, 0);
+    assert.equal(
+      result.stderr,
+      `captured 2 events of demo/upload-app from http://127.0.0.1:${board.port} into ${out} (1 secret-shaped value redacted)\n`,
+    );
+    const text = readFileSync(out, "utf8");
+    assert.doesNotMatch(text, /eyJ/);
+    const file: unknown = JSON.parse(text);
+    assert.ok(isRecord(file) && Array.isArray(file.events) && isRecord(file.events[0]));
+    assert.deepEqual(file.events[0].data, {
+      ...first.data,
+      body: "rh push failed with [redacted]",
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await board.close();
+  }
+});
+
+/** `issue.filed` events 1 to `count` of repository `rep_synthrepo`, from the board fixtures. */
+async function syntheticIssues() {
+  const { SYNTH_OWNER, SYNTH_START_MS } = await load("fixtures/board/syntheticLog.ts");
+  return {
+    issues: (count: number): unknown[] =>
+      Array.from({ length: count }, (_, index) => ({
+        v: 1,
+        seq: index + 1,
+        at: Number(SYNTH_START_MS) + index + 1,
+        repo: "rep_synthrepo",
+        actor: SYNTH_OWNER,
+        type: "issue.filed",
+        data: {
+          issueId: `iss_synth${(index + 1).toString().padStart(6, "0")}`,
+          title: "Synthetic",
+          body: "",
+        },
+      })),
+  };
+}
