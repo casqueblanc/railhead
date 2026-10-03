@@ -2,6 +2,8 @@
 // confirmation code. Format reference: openssh-portable PROTOCOL.sshsig. Ported from the SSH
 // signature spike (#8).
 
+import { equalBytes } from "../modules/owner/encoding";
+
 /** The signing namespace reserved for Railhead login challenges. */
 export const SSHSIG_NAMESPACE = "railhead-auth";
 
@@ -110,10 +112,6 @@ function concat(parts: readonly Uint8Array[]): Uint8Array<ArrayBuffer> {
     offset += p.length;
   }
   return out;
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 function parseKeyBlob(blob: Uint8Array<ArrayBuffer>): Ed25519PublicKey {
