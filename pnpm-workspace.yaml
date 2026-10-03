@@ -9,12 +9,18 @@ packages:
 # The toolchain versions every package shares, declared once so a bump is one edit. Every entry is
 # exact: the lockfile and Dependabot move versions, a range never does.
 catalog:
+  # Runs the trusted checks, patched below.
+  "@cloudflare/ci": 0.2.0
   # The Workers test pool, under its current package name (formerly `@cloudflare/vitest-pool-workers`).
   # Released in step with Wrangler: 1.3.4 depends on exactly the `wrangler` pinned below, so the
   # pool, Wrangler, Miniflare and workerd are one matched set without overrides.
   "@cloudflare/vitest-plugin": 1.3.4
   # Types follow the Node runtime pinned in .node-version, not the newest Node.
   "@types/node": 24.19.0
+  # Not 1.x: @cloudflare/ci 0.2.0, which runs the trusted checks, pins exactly 0.12.1, so merges and
+  # checks share one Sandbox class and one container image. The image tag in
+  # containers/railhead/Dockerfile moves with this pin.
+  "@cloudflare/sandbox": 0.12.1
   capnweb: 0.12.0
   # Pinned in lockstep with capnweb (declared as a >=0.7.0 peer).
   capnweb-validate: 0.3.0
@@ -48,3 +54,12 @@ minimumReleaseAge: 1440
 allowBuilds:
   esbuild: true
   workerd: true
+
+# The smallest changes Railhead needs in @cloudflare/ci 0.2.0 (#9, #10): the runner selects the
+# sandbox's Git gateway before checkout so no token enters the sandbox, a nonzero checkout exit ends
+# the run before the command, backups use the R2 binding because the sandbox cannot reach R2, and a
+# cached workspace is reused only by the commit that produced it, so a deleted file cannot linger.
+# SDK files that fail Railhead's stricter type checks get `@ts-nocheck`: the SDK ships TypeScript
+# source written for looser compiler options. Drop each change once upstream provides it.
+patchedDependencies:
+  "@cloudflare/ci@0.2.0": patches/@cloudflare__ci@0.2.0.patch

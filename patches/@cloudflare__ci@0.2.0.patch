@@ -1,0 +1,647 @@
+diff --git a/src/artifacts/events.ts b/src/artifacts/events.ts
+index 23c97f11727bc453533a1fa12798545a95ce34e6..c36e5f6dda0b8121449bd658e625648e1ff923f5 100644
+--- a/src/artifacts/events.ts
++++ b/src/artifacts/events.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { z } from 'zod';
+ import type {
+diff --git a/src/artifacts/source-control.ts b/src/artifacts/source-control.ts
+index 481724b271c3cd141b71d5bee1928932fdfafa00..37c54d671816e8d788752046e2b4677d7cf2466f 100644
+--- a/src/artifacts/source-control.ts
++++ b/src/artifacts/source-control.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type { CloudflareArtifacts } from '../pipeline';
+ import type { SourceControlRepositoryFilter } from '../source-control-adapter';
+diff --git a/src/ci/cache.ts b/src/ci/cache.ts
+index 433f19c0e750f2957e1c08e9c41600f90b234296..313689a60b31712c80f6c8e703cd6d8dad70383d 100644
+--- a/src/ci/cache.ts
++++ b/src/ci/cache.ts
+@@ -55,12 +55,25 @@ export type SnapshotCacheInput = {
+   label: string;
+ };
+ 
++// Railhead patch: the commit a lookup restores for. A restored workspace is
++// overlaid without deleting files, so a backup from another commit could keep a
++// file this commit removed; only the commit that produced a backup reuses it.
++export type SnapshotCacheLookupInput = SnapshotCacheInput & { sha: string };
++
+ export type PublishSnapshotCacheInput = SnapshotCacheInput & {
+   snapshot: DirectoryBackup;
+   producedBySha: string;
+ };
+ 
+ const CACHE_PREFIX = 'cache';
++
++// Railhead patch: the binding is optional, and a step without it never caches.
++function backupBucket(env: Bindings): R2Bucket {
++  if (env.BACKUP_BUCKET === undefined) {
++    throw new Error('the snapshot cache needs a BACKUP_BUCKET binding');
++  }
++  return env.BACKUP_BUCKET;
++}
+ // Layout the @cloudflare/sandbox backup store writes under BACKUP_BUCKET.
+ const BACKUP_PREFIX = 'backups';
+ const BACKUP_META = 'meta.json';
+@@ -101,7 +114,7 @@ async function readCachePointer(
+   env: Bindings,
+   key: string
+ ): Promise<CachePointer | null> {
+-  const object = await env.BACKUP_BUCKET.get(`${CACHE_PREFIX}/${key}.json`);
++  const object = await backupBucket(env).get(`${CACHE_PREFIX}/${key}.json`);
+   if (!object) {
+     return null;
+   }
+@@ -131,7 +144,7 @@ async function writeCachePointer(
+   key: string,
+   pointer: CachePointer
+ ): Promise<void> {
+-  await env.BACKUP_BUCKET.put(
++  await backupBucket(env).put(
+     `${CACHE_PREFIX}/${key}.json`,
+     JSON.stringify(pointer)
+   );
+@@ -143,7 +156,7 @@ async function writeCachePointer(
+  */
+ export async function lookupSnapshotCache(
+   env: Bindings,
+-  input: SnapshotCacheInput
++  input: SnapshotCacheLookupInput
+ ): Promise<SnapshotCacheLookup> {
+   const pointer = await readCachePointer(env, input.key);
+   console.log('[cache] pointer read', {
+@@ -168,12 +181,13 @@ export async function lookupSnapshotCache(
+     result: pointer && metadata ? 'HIT' : 'MISS',
+   });
+ 
+-  if (!pointer || !metadata) {
++  if (!pointer || !metadata || pointer.producedBySha !== input.sha) {
+     return { status: 'miss' };
+   }
+   return {
+     status: 'hit',
+-    snapshot: { id: pointer.backupId, dir: pointer.dir },
++    // Railhead patch: every backup is written through the R2 binding.
++    snapshot: { id: pointer.backupId, dir: pointer.dir, localBucket: true },
+     cachePointer: { key: input.key, ...metadata },
+   };
+ }
+@@ -222,7 +236,7 @@ async function readBackupMetadata(
+   env: Bindings,
+   backupId: string
+ ): Promise<{ createdAt: string; sizeBytes: number } | null> {
+-  const meta = await env.BACKUP_BUCKET.get(
++  const meta = await backupBucket(env).get(
+     `${BACKUP_PREFIX}/${backupId}/${BACKUP_META}`
+   );
+   if (!meta) {
+@@ -261,7 +275,7 @@ async function readBackupMetadata(
+     });
+     return null;
+   }
+-  const archive = await env.BACKUP_BUCKET.head(
++  const archive = await backupBucket(env).head(
+     `${BACKUP_PREFIX}/${backupId}/${BACKUP_ARCHIVE}`
+   );
+   if (!archive) {
+diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a11b5a360 100644
+--- a/src/ci/capabilities.ts
++++ b/src/ci/capabilities.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { z } from 'zod';
+ import type {
+@@ -103,7 +104,8 @@ async function prepareStep(
+   const cacheKey = await resolveStepCacheKey(
+     sourceControlProvider,
+     source,
+-    input
++    input,
++    env.BACKUP_BUCKET !== undefined
+   );
+   const extraEnv: Record<string, string> = { ...input.env };
+   if (
+@@ -167,6 +169,7 @@ async function executeStep(
+     ? await lookupSnapshotCache(env, {
+         key: prepared.cacheKey,
+         label: input.label,
++        sha: input.source.sha,
+       })
+     : { status: 'miss' as const };
+   if (cache.status === 'hit') {
+@@ -210,9 +213,14 @@ async function finalizeStep(
+   prepared: PreparedStep,
+   execution: CompletedStepExecution
+ ): Promise<CompletedStepExecution> {
++  // Railhead patch: a step with a cache key ran with the binding, so its
++  // runner made a backup; a missing one is an error, not a silent skip.
+   if (!prepared.cacheKey || execution.cachePointer) {
+     return execution;
+   }
++  if (!execution.snapshot) {
++    throw new Error(`${input.label} did not produce a workspace snapshot`);
++  }
+   // Write the small JSON pointer at the deterministic cache key. It records the
+   // randomly generated id of the sandbox workspace backup so a future run can
+   // rediscover it; the backup already exists, we only add the indirection.
+@@ -234,11 +242,19 @@ async function finalizeStep(
+ async function resolveStepCacheKey(
+   sourceControlProvider: SourceControlProvider,
+   source: SourceControlSource,
+-  input: CiRunStepInput
++  input: CiRunStepInput,
++  hasBackupBucket: boolean
+ ) {
+   if (!input.cachePaths) {
+     return undefined;
+   }
++  // Railhead patch: without the binding there is no backup to cache.
++  if (!hasBackupBucket) {
++    console.warn('[cache] no BACKUP_BUCKET binding; skipping cache', {
++      label: input.label,
++    });
++    return undefined;
++  }
+   if (input.cachePaths.length === 0) {
+     throw new Error(`cache(${input.label}): inputs must not be empty`);
+   }
+diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f1115a07c61 100644
+--- a/src/ci/runners/sandbox.ts
++++ b/src/ci/runners/sandbox.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
+ import { posix } from 'node:path';
+@@ -33,7 +34,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+   /**
+    * Copies source, runs the command, and snapshots `/workspace` after a
+    * successful exit. A restored Snapshot is overlaid with the current source.
+-   * Large log streams keep the Sandbox alive until they are read or cancelled.
++   * Logs above the inline limit keep their tail.
+    */
+   async run(
+     input: RunStepInput & { restore?: DirectoryBackup }
+@@ -45,13 +46,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+       containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
+     });
+ 
+-    let cleanupTransferredToStreams = false;
++    // Railhead patch: a fenced sandbox is released through its fence's
++    // retirement, which ends the grant before it destroys the container and
++    // keeps retrying a destroy that fails. That failure is not swallowed: the
++    // run fails instead of settling over a sandbox that may still be running.
++    const fenced = input.source.kind === 'git' && !!input.source.fence;
++    const release = () =>
++      fenced ? sandbox.railheadRetire() : destroySandbox(sandbox);
++    let released = false;
+     try {
+-      // Containers without FUSE must restore through the local R2 binding and
+-      // unsquashfs. RPC streams those archives instead of base64-encoding them
+-      // into a single request, which can exceed the local dev request limit.
+-      const localBucket =
+-        (await sandbox.exec('test -c /dev/fuse')).exitCode !== 0;
++      // Railhead patch: start the sandbox's fenced incarnation before the first
++      // command. The fence routes the checkout's Git requests to the gateway
++      // under the grant and retires the sandbox when the grant lapses. Every
++      // call below (restore, exec, process, backup, file listing) runs inside
++      // that incarnation, so none touches the container after it retires.
++      if (fenced) {
++        await sandbox.railheadStart(
++          input.source.fence.policy,
++          input.source.fence.expiresAt
++        );
++      }
++      // Railhead patch: back up and restore only through the R2 binding. The
++      // container has no route to R2 presigned URLs, and RPC streams those
++      // archives instead of base64-encoding them into a single request. Without
++      // the binding the run makes no backup and cannot restore one.
++      const localBucket = true;
++      const backups = this.env.BACKUP_BUCKET !== undefined;
++      if (!backups) {
++        console.warn('[sandbox] no BACKUP_BUCKET binding; no workspace backup', {
++          label: input.label,
++        });
++        if (input.restore) {
++          throw new Error('restoring a workspace needs a BACKUP_BUCKET binding');
++        }
++      }
+       if (input.restore) {
+         await sandbox.restoreBackup(input.restore);
+         // Overlay (no rm) so cached node_modules survive while tracked source
+@@ -59,20 +87,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         // different commit's source (e.g. a reused install cache), so this is
+         // what keeps it correct. Files deleted since then linger; the next
+         // install/build regenerates derived output.
+-        await sandbox.exec(
+-          checkoutSourceScript(input.source, WORKSPACE_DIR, true),
+-          {
+-            cwd: '/',
+-            timeout: SOURCE_TIMEOUT_MS,
+-            env: checkoutSourceEnv(input.source),
+-          }
++        assertCheckedOut(
++          await sandbox.exec(
++            checkoutSourceScript(input.source, WORKSPACE_DIR, true),
++            {
++              cwd: '/',
++              timeout: SOURCE_TIMEOUT_MS,
++              env: checkoutSourceEnv(input.source),
++            }
++          )
+         );
+       } else {
+-        await sandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+-          cwd: '/',
+-          timeout: SOURCE_TIMEOUT_MS,
+-          env: checkoutSourceEnv(input.source),
+-        });
++        assertCheckedOut(
++          await sandbox.exec(
++            checkoutSourceScript(input.source, WORKSPACE_DIR),
++            {
++              cwd: '/',
++              timeout: SOURCE_TIMEOUT_MS,
++              env: checkoutSourceEnv(input.source),
++            }
++          )
++        );
+       }
+ 
+       const proc = await sandbox.startProcess(
+@@ -95,53 +130,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         return { exitCode, logs: preview, preview };
+       }
+ 
+-      const snapshot = await sandbox.createBackup({
+-        dir: WORKSPACE_DIR,
+-        name: input.label,
+-        multipart: true,
+-        ttl: input.ttlSeconds,
+-        localBucket,
+-      });
+-      const rawLogs = await readLogs(sandbox);
+-      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
+-        (value): value is ReadableStream<Uint8Array> =>
+-          typeof value !== 'string'
+-      );
+-      if (streams.length === 0) {
+-        return { exitCode, logs: rawLogs, preview, snapshot };
++      const snapshot = backups
++        ? await sandbox.createBackup({
++            dir: WORKSPACE_DIR,
++            name: input.label,
++            multipart: true,
++            ttl: input.ttlSeconds,
++            localBucket,
++          })
++        : undefined;
++      // Railhead patch: logs are read in full before the sandbox is released,
++      // so the run returns, and a cache pointer is published, only after its
++      // retirement settled. A log above the inline limit keeps its tail.
++      const logs = await readLogs(sandbox);
++      return { exitCode, logs, preview, snapshot };
++    } catch (error) {
++      released = true;
++      try {
++        await release();
++      } catch (releaseError) {
++        throw new AggregateError(
++          [error, releaseError],
++          'the CI sandbox failed and was not retired',
++          { cause: releaseError }
++        );
+       }
+-
+-      let remainingStreams = streams.length;
+-      const releaseStream = async () => {
+-        remainingStreams -= 1;
+-        if (remainingStreams === 0) {
+-          await destroySandbox(sandbox);
+-        }
+-      };
+-      cleanupTransferredToStreams = true;
+-      return {
+-        exitCode,
+-        logs: {
+-          stdout:
+-            typeof rawLogs.stdout === 'string'
+-              ? rawLogs.stdout
+-              : withCleanup(rawLogs.stdout, releaseStream),
+-          stderr:
+-            typeof rawLogs.stderr === 'string'
+-              ? rawLogs.stderr
+-              : withCleanup(rawLogs.stderr, releaseStream),
+-        },
+-        preview,
+-        snapshot,
+-      };
++      throw error;
+     } finally {
+-      if (!cleanupTransferredToStreams) {
+-        await destroySandbox(sandbox);
++      if (!released) {
++        await release();
+       }
+     }
+   }
+ }
+ 
++// Railhead patch: a failed checkout ends the run before the command starts, so
++// a missing commit or a refused fetch is never reported as the command's exit.
++function assertCheckedOut({ exitCode }: { exitCode: number }) {
++  if (exitCode !== 0) {
++    throw new Error(`source checkout exited with status ${exitCode}`);
++  }
++}
++
+ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+   const listing = await sandbox.listFiles('/tmp');
+   const sizes = new Map(
+@@ -157,11 +187,20 @@ async function readLog(
+   sandbox: ReturnType<typeof getSandbox>,
+   file: string,
+   size: number
+-): Promise<string | ReadableStream<Uint8Array>> {
+-  if (size > INLINE_LOG_BYTES) {
+-    return sandbox.readFileStream(file);
++): Promise<string> {
++  // Railhead patch: every log is read through `exec`, which the sandbox's
++  // fence tracks, and a log above the inline limit keeps its tail instead of
++  // a stream that would keep the sandbox alive after the run returns.
++  const { exitCode, stdout } = await sandbox.exec(
++    `tail -c ${INLINE_LOG_BYTES} ${file}`,
++    { cwd: '/', timeout: 30_000 }
++  );
++  if (exitCode !== 0) {
++    throw new Error(`reading a log exited with status ${exitCode}`);
+   }
+-  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
++  return size > INLINE_LOG_BYTES
++    ? `[log truncated to its last ${INLINE_LOG_BYTES} bytes]\n${stdout}`
++    : stdout;
+ }
+ 
+ async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
+@@ -198,43 +237,6 @@ function resolveCwd(cwd: string | undefined) {
+   return posix.join(WORKSPACE_DIR, normalized);
+ }
+ 
+-function withCleanup(
+-  stream: ReadableStream<Uint8Array>,
+-  release: () => Promise<void>
+-) {
+-  const reader = stream.getReader();
+-  let released = false;
+-  const releaseOnce = async () => {
+-    if (!released) {
+-      released = true;
+-      await release();
+-    }
+-  };
+-  return new ReadableStream<Uint8Array>({
+-    async pull(controller) {
+-      try {
+-        const result = await reader.read();
+-        if (result.done) {
+-          controller.close();
+-          await releaseOnce();
+-        } else {
+-          controller.enqueue(result.value);
+-        }
+-      } catch (error) {
+-        controller.error(error);
+-        await releaseOnce();
+-      }
+-    },
+-    async cancel(reason) {
+-      try {
+-        await reader.cancel(reason);
+-      } finally {
+-        await releaseOnce();
+-      }
+-    },
+-  });
+-}
+-
+ function createRunnerId(label: string) {
+   return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
+ }
+diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
+index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..2ccefdbb7abd707a4b947e96e45ee5daa6bc3f39 100644
+--- a/src/ci/step-notification.ts
++++ b/src/ci/step-notification.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type {
+   CacheSnapshotPointer,
+@@ -21,9 +22,9 @@ export type StepExecution = {
+   cacheHit: boolean;
+ };
+ 
+-export type CompletedStepExecution = StepExecution & {
+-  snapshot: DirectoryBackup;
+-};
++// Railhead patch: a run without a BACKUP_BUCKET binding completes with no
++// snapshot; the runner makes one whenever the binding is present.
++export type CompletedStepExecution = StepExecution;
+ 
+ /**
+  * Runs and finalizes a runner, then reports success or failure.
+@@ -52,17 +53,15 @@ export async function withStepNotification(
+         execution.preview,
+         input.sensitiveValues
+       );
+-      throw new Error(
++      // Railhead patch: only the previews are redacted. The header names the
++      // runner and its exit code, which are not secrets, and must reach the
++      // failure classifier unchanged: a literal env value such as `test` or
++      // `1` would otherwise redact it and turn a failed command into an error.
++      throw new CommandExitError(
+         `${input.label} failed with exit code ${execution.exitCode}\n=== stdout ===\n${stdout}\n=== stderr ===\n${stderr}`
+       );
+     }
+-    if (!execution.snapshot) {
+-      throw new Error(`${input.label} did not produce a workspace snapshot`);
+-    }
+-    const completed = await finalize({
+-      ...execution,
+-      snapshot: execution.snapshot,
+-    });
++    const completed = await finalize(execution);
+     execution = completed;
+ 
+     await input.handle?.succeed({
+@@ -115,7 +114,13 @@ function redactPreview(
+   };
+ }
+ 
++// Railhead patch: a command's nonzero exit, whose previews are already redacted.
++class CommandExitError extends Error {}
++
+ function sanitizeError(error: unknown, sensitiveValues: string[]) {
++  if (error instanceof CommandExitError) {
++    return error;
++  }
+   const message = redact(
+     error instanceof Error ? error.message : String(error),
+     sensitiveValues
+diff --git a/src/env.ts b/src/env.ts
+index bf350484ff9f6a861b661800e48ed2b52a10e77b..c3bc3075d1e23912f6fcb5c725be40a152036644 100644
+--- a/src/env.ts
++++ b/src/env.ts
+@@ -19,7 +19,9 @@ type Secrets = {
+ // this with its Wrangler-generated CloudflareBindings for configuration checks.
+ export type Bindings = Secrets & {
+   ARTIFACTS: Artifacts;
+-  BACKUP_BUCKET: R2Bucket;
++  // Railhead patch: optional. Without it a run makes no workspace backup, so
++  // nothing is cached or restored and a chained runner cannot start.
++  BACKUP_BUCKET?: R2Bucket;
+   BACKUP_BUCKET_NAME: string;
+   CLOUDFLARE_ACCOUNT_ID: string;
+   SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox>;
+diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
+index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160fc0066e7 100644
+--- a/src/pipeline/ci-workflow.ts
++++ b/src/pipeline/ci-workflow.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import {
+   WorkflowEntrypoint,
+@@ -140,9 +141,20 @@ export abstract class CIWorkflow<
+     // Workflow waits.
+     const invoke = (
+       options: RunnerOptions,
+-      inherited: DirectoryBackup | undefined
++      inherited: DirectoryBackup | undefined,
++      chained = false
+     ): Promise<CiRunnerResult> =>
+       runners.run(options, inherited, () => {
++        // Railhead patch: a chained runner continues its parent's workspace.
++        // Without a BACKUP_BUCKET binding the parent saved none, so the runner
++        // fails before it starts a sandbox instead of running on a bare checkout.
++        if (chained && inherited === undefined) {
++          return Promise.reject(
++            new Error(
++              `runner(${options.name}): no BACKUP_BUCKET binding, so a chained runner cannot inherit its parent's workspace`
++            )
++          );
++        }
+         const config = resolveRunnerConfig(options);
+         return step
+           .do(options.name, config.workflow, (ctx) =>
+@@ -166,7 +178,7 @@ export abstract class CIWorkflow<
+             Object.freeze({
+               ...output,
+               runner: (nextOptions: RunnerOptions) =>
+-                invoke(nextOptions, output.snapshot),
++                invoke(nextOptions, output.snapshot, true),
+             })
+           );
+       });
+diff --git a/src/pipeline/failures.ts b/src/pipeline/failures.ts
+index 0de55443ec8666eab4e24d0095c70d4b5878179c..e68af6643f119c1340cba3adff708dbfb6526f79 100644
+--- a/src/pipeline/failures.ts
++++ b/src/pipeline/failures.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type { DirectoryBackup, RunnerOptions } from './types';
+ 
+diff --git a/src/pipeline/runner-group.ts b/src/pipeline/runner-group.ts
+index 5246f0c3af3b1b2eca5ad58f50e2b7807cb7201b..b572f5d1f59522575b5f25fd03fc14f3047b4265 100644
+--- a/src/pipeline/runner-group.ts
++++ b/src/pipeline/runner-group.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import { CiRunnerFailure } from './failures';
+ import type { CiRunnerResult, DirectoryBackup, RunnerOptions } from './types';
+diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
+index a1f5ff3aa8c30350300f3bd8d1f25cbc850aff65..33e4f26712e516fd31d2696ee5271ef774e45e93 100644
+--- a/src/pipeline/types.ts
++++ b/src/pipeline/types.ts
+@@ -141,8 +141,8 @@ export type CiRunStepOutput = {
+   // The workspace backup the sandbox writes after every successful runner. The
+   // sandbox SDK stores it under a randomly generated id, so this handle is the
+   // only way to find it again; the next chained runner restores from it.
+-  // Always present.
+-  snapshot: DirectoryBackup;
++  // Railhead patch: absent only when the Worker has no BACKUP_BUCKET binding.
++  snapshot?: DirectoryBackup;
+   // Metadata for the deterministic cache pointer, present only when the runner
+   // opted into caching. The pointer is a second-order indirection: a small R2
+   // object at a content-addressed key that records `snapshot`'s random id, so a
+diff --git a/src/shared/source-checkout.ts b/src/shared/source-checkout.ts
+index f83770cfc430aacd3c257dc90e46ae8b2fa8be51..5defe23bfdbb4cfc3ae358b0cc9a1603a3751b13 100644
+--- a/src/shared/source-checkout.ts
++++ b/src/shared/source-checkout.ts
+@@ -28,14 +28,15 @@ export function checkoutSourceScript(
+     `rm -rf ${shellQuote(CLONE_DIR)}`,
+     `git init -q ${shellQuote(CLONE_DIR)}`,
+     `git -C ${shellQuote(CLONE_DIR)} remote add origin ${shellQuote(source.remote)}`,
+-    `git -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN" -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`,
++    // Railhead patch: send the header only when the checkout carries a token.
++    `git${source.token === undefined ? '' : ' -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN"'} -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`,
+     `git -C ${shellQuote(CLONE_DIR)} checkout --detach FETCH_HEAD`,
+     `tar --exclude=.git -C ${shellQuote(CLONE_DIR)} -cf - . | tar -C ${shellQuote(workspace)} -xf -`,
+   ].join(' && ');
+ }
+ 
+ export function checkoutSourceEnv(source: SourceControlCheckout) {
+-  return source.kind === 'git'
++  return source.kind === 'git' && source.token !== undefined
+     ? { SOURCE_CONTROL_TOKEN: source.token }
+     : undefined;
+ }
+diff --git a/src/source-control.ts b/src/source-control.ts
+index 83946a318ec5493d258581f33babf8ed43a9e909..fb4e5506cb24b61600dc7b236a5f9815c4d869d9 100644
+--- a/src/source-control.ts
++++ b/src/source-control.ts
+@@ -1,5 +1,6 @@
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
++// @ts-nocheck Railhead patch: written for looser compiler options than Railhead's.
+ 
+ import type {
+   CiParams,
+@@ -114,8 +115,13 @@ export type SourceControlCheckout =
+   | {
+       kind: 'git';
+       remote: string;
+-      token: string;
++      // Railhead patch: omitted when the `fence` grant adds credentials outside the
++      // Sandbox, so no token is ever placed inside it.
++      token?: string;
+       sha: string;
++      // Railhead patch: the grant the sandbox's fenced incarnation starts
++      // under; its Git requests are served only while that incarnation is live.
++      fence?: { policy: unknown; expiresAt: number };
+     };
+ 
+ export type SourceControlEvent<

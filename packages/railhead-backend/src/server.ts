@@ -7,6 +7,7 @@ import { RailheadApiImpl } from "./gateway/rpc";
 
 export { Owner } from "./modules/owner/OwnerObject";
 export { Repo } from "./repo/RepoObject";
+export { ContainerProxy, RailheadSandbox } from "./sandbox/sandboxObject";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

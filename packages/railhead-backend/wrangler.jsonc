@@ -11,11 +11,21 @@
       "invocation_logs": false
     }
   },
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "railhead"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
         "name": "REPO",
         "class_name": "Repo"
+      },
+      {
+        "name": "SANDBOX",
+        "class_name": "RailheadSandbox"
       },
       {
         "name": "OWNER",
@@ -48,11 +58,24 @@
       "type": "durable-object",
       "storage": "sqlite"
     },
+    "RailheadSandbox": {
+      "type": "durable-object",
+      "storage": "sqlite",
+      "container": "railhead-sandbox"
+    },
     "Owner": {
       "type": "durable-object",
       "storage": "sqlite"
     }
   },
+  "containers": [
+    {
+      "name": "railhead-sandbox",
+      "image": "../../containers/railhead/Dockerfile",
+      "max_instances": 10,
+      "instance_type": "basic"
+    }
+  ],
   "build": {
     "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
     "watch_dir": "src"
