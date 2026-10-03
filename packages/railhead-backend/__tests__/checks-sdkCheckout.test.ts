@@ -27,7 +27,7 @@ import {
   type RunnerFailure,
 } from "../src/checks/sdkCheckout";
 import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
-import { SandboxFence } from "../src/sandbox/fence";
+import { MAX_TEARDOWN_ATTEMPTS, SandboxFence, teardownRetryDelay } from "../src/sandbox/fence";
 import { parseSandboxGrant, type SandboxGrant } from "../src/sandbox/policy";
 import {
   FENCED_SANDBOX_METHODS,
@@ -637,6 +637,57 @@ describe("RailheadSandbox's storage after retirement", () => {
       await sandbox.alarm();
 
       expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("keeps its record and schedules a retry when deleting its storage fails, then finishes", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      const deleteAll = state.storage.deleteAll.bind(state.storage);
+      const failing = vi
+        .spyOn(state.storage, "deleteAll")
+        .mockRejectedValueOnce(new Error("scripted storage failure"));
+      const logged = vi.spyOn(console, "error").mockImplementation(noop);
+
+      const before = Date.now();
+      await sandbox.alarm();
+
+      // Nothing was deleted, and the object asked to be woken again to finish.
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(state.storage.kv.get("railhead:disposal-failures")).toBe(1);
+      expect(await state.storage.getAlarm()).toBeGreaterThanOrEqual(before + teardownRetryDelay(1));
+      expect(logged).toHaveBeenCalledWith(
+        JSON.stringify({ event: "sandbox.dispose_failed", failures: 1, error: "Error" }),
+      );
+
+      failing.mockImplementation(deleteAll);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("stops scheduling retries once deleting its storage failed the most times in a row", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      vi.spyOn(state.storage, "deleteAll").mockRejectedValue(new Error("scripted storage failure"));
+      vi.spyOn(console, "error").mockImplementation(noop);
+      state.storage.kv.put("railhead:disposal-failures", MAX_TEARDOWN_ATTEMPTS - 1);
+      // No wake-up of the fence's own is pending, so any alarm left would be a disposal retry.
+      state.storage.sql.exec("DELETE FROM container_schedules");
+
+      await sandbox.alarm();
+
+      expect(state.storage.kv.get("railhead:disposal-failures")).toBe(MAX_TEARDOWN_ATTEMPTS);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
       expect(await state.storage.getAlarm()).toBeNull();
     });
   });

@@ -28,7 +28,7 @@ import {
   type RestoreBackupResult,
 } from "@cloudflare/sandbox";
 import { MAX_OUTPUT_BYTES, type SandboxCommand, type SandboxDriver } from "./entry";
-import { SandboxFence } from "./fence";
+import { MAX_TEARDOWN_ATTEMPTS, SandboxFence, teardownRetryDelay } from "./fence";
 import { serveGitGateway } from "./gateway";
 import { readBoundedExec, type BoundedOutput } from "./output";
 import { parseSandboxGrant, type SandboxPolicy } from "./policy";
@@ -46,6 +46,9 @@ const IDLE_BACKSTOP = "45m";
  * `getSandbox(..., { enableDefaultSession: false })` sends for each `exec` in SDK 0.12.1.
  */
 const SESSIONLESS = "__DISABLE_SESSION__";
+
+/** How many storage deletions in a row failed, kept until one succeeds. */
+const DISPOSAL_FAILURES = "railhead:disposal-failures";
 
 /** The outbound handler a sandbox's policy selects. */
 const GIT_GATEWAY = "gitGateway";
@@ -109,15 +112,33 @@ export class RailheadSandbox extends Sandbox<Env> {
 
   /**
    * Runs the SDK's alarm, which calls `railheadExpire` when it is due. Afterwards, once the fence is
-   * `disposable`, deletes the object's alarm and all its storage, so a sandbox leaves no object
+   * `disposable`, deletes all the object's storage and then its alarm, so a sandbox leaves no object
    * behind. The deletion follows the SDK's alarm rather than running inside it, which still writes
-   * its schedule table after each callback.
+   * its schedule table after each callback. A deletion that fails leaves the record in place and
+   * schedules another alarm, backing off like a teardown, up to `MAX_TEARDOWN_ATTEMPTS` in a row;
+   * the alarm is removed only once the storage is gone.
    */
   override async alarm(alarmProps?: AlarmInvocationInfo): Promise<void> {
     await super.alarm(alarmProps);
     if (!this.#fence.disposable()) return;
+    try {
+      await this.ctx.storage.deleteAll();
+    } catch (error) {
+      const failures = disposalFailures(this.ctx.storage.kv.get(DISPOSAL_FAILURES)) + 1;
+      this.ctx.storage.kv.put(DISPOSAL_FAILURES, failures);
+      if (failures < MAX_TEARDOWN_ATTEMPTS) {
+        await this.ctx.storage.setAlarm(Date.now() + teardownRetryDelay(failures));
+      }
+      console.error(
+        JSON.stringify({
+          event: "sandbox.dispose_failed",
+          failures,
+          error: error instanceof Error ? error.name : "unknown",
+        }),
+      );
+      return;
+    }
     await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
   }
 
   // The SDK calls a CI run issues on this object, each run through `fenceSandbox`.
@@ -291,6 +312,11 @@ RailheadSandbox.outboundHandlers = {
       now: Date.now,
     }),
 };
+
+/** The stored count of failed storage deletions, `0` when none is stored. */
+function disposalFailures(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
 
 /**
  * When to schedule a wake-up meant for `at`. The SDK stores a scheduled time in whole seconds,
