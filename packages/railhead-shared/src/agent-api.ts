@@ -38,6 +38,7 @@ import {
   isCommitSha,
   isId,
   type AgentId,
+  type CheckRunId,
   type ClaimId,
   type CommitSha,
   type DecisionId,
@@ -259,6 +260,7 @@ export type AgentRouteName =
   | "work"
   | "claim"
   | "ready"
+  | "pin"
   | "inbox"
   | "ack"
   | "ask"
@@ -362,6 +364,13 @@ export const AGENT_ROUTES = {
       "commit_not_found",
       "claim_closed",
     ],
+  },
+  pin: {
+    method: "GET",
+    path: "/pin",
+    auth: "session",
+    idempotency: "read only",
+    errors: [],
   },
   inbox: {
     method: "GET",
@@ -723,6 +732,70 @@ export interface ReadyResult {
   repeated: boolean;
 }
 
+/** Where a batch holding a pin stands. */
+export type PinBatchState =
+  /** The batch is being composed on main. */
+  | "forming"
+  /** The batch's candidate is being checked. */
+  | "checking"
+  /** The candidate edits protected check paths and waits for a person; it is not run meanwhile. */
+  | "held"
+  /** The check passed; the merge is being authorized and main moved. */
+  | "landing";
+
+/** Why the train took a pin out of its queue without landing it. */
+export type PinLeaveReason =
+  /** The claim's current pin is no longer this generation and commit. */
+  | "pin_changed"
+  /** The claim's decision requirements could not be read. */
+  | "requirements_refused"
+  /** The change failed its check when checked alone. */
+  | "check_failed"
+  /** The change could not be composed alone, such as a missing commit. */
+  | "compose_failed"
+  /** The pin's batches failed for reasons outside it too many times. */
+  | "retries_exhausted"
+  /** The change conflicts with another claim's. */
+  | "conflict"
+  /** Checked alone, the change edits protected check paths and waits for a person. */
+  | "check_held";
+
+/** Where a pin stands on the train. Tagged by `kind`. */
+export type PinTrainState =
+  /** Waiting for a batch. `position` counts from 1, the next pin a batch takes. */
+  | { kind: "queued"; position: number }
+  /** In the active batch; `checkRunId` names its check run once one is recorded. */
+  | { kind: "batched"; batchId: number; batch: PinBatchState; checkRunId: CheckRunId | null }
+  /** Merged to main. */
+  | { kind: "landed" }
+  /** Removed from the train; a new `ready` episode queues the claim again. */
+  | { kind: "dropped"; reason: PinLeaveReason }
+  /** Out of the queue until a person or a new push returns it. */
+  | { kind: "parked"; reason: PinLeaveReason };
+
+/** The train's view of the calling agent's pin. */
+export interface PinView {
+  /** The claim. */
+  claimId: ClaimId;
+  /** The ownership generation the pin was recorded under: the claim's current one. */
+  generation: number;
+  /** The commit the train holds: the one queued, being checked, landed or taken out. */
+  commit: CommitSha;
+  /** A newer pinned commit waiting for the batch holding `commit` to settle, or `null`. */
+  nextCommit: CommitSha | null;
+  /** Where it stands. */
+  state: PinTrainState;
+}
+
+/**
+ * `pin` result. It shows only the calling agent's active claim at its current generation, never an
+ * older generation's pin, which may have belonged to another agent.
+ */
+export interface PinResult {
+  /** The pin, or `null` when the agent has no ready claim or the train holds no pin for it. */
+  pin: PinView | null;
+}
+
 /** `inbox` result. The query may carry `limit`, from 1 to `MAX_INBOX_PAGE`. */
 export interface InboxResult {
   /** Unacknowledged items, oldest first. Returning them records them as delivered. */
@@ -799,6 +872,8 @@ export interface AgentRequests {
   /** See `ReadyRequest`. */
   ready: ReadyRequest;
   /** No body. */
+  pin: null;
+  /** No body. */
   inbox: null;
   /** See `AckRequest`. */
   ack: AckRequest;
@@ -824,6 +899,8 @@ export interface AgentResults {
   claim: ClaimResult;
   /** See `ReadyResult`. */
   ready: ReadyResult;
+  /** See `PinResult`. */
+  pin: PinResult;
   /** See `InboxResult`. */
   inbox: InboxResult;
   /** See `AckResult`. */
@@ -883,6 +960,7 @@ export function validateAgentRequest(request: AgentRequestPair): void {
       return;
     case "work":
     case "status":
+    case "pin":
     case "inbox":
     case "question":
       return;

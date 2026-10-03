@@ -122,6 +122,7 @@ export const unavailableTrain: TrainPort = {
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
   holdsLiveEntry: () => null,
+  pinView: refuse("train"),
   armWake: async () => false,
   resume: async () => {},
 };
