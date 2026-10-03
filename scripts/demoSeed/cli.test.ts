@@ -104,7 +104,7 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
   assert.equal(lines.filter((line) => line.startsWith("--- end issue")).length, 3);
   assert.deepEqual(lines.slice(-2), [
     "note decision upload-size-limit (a, b) is opened by an agent's question, not seeded",
-    "note planned against an empty instance: pass --target ORIGIN to plan against one",
+    "note planned against an empty instance, so every issue shows as still to file: plan with --target ORIGIN before filing any",
   ]);
 });
 

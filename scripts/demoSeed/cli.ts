@@ -165,7 +165,7 @@ export async function run(
           ...describePlan(plan),
           ...describeIssues(plan),
           ...decision,
-          "note planned against an empty instance: pass --target ORIGIN to plan against one",
+          "note planned against an empty instance, so every issue shows as still to file: plan with --target ORIGIN before filing any",
         ];
       }
       using session = openSession(live.origin);
