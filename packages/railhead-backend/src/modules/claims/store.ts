@@ -9,7 +9,8 @@
 // base is written once, when the fork opens, and never changed.
 //
 // A ready claim keeps the decision versions its pin was recorded under, as JSON, so the train's
-// read of the pin can compare them with the current versions.
+// read of the pin can compare them with the current versions. A claim also keeps the last refusal
+// it recorded, so a repeated refusal is not recorded again.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -50,6 +51,7 @@ const MIGRATIONS: readonly string[] = [
   `CREATE INDEX claims_active_by_owner ON claims_claims (owner_id)
     WHERE state IN ('allocating', 'working', 'ready')`,
   "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -221,6 +223,41 @@ export function pinReady(
       JSON.stringify(decisions.map(({ decisionId, version }) => ({ decisionId, version }))),
       claimId,
       generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/**
+ * Returns a ready claim at `generation` to working and clears its pin. Returns `false`, and writes
+ * nothing, when the claim is no longer ready at that generation.
+ */
+export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL
+       WHERE claim_id = ? AND generation = ? AND state = 'ready'
+       RETURNING claim_id`,
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/**
+ * Records `refusal` as the claim's last refusal. Returns `false`, and writes nothing, when it is
+ * already the last one recorded.
+ */
+export function noteRefusal(sql: SqlStorage, claimId: ClaimId, refusal: string): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET last_refusal = ?
+       WHERE claim_id = ? AND last_refusal IS NOT ?
+       RETURNING claim_id`,
+      refusal,
+      claimId,
+      refusal,
     )
     .toArray();
   return updated.length === 1;

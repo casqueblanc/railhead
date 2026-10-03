@@ -612,31 +612,7 @@ describe("pin", () => {
     });
   });
 
-  it("refuses a pin whose decision was superseded after ready, even once the new version is acknowledged", async () => {
-    await withReady(async (setup) => {
-      const { claim, fork } = await setup.open();
-      setup.push(fork, WORK);
-      const first = await decide(setup, claim.claimId, null);
-      await ackAll(setup);
-      const readied = await setup.port.ready(agent(1), claim.claimId, request(WORK));
-      expect(readied).toMatchObject({ ok: true, value: { repeated: false } });
-      expect(await setup.port.pin(claim.claimId)).toEqual(
-        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
-      );
-
-      const second = await decide(setup, claim.claimId, 1, first.decisionId);
-      expect(second).toEqual({ decisionId: first.decisionId, version: 2 });
-
-      // The new version's item blocks the pin until it is acknowledged ...
-      expectFailure(await setup.port.pin(claim.claimId), "unacked_decision");
-      await ackAll(setup);
-      // ... and acknowledging it does not make work pinned under version 1 mergeable.
-      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
-      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
-    });
-  });
-
-  it("answers while the versions match in any order and refuses one more decision", async () => {
+  it("answers while the versions match in any order and reopens the claim when they do not", async () => {
     const a: DecisionRef = { decisionId: "dec_decisiona1", version: 1 };
     const b: DecisionRef = { decisionId: "dec_decisionb1", version: 3 };
     const world: World = { fake: new FakeArtifacts(), versions: [a, b], artifacts: true };
@@ -649,12 +625,27 @@ describe("pin", () => {
       world.versions = [b, a];
       expect(await setup.port.pin(claim.claimId)).toEqual(pinned);
 
-      world.versions = [a, b, { decisionId: "dec_decisionc1", version: 1 }];
-      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
-      world.versions = [a];
-      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
-      world.versions = [];
-      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      const c: DecisionRef = { decisionId: "dec_decisionc1", version: 1 };
+      for (const versions of [[a, b, c], [a], [], [b, a]]) {
+        world.versions = versions;
+        expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+        expect(claimState(setup.sql, claim.claimId)).toEqual({
+          state: "working",
+          ready_commit: null,
+        });
+        expect(setup.events().at(-1)).toMatchObject({
+          actor: { kind: "system", id: "sys_claims" },
+          type: "claim.reopened",
+          data: { claimId: claim.claimId, generation: 1, decisions: versions },
+        });
+        expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+        // The holder marks the work ready again under the versions that are now current.
+        expect(await setup.port.ready(agent(1), claim.claimId, request(WORK))).toMatchObject({
+          ok: true,
+          value: { repeated: false },
+        });
+        expect(await setup.port.pin(claim.claimId)).toEqual(pinned);
+      }
     }, world);
   });
 
@@ -675,7 +666,7 @@ describe("pin", () => {
     }, world);
   });
 
-  it("refuses a pin whose stored versions are missing or unreadable", async () => {
+  it("reopens a claim whose stored versions are missing or unreadable", async () => {
     await withReady(async (setup) => {
       const { claim, fork } = await setup.open();
       setup.push(fork, WORK);
@@ -695,7 +686,193 @@ describe("pin", () => {
           claim.claimId,
         );
         expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+        expect(claimState(setup.sql, claim.claimId).state).toBe("working");
+        expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
       }
+    });
+  });
+});
+
+describe("a decision superseded after ready", () => {
+  const push = { kind: "fork", operation: "push" } as const;
+
+  /** Agent 1's claim, ready at `WORK` under version 1 of a decision, then version 2 recorded. */
+  async function superseded(setup: Setup) {
+    const { claim, fork } = await setup.open();
+    setup.push(fork, WORK);
+    const first = await decide(setup, claim.claimId, null);
+    await ackAll(setup);
+    expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+    const second = await decide(setup, claim.claimId, 1, first.decisionId);
+    expect(second).toEqual({ decisionId: first.decisionId, version: 2 });
+    const access = {
+      principal: agent(1),
+      target: { kind: push.kind, claimId: claim.claimId },
+      operation: push.operation,
+    };
+    return { claim, fork, second, access };
+  }
+
+  it("returns the claim to working, so the holder can push and mark adapted work ready at the new version", async () => {
+    await withReady(async (setup, { fake }) => {
+      const { claim, fork, second, access } = await superseded(setup);
+
+      // The train's read finds the pin superseded and reopens the claim.
+      expectFailure(await setup.port.pin(claim.claimId), "decision_superseded");
+      expect(claimState(setup.sql, claim.claimId)).toEqual({
+        state: "working",
+        ready_commit: null,
+      });
+      expect(setup.events().at(-1)).toMatchObject({
+        actor: { kind: "system", id: "sys_claims" },
+        type: "claim.reopened",
+        data: { claimId: claim.claimId, generation: 1, decisions: [second] },
+      });
+      expect(await setup.port.activeClaim(agent(1))).toEqual(
+        ok({ ...claim, state: "working", readyCommit: null }),
+      );
+
+      // The holder may push again, and the new version still gates ready until acknowledged.
+      expect(await setup.port.authorizeGit(access)).toEqual(
+        ok({ repo: fork, scope: "write", fence: { claimId: claim.claimId, generation: 1 } }),
+      );
+      setup.push(fork, LATER);
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(LATER)),
+        "unacked_decision",
+      );
+      await ackAll(setup);
+      const write = fake.mintFor(fork, "write", 600);
+
+      expect(await setup.port.ready(agent(1), claim.claimId, request(LATER))).toEqual(
+        ok({ claim: { ...claim, state: "ready", readyCommit: LATER }, repeated: false }),
+      );
+      expect(setup.events().at(-1)).toMatchObject({
+        type: "claim.ready",
+        data: { claimId: claim.claimId, commit: LATER, decisions: [second] },
+      });
+      expect(fake.accepts(write.plaintext)).toBe(false);
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: LATER }),
+      );
+      expect(types(setup.events()).filter((type) => type === "claim.reopened")).toHaveLength(1);
+    });
+  });
+
+  it("refuses a repeated ready of the superseded pin instead of answering with it", async () => {
+    await withReady(async (setup) => {
+      const { claim } = await superseded(setup);
+      const head = setup.log.head();
+
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+
+      expect(claimState(setup.sql, claim.claimId)).toEqual({
+        state: "working",
+        ready_commit: null,
+      });
+      expect(types(setup.log.replay(head, 16).events)).toEqual(["claim.reopened", "claim.refused"]);
+      expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+    });
+  });
+
+  it("reopens on the holder's push, but not on another agent's", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork, access } = await superseded(setup);
+      const head = setup.log.head();
+
+      expectFailure(
+        await setup.port.authorizeGit({ ...access, principal: agent(2) }),
+        "stale_generation",
+      );
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+      expect(setup.log.head()).toBe(head);
+
+      expect(await setup.port.authorizeGit(access)).toEqual(
+        ok({ repo: fork, scope: "write", fence: { claimId: claim.claimId, generation: 1 } }),
+      );
+      expect(claimState(setup.sql, claim.claimId)).toEqual({
+        state: "working",
+        ready_commit: null,
+      });
+      expect(types(setup.log.replay(head, 16).events)).toEqual(["claim.reopened"]);
+    });
+  });
+
+  it("keeps the pin and refuses while the decision versions are unknown", async () => {
+    const world: World = { fake: new FakeArtifacts(), versions: [], artifacts: true };
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      const head = setup.log.head();
+
+      world.versions = null;
+      expectFailure(await setup.port.ready(agent(1), claim.claimId, request(WORK)), "unavailable");
+      expectFailure(
+        await setup.port.authorizeGit({
+          principal: agent(1),
+          target: { kind: "fork", claimId: claim.claimId },
+          operation: "push",
+        }),
+        "after_ready",
+      );
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+      expect(setup.log.head()).toBe(head);
+
+      world.versions = [];
+      expect(await setup.port.ready(agent(1), claim.claimId, request(WORK))).toMatchObject({
+        ok: true,
+        value: { repeated: true },
+      });
+    }, world);
+  });
+});
+
+describe("recorded refusals", () => {
+  it("records a repeated refusal once, and again when its reason or the pin changes", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      setup.push(fork, LATER);
+      const refusals = () =>
+        setup.events().filter((event) => event.type === "claim.refused").length;
+
+      for (let i = 0; i < 3; i += 1) {
+        expectFailure(
+          await setup.port.ready(agent(1), claim.claimId, request(WORK, 2)),
+          "stale_generation",
+        );
+      }
+      expect(refusals()).toBe(1);
+
+      queueConflict(setup, claim.claimId);
+      for (let i = 0; i < 3; i += 1) {
+        expectFailure(
+          await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+          "unacked_decision",
+        );
+      }
+      expect(refusals()).toBe(2);
+
+      await ackAll(setup);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      for (let i = 0; i < 3; i += 1) {
+        expectFailure(
+          await setup.port.ready(agent(1), claim.claimId, request(LATER)),
+          "after_ready",
+        );
+      }
+      // The pin changed the claim, so the same stale generation is recorded again, once.
+      for (let i = 0; i < 2; i += 1) {
+        expectFailure(
+          await setup.port.ready(agent(1), claim.claimId, request(WORK, 2)),
+          "stale_generation",
+        );
+      }
+      expect(refusals()).toBe(4);
     });
   });
 });

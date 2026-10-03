@@ -20,6 +20,7 @@ import {
 import {
   UPLOAD,
   checkResult,
+  decide,
   inbox,
   moveMain,
   push,
@@ -76,6 +77,15 @@ const atlasItem = (state: BoardState, item: number) => state.inbox[inboxKey(UPLO
 const ripple = (state: BoardState) => decisionRipple(state, UPLOAD.decision);
 
 const birch = (state: BoardState) => state.claims[UPLOAD.birchClaim];
+
+const atlas = (state: BoardState) => state.claims[UPLOAD.atlasClaim];
+
+/** Atlas's ready claim reopened at `decisions`. */
+const reopen = (decisions = [sizeDecision(2)]): SyntheticStep => ({
+  type: "claim.reopened",
+  actor: SYNTH_TRAIN,
+  data: { claimId: UPLOAD.atlasClaim, generation: 1, decisions },
+});
 
 describe("foldEvents over a delivered stream", () => {
   it("applies a complete log in order", () => {
@@ -352,6 +362,52 @@ describe("a ready claim that loses a redo conflict", () => {
       },
     });
     expect(birch(halted)?.head).toBe(synthCommit(2));
+  });
+});
+
+describe("a ready claim whose decision is superseded", () => {
+  const superseded = syntheticLog("Synthetic reopen of a ready claim", [
+    ...uploadPrelude(),
+    decide(1, "reject"),
+    ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), [sizeDecision(1)]),
+    decide(2, "chunk"),
+  ]);
+  const before = fold(superseded.events);
+
+  it("returns the claim to working with no pin, then lets it become ready at the new version", () => {
+    expect(atlas(before)?.phase).toBe("ready");
+    const reopened = append(before, reopen());
+    expect(reopened.stream).toEqual({ kind: "consistent" });
+    expect(atlas(reopened)).toMatchObject({ phase: "working", head: synthCommit(1), ready: null });
+
+    const readyAgain = append(
+      append(reopened, push(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), synthCommit(2))),
+      ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(2), [sizeDecision(2)]),
+    );
+    expect(readyAgain.stream).toEqual({ kind: "consistent" });
+    expect(atlas(readyAgain)).toMatchObject({
+      phase: "ready",
+      ready: { commit: synthCommit(2), decisions: [sizeDecision(2)] },
+    });
+  });
+
+  it("halts on a reopen of a claim that is not ready", () => {
+    const reopened = append(before, reopen());
+    const halted = append(reopened, reopen());
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: reopened.cursor + 1,
+        message: `claim ${UPLOAD.atlasClaim} cannot reopen while working`,
+      },
+    });
+  });
+
+  it("halts on a reopen naming a decision version never recorded", () => {
+    const halted = append(before, reopen([sizeDecision(3)]));
+    expect(halted.stream.kind).toBe("halted");
+    expect(atlas(halted)?.phase).toBe("ready");
   });
 });
 

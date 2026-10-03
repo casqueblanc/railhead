@@ -77,6 +77,14 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", generation: 1, reason: "after_ready" },
   },
+  "claim.reopened": {
+    actor: SYSTEM,
+    data: {
+      claimId: "clm_42abcd",
+      generation: 1,
+      decisions: [{ decisionId: "dec_upload1", version: 2 }],
+    },
+  },
   "claim.expired": {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", generation: 1 },
