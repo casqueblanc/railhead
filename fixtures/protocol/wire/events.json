@@ -365,6 +365,27 @@
       "data": {
         "agentId": "agt_atlas01"
       }
+    },
+    {
+      "v": 1,
+      "seq": 21,
+      "at": 1790000000021,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "claim.reopened",
+      "data": {
+        "claimId": "clm_42abcd",
+        "generation": 1,
+        "decisions": [
+          {
+            "decisionId": "dec_upload1",
+            "version": 2
+          }
+        ]
+      }
     }
   ],
   "largestSafeSeq": {

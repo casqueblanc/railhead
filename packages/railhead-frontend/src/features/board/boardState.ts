@@ -615,6 +615,17 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
         claims: put(state.claims, claimId, { ...claim, refusal: { generation, reason } }),
       };
     }
+    case "claim.reopened": {
+      const { claimId, generation, decisions } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      currentGeneration(claim, generation);
+      check(claim.phase === "ready", `claim ${claimId} cannot reopen while ${claim.phase}`);
+      for (const ref of decisions) knownDecisionVersion(state, ref);
+      return {
+        ...state,
+        claims: put(state.claims, claimId, { ...claim, phase: "working", ready: null }),
+      };
+    }
     case "claim.expired": {
       const { claimId, generation } = event.data;
       const claim = known(state.claims, claimId, "claim");

@@ -62,6 +62,7 @@ export const unavailableInbox: InboxPort = {
     throw new UnavailableError("inbox");
   },
   readyGate: refuse("inbox"),
+  readyGateNow: () => null,
 };
 
 /**

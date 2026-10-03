@@ -198,6 +198,27 @@ impl ClaimRefused {
     }
 }
 
+/// `claim.reopened`: a decision version recorded after ready superseded the pin, so the claim is
+/// working again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimReopened {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The ownership generation.
+    pub generation: SafeInteger,
+    /// The current decision versions the work must now follow.
+    pub decisions: Vec<DecisionRef>,
+}
+
+impl ClaimReopened {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::Claim, &self.claim_id, "claimId")?;
+        require_positive(self.generation, "generation")?;
+        require_decision_refs(&self.decisions)
+    }
+}
+
 /// `claim.expired`: a claim's lease ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
