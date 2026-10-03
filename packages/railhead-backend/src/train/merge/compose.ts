@@ -10,10 +10,14 @@
 // conflicts with and reports the pair with the conflicted paths if the conflict is one the train can
 // classify: text edits on both sides of every path. Any other conflict is `unsupported`.
 //
-// The whole compose runs within `MERGE_TIMEOUT_MS`, under the train's own bound on a port call, so
-// a slow merge is reported as `timeout` rather than lost. The sandbox is released before returning,
-// waiting at most `RELEASE_WAIT_MS` for its teardown; one that has not confirmed by then is still
-// torn down, and its slot freed, by the sandbox module.
+// The whole compose, release included, runs within `MERGE_TIMEOUT_MS`, under the train's own bound
+// on a port call, so a slow merge is reported as `timeout` rather than lost. Every sandbox and
+// Artifacts call is raced against one deadline, which stops `RELEASE_WAIT_MS` short of the budget
+// so the release still fits: the sandbox port's own limits allow a command a grace period past its
+// timeout, and an Artifacts lookup has its own longer bound. Work still pending at the deadline is
+// abandoned and its answer ignored; releasing the sandbox destroys it, so no command keeps running.
+// A teardown that has not confirmed within `RELEASE_WAIT_MS` is still finished, and its slot freed,
+// by the sandbox module.
 
 import { isCommitSha, isId, type ClaimId, type CommitSha } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
@@ -107,28 +111,35 @@ export function createMerge(deps: MergeDeps): MergePort {
         return fail("invalid_request", "Every pin needs a claim and a full commit SHA.");
       }
       const deadline = deps.clock() + timeoutMs;
-      const location = await within(
-        deps.locate().catch(() => null),
-        timeoutMs,
+      // Work stops early enough that releasing the sandbox still fits within the budget.
+      const until = new Deadline(deadline - releaseWaitMs, deps.clock);
+      const located = await until.race(
+        Promise.all([
+          deps.locate().catch(() => null),
+          deps.mainRepo(),
+          Promise.all(pins.map((pin) => deps.forkRepo(pin.claimId))),
+        ]),
       );
-      if (location.kind !== "done" || location.value === null) {
+      if (located.kind !== "done" || located.value[0] === null) {
         return fail("unavailable", "The repository's Git remote could not be found.");
       }
-      const main = await deps.mainRepo();
-      const forks = await Promise.all(pins.map((pin) => deps.forkRepo(pin.claimId)));
+      const [location, main, forks] = located.value;
       const attemptId = deps.attemptId();
       const prefix = `${CANDIDATE_REF_PREFIX}${attemptId}/`;
       const policy = parseSandboxPolicy({
-        host: location.value.host,
-        namespace: location.value.namespace,
+        host: location.host,
+        namespace: location.namespace,
         read: [...new Set(forks)],
         write: { repo: main, refPrefix: prefix },
       });
       if (policy === null) throw new Error("the merge built an invalid sandbox policy");
 
       const sandbox = deps.sandbox();
+      // Releases the attempt, waiting for its teardown no longer than the budget allows.
+      const release = () =>
+        within(sandbox.release(attemptId), Math.min(releaseWaitMs, deadline - deps.clock()));
       const admitting = sandbox.admit(attemptId, policy, MERGE_SANDBOX_LIFETIME_MS);
-      const admitted = await within(admitting, deadline - deps.clock());
+      const admitted = await until.race(admitting);
       if (admitted.kind !== "done") {
         // Whatever the admission did, release it once it settles.
         void admitting.finally(() => sandbox.release(attemptId)).catch(() => undefined);
@@ -137,19 +148,19 @@ export function createMerge(deps: MergeDeps): MergePort {
       }
       if (!admitted.value.ok) {
         // A start that did not confirm leaves its slot uncertain; releasing it retries the teardown.
-        await within(sandbox.release(attemptId), releaseWaitMs);
+        await release();
         return admitted.value;
       }
       if (admitted.value.value.kind === "queued") {
-        await sandbox.release(attemptId);
+        await release();
         return fail("busy", "Every sandbox is taken; the compose can be tried again later.");
       }
 
-      const run = new Run(sandbox, attemptId, deadline, deps);
+      const run = new Run(sandbox, attemptId, until, deps);
       try {
         return ok(
           await run.compose({
-            location: location.value,
+            location,
             main,
             expectedMain,
             pins,
@@ -158,8 +169,7 @@ export function createMerge(deps: MergeDeps): MergePort {
           }),
         );
       } finally {
-        const releasing = sandbox.release(attemptId);
-        await within(releasing, releaseWaitMs);
+        await release();
       }
     },
   };
@@ -181,10 +191,10 @@ type Step = { kind: "ran"; exec: SandboxExec } | { kind: "ended"; outcome: Merge
 class Run {
   readonly #sandbox: SandboxPort;
   readonly #attemptId: string;
-  readonly #deadline: number;
+  readonly #deadline: Deadline;
   readonly #deps: MergeDeps;
 
-  constructor(sandbox: SandboxPort, attemptId: string, deadline: number, deps: MergeDeps) {
+  constructor(sandbox: SandboxPort, attemptId: string, deadline: Deadline, deps: MergeDeps) {
     this.#sandbox = sandbox;
     this.#attemptId = attemptId;
     this.#deadline = deadline;
@@ -237,8 +247,11 @@ class Run {
       const target = targets[exitCode - FETCH_FAILED_EXIT];
       if (exitCode < FETCH_FAILED_EXIT || target === undefined) return failure("infrastructure");
       // A commit the repository does not hold is missing; any other fetch failure is Railhead's.
-      const exists = await this.#deps.commitExists(target.repo, target.commit);
-      return exists.ok && !exists.value ? failure("missing_commit") : failure("infrastructure");
+      const exists = await this.#deadline.race(this.#deps.commitExists(target.repo, target.commit));
+      if (exists.kind === "timeout" || this.#deadline.passed()) return failure("timeout");
+      return exists.kind === "done" && exists.value.ok && !exists.value.value
+        ? failure("missing_commit")
+        : failure("infrastructure");
     }
     // A pin whose history does not reach main's within the deepest fetch has a missing parent.
     return failure("missing_commit");
@@ -283,20 +296,25 @@ class Run {
 
   /**
    * Runs one command built for the seconds left, or ends the compose: `timeout` when the deadline
-   * passed or cut the command, `infrastructure` when the sandbox did not run it.
+   * passed before the command answered or cut it, `infrastructure` when the sandbox did not run it.
+   * An answer that arrives after the deadline, even a success, is a timeout.
    */
   async #exec(build: (seconds: number) => string): Promise<Step> {
-    const left = this.#deadline - this.#deps.clock();
+    const left = this.#deadline.left();
     const seconds = Math.floor(left / 1000);
     if (seconds < 1) return { kind: "ended", outcome: failure("timeout") };
-    const result = await this.#sandbox.exec(this.#attemptId, {
-      command: build(seconds),
-      timeoutMs: Math.min(left, MAX_COMMAND_TIMEOUT_MS),
-    });
-    if (!result.ok) {
-      const late = this.#deps.clock() >= this.#deadline;
-      return { kind: "ended", outcome: failure(late ? "timeout" : "infrastructure") };
+    const answer = await this.#deadline.race(
+      this.#sandbox.exec(this.#attemptId, {
+        command: build(seconds),
+        timeoutMs: Math.min(left, MAX_COMMAND_TIMEOUT_MS),
+      }),
+    );
+    if (answer.kind === "timeout" || this.#deadline.passed()) {
+      return { kind: "ended", outcome: failure("timeout") };
     }
+    if (answer.kind === "failed") return { kind: "ended", outcome: failure("infrastructure") };
+    const result = answer.value;
+    if (!result.ok) return { kind: "ended", outcome: failure("infrastructure") };
     if (TIMEOUT_EXITS.includes(result.value.exitCode)) {
       return { kind: "ended", outcome: failure("timeout") };
     }
@@ -338,6 +356,30 @@ function failure(
   reason: Extract<MergeOutcome, { kind: "error" }>["reason"],
 ): Extract<MergeOutcome, { kind: "error" }> {
   return { kind: "error", reason };
+}
+
+/** The point by which a compose's work must answer, read from the injected clock. */
+class Deadline {
+  readonly #at: number;
+  readonly #clock: () => number;
+
+  constructor(at: number, clock: () => number) {
+    this.#at = at;
+    this.#clock = clock;
+  }
+
+  left(): number {
+    return this.#at - this.#clock();
+  }
+
+  passed(): boolean {
+    return this.left() <= 0;
+  }
+
+  /** Waits for `work` until the deadline; work still pending then is abandoned. */
+  race<T>(work: Promise<T>): Promise<Within<T>> {
+    return within(work, this.left());
+  }
 }
 
 type Within<T> = { kind: "done"; value: T } | { kind: "failed" } | { kind: "timeout" };

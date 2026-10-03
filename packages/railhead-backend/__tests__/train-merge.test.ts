@@ -98,14 +98,20 @@ interface Harness {
   exists: { calls: string[] };
 }
 
-type Overrides = Partial<Pick<MergeDeps, "locate" | "commitExists">>;
+type Overrides = Partial<Pick<MergeDeps, "locate" | "commitExists" | "clock" | "limits">> & {
+  /** Wraps the sandbox port the merge sees, to change how its calls answer. */
+  wrap?: (port: SandboxPort) => SandboxPort;
+};
 
 /** Runs `body` with a merge port over a sandbox port in a fresh Durable Object's storage. */
-function withMerge(body: (harness: Harness) => Promise<void>, overrides: Overrides = {}) {
+function withMerge(
+  body: (harness: Harness) => Promise<void>,
+  { wrap = (port) => port, ...overrides }: Overrides = {},
+) {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
     let now = 1_000_000;
-    const clock = () => now;
+    const clock = overrides.clock ?? (() => now);
     const fake = new ScriptedDriver();
     const sandbox = createSandboxPort(new SlotTable(state.storage), {
       driver: fake.driver,
@@ -115,7 +121,7 @@ function withMerge(body: (harness: Harness) => Promise<void>, overrides: Overrid
     const exists = { calls: [] as string[] };
     let attempts = 0;
     const merge = createMerge({
-      sandbox: () => sandbox,
+      sandbox: () => wrap(sandbox),
       locate: async () => LOCATION,
       mainRepo: async () => MAIN_REPO,
       forkRepo: async (claimId) => `rh-f-${claimId.slice(4)}`,
@@ -130,6 +136,13 @@ function withMerge(body: (harness: Harness) => Promise<void>, overrides: Overrid
     });
     await body({ merge, fake, sandbox, advance: (ms) => (now += ms), exists });
   });
+}
+
+/** A budget short enough to run on the real clock, with one whole second for the first step. */
+const SHORT = { timeoutMs: 1_500, releaseWaitMs: 200 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function entries(path: string, stages: [number, string, string][]): string {
@@ -394,10 +407,80 @@ describe("compose", () => {
     });
   });
 
+  it("ends at its deadline when a command answers late, even with success, and releases", async () => {
+    // A push the sandbox ran but whose answer arrives after the budget, as the port's grace allows.
+    // The delay is kept to wait for that answer to arrive.
+    const late: Promise<void>[] = [];
+    await withMerge(
+      async (harness) => {
+        harness.fake.replies.merge = [{ exitCode: 0, stdout: `${CANDIDATE}\n` }];
+
+        const started = Date.now();
+        const result = await harness.merge.compose(MAIN, [PIN_A]);
+        const elapsed = Date.now() - started;
+
+        expect(result).toEqual(ok({ kind: "error", reason: "timeout" }));
+        expect(elapsed).toBeLessThan(SHORT.timeoutMs);
+        expect(harness.fake.steps()).toEqual(["init", "fetch", "merge", "push"]);
+        await expectReleased(harness);
+        // The push's answer, once it arrives, changes nothing.
+        expect(late).toHaveLength(1);
+        await Promise.all(late);
+        await expectReleased(harness);
+      },
+      {
+        clock: Date.now,
+        limits: SHORT,
+        wrap: (port) => ({
+          ...port,
+          exec: async (attemptId, command) => {
+            const answer = await port.exec(attemptId, command);
+            if (!command.command.includes("git push")) return answer;
+            const delay = sleep(SHORT.timeoutMs);
+            late.push(delay);
+            await delay;
+            return answer;
+          },
+        }),
+      },
+    );
+  });
+
+  it("ends at its deadline when a missing commit's lookup answers late, and releases", async () => {
+    // The delay is kept to wait for the lookup's answer to arrive.
+    const late: Promise<void>[] = [];
+    await withMerge(
+      async (harness) => {
+        harness.fake.replies.fetch = [{ exitCode: 10 }];
+
+        const started = Date.now();
+        const result = await harness.merge.compose(MAIN, [PIN_A]);
+        const elapsed = Date.now() - started;
+
+        expect(result).toEqual(ok({ kind: "error", reason: "timeout" }));
+        expect(elapsed).toBeLessThan(SHORT.timeoutMs);
+        await expectReleased(harness);
+        expect(late).toHaveLength(1);
+        await Promise.all(late);
+        await expectReleased(harness);
+      },
+      {
+        clock: Date.now,
+        limits: SHORT,
+        commitExists: async () => {
+          const delay = sleep(SHORT.timeoutMs);
+          late.push(delay);
+          await delay;
+          return ok(false);
+        },
+      },
+    );
+  });
+
   it("gives each step only the seconds left", async () => {
     await withMerge(async (harness) => {
       harness.fake.replies.merge = [{ exitCode: 0, stdout: `${CANDIDATE}\n` }];
-      harness.fake.onExec = () => harness.advance(4_000);
+      harness.fake.onExec = () => harness.advance(3_000);
 
       expect(await harness.merge.compose(MAIN, [PIN_A])).toEqual(
         ok({ kind: "clean", candidate: CANDIDATE }),
@@ -405,9 +488,10 @@ describe("compose", () => {
       const budgets = harness.fake.commands.map(
         (command) => /\+ (\d+) \)\)/.exec(command.command)?.[1],
       );
-      expect(budgets).toEqual(["15", "11", "7", "3"]);
+      // The budget less the release wait: 15 s - 50 ms.
+      expect(budgets).toEqual(["14", "11", "8", "5"]);
       expect(harness.fake.commands.map((command) => command.timeoutMs)).toEqual([
-        15_000, 11_000, 7_000, 3_000,
+        14_950, 11_950, 8_950, 5_950,
       ]);
     });
   });
