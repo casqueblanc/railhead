@@ -18,9 +18,9 @@ use crate::events::{InboxEntry, QuestionOption};
 use crate::integer::{SafeInteger, nullable};
 use crate::payloads::{require_options, require_scope};
 use crate::rules::{
-    IdKind, MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, is_armored_signature, is_challenge_id,
-    is_commit_sha, is_ed25519_public_key, is_invite_secret, is_request_id, require, require_id,
-    require_positive, require_text,
+    IdKind, MAX_PATH_LENGTH, MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, is_armored_signature,
+    is_challenge_id, is_commit_sha, is_ed25519_public_key, is_invite_secret, is_request_id,
+    require, require_id, require_positive, require_text,
 };
 
 /// The agent protocol version, the `v1` in every route path.
@@ -866,7 +866,17 @@ impl AskRequest {
             "a question of 1 to 2000 characters",
         )?;
         require_options(&self.options)?;
-        require_scope(&self.scope)
+        require_scope(&self.scope)?;
+        // The inbox refuses blank scope text, so an answer naming a blank path could never be
+        // delivered.
+        self.scope.iter().try_for_each(|path| {
+            require_text(
+                path,
+                MAX_PATH_LENGTH,
+                "scope",
+                "a repository path that is not blank",
+            )
+        })
     }
 }
 

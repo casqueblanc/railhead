@@ -560,6 +560,7 @@ def agent_fixtures() -> dict:
                 rejected("scope over the limit", {**ASK_BODY, "scope": [f"src/file{i}.ts" for i in range(65)]}, "invariant"),
                 rejected("absolute scope path", {**ASK_BODY, "scope": ["/src/upload.ts"]}, "invariant"),
                 rejected("scope path with a dot-dot segment", {**ASK_BODY, "scope": ["src/../upload.ts"]}, "invariant"),
+                rejected("blank scope path", {**ASK_BODY, "scope": [" "]}, "invariant"),
                 rejected("scope missing", {k: v for k, v in ASK_BODY.items() if k != "scope"}, "shape"),
             ],
         },

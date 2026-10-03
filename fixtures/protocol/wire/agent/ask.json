@@ -379,6 +379,26 @@
       "stage": "invariant"
     },
     {
+      "name": "blank scope path",
+      "body": {
+        "generation": 1,
+        "requestId": "req_upload0000000001",
+        "text": "Should uploads above 10 MB be rejected or chunked?",
+        "options": [
+          {
+            "key": "reject",
+            "label": "Reject them"
+          },
+          {
+            "key": "chunk",
+            "label": "Upload them in chunks"
+          }
+        ],
+        "scope": [" "]
+      },
+      "stage": "invariant"
+    },
+    {
       "name": "scope missing",
       "body": {
         "generation": 1,

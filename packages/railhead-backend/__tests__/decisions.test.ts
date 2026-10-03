@@ -9,7 +9,7 @@ import {
   type DecisionView,
 } from "@railhead/shared/agent-api";
 import type { OwnerAction } from "@railhead/shared/board-api";
-import { MAX_LIST_LENGTH, type RailheadEvent } from "@railhead/shared/events";
+import { MAX_LIST_LENGTH, type QuestionOption, type RailheadEvent } from "@railhead/shared/events";
 import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../src/contracts/result";
@@ -201,6 +201,34 @@ describe("ask", () => {
     });
   });
 
+  it("treats a retry with reordered or extra option fields as the same question", async () => {
+    await withDecisions(async (h) => {
+      // Field order and undeclared fields are the sender's serialization, not the question.
+      const reordered: QuestionOption[] = ASK.options.map(({ key, label }) => {
+        const option = { label, key, note: "not part of the question" };
+        return option;
+      });
+      const first = await h.decisions.ask(h.agent(), CLAIM, { ...ASK, options: reordered });
+      if (!first.ok) throw new Error(first.code);
+      const repeat = await h.decisions.ask(h.agent(), CLAIM, ASK);
+      expect(repeat).toEqual(first);
+      expect(h.count("questions")).toBe(1);
+      expect(h.count("decision_claims")).toBe(1);
+      const events = h.events();
+      expect(types(events)).toEqual(["question.asked"]);
+      expect(events[0]).toMatchObject({ data: { options: ASK.options } });
+      expect(events[0]?.type === "question.asked" && events[0].data.options).toEqual(ASK.options);
+
+      // The options' order is part of the question.
+      const reversed = await h.decisions.ask(h.agent(), CLAIM, {
+        ...ASK,
+        options: ASK.options.toReversed(),
+      });
+      expect(reversed).toMatchObject({ ok: false, code: "idempotency_mismatch" });
+      expect(h.count("questions")).toBe(1);
+    });
+  });
+
   it("refuses invalid input and records nothing", async () => {
     await withDecisions(async (h) => {
       const [reject, chunk] = ASK.options;
@@ -218,6 +246,9 @@ describe("ask", () => {
         [CLAIM, { ...ASK, scope: [] }],
         [CLAIM, { ...ASK, scope: ["/src/upload.ts"] }],
         [CLAIM, { ...ASK, scope: ["src/../upload.ts"] }],
+        // The inbox refuses blank scope text, so such a question could never be answered.
+        [CLAIM, { ...ASK, scope: [" "] }],
+        [CLAIM, { ...ASK, scope: ["src/upload.ts", "\t\uFEFF"] }],
         [CLAIM, { ...ASK, scope: Array.from({ length: 65 }, (_, i) => `src/f${i}.ts`) }],
         ["iss_issue001", ASK],
       ];
@@ -327,6 +358,20 @@ describe("record", () => {
         ok({ questionId, decisionId, state: "answered", decision: expected }),
       );
       expect(await h.decisions.requirements(CLAIM)).toEqual(ok([{ decisionId, version: 1 }]));
+    });
+  });
+
+  it("delivers an answer whose scope path holds whitespace, as Git allows", async () => {
+    await withDecisions(async (h) => {
+      // Every scope `ask` accepts must reach the real inbox, or the question could never close.
+      const scope = ["docs/ notes.md", " leading.ts"];
+      const { decisionId } = await h.ask({ scope });
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "reject", expectedVersion: null }),
+      );
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      const page = await h.inbox.pending(h.agent(), MAX_INBOX_PAGE);
+      expect(page.ok && page.value.items.map((item) => item.decision?.scope)).toEqual([scope]);
     });
   });
 

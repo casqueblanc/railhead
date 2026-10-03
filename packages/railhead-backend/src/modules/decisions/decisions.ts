@@ -19,7 +19,7 @@
 
 import {
   MAX_LONG_POLL_MS,
-  isRepositoryPath,
+  isScopePath,
   isRequestId,
   type AskRequest,
   type DecisionView,
@@ -284,13 +284,14 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
   }
 
   return {
-    async ask(agent, claimId, request): Promise<PortResult<QuestionResult>> {
+    async ask(agent, claimId, sent): Promise<PortResult<QuestionResult>> {
       if (foreign(agent)) return notForThisRepo();
       if (!isId("claim", claimId)) {
         return fail("invalid_request", "The claim is not a claim identifier.");
       }
-      const invalid = invalidAsk(request);
+      const invalid = invalidAsk(sent);
       if (invalid !== null) return fail("invalid_request", invalid);
+      const request = ownedAsk(sent);
 
       const repeat = repeated(agent, claimId, request);
       if (repeat !== null) return repeat;
@@ -535,8 +536,22 @@ function invalidAsk(request: AskRequest): string | null {
   if (scope.length === 0 || scope.length > MAX_LIST_LENGTH) {
     return `The scope names from 1 to ${MAX_LIST_LENGTH} repository paths.`;
   }
-  if (!scope.every(isRepositoryPath)) return "A scope entry is not a repository path.";
+  if (!scope.every(isScopePath)) return "A scope entry is not a repository path.";
   return null;
+}
+
+/**
+ * Keeps only the fields a question owns, in a fixed order, so a retry whose option objects list
+ * `key` and `label` in another order, or carry extra properties, is the same request.
+ */
+function ownedAsk(request: AskRequest): AskRequest {
+  return {
+    generation: request.generation,
+    requestId: request.requestId,
+    text: request.text,
+    options: request.options.map(({ key, label }) => ({ key, label })),
+    scope: [...request.scope],
+  };
 }
 
 function sameAsk(row: QuestionRow, claimId: ClaimId, request: AskRequest): boolean {

@@ -470,6 +470,13 @@ fn validates_requests_before_they_are_sent() -> TestResult {
     ask(eight.clone(), &"x".repeat(2000)).validate()?;
     let sixty_four: Vec<String> = (0..64).map(|i| format!("src/f{i}.ts")).collect();
     ask_in(vec![option("a"), option("b")], "Which?", sixty_four).validate()?;
+    // Whitespace inside a path is a valid Git filename; only a blank path is refused.
+    ask_in(
+        vec![option("a"), option("b")],
+        "Which?",
+        vec!["docs/ notes.md".to_owned()],
+    )
+    .validate()?;
     let mut nine = eight;
     nine.push(option("i"));
     for request in [
@@ -483,6 +490,11 @@ fn validates_requests_before_they_are_sent() -> TestResult {
             vec![option("a"), option("b")],
             "Which?",
             vec!["/src".to_owned()],
+        ),
+        ask_in(
+            vec![option("a"), option("b")],
+            "Which?",
+            vec!["\u{feff}".to_owned()],
         ),
         ask_in(
             vec![option("a"), option("b")],

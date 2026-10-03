@@ -753,8 +753,9 @@ export interface AskRequest {
   /** The answers offered, between `MIN_OPTIONS` and `MAX_OPTIONS`, with unique keys. */
   options: QuestionOption[];
   /**
-   * The repository paths the answer applies to: 1 to `MAX_LIST_LENGTH` relative paths, none empty
-   * or with a `.` or `..` segment. The decision the answer records carries them as its scope.
+   * The repository paths the answer applies to: 1 to `MAX_LIST_LENGTH` relative paths, none blank
+   * or with an empty, `.` or `..` segment. The decision the answer records carries them as its
+   * scope.
    */
   scope: string[];
 }
@@ -957,13 +958,17 @@ function requireScope(scope: string[]): void {
     throw new Error(`scope must have between 1 and ${MAX_LIST_LENGTH} entries`);
   }
   scope.forEach((path, index) => {
-    if (!isRepositoryPath(path)) throw new Error(`scope[${index}] is not a repository path`);
+    if (!isScopePath(path)) throw new Error(`scope[${index}] is not a repository path`);
   });
 }
 
-/** True when `path` is a relative repository path with no empty, `.` or `..` segment. */
-export function isRepositoryPath(path: string): boolean {
-  if (path === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
+/**
+ * True when `path` can be a question's scope entry: a relative repository path, not blank, with no
+ * empty, `.` or `..` segment. Blank paths are refused because the inbox refuses blank scope text,
+ * so an answer naming one could never be delivered.
+ */
+export function isScopePath(path: string): boolean {
+  if (path.trim() === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
   return path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
