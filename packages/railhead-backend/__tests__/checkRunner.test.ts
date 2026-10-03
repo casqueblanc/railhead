@@ -1453,7 +1453,10 @@ describe("a held check through the train", () => {
         claims: { ...composed.claims, pin: async () => ok(pin) },
         decisions: { ...composed.decisions, requirements: async () => ok([]) },
         mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
-        merge: { compose: async () => ok({ kind: "clean", candidate: CANDIDATE }) },
+        merge: {
+          compose: async () => ok({ kind: "clean", candidate: CANDIDATE }),
+          discard: async () => ok({ removed: 1 }),
+        },
       });
       const train = createTrain(context, ports);
 
