@@ -6,11 +6,12 @@
 // backend verifies the signature, the action the challenge commits to and the origin; this module
 // only carries bytes.
 
-import type {
-  ActionChallenge,
-  EnrollmentChallenge,
-  PasskeyAssertion,
-  PasskeyRegistration,
+import {
+  ACTION_CHALLENGE_TTL_MS,
+  type ActionChallenge,
+  type EnrollmentChallenge,
+  type PasskeyAssertion,
+  type PasskeyRegistration,
 } from "@railhead/shared/board-api";
 
 /** The two calls of `navigator.credentials` the owner's passkey uses. */
@@ -58,8 +59,11 @@ export const fromBase64Url = (text: string): Uint8Array<ArrayBuffer> | null => {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 };
 
-/** Milliseconds left until `expiresAt`, never negative. */
-const remaining = (expiresAt: number, now: number): number => Math.max(0, expiresAt - now);
+/**
+ * How long the browser shows a passkey prompt. A challenge's `expiresAt` is on the backend's clock,
+ * so the board does not compare it with its own; the backend refuses an expired challenge.
+ */
+const CEREMONY_TIMEOUT_MS = ACTION_CHALLENGE_TTL_MS;
 
 /**
  * Asks the authenticator to sign the challenge the backend bound to one owner action. Aborting
@@ -69,18 +73,11 @@ export const signAction = async (
   authenticator: Authenticator,
   challenge: ActionChallenge,
   signal: AbortSignal,
-  now: number = Date.now(),
 ): Promise<CeremonyOutcome<PasskeyAssertion>> => {
   const bytes = fromBase64Url(challenge.challenge);
   const allow = challenge.allowCredentials.map(fromBase64Url);
   if (bytes === null || allow.some((id) => id === null)) {
     return { kind: "failed", message: "The backend sent a challenge this browser cannot read." };
-  }
-  if (remaining(challenge.expiresAt, now) === 0) {
-    return {
-      kind: "failed",
-      message: "The passkey request expired before it was shown. Try again.",
-    };
   }
   return ceremony(
     () =>
@@ -93,7 +90,7 @@ export const signAction = async (
             id === null ? [] : [{ type: "public-key", id }],
           ),
           userVerification: "required",
-          timeout: remaining(challenge.expiresAt, now),
+          timeout: CEREMONY_TIMEOUT_MS,
         },
       }),
     readAssertion,
@@ -108,18 +105,11 @@ export const registerPasskey = async (
   authenticator: Authenticator,
   challenge: EnrollmentChallenge,
   signal: AbortSignal,
-  now: number = Date.now(),
 ): Promise<CeremonyOutcome<PasskeyRegistration>> => {
   const bytes = fromBase64Url(challenge.challenge);
   const userHandle = fromBase64Url(challenge.userHandle);
   if (bytes === null || userHandle === null) {
     return { kind: "failed", message: "The backend sent a challenge this browser cannot read." };
-  }
-  if (remaining(challenge.expiresAt, now) === 0) {
-    return {
-      kind: "failed",
-      message: "The passkey request expired before it was shown. Try again.",
-    };
   }
   return ceremony(
     () =>
@@ -132,7 +122,7 @@ export const registerPasskey = async (
           pubKeyCredParams: [{ type: "public-key", alg: COSE_ALG_ES256 }],
           authenticatorSelection: { residentKey: "preferred", userVerification: "required" },
           attestation: "none",
-          timeout: remaining(challenge.expiresAt, now),
+          timeout: CEREMONY_TIMEOUT_MS,
         },
       }),
     readRegistration,

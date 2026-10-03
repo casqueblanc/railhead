@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ActionChallenge, EnrollmentChallenge } from "@railhead/shared/board-api";
+import {
+  ACTION_CHALLENGE_TTL_MS,
+  type ActionChallenge,
+  type EnrollmentChallenge,
+} from "@railhead/shared/board-api";
 import { FAKE_ENCODED, fakeAuthenticator } from "./fakeAuthenticator";
 import { fromBase64Url, registerPasskey, signAction, toBase64Url } from "./webauthn";
 
@@ -51,7 +55,7 @@ describe("base64url", () => {
 describe("signAction", () => {
   it("asks for a user-verified assertion over the challenge and encodes the credential", async () => {
     const { authenticator, requests } = fakeAuthenticator();
-    const outcome = await signAction(authenticator, actionChallenge(), live, NOW);
+    const outcome = await signAction(authenticator, actionChallenge(), live);
 
     expect(outcome).toEqual({
       kind: "done",
@@ -66,7 +70,7 @@ describe("signAction", () => {
     const publicKey = requests[0]?.publicKey;
     expect(publicKey?.rpId).toBe("railhead.dev");
     expect(publicKey?.userVerification).toBe("required");
-    expect(publicKey?.timeout).toBe(60_000);
+    expect(publicKey?.timeout).toBe(ACTION_CHALLENGE_TTL_MS);
     expect(publicKey?.challenge).toEqual(new Uint8Array([0, 1, 2, 3]));
     expect(publicKey?.allowCredentials).toEqual([
       { type: "public-key", id: new Uint8Array([1, 2, 3]) },
@@ -76,7 +80,7 @@ describe("signAction", () => {
   it("hands the browser the signal that cancels its prompt", async () => {
     const { authenticator, requests } = fakeAuthenticator();
     const controller = new AbortController();
-    await signAction(authenticator, actionChallenge(), controller.signal, NOW);
+    await signAction(authenticator, actionChallenge(), controller.signal);
 
     controller.abort();
     expect(requests[0]?.signal?.aborted).toBe(true);
@@ -85,38 +89,38 @@ describe("signAction", () => {
   it("reports a dismissed prompt and a missing credential as cancelled", async () => {
     for (const answer of ["dismiss", "none"] as const) {
       const { authenticator } = fakeAuthenticator(() => answer);
-      expect(await signAction(authenticator, actionChallenge(), live, NOW)).toEqual({
+      expect(await signAction(authenticator, actionChallenge(), live)).toEqual({
         kind: "cancelled",
       });
     }
   });
 
-  it("does not prompt for a challenge it cannot decode or one already expired", async () => {
+  it("does not prompt for a challenge it cannot decode", async () => {
     const { authenticator, requests } = fakeAuthenticator();
-    const unreadable = await signAction(
-      authenticator,
-      actionChallenge({ challenge: "A=" }),
-      live,
-      NOW,
-    );
+    const unreadable = await signAction(authenticator, actionChallenge({ challenge: "A=" }), live);
     const badCredential = await signAction(
       authenticator,
       actionChallenge({ allowCredentials: ["AQID", "not base64!"] }),
       live,
-      NOW,
     );
-    const expired = await signAction(authenticator, actionChallenge({ expiresAt: NOW }), live, NOW);
 
     expect(unreadable.kind).toBe("failed");
     expect(badCredential.kind).toBe("failed");
-    expect(expired.kind).toBe("failed");
     expect(requests).toHaveLength(0);
+  });
+
+  it("leaves expiry to the backend's clock and prompts for the challenge lifetime", async () => {
+    const { authenticator, requests } = fakeAuthenticator();
+    const outcome = await signAction(authenticator, actionChallenge({ expiresAt: 0 }), live);
+
+    expect(outcome.kind).toBe("done");
+    expect(requests[0]?.publicKey?.timeout).toBe(ACTION_CHALLENGE_TTL_MS);
   });
 
   it("fails on a browser error or a credential without a signature", async () => {
     for (const answer of ["error", "malformed"] as const) {
       const { authenticator } = fakeAuthenticator(() => answer);
-      const outcome = await signAction(authenticator, actionChallenge(), live, NOW);
+      const outcome = await signAction(authenticator, actionChallenge(), live);
       expect(outcome.kind).toBe("failed");
     }
   });
@@ -125,7 +129,7 @@ describe("signAction", () => {
 describe("registerPasskey", () => {
   it("creates an ES256 passkey for the owner's user handle and encodes the attestation", async () => {
     const { authenticator, creations } = fakeAuthenticator();
-    const outcome = await registerPasskey(authenticator, enrollmentChallenge(), live, NOW);
+    const outcome = await registerPasskey(authenticator, enrollmentChallenge(), live);
 
     expect(outcome).toEqual({
       kind: "done",
@@ -145,7 +149,7 @@ describe("registerPasskey", () => {
   it("hands the browser the signal that cancels its prompt", async () => {
     const { authenticator, creations } = fakeAuthenticator();
     const controller = new AbortController();
-    await registerPasskey(authenticator, enrollmentChallenge(), controller.signal, NOW);
+    await registerPasskey(authenticator, enrollmentChallenge(), controller.signal);
 
     controller.abort();
     expect(creations[0]?.signal?.aborted).toBe(true);
@@ -153,34 +157,36 @@ describe("registerPasskey", () => {
 
   it("reports a dismissed prompt as cancelled", async () => {
     const { authenticator } = fakeAuthenticator(() => "dismiss");
-    expect(await registerPasskey(authenticator, enrollmentChallenge(), live, NOW)).toEqual({
+    expect(await registerPasskey(authenticator, enrollmentChallenge(), live)).toEqual({
       kind: "cancelled",
     });
   });
 
-  it("does not prompt for an unreadable user handle or an expired challenge", async () => {
+  it("does not prompt for an unreadable user handle", async () => {
     const { authenticator, creations } = fakeAuthenticator();
     const unreadable = await registerPasskey(
       authenticator,
       enrollmentChallenge({ userHandle: "?" }),
       live,
-      NOW,
-    );
-    const expired = await registerPasskey(
-      authenticator,
-      enrollmentChallenge({ expiresAt: NOW - 1 }),
-      live,
-      NOW,
     );
     expect(unreadable.kind).toBe("failed");
-    expect(expired.kind).toBe("failed");
     expect(creations).toHaveLength(0);
+  });
+
+  it("leaves expiry to the backend's clock and prompts for the challenge lifetime", async () => {
+    const { authenticator, creations } = fakeAuthenticator();
+    const outcome = await registerPasskey(
+      authenticator,
+      enrollmentChallenge({ expiresAt: 0 }),
+      live,
+    );
+
+    expect(outcome.kind).toBe("done");
+    expect(creations[0]?.publicKey?.timeout).toBe(ACTION_CHALLENGE_TTL_MS);
   });
 
   it("fails on a credential without an attestation object", async () => {
     const { authenticator } = fakeAuthenticator(() => "malformed");
-    expect((await registerPasskey(authenticator, enrollmentChallenge(), live, NOW)).kind).toBe(
-      "failed",
-    );
+    expect((await registerPasskey(authenticator, enrollmentChallenge(), live)).kind).toBe("failed");
   });
 });
