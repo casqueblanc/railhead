@@ -16,7 +16,11 @@ import { FakeArtifacts, FakeArtifactsError } from "../src/artifacts/fake";
 import { actionChallenge, relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
 import { ok, type PortResult } from "../src/contracts/result";
 import { readBundle } from "../src/modules/demoSeed/bundle";
-import { createSeedControl, type SeedTargetCalls } from "../src/modules/demoSeed/control";
+import {
+  checkPerformInput,
+  createSeedControl,
+  type SeedTargetCalls,
+} from "../src/modules/demoSeed/control";
 import { DEMO_OBJECT_NAME, DEMO_SEED_CONTROL, demoRepoId } from "../src/modules/demoSeed/entry";
 import { pushMain } from "../src/modules/demoSeed/receivePack";
 import {
@@ -1164,6 +1168,59 @@ describe("seed control", () => {
   });
 });
 
+/** A challenge id shaped like a seed challenge for `action`, under a seal no object issued. */
+function forgedChallengeId(action: DemoSeedAction, prefix = "dsc"): string {
+  return [
+    `${prefix}_${"0".repeat(32)}`,
+    String(Date.now() + 60_000),
+    b64url(new Uint8Array(32).fill(1)),
+    b64url(enc.encode(JSON.stringify(action))),
+    b64url(new Uint8Array(32).fill(2)),
+  ].join(".");
+}
+
+describe("checkPerformInput", () => {
+  const seedId = forgedChallengeId({ kind: "demo.seed", head: HEAD });
+
+  it("passes a seed-shaped id with a bundle up to the bound, and a reset with none", () => {
+    expect(checkPerformInput(seedId, MAIN_BUNDLE)).toEqual(ok(undefined));
+    expect(checkPerformInput(seedId, new Uint8Array(MAX_DEMO_BUNDLE_BYTES))).toEqual(ok(undefined));
+    expect(checkPerformInput(forgedChallengeId({ kind: "demo.reset" }), null)).toEqual(
+      ok(undefined),
+    );
+  });
+
+  it("refuses a bundle one byte over the bound", () => {
+    expect(checkPerformInput(seedId, new Uint8Array(MAX_DEMO_BUNDLE_BYTES + 1))).toEqual({
+      ok: false,
+      code: "invalid_request",
+      message: "The bundle is too large.",
+    });
+  });
+
+  it("refuses an id not shaped like a seed challenge", () => {
+    const parts = seedId.split(".");
+    for (const id of [
+      "",
+      "not-a-challenge",
+      parts.slice(0, 4).join("."),
+      `${seedId}.extra`,
+      // An owner-action id, or one sealing something that is not a seed action.
+      forgedChallengeId({ kind: "demo.seed", head: HEAD }, "pkc"),
+      [parts[0], parts[1], parts[2], b64url(enc.encode('{"kind":"demo.drop"}')), parts[4]].join(
+        ".",
+      ),
+      `${seedId}${"A".repeat(1024)}`,
+    ]) {
+      expect(checkPerformInput(id, null)).toEqual({
+        ok: false,
+        code: "invalid_request",
+        message: "That is not an action challenge id.",
+      });
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // The deployed entry
 
@@ -1193,6 +1250,37 @@ describe("demo seed entry", () => {
     const bogus: unknown = { kind: "demo.drop" };
     // @ts-expect-error: the boundary's own validation is under test.
     await expect(seed.prepare(bogus)).rejects.toThrow();
+  });
+
+  it("refuses an oversized bundle and a malformed id before the control object", async () => {
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using seed = await api.demoSeed();
+    const assertion: PasskeyAssertion = {
+      credentialId: "AAAA",
+      clientDataJson: "AAAA",
+      authenticatorData: "AAAA",
+      signature: "AAAA",
+      userHandle: null,
+    };
+    const forged = forgedChallengeId({ kind: "demo.seed", head: HEAD });
+    // Within the bound, the forged id reaches the control, which refuses its seal.
+    expect(await seed.perform(forged, assertion, MAIN_BUNDLE)).toMatchObject({
+      ok: false,
+      code: "proof_invalid",
+    });
+    // Over it, the Worker refuses first: the control, which checks the seal before the size, would
+    // have answered `proof_invalid`.
+    const oversized = new Uint8Array(MAX_DEMO_BUNDLE_BYTES + 1);
+    expect(await seed.perform(forged, assertion, oversized)).toEqual({
+      ok: false,
+      code: "invalid_request",
+      message: "The bundle is too large.",
+    });
+    expect(await seed.perform("not-a-challenge", assertion, oversized)).toEqual({
+      ok: false,
+      code: "invalid_request",
+      message: "That is not an action challenge id.",
+    });
   });
 
   it("answers each role only on its own object", async () => {

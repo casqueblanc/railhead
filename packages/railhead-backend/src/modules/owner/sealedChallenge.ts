@@ -87,8 +87,6 @@ export function sealedChallenges<A extends ApprovableAction>(
   const { storage, clock, repoId, instance, relyingParty: party } = context;
   const { domain, keyTable, spentTable, maxActionBytes } = kind;
   const sql = storage.sql;
-  const grantId = new RegExp(`^${kind.idPrefix}_[0-9a-f]{32}$`);
-  const maxLength = maxSealedLength(maxActionBytes);
 
   return {
     async prepare(action) {
@@ -125,9 +123,8 @@ export function sealedChallenges<A extends ApprovableAction>(
     },
 
     async open(sealedId) {
-      const opened = parseSealed(sealedId);
-      if (opened === undefined)
-        return fail("invalid_request", "That is not an action challenge id.");
+      const opened = parseSealed(kind, sealedId);
+      if (opened === undefined) return notAChallenge();
       if (party === undefined) return misconfigured();
       const intact = await crypto.subtle.verify(
         "HMAC",
@@ -136,7 +133,8 @@ export function sealedChallenges<A extends ApprovableAction>(
         sealed(opened.fields),
       );
       if (!intact) return fail("proof_invalid", "That action challenge was not issued here.");
-      return ok(opened.binding);
+      const { challengeId, nonce, expiresAt, action } = opened;
+      return ok({ repoId, challengeId, nonce, expiresAt, action });
     },
 
     async spend(binding, assertion) {
@@ -211,49 +209,77 @@ export function sealedChallenges<A extends ApprovableAction>(
       0
     );
   }
+}
 
-  /**
-   * Splits a sealed challenge id into its fields, its seal and the binding the fields name, or
-   * returns `undefined` when it is not shaped like one. The seal is not checked here.
-   */
-  function parseSealed(
-    text: string,
-  ): { fields: string; seal: Uint8Array<ArrayBuffer>; binding: ActionBinding<A> } | undefined {
-    if (text.length > maxLength) return undefined;
-    const parts = text.split(".");
-    if (parts.length !== 5) return undefined;
-    const [challengeId, expiry, nonce, action, seal] = parts;
-    if (
-      challengeId === undefined ||
-      !grantId.test(challengeId) ||
-      expiry === undefined ||
-      !EXPIRY.test(expiry) ||
-      nonce === undefined ||
-      decodeBase64Url(nonce, 32) === undefined ||
-      action === undefined ||
-      seal === undefined
-    ) {
-      return undefined;
-    }
-    const actionBytes = decodeBase64Url(action, maxActionBytes);
-    const sealBytes = decodeBase64Url(seal, 32);
-    if (actionBytes === undefined || sealBytes === undefined) return undefined;
-    let parsed: A | undefined;
-    try {
-      parsed = kind.decodeAction(
-        new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(actionBytes),
-      );
-    } catch (error) {
-      if (error instanceof SyntaxError || error instanceof TypeError) return undefined;
-      throw error;
-    }
-    if (parsed === undefined) return undefined;
-    return {
-      fields: [challengeId, expiry, nonce, action].join("."),
-      seal: sealBytes,
-      binding: { repoId, challengeId, nonce, expiresAt: Number(expiry), action: parsed },
-    };
+/** Whether `text` is shaped like a challenge id of `kind`. Checks no seal and reads no storage. */
+export function isSealedChallengeId<A extends ApprovableAction>(
+  kind: SealedChallengeKind<A>,
+  text: string,
+): boolean {
+  return parseSealed(kind, text) !== undefined;
+}
+
+/** A sealed challenge id split into its fields, its seal and the parts of the binding they name. */
+interface ParsedSealed<A extends ApprovableAction> {
+  readonly fields: string;
+  readonly seal: Uint8Array<ArrayBuffer>;
+  readonly challengeId: string;
+  readonly nonce: string;
+  readonly expiresAt: number;
+  readonly action: A;
+}
+
+/**
+ * Splits a sealed challenge id of `kind`, or returns `undefined` when it is not shaped like one.
+ * The seal is not checked here.
+ */
+function parseSealed<A extends ApprovableAction>(
+  kind: SealedChallengeKind<A>,
+  text: string,
+): ParsedSealed<A> | undefined {
+  const { maxActionBytes } = kind;
+  if (text.length > maxSealedLength(maxActionBytes)) return undefined;
+  const parts = text.split(".");
+  if (parts.length !== 5) return undefined;
+  const [challengeId, expiry, nonce, action, seal] = parts;
+  if (
+    challengeId === undefined ||
+    !new RegExp(`^${kind.idPrefix}_[0-9a-f]{32}$`).test(challengeId) ||
+    expiry === undefined ||
+    !EXPIRY.test(expiry) ||
+    nonce === undefined ||
+    decodeBase64Url(nonce, 32) === undefined ||
+    action === undefined ||
+    seal === undefined
+  ) {
+    return undefined;
   }
+  const actionBytes = decodeBase64Url(action, maxActionBytes);
+  const sealBytes = decodeBase64Url(seal, 32);
+  if (actionBytes === undefined || sealBytes === undefined) return undefined;
+  let parsed: A | undefined;
+  try {
+    parsed = kind.decodeAction(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(actionBytes),
+    );
+  } catch (error) {
+    if (error instanceof SyntaxError || error instanceof TypeError) return undefined;
+    throw error;
+  }
+  if (parsed === undefined) return undefined;
+  return {
+    fields: [challengeId, expiry, nonce, action].join("."),
+    seal: sealBytes,
+    challengeId,
+    nonce,
+    expiresAt: Number(expiry),
+    action: parsed,
+  };
+}
+
+/** The refusal of a challenge id that is not shaped like one. */
+export function notAChallenge(): PortResult<never> {
+  return fail("invalid_request", "That is not an action challenge id.");
 }
 
 function spent(): PortResult<never> {

@@ -16,6 +16,8 @@ import {
 import { isCommitSha, type CommitSha } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import {
+  isSealedChallengeId,
+  notAChallenge,
   type SealedChallengeContext,
   type SealedChallengeKind,
   sealedChallenges,
@@ -77,6 +79,21 @@ const MIGRATIONS: readonly string[] = [
   ) STRICT`,
 ];
 
+/**
+ * Refuses a `perform` whose challenge id is not shaped like a seed challenge or whose bundle is over
+ * `MAX_DEMO_BUNDLE_BYTES`. It is stateless, so the Worker runs it before any call reaches the
+ * control object: an unauthenticated caller cannot hand that one object a malformed id or an
+ * oversized bundle. It checks no seal; the control does that.
+ */
+export function checkPerformInput(
+  challengeId: string,
+  bundle: Uint8Array | null,
+): PortResult<void> {
+  if (!isSealedChallengeId(SEED_CHALLENGE, challengeId)) return notAChallenge();
+  if (bundle !== null && bundle.length > MAX_DEMO_BUNDLE_BYTES) return bundleTooLarge();
+  return ok(undefined);
+}
+
 /** Builds the control and migrates its tables. */
 export function createSeedControl(context: SeedControlContext): SeedControl {
   migrate(context.storage, CONTROL_OWNER, MIGRATIONS);
@@ -126,9 +143,7 @@ function actionInput(
       return bundle === null ? ok(null) : fail("invalid_request", "A reset takes no bundle.");
     case "demo.seed": {
       if (bundle === null) return fail("invalid_request", "A seed needs the main bundle.");
-      if (bundle.length > MAX_DEMO_BUNDLE_BYTES) {
-        return fail("invalid_request", "The bundle is too large.");
-      }
+      if (bundle.length > MAX_DEMO_BUNDLE_BYTES) return bundleTooLarge();
       const read = readBundle(bundle);
       if (!read.ok) return fail("invalid_request", bundleMessage(read.reason));
       if (read.bundle.head !== action.head) {
@@ -141,6 +156,10 @@ function actionInput(
       return unreachable;
     }
   }
+}
+
+function bundleTooLarge(): PortResult<never> {
+  return fail("invalid_request", "The bundle is too large.");
 }
 
 function bundleMessage(reason: BundleFailure): string {

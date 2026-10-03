@@ -22,7 +22,7 @@ import type { PortResult } from "../../contracts/result";
 import type { RepoStorage } from "../../repo/storage";
 import type { InstanceOwnerPort } from "../owner/entry";
 import { OWNER_OBJECT_NAME } from "../owner/OwnerObject";
-import { createSeedControl, type SeedControl } from "./control";
+import { checkPerformInput, createSeedControl, type SeedControl } from "./control";
 import { artifactsBinding, createSeedTarget, type SeedTarget } from "./target";
 
 /**
@@ -49,15 +49,21 @@ export interface DemoSeedPort {
   ): Promise<PortResult<DemoSeedResult>>;
 }
 
-/** The demo seed through the two fixed `Repo` objects. A fresh stub per call. */
+/**
+ * The demo seed through the two fixed `Repo` objects. A fresh stub per call. `perform` is
+ * unauthenticated until the control opens the seal, so its stateless checks run here first.
+ */
 export function demoSeedPort(env: Env): DemoSeedPort {
   const control = () => env.REPO.getByName(DEMO_SEED_CONTROL);
   const demo = () => env.REPO.getByName(DEMO_OBJECT_NAME);
   return {
     read: () => demo().demoSeedState(),
     prepare: (action) => control().prepareDemoSeed(action),
-    perform: (challengeId, assertion, bundle) =>
-      control().performDemoSeed(challengeId, assertion, bundle),
+    perform: async (challengeId, assertion, bundle) => {
+      const input = checkPerformInput(challengeId, bundle);
+      if (!input.ok) return input;
+      return control().performDemoSeed(challengeId, assertion, bundle);
+    },
   };
 }
 
