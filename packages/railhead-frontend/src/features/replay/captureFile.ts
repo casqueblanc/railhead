@@ -748,6 +748,7 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
         data: {
           claimId: string(d, "claimId", p),
           generation: integer(d, "generation", p),
+          reason: oneOf(d, "reason", p, ["lost_conflict", "decision_superseded", "check_failed"]),
           decisions: list(d, "decisions", p, readDecisionRef),
         },
       };

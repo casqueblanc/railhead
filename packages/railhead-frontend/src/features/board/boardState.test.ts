@@ -86,7 +86,7 @@ const atlas = (state: BoardState) => state.claims[UPLOAD.atlasClaim];
 const reopen = (decisions = [sizeDecision(2)]): SyntheticStep => ({
   type: "claim.reopened",
   actor: SYNTH_TRAIN,
-  data: { claimId: UPLOAD.atlasClaim, generation: 1, decisions },
+  data: { claimId: UPLOAD.atlasClaim, generation: 1, reason: "decision_superseded", decisions },
 });
 
 describe("foldEvents over a delivered stream", () => {

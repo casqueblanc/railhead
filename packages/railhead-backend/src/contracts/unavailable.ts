@@ -52,6 +52,9 @@ export const unavailableClaims: ClaimsPort = {
   workingGeneration: () => null,
   workingEpisode: () => null,
   readyPin: () => null,
+  reopen: () => {
+    throw new UnavailableError("claims");
+  },
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
   resume: async () => {},

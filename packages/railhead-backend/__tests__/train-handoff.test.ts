@@ -16,8 +16,12 @@ import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok } from "../src/contracts/result";
 import type { CheckAttempt, MainRefPort, TrainPort } from "../src/contracts/train";
-import { unavailableTrain } from "../src/contracts/unavailable";
-import { createClaims } from "../src/modules/claims/module";
+import {
+  UnavailableError,
+  unavailableClaims,
+  unavailableTrain,
+} from "../src/contracts/unavailable";
+import { CLAIM_LEASE_MS, createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { createMainWriter } from "../src/modules/mainWriter/mainWriter";
@@ -68,6 +72,15 @@ interface Setup {
   entries(): { commit: string; state: string; next: string | null }[];
   /** Files an issue and claims it for agent 1, with `commits` pushed to its fork. */
   open(...commits: string[]): Promise<ClaimView>;
+  /** Files an issue and claims it for agent `n`, with `commits` pushed to its fork. */
+  openFor(n: number, ...commits: string[]): Promise<ClaimView>;
+  /** Whether the decisions port the other modules reach can read a claim's current versions. */
+  versionsKnown: boolean;
+  /**
+   * While set, the merge port answers a conflict between these two pins on `src/upload.ts` for any
+   * pin list holding both, rather than a clean candidate.
+   */
+  conflict: [ClaimPin, ClaimPin] | null;
   /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
   decide(claimId: string, decisionId?: string): Promise<DecisionRef>;
   /** Acknowledges every inbox item agent 1 has pending. */
@@ -216,7 +229,11 @@ function withHandoff<T>(
         },
       },
       inbox,
-      decisions,
+      decisions: {
+        ...decisions,
+        currentVersions: (claimId) =>
+          setup.versionsKnown ? decisions.currentVersions(claimId) : null,
+      },
       train: install(train),
       authorization,
       mainWriter: {
@@ -245,6 +262,10 @@ function withHandoff<T>(
       merge: {
         compose: async (_main, pins) => {
           composed.push(pins);
+          const pair = setup.conflict;
+          if (pair !== null && pair.every((one) => pins.some((pin) => samePin(pin, one)))) {
+            return ok({ kind: "conflict", pins: pair, paths: ["src/upload.ts"] });
+          }
           return ok({ kind: "clean", candidate: candidateOf(pins) });
         },
         discard: async () => ok({ removed: 1 }),
@@ -273,7 +294,8 @@ function withHandoff<T>(
           state: entry.state,
           next: entry.nextCommit,
         })),
-      async open(...commits) {
+      open: (...commits) => setup.openFor(1, ...commits),
+      async openFor(n, ...commits) {
         const grant: GrantFor<"issue.file"> = {
           kind: "human",
           userId: OWNER,
@@ -283,7 +305,7 @@ function withHandoff<T>(
         };
         const filed = await claims.fileIssue(grant);
         if (!filed.ok) throw new Error(`filing refused: ${filed.code}`);
-        const claimed = await claims.work(agent(1));
+        const claimed = await claims.work(agent(n));
         if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
         for (const commit of commits) await push(claimed.value.claim.claimId, commit);
         return claimed.value.claim;
@@ -332,6 +354,8 @@ function withHandoff<T>(
         }
       },
       push,
+      versionsKnown: true,
+      conflict: null,
       fake,
       holdNextPin() {
         const reached = signal();
@@ -365,6 +389,14 @@ function withHandoff<T>(
     };
     return body(setup);
   });
+}
+
+function samePin(left: ClaimPin, right: ClaimPin): boolean {
+  return (
+    left.claimId === right.claimId &&
+    left.generation === right.generation &&
+    left.commit === right.commit
+  );
 }
 
 /** A promise and the function that settles it. */
@@ -1221,6 +1253,202 @@ describe("a re-ready of a commit that already landed", () => {
         await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: LATER }),
       ).toMatchObject({ ok: true, value: { repeated: false } });
       expect(setup.entries()).toEqual([{ commit: LATER, state: "queued", next: null }]);
+    });
+  });
+});
+
+/** The commit the loser of a conflict pushes after its claim is reopened. */
+const REDO = "6".repeat(40);
+
+/** Both claims' entries, ordered by commit. */
+function sortedEntries(setup: Setup) {
+  return setup.entries().toSorted((left, right) => left.commit.localeCompare(right.commit));
+}
+
+/** Claims for agents 1 and 2, readied with `WORK` and `LATER`, that conflict in one batch. */
+async function losePair(setup: Setup): Promise<{ winner: ClaimPin; loser: ClaimPin }> {
+  const first = await setup.openFor(1, WORK);
+  const second = await setup.openFor(2, LATER);
+  for (const [n, claim, commit] of [
+    [1, first, WORK],
+    [2, second, LATER],
+  ] as const) {
+    const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+    expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+  }
+  const winner: ClaimPin = { claimId: first.claimId, generation: 1, commit: WORK };
+  const loser: ClaimPin = { claimId: second.claimId, generation: 1, commit: LATER };
+  setup.conflict = [winner, loser];
+  await setup.train.resume();
+  expect(setup.composed).toEqual([[winner, loser]]);
+  expect(sortedEntries(setup)).toEqual([
+    { commit: WORK, state: "parked", next: null },
+    { commit: LATER, state: "parked", next: null },
+  ]);
+  return { winner, loser };
+}
+
+function reopenLost(setup: Setup, pin: ClaimPin, episode: number): boolean {
+  return setup.log.transaction((tx) => setup.claims.reopen(tx, pin, episode, "lost_conflict"))
+    .value;
+}
+
+function episodeOf(setup: Setup, pin: ClaimPin): number {
+  const ready = setup.claims.readyPin(pin.claimId);
+  if (ready === null) throw new Error("the claim is not ready");
+  return ready.episode;
+}
+
+/** Passes the latest check attempt and drives the train to publish it. */
+async function pass(setup: Setup): Promise<CheckAttempt> {
+  const attempt = setup.started.at(-1);
+  if (attempt === undefined) throw new Error("no check was started");
+  const recorded = await setup.train.recordCheck({
+    attemptId: attempt.attemptId,
+    candidate: attempt.candidate,
+    result: "pass",
+    logDigest: null,
+    finishedAt: attempt.createdAt,
+  });
+  expect(recorded.ok).toBe(true);
+  await setup.train.resume();
+  return attempt;
+}
+
+describe("a ready claim reopened for rework", () => {
+  it("lets the loser of a conflict push, ready again and land", async () => {
+    await withHandoff(async (setup) => {
+      const { loser } = await losePair(setup);
+      const episode = episodeOf(setup, loser);
+      const pushTo = {
+        principal: agent(2),
+        target: { kind: "fork", claimId: loser.claimId },
+        operation: "push",
+      } as const;
+      expect(await setup.claims.authorizeGit(pushTo)).toMatchObject({
+        ok: false,
+        code: "after_ready",
+      });
+
+      expect(reopenLost(setup, loser, episode)).toBe(true);
+
+      expect(setup.log.replay(0, 64).events.at(-1)).toMatchObject({
+        actor: { kind: "system", id: "sys_claims" },
+        type: "claim.reopened",
+        data: { claimId: loser.claimId, generation: 1, reason: "lost_conflict", decisions: [] },
+      });
+      expect(claimState(setup.sql, loser.claimId)).toBe("working");
+      expect(setup.claims.readyPin(loser.claimId)).toBeNull();
+      // The reopened claim is a lease again, and a push is fenced to the new episode.
+      expect(leaseOf(setup.sql, loser.claimId)).toBe(setup.now() + CLAIM_LEASE_MS);
+      expect(await setup.claims.authorizeGit(pushTo)).toMatchObject({
+        ok: true,
+        value: {
+          scope: "write",
+          fence: { claimId: loser.claimId, generation: 1, episode: episode + 1 },
+        },
+      });
+
+      await setup.push(loser.claimId, REDO);
+      const ready = await setup.claims.ready(agent(2), loser.claimId, {
+        generation: 1,
+        commit: REDO,
+      });
+      expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+      // The parked entry is queued again for the new episode; the winner stays parked.
+      expect(sortedEntries(setup)).toEqual([
+        { commit: WORK, state: "parked", next: null },
+        { commit: REDO, state: "queued", next: null },
+      ]);
+
+      await setup.train.resume();
+      const redone: ClaimPin = { ...loser, commit: REDO };
+      expect(setup.composed.at(-1)).toEqual([redone]);
+      const attempt = await pass(setup);
+
+      expect(setup.published).toHaveLength(1);
+      expect(setup.main()).toBe(attempt.candidate);
+      expect(sortedEntries(setup)).toEqual([
+        { commit: WORK, state: "parked", next: null },
+        { commit: REDO, state: "landed", next: null },
+      ]);
+    });
+  });
+
+  it("never lands a batch formed for the episode the reopening ended", async () => {
+    await withHandoff(async (setup) => {
+      const claim = await setup.open(WORK);
+      const request = { generation: 1, commit: WORK };
+      expect((await setup.claims.ready(agent(1), claim.claimId, request)).ok).toBe(true);
+      await setup.train.resume();
+      const pin: ClaimPin = { claimId: claim.claimId, generation: 1, commit: WORK };
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+
+      // The pin is reopened while its check runs; the check then passes.
+      expect(reopenLost(setup, pin, episodeOf(setup, pin))).toBe(true);
+      await pass(setup);
+
+      expect(setup.published).toEqual([]);
+      expect(setup.main()).toBe(MAIN);
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+
+      // The reworked commit is scheduled and lands under its own episode.
+      await setup.push(claim.claimId, LATER);
+      const again = { generation: 1, commit: LATER };
+      expect(await setup.claims.ready(agent(1), claim.claimId, again)).toMatchObject({
+        ok: true,
+        value: { repeated: false },
+      });
+      await setup.train.resume();
+      expect(setup.composed.at(-1)).toEqual([{ ...pin, commit: LATER }]);
+      const attempt = await pass(setup);
+      expect(setup.main()).toBe(attempt.candidate);
+      expect(setup.entries()).toEqual([{ commit: LATER, state: "landed", next: null }]);
+    });
+  });
+
+  it("reopens only the exact pin and episode it is given, once", async () => {
+    await withHandoff(async (setup) => {
+      const { loser } = await losePair(setup);
+      const episode = episodeOf(setup, loser);
+      const count = () => setup.log.replay(0, 64).events.length;
+      const before = count();
+
+      expect(reopenLost(setup, loser, episode - 1)).toBe(false);
+      expect(reopenLost(setup, loser, episode + 1)).toBe(false);
+      expect(reopenLost(setup, { ...loser, commit: REDO }, episode)).toBe(false);
+      expect(reopenLost(setup, { ...loser, generation: 2 }, episode)).toBe(false);
+      expect(reopenLost(setup, { ...loser, claimId: "clm_unknown0001" }, episode)).toBe(false);
+      expect(count()).toBe(before);
+      expect(claimState(setup.sql, loser.claimId)).toBe("ready");
+
+      expect(reopenLost(setup, loser, episode)).toBe(true);
+      // A second reopening of the same episode, as from a repeated train pass, changes nothing.
+      expect(reopenLost(setup, loser, episode)).toBe(false);
+      const types = setup.log.replay(0, 64).events.map((event) => event.type);
+      expect(types.filter((type) => type === "claim.reopened")).toHaveLength(1);
+      expect(claimState(setup.sql, loser.claimId)).toBe("working");
+    });
+  });
+
+  it("rolls back while the claim's decision versions are unknown", async () => {
+    await withHandoff(async (setup) => {
+      const { loser } = await losePair(setup);
+      const episode = episodeOf(setup, loser);
+      const before = setup.log.replay(0, 64).events.length;
+      setup.versionsKnown = false;
+      expect(() => reopenLost(setup, loser, episode)).toThrow(UnavailableError);
+      setup.versionsKnown = true;
+
+      expect(setup.log.replay(0, 64).events).toHaveLength(before);
+      expect(claimState(setup.sql, loser.claimId)).toBe("ready");
+      expect(setup.claims.readyPin(loser.claimId)).toMatchObject({ pin: loser, episode });
+      // A Repo without the claims module refuses the same way.
+      expect(() =>
+        setup.log.transaction((tx) =>
+          unavailableClaims.reopen(tx, loser, episode, "lost_conflict"),
+        ),
+      ).toThrow(UnavailableError);
     });
   });
 });

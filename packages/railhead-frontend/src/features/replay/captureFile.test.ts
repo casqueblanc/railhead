@@ -738,23 +738,36 @@ describe("parseCapture", () => {
     },
   );
 
+  const reopened: RailheadEvent = {
+    v: 1,
+    seq: 4,
+    at: SYNTH_START_MS + 4,
+    repo: SYNTH_REPO,
+    actor: { kind: "system", id: "sys_train" },
+    type: "claim.reopened",
+    data: {
+      claimId: "clm_synthatlas",
+      generation: 2,
+      reason: "lost_conflict",
+      decisions: [{ decisionId: "dec_synthsize", version: 2 }],
+    },
+  };
+
   it("copies an event type no fixture log uses yet", () => {
-    const reopened: RailheadEvent = {
-      v: 1,
-      seq: 4,
-      at: SYNTH_START_MS + 4,
-      repo: SYNTH_REPO,
-      actor: { kind: "system", id: "sys_train" },
-      type: "claim.reopened",
-      data: {
-        claimId: "clm_synthatlas",
-        generation: 2,
-        decisions: [{ decisionId: "dec_synthsize", version: 2 }],
-      },
-    };
     const events = [...issues(3), { ...reopened, data: { ...reopened.data, note: SECRET } }];
     const result = parseCapture(fileOf({ events, head: 4 }));
     expect(result.ok && result.capture.events).toEqual([...issues(3), reopened]);
+  });
+
+  it.each([
+    ["an unknown reopen reason", "lost_race"],
+    ["a missing reopen reason", undefined],
+  ])("refuses %s", (_, reason) => {
+    const events = [...issues(3), { ...reopened, data: { ...reopened.data, reason } }];
+    expect(parsedError(fileOf({ events, head: 4 }))).toEqual({
+      kind: "malformed",
+      path: "events[3].data.reason",
+    });
   });
 
   it("reads a captured source and its history", () => {

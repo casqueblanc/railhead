@@ -65,6 +65,18 @@ pub enum RefusalReason {
     UnackedDecision,
 }
 
+/// Why a ready claim went back to working: the system decided its pinned work must be redone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReopenReason {
+    /// The pin lost a conflict on the train and must be redone on the new base.
+    LostConflict,
+    /// A decision version recorded after ready superseded the versions the pin was recorded under.
+    DecisionSuperseded,
+    /// The train's check failed on the pin.
+    CheckFailed,
+}
+
 /// What an inbox entry asks of the agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(

@@ -3,8 +3,8 @@
 use railhead_protocol::Error;
 use railhead_protocol::{
     Actor, AgentErrorCode, AgentResponse, AskRequest, EventPayload, InboxResult, JoinRequest,
-    MAX_SAFE_INTEGER, QuestionOption, ReadyRequest, SafeInteger, StatusResult, decode_event,
-    decode_response,
+    MAX_SAFE_INTEGER, QuestionOption, ReadyRequest, ReopenReason, SafeInteger, StatusResult,
+    decode_event, decode_response,
 };
 use serde_json::{Value, json};
 
@@ -69,6 +69,38 @@ fn refuses_unknown_tags_and_enum_values() -> TestResult {
         "data": {"claimId": "clm_42abcd", "generation": 1, "reason": "too_slow"},
     });
     assert!(matches!(decode(&refused), Err(Error::Json { .. })));
+    Ok(())
+}
+
+#[test]
+fn decodes_each_reopen_reason_and_refuses_another_or_none() -> TestResult {
+    let reopened = |reason: Option<&str>| {
+        let mut data = json!({"claimId": "clm_42abcd", "generation": 1, "decisions": []});
+        if let (Some(reason), Some(fields)) = (reason, data.as_object_mut()) {
+            fields.insert("reason".to_owned(), json!(reason));
+        }
+        json!({
+            "v": 1, "seq": 1, "at": 1, "repo": "rep_demo0001",
+            "actor": {"kind": "system", "id": "sys_claims"},
+            "type": "claim.reopened",
+            "data": data,
+        })
+    };
+    for (wire, reason) in [
+        ("lost_conflict", ReopenReason::LostConflict),
+        ("decision_superseded", ReopenReason::DecisionSuperseded),
+        ("check_failed", ReopenReason::CheckFailed),
+    ] {
+        match decode(&reopened(Some(wire)))?.payload {
+            EventPayload::ClaimReopened(data) => assert_eq!(data.reason, reason, "{wire}"),
+            other => return Err(format!("{wire} decoded as {other:?}").into()),
+        }
+    }
+    assert!(matches!(
+        decode(&reopened(Some("lost_race"))),
+        Err(Error::Json { .. })
+    ));
+    assert!(matches!(decode(&reopened(None)), Err(Error::Json { .. })));
     Ok(())
 }
 
@@ -214,7 +246,7 @@ fn refuses_an_event_recorded_by_the_wrong_kind_of_actor() -> TestResult {
         &mut reopened,
         "/data",
         json!({
-            "claimId": "clm_42abcd", "generation": 1,
+            "claimId": "clm_42abcd", "generation": 1, "reason": "lost_conflict",
             "decisions": [{"decisionId": "dec_upload1", "version": 2}],
         }),
     )?;

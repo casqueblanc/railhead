@@ -139,6 +139,15 @@ export type RefusalReason =
   /** A decision affecting the claim has not been acknowledged. */
   | "unacked_decision";
 
+/** Why a ready claim went back to working: the system decided its pinned work must be redone. */
+export type ReopenReason =
+  /** The pin lost a conflict on the train and must be redone on the new base. */
+  | "lost_conflict"
+  /** A decision version recorded after ready superseded the versions the pin was recorded under. */
+  | "decision_superseded"
+  /** The train's check failed on the pin. */
+  | "check_failed";
+
 /** What an inbox entry asks of the agent. */
 export type InboxEntry =
   /** A decision in the claim's scope was recorded or superseded. */
@@ -214,10 +223,15 @@ export type EventPayload =
       data: { claimId: ClaimId; generation: number; reason: RefusalReason };
     }
   | {
-      // A decision version recorded after ready superseded the pin, so the claim is working again
-      // and its holder must adapt the work and mark it ready at `decisions`, the current versions.
+      // The system decided the pinned work must be redone, for `reason`, so the claim is working
+      // again and its holder must rework it and mark it ready at `decisions`, the current versions.
       type: "claim.reopened";
-      data: { claimId: ClaimId; generation: number; decisions: DecisionRef[] };
+      data: {
+        claimId: ClaimId;
+        generation: number;
+        reason: ReopenReason;
+        decisions: DecisionRef[];
+      };
     }
   | { type: "claim.expired"; data: { claimId: ClaimId; generation: number } }
   | {

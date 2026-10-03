@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::events::{
     Acceptance, CheckResult, ConflictClass, ConflictRoute, DecisionRef, InboxEntry, MainOutcome,
-    QuestionOption, RefusalReason,
+    QuestionOption, RefusalReason, ReopenReason,
 };
 use crate::integer::{SafeInteger, nullable};
 use crate::rules::{
@@ -198,8 +198,8 @@ impl ClaimRefused {
     }
 }
 
-/// `claim.reopened`: a decision version recorded after ready superseded the pin, so the claim is
-/// working again.
+/// `claim.reopened`: the system decided the pinned work must be redone, so the claim is working
+/// again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimReopened {
@@ -207,6 +207,8 @@ pub struct ClaimReopened {
     pub claim_id: String,
     /// The ownership generation.
     pub generation: SafeInteger,
+    /// Why the work must be redone.
+    pub reason: ReopenReason,
     /// The current decision versions the work must now follow.
     pub decisions: Vec<DecisionRef>,
 }
