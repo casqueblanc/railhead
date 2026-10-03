@@ -29,8 +29,11 @@
 //
 // A push the upstream applied is recorded even when its response gives no record. Before its last
 // bytes are sent, the push is saved in storage as pending, with its claim, generation and refs, and
-// the Repo's alarm is asked for once the exchange must have ended; if it cannot be saved, the bytes
-// are withheld. Its report settles it: the record and the pending row are written in one
+// the Repo's alarm is asked for once the exchange must have ended, in the same transaction. The
+// bytes wait until storage confirms that alarm, asked for a second time if the first write failed;
+// if the push cannot be saved or its alarm set, the bytes are withheld and the row dropped, so no
+// applied push is ever pending without a wake to record it. A restarted gateway asks again for the
+// wake its pending pushes need. Its report settles it: the record and the pending row are written in one
 // transaction, and a complete refusal drops it. A push the report does not settle, because the
 // outcome is unknown or the record failed, is left to the alarm. Finding a branch at the commit the
 // push sent proves nothing on its own: a stale push Git refused can find the fork already there. So
@@ -126,8 +129,12 @@ export interface GitGatewayContext {
   readonly storage: RepoStorage;
   /** The current time, in milliseconds since the Unix epoch. */
   readonly clock: () => number;
-  /** Asks the Repo's alarm to run `resume` no later than `at`. */
-  readonly wake: (at: number) => void;
+  /**
+   * Asks the Repo's alarm to run `resume` no later than `at`, issuing the write at once so it commits
+   * with the transaction that asks for it. Resolves `true` once storage holds an alarm no later than
+   * `at`, `false` if the write failed; never rejects.
+   */
+  readonly wake: (at: number) => Promise<boolean>;
   /** The ports the gateway calls on each request; never called while the Repo is composed. */
   readonly ports: () => Pick<RepoPorts, "sessions" | "claims" | "artifacts">;
   /** Where each Artifacts repository is served. */
@@ -211,9 +218,10 @@ class GitGateway implements GitPort {
     this.#context = context;
     this.#limits = limits;
     migrate(context.storage, GIT_OWNER, MIGRATIONS);
-    // A wake asked for with a pending push may have failed to reach storage; ask again.
+    // A wake asked for with a pending push may have failed to reach storage; ask again. A failure is
+    // logged by the Repo, and the next push or start asks again.
     const next = this.#nextDue();
-    if (next !== null) context.wake(next);
+    if (next !== null) void context.wake(next);
   }
 
   async serve(request: Request, target: GitTarget, path: string): Promise<Response> {
@@ -330,14 +338,28 @@ class GitGateway implements GitPort {
       observe: async () => {
         observed = await this.#observe(grant.repo, head);
       },
-      release: () => {
+      release: async () => {
+        let saved: Saved | null;
         try {
-          pending = this.#save(principal, fence, grant.repo, head, observed);
+          saved = this.#save(principal, fence, grant.repo, head, observed);
         } catch (error) {
           logPush("git_push_unsaved", fence, { error: errorName(error) });
           return "unsaved";
         }
-        return pending === null ? "claim_changed" : "released";
+        if (saved === null) return "claim_changed";
+        // Without a wake, a push whose report is lost would stay pending with nothing to record it.
+        if (!(await saved.armed) && !(await this.#context.wake(saved.dueAt))) {
+          logPush("git_push_unarmed", fence, {});
+          this.#drop(saved.id, fence);
+          return "unsaved";
+        }
+        // The claim may have moved on while the alarm was written.
+        if (!this.#working(fence)) {
+          this.#drop(saved.id, fence);
+          return "claim_changed";
+        }
+        pending = saved.id;
+        return "released";
       },
       record: (updated) => {
         if (pending !== null) this.#recordPush(pending, principal, fence, head, updated);
@@ -386,8 +408,8 @@ class GitGateway implements GitPort {
    * Saves a push about to be released as pending, counts its release to the fork, and asks the alarm
    * for it once the exchange must have ended, in one transaction, if the claim is still working at
    * the push's generation. The fork's branches `observed` before are kept only if no other push was
-   * released to the fork since they were read. Returns the pending row, or `null` when the claim
-   * changed.
+   * released to the fork since they were read. Returns the pending row with its alarm write, or
+   * `null` when the claim changed.
    */
   #save(
     principal: AgentPrincipal,
@@ -395,13 +417,11 @@ class GitGateway implements GitPort {
     repo: ArtifactsRepoName,
     head: ReceivePackHead,
     observed: Observed | null,
-  ): number | null {
+  ): Saved | null {
     const updates = head.updates.flatMap(pushedRef);
     const dueAt = this.#context.clock() + this.#limits.maxDurationMs;
     return atomically(this.#context.storage, () => {
-      if (this.#context.ports().claims.workingGeneration(fence.claimId) !== fence.generation) {
-        return null;
-      }
+      if (!this.#working(fence)) return null;
       const { sql } = this.#context.storage;
       const before = this.#released(repo);
       const prior =
@@ -433,9 +453,13 @@ class GitGateway implements GitPort {
           prior,
         )
         .one();
-      this.#context.wake(dueAt);
-      return row.id;
+      return { id: row.id, dueAt, armed: this.#context.wake(dueAt) };
     });
+  }
+
+  /** Whether the push's claim is still working at the push's generation. */
+  #working(fence: Fence): boolean {
+    return this.#context.ports().claims.workingGeneration(fence.claimId) === fence.generation;
   }
 
   /** Drops a pending push its complete report refused. If that fails, the alarm finds nothing moved. */
@@ -472,7 +496,8 @@ class GitGateway implements GitPort {
       }
     } finally {
       const next = this.#nextDue();
-      if (next !== null) this.#context.wake(next);
+      // A failed write is logged by the Repo, whose alarm handler then throws to be retried.
+      if (next !== null) await this.#context.wake(next);
     }
   }
 
@@ -998,6 +1023,13 @@ type Unproven = "unobserved" | "later_push";
 /** What a push's release decided. */
 type Release = "released" | "claim_changed" | "unsaved";
 
+/** A push saved as pending, and its alarm write. */
+interface Saved {
+  readonly id: number;
+  readonly dueAt: number;
+  readonly armed: Promise<boolean>;
+}
+
 /** `update` as a pushed ref; a deletion, which is refused before a push is sent, is none. */
 function pushedRef(update: RefUpdate): PushedRef[] {
   switch (update.kind) {
@@ -1068,10 +1100,10 @@ interface PendingPush {
   /** Reads the fork's branches the push names, before anything of it can reach the fork. */
   readonly observe: () => Promise<void>;
   /**
-   * Decides, without awaiting, whether the push's last bytes may be sent: only while the claim is
-   * still working at the push's generation, and only once the push is saved as pending.
+   * Decides whether the push's last bytes may be sent: only while the claim is still working at the
+   * push's generation, once the push is saved as pending and storage holds the alarm that records it.
    */
-  readonly release: () => Release;
+  readonly release: () => Promise<Release>;
   /** Records the refs the upstream reported updated. */
   readonly record: (updated: ReadonlySet<string>) => void;
   /** Drops a push whose complete report said nothing was updated. */
@@ -1486,7 +1518,7 @@ function limited(
   body: ReadableStream<Uint8Array>,
   max: number,
   deadline: Deadline,
-  release: (() => Release) | null,
+  release: (() => Promise<Release>) | null,
   ended: () => void,
 ): {
   readonly stream: ReadableStream<Uint8Array>;
@@ -1529,9 +1561,9 @@ function limited(
         if (cut > 0) controller.enqueue(data.subarray(0, cut));
         held = data.slice(cut);
       },
-      flush(controller) {
+      async flush(controller) {
         if (release !== null) {
-          const decision = release();
+          const decision = await release();
           if (decision !== "released") {
             withheld = decision;
             controller.error(new Error(decision === "claim_changed" ? CLAIM_CHANGED : UNSAVED));

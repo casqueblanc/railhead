@@ -158,8 +158,10 @@ interface World {
   live: () => FakeToken[];
   /** How far the gateway's clock is ahead of the real one, in milliseconds. */
   skew: number;
-  /** Every alarm time the gateway asked the Repo for. */
+  /** Every alarm time the gateway asked the Repo for, whether its write succeeded or not. */
   wakes: number[];
+  /** Whether the Repo's alarm write for a wake succeeds; called as the gateway asks for it. */
+  wakeAnswer: (at: number) => boolean;
   /** Builds a new gateway over the same storage, as a restarted Repo would. */
   restart: () => void;
   /** The pushes waiting for their record, as stored. */
@@ -293,6 +295,7 @@ function withGateway(
       live: () => [...fake.liveTokens(mainName), ...fake.liveTokens(forkName)],
       skew: 0,
       wakes: [],
+      wakeAnswer: () => true,
       restart: () => {
         world.gateway = build();
       },
@@ -315,6 +318,9 @@ function withGateway(
           clock: () => Date.now() + world.skew,
           wake: (at) => {
             world.wakes.push(at);
+            // Resolved later, as the Repo's alarm write is.
+            const answer = world.wakeAnswer(at);
+            return new Promise((resolve) => setTimeout(() => resolve(answer), 0));
           },
           ports: () => ({ sessions, claims, artifacts }),
           remote: (repo) => world.remote(repo),
@@ -2777,6 +2783,112 @@ describe("a push left pending", () => {
           error: "Error",
         }),
       ]);
+    });
+  });
+});
+
+/** Answers each push upload with `answer`, recording its length, or -1 if it was cut off. */
+function uploads(world: World, answer: () => Response): number[] {
+  const received: number[] = [];
+  world.upstream = async (request) => {
+    if (request.method === "GET") return advertisement(world.fork ?? []);
+    try {
+      received.push((await request.arrayBuffer()).byteLength);
+    } catch {
+      received.push(-1);
+      return new Response(null, { status: 500 });
+    }
+    return answer();
+  };
+  return received;
+}
+
+describe("a push whose alarm write fails", () => {
+  it("is released once the wake asked for again is set, and recorded by the alarm without a restart when its outcome is unknown", async () => {
+    await withGateway(async (world) => {
+      let failures = 1;
+      world.wakeAnswer = () => {
+        failures -= 1;
+        return failures < 0;
+      };
+      // The upstream applies the push, but its response is lost.
+      const received = uploads(world, () => new Response(null, { status: 500 }));
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(502);
+      expect(received).toEqual([PUSH_REQUEST.byteLength]);
+      const [row, ...others] = world.pending();
+      expect(others).toEqual([]);
+      // The failed write was asked for again before the last bytes were sent.
+      expect(world.wakes).toEqual([row?.due_at, row?.due_at]);
+      expect(world.events()).toEqual([]);
+
+      // The same gateway, not a restarted one, is woken by the alarm that was set.
+      world.upstream = (request) =>
+        Promise.resolve(
+          request.method === "GET"
+            ? advertisement([
+                [HEAD, "refs/heads/main"],
+                [PUSHED, "refs/heads/feature"],
+              ])
+            : new Response(null, { status: 500 }),
+        );
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(pushedEvents(world)).toMatchObject([
+        { data: { claimId: CLAIM, generation: 3, ref: "refs/heads/feature", to: PUSHED } },
+      ]);
+      expect(world.pending()).toEqual([]);
+    });
+  });
+
+  it("withholds the push's last bytes and drops it when its alarm cannot be set", async () => {
+    await withGateway(async (world) => {
+      world.wakeAnswer = () => false;
+      const received = uploads(world, () => gitResponse("git-receive-pack", "result", PUSH_RESULT));
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("5");
+      expect(await response.text()).toBe(
+        "railhead: the push could not be saved for its record; nothing was updated\n",
+      );
+      expect(received).toEqual([-1]);
+      expect(world.wakes).toHaveLength(2);
+      expect(world.pending()).toEqual([]);
+      expect(world.events()).toEqual([]);
+      expect(logged).toContain(
+        JSON.stringify({ event: "git_push_unarmed", claimId: CLAIM, generation: 3 }),
+      );
+    });
+  });
+
+  it("withholds the push's last bytes when its claim moves on while its alarm is written", async () => {
+    await withGateway(async (world) => {
+      world.wakeAnswer = () => {
+        world.claim = { ...world.claim, generation: 4 };
+        return true;
+      };
+      const received = uploads(world, () => gitResponse("git-receive-pack", "result", PUSH_RESULT));
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", PUSH_REQUEST),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(200);
+      expect(new TextDecoder().decode(await bytesOf(response))).toContain(
+        "the claim changed while this push was being sent",
+      );
+      expect(received).toEqual([-1]);
+      expect(world.wakes).toHaveLength(1);
+      expect(world.pending()).toEqual([]);
+      expect(world.events()).toEqual([]);
     });
   });
 });

@@ -7,6 +7,8 @@
 //     log: context.log,
 //     storage: context.storage,
 //     clock: context.clock,
+//     // The Repo's wake already resolves whether its alarm write succeeded; `ModuleContext.wake`
+//     // is typed to say so then, which the gateway needs before it releases a push.
 //     wake: context.wake,
 //     ports,
 //     remote: artifactsRemotes(context.env.ARTIFACTS),
