@@ -1,5 +1,6 @@
 import {
   CIWorkflow,
+  isCiRunnerFailure,
   type CiContext,
   type CiParams,
   type CloudflareArtifacts,
@@ -76,10 +77,15 @@ describe("gatewayCheckout", () => {
   );
 });
 
-/** The grants a fence routed, over a container whose every command succeeds. */
+/**
+ * The grants a fence routed, its destroys and wake-ups, over a container whose every command
+ * succeeds. The first `failingDestroys` destroys reject.
+ */
 class FenceRecorder {
   readonly routed: SandboxGrant[] = [];
+  readonly wakes: number[] = [];
   destroys = 0;
+  failingDestroys = 0;
 }
 
 /**
@@ -99,8 +105,11 @@ function withFence(body: (fence: SandboxFence, recorder: FenceRecorder) => Promi
         exec: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
         destroy: async () => {
           recorder.destroys += 1;
+          if (recorder.destroys <= recorder.failingDestroys) throw new Error("destroy failed");
         },
-        wake: async () => {},
+        wake: async (at) => {
+          recorder.wakes.push(at);
+        },
       },
       () => Date.now(),
     );
@@ -390,6 +399,12 @@ class ScriptedSandbox {
     return { content: "" };
   }
 
+  /** `RailheadSandbox.railheadRetire`, through `fence` when the test gives one. */
+  async railheadRetire() {
+    this.calls.push("retire");
+    await this.fence?.retire();
+  }
+
   async destroy() {
     this.calls.push("destroy");
   }
@@ -453,7 +468,11 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   }
 
   outcome: Outcome | null = null;
+  /** The failed runner's output, as the SDK stores and shows it. */
+  output: string | null = null;
   cached = false;
+  /** The literal environment the test runner is given. */
+  testEnv: Record<string, string> = {};
 
   protected override async pipeline(
     _event: WorkflowEvent<unknown>,
@@ -468,10 +487,11 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
         config,
         ...(this.cached ? { cache: { inputs: ["package.json"] } } : {}),
       });
-      await install.runner({ name: "test", command: "npm test", config });
+      await install.runner({ name: "test", command: "npm test", config, env: this.testEnv });
       this.outcome = { kind: "pass" };
     } catch (rejection) {
       this.outcome = { kind: "rejected", failure: classifyRunnerFailure(rejection) };
+      if (isCiRunnerFailure(rejection)) this.output = rejection.output;
     }
   }
 }
@@ -488,6 +508,8 @@ async function run(options: {
   trees?: Record<string, readonly string[]>;
   /** The fence the sandbox starts through; the run must then start only one sandbox. */
   fence?: SandboxFence;
+  /** The literal environment the test runner is given. */
+  testEnv?: Record<string, string>;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -515,7 +537,13 @@ async function run(options: {
   // Workerd constructs a Workflow only for a real instance, so the test builds one from the
   // prototype and gives it the fake bindings the engine reads through `this.env`.
   const workflow: CheckRun = Object.create(CheckRun.prototype);
-  Object.assign(workflow, { env: bindings, cached: options.cached ?? false, outcome: null });
+  Object.assign(workflow, {
+    env: bindings,
+    cached: options.cached ?? false,
+    testEnv: options.testEnv ?? {},
+    outcome: null,
+    output: null,
+  });
   const step = {
     do: async (_name: string, _config: unknown, body: (ctx: { attempt: number }) => unknown) =>
       body({ attempt: 1 }),
@@ -537,7 +565,7 @@ async function run(options: {
   };
   // The fakes implement only what the engine calls, not the SDK's full binding and step types.
   await Reflect.apply(CheckRun.prototype.run, workflow, [event, step]);
-  return { outcome: workflow.outcome, sandbox, artifacts };
+  return { outcome: workflow.outcome, output: workflow.output, sandbox, artifacts };
 }
 
 const SECRETS = [
@@ -550,6 +578,7 @@ const SECRETS = [
 
 describe("a check run through the patched SDK", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -562,13 +591,13 @@ describe("a check run through the patched SDK", () => {
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
-      "destroy",
+      "retire",
       "start",
       "restore",
       "checkout:overlay",
       "command:(npm test) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
-      "destroy",
+      "retire",
     ]);
     expect(sandbox.started).toEqual({
       policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
@@ -583,32 +612,82 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
   });
 
-  it("starts the sandbox's fence under a grant the registered gateway serves until retirement", async () => {
+  it("serves the checkout's grant while the check runs and retires the fence when it ends", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
     await withFence(async (fence, recorder) => {
-      const started = Date.now();
+      const current: boolean[] = [];
+      const command: ScriptedCommand = () => {
+        current.push(fence.grantCurrent(expiresAt));
+        return { exitCode: 0 };
+      };
       // The cache hit skips the install, so only the test's sandbox starts.
-      const { outcome, sandbox } = await run({ cached: true, fence });
-      const finished = Date.now();
-      const grant = parseSandboxGrant(sandbox.started);
+      const { outcome, sandbox } = await run({ cached: true, fence, command });
       const gateway = registeredGateway(fence);
-      const remote = `https://${HOST}/git/railhead/demo.git`;
 
-      const live = await gateway.serve(fetchRefs(remote), sandbox.started);
-      await fence.retire();
-      const retired = await gateway.serve(fetchRefs(remote), sandbox.started);
+      const after = await gateway.serve(
+        fetchRefs(`https://${HOST}/git/railhead/demo.git`),
+        sandbox.started,
+      );
 
       expect(outcome).toEqual({ kind: "pass" });
-      expect(sandbox.calls.filter((call) => call === "start")).toHaveLength(1);
-      expect(recorder.routed).toEqual([grant]);
-      expect(grant?.expiresAt).toBeGreaterThanOrEqual(started + MAX_SANDBOX_LIFETIME_MS);
-      expect(grant?.expiresAt).toBeLessThanOrEqual(finished + MAX_SANDBOX_LIFETIME_MS);
-      expect(live.status).toBe(200);
-      expect(retired.status).toBe(403);
-      expect(await retired.text()).toContain("retired");
-      expect(gateway.minted).toEqual(["read:demo:60"]);
-      expect(gateway.forwarded.map(({ auth }) => auth)).toEqual(["Bearer minted-read"]);
+      expect(sandbox.started).toEqual({
+        policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
+        expiresAt,
+      });
+      expect(recorder.routed).toEqual([parseSandboxGrant(sandbox.started)]);
+      expect(current).toEqual([true]);
+      // The runner's own cleanup retired the fence: nothing in the test did.
+      expect(sandbox.calls.slice(-2)).toEqual(["backup", "retire"]);
+      expect(sandbox.calls).not.toContain("destroy");
+      expect(recorder.destroys).toBe(1);
+      expect(fence.grantCurrent(expiresAt)).toBe(false);
+      expect(after.status).toBe(403);
+      expect(await after.text()).toContain("retired");
+      expect(gateway.minted).toEqual([]);
+      expect(gateway.forwarded).toEqual([]);
     });
   });
+
+  it.each([
+    ["a passing check", { exitCode: 0 }],
+    ["a failing check", { exitCode: 1 }],
+  ])(
+    "fails %s whose sandbox was not destroyed, with the grant ended and the retry kept",
+    async (_name, command) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(NOW);
+      const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
+      await withFence(async (fence, recorder) => {
+        recorder.failingDestroys = 1;
+        const { outcome, sandbox } = await run({ cached: true, fence, command });
+        const gateway = registeredGateway(fence);
+
+        const after = await gateway.serve(
+          fetchRefs(`https://${HOST}/git/railhead/demo.git`),
+          sandbox.started,
+        );
+
+        // Railhead could not confirm the sandbox is gone, so the run neither passes nor blames
+        // the change.
+        expect(outcome).toEqual({
+          kind: "rejected",
+          failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+        });
+        expect(sandbox.calls.at(-1)).toBe("retire");
+        expect(recorder.destroys).toBe(1);
+        // Retirement was recorded before the destroy, so the grant already ended.
+        expect(after.status).toBe(403);
+        expect(gateway.minted).toEqual([]);
+        // The fence kept a retry: its wake-up destroys the container.
+        expect(recorder.wakes.at(-1)).toBeGreaterThan(NOW);
+        await fence.expire();
+        expect(recorder.destroys).toBe(2);
+        expect(fence.grantCurrent(expiresAt)).toBe(false);
+      });
+    },
+  );
 
   it("runs no command when the sandbox's fence refuses to start", async () => {
     await withFence(async (fence) => {
@@ -620,7 +699,7 @@ describe("a check run through the patched SDK", () => {
         kind: "rejected",
         failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
       });
-      expect(sandbox.calls).toEqual(["start", "destroy"]);
+      expect(sandbox.calls).toEqual(["start", "retire"]);
     });
   });
 
@@ -631,7 +710,7 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "error", runner: "install", reason: "checkout" },
     });
-    expect(sandbox.calls).toEqual(["start", "checkout", "destroy"]);
+    expect(sandbox.calls).toEqual(["start", "checkout", "retire"]);
   });
 
   it("records a failed overlay checkout on a chained runner as an error before its command", async () => {
@@ -677,6 +756,42 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "fail", runner: "install", exitCode: 2 },
     });
+  });
+
+  it.each([
+    ["the runner's name", { NODE_ENV: "test" }],
+    ["the exit code", { CI: "1" }],
+  ])(
+    "records a failure when an env value matches %s, and still redacts it from the output",
+    async (_name, testEnv) => {
+      const value = Object.values(testEnv)[0] ?? "";
+      const { outcome, output } = await run({
+        testEnv,
+        command: (line) =>
+          line.includes("npm test") ? { exitCode: 1, stdout: `env=${value}` } : { exitCode: 0 },
+      });
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "fail", runner: "test", exitCode: 1 },
+      });
+      expect(output).toBe(
+        "test failed with exit code 1\n=== stdout ===\nenv=[REDACTED]\n=== stderr ===\n",
+      );
+    },
+  );
+
+  it("keeps a failed checkout an error when an env value redacts its message", async () => {
+    const { outcome, output } = await run({
+      testEnv: { STAGE: "source checkout" },
+      checkout: (overlay) => ({ exitCode: overlay ? 1 : 0 }),
+    });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+    });
+    expect(output).toBe("[REDACTED] exited with status 1");
   });
 
   it("restores a cached workspace through the R2 binding", async () => {

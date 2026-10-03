@@ -6,8 +6,10 @@
 // runner starts the sandbox's fenced incarnation (`src/sandbox/fence.ts`) under that grant, which
 // routes the sandbox's Git requests to the gateway (`src/sandbox/gateway.ts`) and retires it when
 // the grant lapses. The gateway serves the grant only while that incarnation is live, and adds a
-// short-lived token outside the container. The patched runner also stops a run whose checkout exits
-// nonzero before the check's command starts.
+// short-lived token outside the container. When the run ends the patched runner retires the
+// incarnation through its fence, which ends the grant before it destroys the container; a destroy
+// that fails fails the run, and the fence keeps retrying it. The patched runner also stops a run
+// whose checkout exits nonzero before the check's command starts.
 //
 // `classifyRunnerFailure` then separates the change's fault from Railhead's: `fail` only when the
 // check's own command exited nonzero, `error` for everything else, so a missing commit, a refused
@@ -29,7 +31,8 @@ const CHECKOUT_FAILED = "source checkout exited with status ";
 
 const SHA = /^[0-9a-f]{40}$/;
 const ACCOUNT_ID = /^[0-9a-f]{32}$/;
-// The SDK's failure message for a nonzero command exit, after the runner's name.
+// The SDK's failure message for a nonzero command exit, after the runner's name. The patch keeps
+// this header out of environment redaction; only the output after it is redacted.
 const COMMAND_FAILED = /^ failed with exit code ([1-9][0-9]{0,9})\n=== stdout ===\n/;
 
 type Provider = ReturnType<SourceControlAdapter<CloudflareArtifacts>["create"]>;
