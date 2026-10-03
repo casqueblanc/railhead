@@ -4,6 +4,7 @@ import { SYNTH_TRAIN, syntheticLog, synthCommit } from "./syntheticLog";
 import {
   UPLOAD,
   UPLOAD_BASE,
+  adapt,
   checkResult,
   decide,
   inbox,
@@ -17,10 +18,10 @@ import {
 
 /**
  * The demo's decision reversal. The owner answers "reject"; both agents acknowledge, and atlas's
- * work lands with the reject acceptance check passing. The owner then supersedes the decision with
- * "chunk". Atlas receives the new version and a rework item, acknowledges both, reworks and lands
- * with the chunk acceptance check passing. Birch stays disconnected: its new item remains queued
- * and its `ready` is refused.
+ * work lands with the reject acceptance check passing, so the backend records it adapted. The owner
+ * then supersedes the decision with "chunk". Atlas receives the new version and a rework item,
+ * acknowledges both, reworks and lands with the chunk acceptance check passing, and is recorded
+ * adapted again. Birch stays disconnected: its new item remains queued and its `ready` is refused.
  */
 export const decisionReversal = syntheticLog("Synthetic decision reversal, reject then chunk", [
   ...uploadPrelude(),
@@ -55,6 +56,7 @@ export const decisionReversal = syntheticLog("Synthetic decision reversal, rejec
     "chk_synth01",
   ),
   moveMain("int_synth01", "updated", synthCommit(3)),
+  adapt(UPLOAD.atlasClaim, "int_synth01", sizeDecision(1)),
   decide(2, "chunk"),
   ...inbox(
     UPLOAD.atlas,
@@ -128,4 +130,5 @@ export const decisionReversal = syntheticLog("Synthetic decision reversal, rejec
     "chk_synth02",
   ),
   moveMain("int_synth02", "updated", synthCommit(5)),
+  adapt(UPLOAD.atlasClaim, "int_synth02", sizeDecision(2)),
 ]);

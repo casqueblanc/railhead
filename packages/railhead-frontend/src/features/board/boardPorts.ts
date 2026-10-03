@@ -9,13 +9,14 @@ import type { ComponentType } from "react";
 import type {
   ActionChallenge,
   BoardResult,
+  CheckDetail,
   EnrollmentChallenge,
   OwnerAction,
   OwnerActionResult,
   PasskeyAssertion,
   PasskeyRegistration,
 } from "@railhead/shared/board-api";
-import type { UserId } from "@railhead/shared/events";
+import type { CheckRunId, UserId } from "@railhead/shared/events";
 import type { ConnectionStatus } from "../../rpc/useApiConnection";
 import type { BoardFeed } from "../claims/boardFeed";
 import type { DecisionActions } from "../decisions/decisionActions";
@@ -67,6 +68,18 @@ export type EnrollmentPort =
     }
   | { kind: "unavailable"; reason: OwnerUnavailableReason };
 
+/** Why check runs cannot be read: as for owner actions, or a replay that has no backend. */
+export type CheckDetailUnavailableReason = OwnerUnavailableReason | "replay";
+
+/** Reading what the backend recorded for one check run, as a plain callback. */
+export type CheckDetailPort =
+  | {
+      kind: "available";
+      /** Reads the run's candidate, command and result. Never throws. */
+      onReadCheck: (checkRunId: CheckRunId) => Promise<BoardResult<CheckDetail>>;
+    }
+  | { kind: "unavailable"; reason: CheckDetailUnavailableReason };
+
 /** Everything the board page is composed from. */
 export interface BoardPorts {
   /** Whether the one backend session answers. */
@@ -77,6 +90,7 @@ export interface BoardPorts {
   decisions: DecisionActions;
   owner: OwnerPort;
   enrollment: EnrollmentPort;
+  checks: CheckDetailPort;
 }
 
 /** What every leaf slot receives: the board it renders from. */
@@ -144,6 +158,8 @@ export const gateOnConnection = (ports: BoardPorts): BoardPorts => {
       ports.enrollment.kind === "available"
         ? { kind: "unavailable", reason: "offline" }
         : ports.enrollment,
+    checks:
+      ports.checks.kind === "available" ? { kind: "unavailable", reason: "offline" } : ports.checks,
   };
 };
 

@@ -24,6 +24,7 @@ vi.mock("../../features/enrollment/entry", () => ({
 vi.mock("../../features/issues/entry", () => ({ issuesEntry: { kind: "unavailable" } }));
 vi.mock("../../features/phone/entry", () => ({ phoneEntry: { kind: "unavailable" } }));
 vi.mock("../../features/app/entry", () => ({ appEntry: { kind: "unavailable" } }));
+vi.mock("../../features/metrics/entry", () => ({ metricsEntry: { kind: "unavailable" } }));
 
 const reversal = foldEvents(emptyBoardState(SYNTH_REPO), decisionReversal.events);
 const openQuestion = foldEvents(
@@ -60,6 +61,10 @@ const ports = (overrides: Partial<BoardPorts> = {}): BoardPorts => ({
     kind: "available",
     onPrepareEnrollment: () => Promise.reject(new Error("no enrollment in this test")),
     onCompleteEnrollment: () => Promise.reject(new Error("no enrollment in this test")),
+  },
+  checks: {
+    kind: "available",
+    onReadCheck: () => Promise.reject(new Error("no check read in this test")),
   },
   ...overrides,
 });

@@ -5,6 +5,7 @@ import type {
   ActionChallenge,
   BoardListener,
   BoardResult,
+  CheckDetail,
   EnrollmentChallenge,
   EventPage,
   OwnerAction,
@@ -12,7 +13,7 @@ import type {
   PasskeyAssertion,
   PasskeyRegistration,
 } from "@railhead/shared/board-api";
-import type { UserId } from "@railhead/shared/events";
+import type { CheckRunId, UserId } from "@railhead/shared/events";
 
 // The parts of the backend's capabilities the board calls, as the Cap'n Web stub of `RailheadApi`
 // presents them. `openApiSession` returns the real stub as an `ApiSession` without a cast, so the
@@ -51,6 +52,7 @@ export interface BoardSession extends Disposable {
     history?: string,
   ): PromiseLike<BoardResult<SubscriptionSession>>;
   owner(): PromiseLike<OwnerSession>;
+  checkDetail(checkRunId: CheckRunId): PromiseLike<BoardResult<CheckDetail>>;
 }
 
 /** One RPC session with the backend, after `RailheadApi`. */
