@@ -499,6 +499,25 @@ describe("joins", () => {
     );
   });
 
+  it("counts concurrent refused joins before checking any of them", async () => {
+    await withIdentity(
+      async ({ identity, repo, invite, rows }) => {
+        const ticket = await invite();
+        const key = await AgentKey.create();
+        const bad = {
+          ...(await joinRequest(key, ticket, repo)),
+          inviteSecret: flipLast(ticket.inviteSecret),
+        };
+        const results = await Promise.all(Array.from({ length: 8 }, () => identity.join(bad)));
+        const outcomes = results.map((r) => (r.ok ? "ok" : r.code));
+        expect(outcomes.filter((code) => code === "join_refused")).toHaveLength(3);
+        expect(outcomes.filter((code) => code === "rate_limited")).toHaveLength(5);
+        expect(rows("identity_agent")).toBe(0);
+      },
+      { refusalsPerWindow: 3 },
+    );
+  });
+
   it("fails closed without a configured origin", async () => {
     await withIdentity(
       async ({ identity, repoId, repo, rows, state }) => {

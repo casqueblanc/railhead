@@ -215,8 +215,12 @@ export function createIdentity(
       if (refusals.count >= dependencies.refusalsPerWindow) {
         return fail("rate_limited", "Too many refused joins; wait a minute and try again.");
       }
+      // Reserve a slot before the first await, so concurrent attempts cannot all pass the check;
+      // give it back unless the attempt was refused.
+      const window = refusals;
+      window.count += 1;
       const result = await attemptJoin(request);
-      if (!result.ok && result.code === "join_refused") refusals.count += 1;
+      if (result.ok || result.code !== "join_refused") window.count -= 1;
       return result;
     },
 
