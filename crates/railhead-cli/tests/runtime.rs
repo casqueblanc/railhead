@@ -23,13 +23,10 @@ const AGENT_COMMANDS: [&[&str]; 8] = [
     &["ready"],
     &["status"],
     &["sync"],
-    &["ack"],
-    &["ask"],
+    &["ack", "17", "--plan", "p"],
+    &["ask", "Reject?"],
     &["credential", "get"],
 ];
-
-/// Agent commands whose entry points are stubs. A command leaves this list when it is built.
-const STUBBED_AGENT_COMMANDS: [&str; 3] = ["sync", "ack", "ask"];
 
 struct World {
     home: tempfile::TempDir,
@@ -280,22 +277,7 @@ async fn a_mismatched_agent_in_a_clone_sends_nothing() -> anyhow::Result<()> {
 async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let world = world(&server.uri())?;
-    for agent in [None, Some("atlas"), Some("agt_atlas01")] {
-        for command in STUBBED_AGENT_COMMANDS {
-            let argv = ["--json", command];
-            let run = rh(&world, world.clone.path(), agent, &argv, "")?;
-            assert_eq!(run.code, Some(1));
-            let envelope = run.json()?;
-            assert_eq!(
-                envelope.pointer("/error/code"),
-                Some(&json!("command_unavailable")),
-                "{command}"
-            );
-            let message = format!("rh {command} is not available in this build yet");
-            assert_eq!(envelope.pointer("/error/message"), Some(&json!(message)));
-        }
-    }
-    // Outside the clone, the named agent is used.
+    // Outside the clone, the named agent is used: boreas has no session and no key to log in with.
     let outside = rh(
         &world,
         world.outside.path(),
@@ -305,7 +287,15 @@ async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result
     )?;
     assert_eq!(
         outside.json()?.pointer("/error/code"),
-        Some(&json!("command_unavailable"))
+        Some(&json!("no_session"))
+    );
+    let message = outside.json()?.pointer("/error/message").cloned();
+    assert!(
+        message
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("boreas has no session")),
+        "{message:?}"
     );
     let join = rh(&world, world.outside.path(), None, &["--json", "join"], "")?;
     assert_eq!(
