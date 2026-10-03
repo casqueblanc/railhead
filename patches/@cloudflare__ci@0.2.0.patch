@@ -177,7 +177,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a
      throw new Error(`cache(${input.label}): inputs must not be empty`);
    }
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd523599f6 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..da8c30f2fa6386a7f07c0b3b557c8255f207af56 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
 @@ -1,5 +1,6 @@
@@ -187,7 +187,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
  
  import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
  import { posix } from 'node:path';
-@@ -33,25 +34,63 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -33,25 +34,71 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    /**
     * Copies source, runs the command, and snapshots `/workspace` after a
     * successful exit. A restored Snapshot is overlaid with the current source.
@@ -204,6 +204,14 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
 +    const fenced = input.source.kind === 'git' && !!input.source.fence;
 +    if (fenced && typeof input.source.fence.sandbox !== 'string') {
 +      throw new Error('a fenced checkout must name its admitted sandbox');
++    }
++    // The admitted sandbox serves one runner: the first runner's release
++    // retires it for good, so a chained runner, which restores its parent's
++    // workspace, is refused here before it opens the sandbox.
++    if (fenced && input.restore) {
++      throw new Error(
++        'a fenced sandbox serves one runner, so a chained runner cannot continue its workspace'
++      );
 +    }
      // create the sandbox handle
 -    const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
@@ -263,7 +271,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
          // Overlay (no rm) so cached node_modules survive while tracked source
-@@ -59,20 +98,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -59,20 +106,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          // different commit's source (e.g. a reused install cache), so this is
          // what keeps it correct. Files deleted since then linger; the next
          // install/build regenerates derived output.
@@ -303,7 +311,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
        }
  
        const proc = await sandbox.startProcess(
-@@ -95,53 +141,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -95,53 +149,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          return { exitCode, logs: preview, preview };
        }
  
@@ -392,7 +400,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -157,11 +198,20 @@ async function readLog(
+@@ -157,11 +206,20 @@ async function readLog(
    sandbox: ReturnType<typeof getSandbox>,
    file: string,
    size: number
@@ -417,7 +425,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..e0287442ee6c39d7e0a44a6a87bd8ccd
  }
  
  async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
-@@ -198,43 +248,6 @@ function resolveCwd(cwd: string | undefined) {
+@@ -198,43 +256,6 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

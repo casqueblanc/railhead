@@ -11,8 +11,8 @@
 // grant lapses. The gateway serves the grant only while that incarnation is live, and adds a
 // short-lived token outside the container. When the run ends the patched runner retires the
 // incarnation through its fence, which ends the grant before it destroys the container; a destroy
-// that fails fails the run, and the fence keeps retrying it. One slot serves one runner: a chained
-// runner would join an incarnation already retired, and is refused. The patched runner also stops a run
+// that fails fails the run, and the fence keeps retrying it. One slot serves one runner: the patched
+// runner refuses a chained runner before it opens the sandbox. The patched runner also stops a run
 // whose checkout exits nonzero before the check's command starts. Workspace backups need a
 // `BACKUP_BUCKET` R2 binding; without one a runner runs with no backup or cache, and a chained
 // runner, which would continue its parent's workspace, ends as an error before it starts.

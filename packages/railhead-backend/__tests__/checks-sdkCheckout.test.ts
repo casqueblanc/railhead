@@ -875,12 +875,6 @@ class ScriptedSandbox {
   tailFails = false;
   /** Whether `railheadRetire` rejects without retiring. */
   retireFails = false;
-  /** Called when the runner asks for a restore, before the fence sees it. */
-  onRestore: () => void = noop;
-  /** When set, a restore waits on it, as the SDK's restore waits on R2, before it extracts. */
-  restoreWaits: Promise<void> | null = null;
-  /** Called once a restore is waiting on `restoreWaits`. */
-  onRestoreWaiting: () => void = noop;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -926,7 +920,6 @@ class ScriptedSandbox {
   }
 
   restoreBackup(backup: DirectoryBackup) {
-    this.onRestore();
     return this.sdk.restoreBackup(backup);
   }
 
@@ -961,10 +954,6 @@ class ScriptedSandbox {
         return { id, dir: "/workspace", localBucket: options.localBucket ?? false };
       },
       restoreBackup: async (backup) => {
-        if (this.restoreWaits !== null) {
-          this.onRestoreWaiting();
-          await this.restoreWaits;
-        }
         await this.reach();
         this.calls.push("restore");
         this.restored.push(backup);
@@ -1084,7 +1073,10 @@ class CacheBucket {
 
 type Outcome = { kind: "pass" } | { kind: "rejected"; failure: RunnerFailure };
 
-/** The pipeline each test runs: an install, then a test chained on its workspace. */
+/**
+ * The pipeline each test runs: an install, which a check's single runner stands for, and, when
+ * `chained`, a test chained on its workspace, which an admitted sandbox refuses.
+ */
 class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   static override getProvider() {
     return railheadCheckout({ owner: NAMESPACE, repo: REPO });
@@ -1095,8 +1087,8 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   output: string | null = null;
   cached = false;
   /** Whether a test runner is chained on the install's workspace. */
-  chained = true;
-  /** The literal environment the test runner is given. */
+  chained = false;
+  /** The literal environment the last runner is given. */
   testEnv: Record<string, string> = {};
 
   protected override async pipeline(
@@ -1111,6 +1103,7 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
         command: "npm ci",
         config,
         ...(this.cached ? { cache: { inputs: ["package.json"] } } : {}),
+        ...(this.chained ? {} : { env: this.testEnv }),
       });
       if (this.chained) {
         await install.runner({ name: "test", command: "npm test", config, env: this.testEnv });
@@ -1135,9 +1128,9 @@ async function run(options: {
   trees?: Record<string, readonly string[]>;
   /** The fence the sandbox starts through; the run must then start only one sandbox. */
   fence?: SandboxFence;
-  /** The literal environment the test runner is given. */
+  /** The literal environment the last runner is given. */
   testEnv?: Record<string, string>;
-  /** Whether the test runner is chained on the install; defaults to true. */
+  /** Whether a test runner is chained on the install; defaults to false. */
   chained?: boolean;
   /** Whether the run carries the slot the repository admitted for it; defaults to true. */
   admitted?: boolean;
@@ -1147,11 +1140,6 @@ async function run(options: {
   logBytes?: number;
   tailFails?: boolean;
   retireFails?: boolean;
-  /** Called when the runner asks for a restore, before the fence sees it. */
-  onRestore?: () => void;
-  /** A restore waits on this, as on R2, and calls `onRestoreWaiting` once it is waiting. */
-  restoreWaits?: Promise<void>;
-  onRestoreWaiting?: () => void;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -1167,9 +1155,6 @@ async function run(options: {
   sandbox.logBytes = options.logBytes ?? 0;
   sandbox.tailFails = options.tailFails ?? false;
   sandbox.retireFails = options.retireFails ?? false;
-  sandbox.onRestore = options.onRestore ?? noop;
-  sandbox.restoreWaits = options.restoreWaits ?? null;
-  sandbox.onRestoreWaiting = options.onRestoreWaiting ?? noop;
   // Every method the runner calls on the sandbox object, whatever path it takes.
   const runnerCalls = new Set<string>();
   const observed = new Proxy(sandbox, {
@@ -1208,7 +1193,7 @@ async function run(options: {
   Object.assign(workflow, {
     env: bindings,
     cached: options.cached ?? false,
-    chained: options.chained ?? true,
+    chained: options.chained ?? false,
     testEnv: options.testEnv ?? {},
     outcome: null,
     output: null,
@@ -1269,20 +1254,12 @@ describe("a check run through the patched SDK", () => {
     const { outcome, sandbox, artifacts, opened } = await run({});
 
     expect(outcome).toEqual({ kind: "pass" });
-    // Both runners open the admitted slot's sandbox, never one of their own naming.
+    // The runner opens the admitted slot's sandbox, never one of its own naming.
     expect(new Set(opened)).toEqual(new Set([SANDBOX]));
     expect(sandbox.calls).toEqual([
       "start",
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-      "backup",
-      "log:read",
-      "log:read",
-      "retire",
-      "start",
-      "restore",
-      "checkout:overlay",
-      "command:(npm test) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
       "log:read",
       "log:read",
@@ -1298,13 +1275,14 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.scripts[0]).toContain(`fetch --depth=1 origin '${SHA}'`);
     expect(artifacts.calls).toEqual([]);
     // Backups stay on the R2 binding: the container has no route to presigned URLs.
-    expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
+    expect(sandbox.backups).toEqual([{ localBucket: true }]);
   });
 
   it("calls no sandbox method that bypasses the fence", async () => {
     const runs = await Promise.all([
       run({}),
-      run({ cached: true, logBytes: INLINE_LOG_BYTES + 1 }),
+      run({ logBytes: INLINE_LOG_BYTES + 1 }),
+      run({ chained: true }),
       run({ command: { exitCode: 1 } }),
       run({ checkout: () => ({ exitCode: 128 }) }),
     ]);
@@ -1323,7 +1301,6 @@ describe("a check run through the patched SDK", () => {
       "listFiles",
       "railheadRetire",
       "railheadStart",
-      "restoreBackup",
       "startProcess",
     ]);
   });
@@ -1338,8 +1315,7 @@ describe("a check run through the patched SDK", () => {
         current.push(fence.grantCurrent(expiresAt));
         return { exitCode: 0 };
       };
-      // The cache hit skips the install, so only the test's sandbox starts.
-      const { outcome, sandbox } = await run({ cached: true, fence, command });
+      const { outcome, sandbox } = await run({ fence, command });
       const gateway = registeredGateway(fence);
 
       const after = await gateway.serve(
@@ -1366,68 +1342,32 @@ describe("a check run through the patched SDK", () => {
     });
   });
 
-  it("never touches the container when a restore that began before expiry resumes after it", async () => {
+  it("refuses a runner chained on the install before it reaches the retired sandbox", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
     const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
     await withFence(async (fence, recorder) => {
-      const r2 = deferred();
-      const waiting = deferred();
-      // The cache hit skips the install, so the test's sandbox restores the cached workspace.
-      const pending = run({
-        cached: true,
-        fence,
-        restoreWaits: r2.promise,
-        onRestoreWaiting: waiting.resolve,
-      });
-      await waiting.promise;
+      const { outcome, output, sandbox } = await run({ chained: true, fence });
 
-      // The deadline's wake-up retires the sandbox while the restore waits on R2. It cannot confirm
-      // the teardown while the restore is unresolved.
-      vi.setSystemTime(expiresAt);
-      await expect(fence.expire()).rejects.toMatchObject({ code: "unsettled" });
-      expect(fence.grantCurrent(expiresAt)).toBe(false);
-      const destroysAtExpiry = recorder.destroys;
-      expect(destroysAtExpiry).toBeGreaterThan(0);
-
-      r2.resolve();
-      const { outcome, sandbox } = await pending;
-
+      // The install retired the slot's one incarnation; the chained test never asked to start it.
       expect(outcome).toEqual({
         kind: "rejected",
         failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
       });
-      // Nothing reached the container after the restore resumed: no extraction, checkout,
-      // command, backup or log read, and no cache pointer.
-      expect(sandbox.calls).toEqual(["start", "retire"]);
+      expect(output).toBe(
+        "a fenced sandbox serves one runner, so a chained runner cannot continue its workspace",
+      );
+      expect(sandbox.calls).toEqual([
+        "start",
+        "checkout",
+        "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
+        "backup",
+        "log:read",
+        "log:read",
+        "retire",
+      ]);
+      expect(recorder.routed).toHaveLength(1);
       expect(sandbox.restored).toEqual([]);
-      // The restore's settling and the runner's release each destroyed the container again, and
-      // the teardown is now confirmed.
-      expect(recorder.destroys).toBe(destroysAtExpiry + 2);
-      await fence.retire();
-      expect(fence.grantCurrent(expiresAt)).toBe(false);
-    });
-  });
-
-  it("refuses a restore asked for after the sandbox's deadline without running it", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(NOW);
-    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
-    await withFence(async (fence, recorder) => {
-      const { outcome, sandbox } = await run({
-        cached: true,
-        fence,
-        onRestore: () => vi.setSystemTime(expiresAt),
-      });
-
-      expect(outcome).toEqual({
-        kind: "rejected",
-        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
-      });
-      expect(sandbox.calls).toEqual(["start", "retire"]);
-      expect(sandbox.restored).toEqual([]);
-      expect(recorder.destroys).toBeGreaterThan(0);
-      await fence.retire();
       expect(fence.grantCurrent(expiresAt)).toBe(false);
     });
   });
@@ -1443,7 +1383,7 @@ describe("a check run through the patched SDK", () => {
       const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
       await withFence(async (fence, recorder) => {
         recorder.failingDestroys = 1;
-        const { outcome, sandbox } = await run({ cached: true, fence, command });
+        const { outcome, sandbox } = await run({ fence, command });
         const gateway = registeredGateway(fence);
 
         const after = await gateway.serve(
@@ -1455,7 +1395,7 @@ describe("a check run through the patched SDK", () => {
         // the change.
         expect(outcome).toEqual({
           kind: "rejected",
-          failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+          failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
         });
         expect(sandbox.calls.at(-1)).toBe("retire");
         expect(recorder.destroys).toBe(1);
@@ -1490,8 +1430,7 @@ describe("a check run through the patched SDK", () => {
         "retire",
         "pointer",
       ]);
-      // The chained test is not cached, but still reads its logs before it retires.
-      expect(sandbox.calls.slice(-4)).toEqual(["backup", ...reads, "retire"]);
+      expect(sandbox.calls).toHaveLength(8);
     },
   );
 
@@ -1565,11 +1504,11 @@ describe("a check run through the patched SDK", () => {
     await withFence(async (fence) => {
       // A retired object never starts again, as when the deadline passed before the runner began.
       await fence.retire();
-      const { outcome, sandbox } = await run({ cached: true, fence });
+      const { outcome, sandbox } = await run({ fence });
 
       expect(outcome).toEqual({
         kind: "rejected",
-        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+        failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
       });
       expect(sandbox.calls).toEqual(["start", "retire"]);
     });
@@ -1583,20 +1522,6 @@ describe("a check run through the patched SDK", () => {
       failure: { conclusion: "error", runner: "install", reason: "checkout" },
     });
     expect(sandbox.calls).toEqual(["start", "checkout", "retire"]);
-  });
-
-  it("records a failed overlay checkout on a chained runner as an error before its command", async () => {
-    const { outcome, sandbox } = await run({
-      checkout: (overlay) => ({ exitCode: overlay ? 1 : 0 }),
-    });
-
-    expect(outcome).toEqual({
-      kind: "rejected",
-      failure: { conclusion: "error", runner: "test", reason: "checkout" },
-    });
-    expect(sandbox.calls.filter((call) => call.startsWith("command:"))).toEqual([
-      "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-    ]);
   });
 
   it("refuses a SHA that is not a full commit before any sandbox starts", async () => {
@@ -1643,7 +1568,7 @@ describe("a check run through the patched SDK", () => {
   });
 
   it.each([
-    ["the runner's name", { NODE_ENV: "test" }],
+    ["the runner's name", { NODE_ENV: "install" }],
     ["the exit code", { CI: "1" }],
   ])(
     "records a failure when an env value matches %s, and still redacts it from the output",
@@ -1651,16 +1576,15 @@ describe("a check run through the patched SDK", () => {
       const value = Object.values(testEnv)[0] ?? "";
       const { outcome, output } = await run({
         testEnv,
-        command: (line) =>
-          line.includes("npm test") ? { exitCode: 1, stdout: `env=${value}` } : { exitCode: 0 },
+        command: { exitCode: 1, stdout: `env=${value}` },
       });
 
       expect(outcome).toEqual({
         kind: "rejected",
-        failure: { conclusion: "fail", runner: "test", exitCode: 1 },
+        failure: { conclusion: "fail", runner: "install", exitCode: 1 },
       });
       expect(output).toBe(
-        "test failed with exit code 1\n=== stdout ===\nenv=[REDACTED]\n=== stderr ===\n",
+        "install failed with exit code 1\n=== stdout ===\nenv=[REDACTED]\n=== stderr ===\n",
       );
     },
   );
@@ -1668,23 +1592,23 @@ describe("a check run through the patched SDK", () => {
   it("keeps a failed checkout an error when an env value redacts its message", async () => {
     const { outcome, output } = await run({
       testEnv: { STAGE: "source checkout" },
-      checkout: (overlay) => ({ exitCode: overlay ? 1 : 0 }),
+      checkout: () => ({ exitCode: 1 }),
     });
 
     expect(outcome).toEqual({
       kind: "rejected",
-      failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
     });
     expect(output).toBe("[REDACTED] exited with status 1");
   });
 
-  it("restores a cached workspace through the R2 binding", async () => {
+  it("reuses a cached install without starting the sandbox", async () => {
     const { outcome, sandbox, artifacts } = await run({ cached: true });
 
     expect(outcome).toEqual({ kind: "pass" });
-    // The cache hit skips the install; the test restores its workspace from the binding.
-    expect(sandbox.restored).toEqual([{ id: BACKUP_ID, dir: "/workspace", localBucket: true }]);
-    expect(sandbox.calls).not.toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
+    // The cache hit skips the install's command, so the sandbox is never started or restored.
+    expect(sandbox.calls).toEqual([]);
+    expect(sandbox.restored).toEqual([]);
     expect(artifacts.calls).toEqual(["get:demo"]);
   });
 
@@ -1716,7 +1640,7 @@ describe("a check run through the patched SDK", () => {
 
   it("records a chained runner without a BACKUP_BUCKET binding as an error before it starts", async () => {
     vi.spyOn(console, "warn").mockImplementation(noop);
-    const { outcome, output, sandbox } = await run({ backupBucket: false });
+    const { outcome, output, sandbox } = await run({ backupBucket: false, chained: true });
 
     expect(outcome).toEqual({
       kind: "rejected",
@@ -1741,21 +1665,19 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.backups).toEqual([{ localBucket: true }]);
   });
 
-  it("never restores another commit's cached workspace, so a deleted file cannot linger", async () => {
+  it("never reuses another commit's cached workspace, so a deleted file cannot linger", async () => {
     const before = "c".repeat(40);
     const after = "d".repeat(40);
-    // `after` deletes src/legacy.ts but keeps src/index.ts, which imports it, and package.json,
-    // the cache input, so both commits share one cache key.
+    // `after` deletes src/legacy.ts but keeps package.json, the cache input, so both commits
+    // share one cache key.
     const trees = {
       [before]: ["package.json", "src/index.ts", "src/legacy.ts"],
       [after]: ["package.json", "src/index.ts"],
     };
     const seen: string[][] = [];
-    // The test passes only while the deleted module is still on disk.
-    const command: ScriptedCommand = (line, workspace) => {
+    const command: ScriptedCommand = (_line, workspace) => {
       seen.push([...workspace].toSorted());
-      const stale = workspace.has("src/legacy.ts");
-      return { exitCode: line.includes("npm test") && !stale ? 1 : 0 };
+      return { exitCode: 0 };
     };
 
     const { outcome, sandbox } = await run({
@@ -1766,18 +1688,11 @@ describe("a check run through the patched SDK", () => {
       command,
     });
 
-    expect(outcome).toEqual({
-      kind: "rejected",
-      failure: { conclusion: "fail", runner: "test", exitCode: 1 },
-    });
-    // The install runs on a clean checkout; the test restores only that install's backup.
+    expect(outcome).toEqual({ kind: "pass" });
+    // The install runs on a clean checkout of its own commit; nothing is restored.
     expect(sandbox.calls).toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
-    expect(sandbox.restored).toHaveLength(1);
-    expect(sandbox.restored).not.toContainEqual(expect.objectContaining({ id: BACKUP_ID }));
-    expect(seen).toEqual([
-      ["package.json", "src/index.ts"],
-      ["package.json", "src/index.ts"],
-    ]);
+    expect(sandbox.restored).toEqual([]);
+    expect(seen).toEqual([["package.json", "src/index.ts"]]);
   });
 });
 
