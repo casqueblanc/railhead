@@ -107,6 +107,8 @@ interface Harness {
   train: Train;
   ref: FakeMain;
   authorization: AuthorizationPort;
+  /** Each claim's current pin; a test replaces one to model a change of owner. */
+  claims: Map<string, ClaimPin>;
   started: CheckAttempt[];
   events(): RailheadEvent[];
   sql: SqlStorage;
@@ -183,6 +185,7 @@ function withRepo<R>(
       train,
       ref,
       authorization,
+      claims: current,
       started,
       events: () => log.replay(0, 256).events,
       sql: state.storage.sql,
@@ -338,6 +341,54 @@ describe("the train publishes through the real main writer", () => {
       expect(h.started.at(-1)?.expectedMain).toBe(ELSEWHERE);
       expect(h.started.at(-1)?.candidate).not.toBe(first.candidate);
       expect(ref.updates).toHaveLength(MAX_WRITE_ATTEMPTS);
+    });
+  });
+
+  it("holds a batch whose claim moved while its write may still land, and lands it late", async () => {
+    const ref = new FakeMain(MAIN, ["hang"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      expect(ref.late).toHaveLength(1);
+
+      // The claim changes owner while the timed-out update is still on its way to Git.
+      h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
+      await h.alarm();
+      expect(batchStates(h.train)).toEqual([["passed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "batched" });
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized", attempts: 1 });
+      expect(ref.updates).toHaveLength(1);
+
+      // The update lands: the batch lands with it, not a failure beside work already on main.
+      ref.release();
+      await h.alarm();
+      expect(ref.main).toBe(first.candidate);
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(mainOutcomes(h.events())).toEqual([
+        { intentId, outcome: "reconciled", main: first.candidate },
+      ]);
+      expect(ref.updates).toHaveLength(1);
+    });
+  });
+
+  it("holds the batch without writing while the uncertain write never lands", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    ref.fallback = "refuse";
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      await pass(h);
+      const intentId = latestIntent(h.train);
+
+      const writes = ref.updates.length;
+      h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
+      for (let drive = 0; drive < 3; drive += 1) await h.alarm();
+      expect(ref.updates).toHaveLength(writes);
+      expect(batchStates(h.train)).toEqual([["passed", null]]);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized" });
+      expect(ref.main).toBe(MAIN);
+      expect(mainOutcomes(h.events())).toEqual([]);
     });
   });
 });

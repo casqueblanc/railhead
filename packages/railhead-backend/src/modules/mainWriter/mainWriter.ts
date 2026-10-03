@@ -18,6 +18,11 @@
 // that same expected commit may start, so whichever of the two lands, the other's conditional
 // update can no longer apply and the next read-back tells them apart. Nothing here forces main.
 //
+// A claim or decision fence that moves while the intent's own earlier write is unsettled stops any
+// further write, but the publication returns `unavailable`, not the fence's refusal: that write may
+// still land, and a definitive refusal would let the train fail work that then reaches main. Once
+// main moves, the read-back settles the intent and the publication returns what it found.
+//
 // Every call to main's ref is bounded by a deadline. A read that does not answer in time refuses
 // the publication; an update that does not answer in time stays counted and is read back on the
 // next publication, like any uncertain write.
@@ -29,7 +34,7 @@
 
 import { isId, type CommitSha, type IntentId } from "@railhead/shared/events";
 import type { ClaimId, DecisionRef } from "@railhead/shared/events";
-import { fail, ok, type PortResult } from "../../contracts/result";
+import { fail, ok, type PortErrorCode, type PortResult } from "../../contracts/result";
 import type {
   AuthorizationPort,
   MainRefPort,
@@ -47,7 +52,12 @@ export const MAX_WRITE_ATTEMPTS = 3;
 /** Publications that may wait behind the one in progress before more are refused as `busy`. */
 export const MAX_QUEUED_PUBLICATIONS = 32;
 
-/** How long one call to main's ref may take before the writer stops waiting for it. */
+/**
+ * How long one call to main's ref may take before the writer stops waiting for it. A publication
+ * makes up to `2 * MAX_WRITE_ATTEMPTS + 1` calls, so a slow one can outlast the train's own
+ * `PORT_TIMEOUT_MS`. The train then reports the drive unavailable while the publication carries on
+ * and records its outcome, which the train's next drive reads; only the wake's retry budget pays.
+ */
 export const MAIN_REF_TIMEOUT_MS = 10_000;
 
 /** What the main writer needs from its Repo. */
@@ -136,7 +146,14 @@ async function publish(
       return fail("unavailable", "Main could not be confirmed moved; it will be read back again.");
     }
     const begun = begin(log, deps, record);
-    if (!begun.ok) return begun;
+    if (!begun.ok) {
+      // Main was read back at the expected commit, so an earlier attempt may still land: a fence
+      // that moved since says nothing yet about whether this intent's work reaches main.
+      if (record.attempts > 0 && isFenceRefusal(begun.code)) {
+        return fail("unavailable", "An earlier write of this intent may still land; try again.");
+      }
+      return begun;
+    }
     const update = await mainRef.update(begun.value.expectedMain, begun.value.candidate);
     if (!update.ok) return update;
     switch (update.value.kind) {
@@ -257,6 +274,11 @@ function settle(
     return ok(settled);
   });
   return value;
+}
+
+/** A refusal from `begin` because the work the intent rests on is no longer current. */
+function isFenceRefusal(code: PortErrorCode): boolean {
+  return code === "stale_generation" || code === "decision_superseded";
 }
 
 /** Passes on the refusal of an intent read that found no record. */

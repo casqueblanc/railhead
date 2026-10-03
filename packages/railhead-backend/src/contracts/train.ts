@@ -176,9 +176,10 @@ export interface MergeIntentWrite {
  * candidate, that every pin's generation and every required decision version is still current,
  * and records the `MergeIntentRecord`. A repeat for the same attempt returns the same record.
  *
- * `record` and `recordWrite` are fence methods: they are synchronous and touch only the Repo's
- * storage, so a caller calls them inside its own `log.transaction` body, and what they read or
- * write commits or rolls back with that transaction.
+ * `record`, `unsettled` and `recordWrite` are fence methods: they are synchronous and touch only
+ * the Repo's storage. Called inside a caller's `log.transaction` body, what they read holds and what
+ * they write commits or rolls back with that transaction. Read outside one, a result may already be
+ * stale, so a caller re-reads inside the transaction whose write relies on it.
  */
 export interface AuthorizationPort {
   /** Authorizes the merge of a passed attempt. */
@@ -187,12 +188,13 @@ export interface AuthorizationPort {
   intent(intentId: IntentId): Promise<PortResult<MergeIntentRecord>>;
   /**
    * The stored intent, or `null` when it is unknown or the module is missing; `null` is a refusal.
-   * Call it only inside the caller's transaction.
+   * Read it inside the caller's transaction when the result decides a write.
    */
   record(intentId: IntentId): MergeIntentRecord | null;
   /**
    * Every intent still `authorized` with a write attempt counted, oldest first: the writes that may
-   * have moved main unheard. Call it only inside the caller's transaction.
+   * have moved main unheard. Read it inside the caller's transaction when the result decides a
+   * write.
    */
   unsettled(): MergeIntentRecord[];
   /**

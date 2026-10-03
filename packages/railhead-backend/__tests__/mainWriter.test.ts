@@ -596,6 +596,78 @@ describe("publish fences claims and decisions", () => {
   });
 });
 
+describe("publish holds a moved fence while the intent's own write may still land", () => {
+  it("returns unavailable, writes nothing, and settles the write when it lands late", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.generations.set(CLAIM_B, 4);
+
+        expect(await h.writer.publish(INTENT)).toEqual(
+          fail("unavailable", "An earlier write of this intent may still land; try again."),
+        );
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        expect(h.log.head()).toBe(1);
+
+        // The first update reaches Git after all.
+        ref.main = CANDIDATE;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, CANDIDATE),
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", CANDIDATE)]);
+      },
+      world,
+    );
+  });
+
+  it("settles the intent as not landed once main moves past its expected commit", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["refuse"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        world.versions.set(CLAIM_A, [{ ...DEC_FORMAT, version: 2 }]);
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+
+        ref.main = OTHER;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: settled("reconciled", 1, OTHER),
+        });
+        expect(ref.updates).toHaveLength(1);
+        expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", OTHER)]);
+      },
+      world,
+    );
+  });
+
+  it("does not refuse definitively when the fence moves during an uncertain write", async () => {
+    const world = new World();
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withIntent(
+      ref,
+      async (h) => {
+        const update = ref.update.bind(ref);
+        ref.update = async (expected, next) => {
+          world.generations.set(CLAIM_A, 2);
+          return update(expected, next);
+        };
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(ref.updates).toHaveLength(1);
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+      },
+      world,
+    );
+  });
+});
+
 describe("publish fails closed", () => {
   it("leaves the intent to be reconciled when the ref refuses", async () => {
     const ref = new FakeMain(MAIN, ["refuse"]);
