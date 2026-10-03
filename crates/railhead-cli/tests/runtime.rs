@@ -37,6 +37,13 @@ struct World {
     outside: tempfile::TempDir,
 }
 
+/// `atlas`'s stored session record: [`TOKEN`], issued by `origin` and valid until 2100.
+fn session_record(origin: &str) -> String {
+    json!({"agentId": "agt_atlas01", "origin": origin, "repo": "casqueblanc/demo",
+        "token": TOKEN, "expiresAt": 4_102_444_800_000_u64})
+    .to_string()
+}
+
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -78,7 +85,7 @@ fn world(origin: &str) -> anyhow::Result<World> {
     }
     let atlas = home.path().join("agents/atlas");
     write_private(&atlas.join("key"), KEY)?;
-    write_private(&atlas.join("session"), TOKEN)?;
+    write_private(&atlas.join("session"), &session_record(origin))?;
 
     let clone = tempfile::tempdir()?;
     git(clone.path(), &["init", "--quiet"])?;
@@ -122,6 +129,7 @@ fn rh(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env_remove("RAILHEAD_AGENT")
+        .env_remove("RAILHEAD_INVITE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -302,7 +310,7 @@ async fn the_clone_identity_reaches_each_command_entry_point() -> anyhow::Result
     let join = rh(&world, world.outside.path(), None, &["--json", "join"], "")?;
     assert_eq!(
         join.json()?.pointer("/error/message"),
-        Some(&json!("rh join is not available in this build yet"))
+        Some(&json!("name the invite URL, or set RAILHEAD_INVITE"))
     );
     assert_eq!(requests(&server).await, 0);
     Ok(())
@@ -316,7 +324,8 @@ async fn credential_mode_writes_nothing_but_the_protocol_on_stdout() -> anyhow::
         "protocol=http\nhost={}\npath=git/casqueblanc/demo/claims/clm_42abcd.git\n\n",
         server.address()
     );
-    for operation in ["get", "store", "erase", "capability"] {
+    // Outcomes Git reports and operations the helper does not know are acknowledged silently.
+    for operation in ["store", "erase", "capability"] {
         let run = rh(
             &world,
             world.clone.path(),
@@ -324,14 +333,26 @@ async fn credential_mode_writes_nothing_but_the_protocol_on_stdout() -> anyhow::
             &["credential", operation, "--json"],
             &request,
         )?;
-        assert_eq!(run.code, Some(1), "{operation}");
-        assert_eq!(run.stdout, "", "{operation}");
-        assert!(
-            run.stderr.starts_with("rh: rh credential is not available"),
-            "{}",
-            run.stderr
+        assert_eq!(
+            (run.code, run.stdout.as_str()),
+            (Some(0), ""),
+            "{operation}"
         );
     }
+    // A refused request is reported on stderr only.
+    let hostile = rh(
+        &world,
+        world.clone.path(),
+        None,
+        &["credential", "get", "--json"],
+        "protocol=http\nhost=evil.example\npath=git/casqueblanc/demo/claims/clm_42abcd.git\n\n",
+    )?;
+    assert_eq!((hostile.code, hostile.stdout.as_str()), (Some(1), ""));
+    assert!(
+        hostile.stderr.starts_with("rh: Git asked for another host"),
+        "{}",
+        hostile.stderr
+    );
     // Outside a clone, the helper has no identity to answer for.
     let outside = rh(
         &world,

@@ -2,8 +2,14 @@
 //!
 //! Each identity lives under `<home>/agents/<name>/`: `identity.json` names the agent and the
 //! repository it joined, `key` holds its OpenSSH private key and `session` its current session
-//! token. The two secrets go through [`SecretStore`], so a system keychain can replace the file
+//! record. While `rh join` has an enrollment it has not finished, `enrollment.json` holds its
+//! scope. The two secrets go through [`SecretStore`], so a system keychain can replace the file
 //! store without touching the commands. Secrets never reach `Debug`, `Display` or an error.
+//!
+//! The session is stored with the identity it was issued to and its expiry, so a session is never
+//! used for another identity or after it lapses. Processes that act on one agent at once take a
+//! [`StoreLock`]: one `rh join` enrolls a name at a time, and a session is compared, renewed and
+//! replaced or removed under one lock.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -26,8 +32,15 @@ const MAX_IDENTITIES: usize = 256;
 /// Most names a write tries for its temporary file before giving up.
 const MAX_TEMP_ATTEMPTS: u32 = 16;
 
+/// The file that holds an agent's unfinished enrollment.
+const ENROLLMENT_FILE: &str = "enrollment.json";
+
 /// Distinguishes the temporary files of writes made by this process.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// How long before its expiry a stored session stops being used, in milliseconds, so a request
+/// made with it does not reach the backend after it lapsed.
+pub const SESSION_EXPIRY_SKEW_MS: u64 = 30_000;
 
 /// A store or identity failure. No variant carries a secret or file contents.
 #[derive(Debug, thiserror::Error)]
@@ -280,11 +293,187 @@ impl SessionToken {
     }
 }
 
+/// Milliseconds since the Unix epoch. A clock before the epoch reads as the end of time, so no
+/// stored session counts as current.
+#[must_use]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// A session as stored: the token, the identity it was issued to and when it expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// The agent the token authenticates.
+    pub agent_id: AgentId,
+    /// The origin that issued it.
+    pub origin: Origin,
+    /// The repository it is bound to.
+    pub repo: RepoRef,
+    /// The token.
+    pub token: SessionToken,
+    /// When it expires, in milliseconds since the Unix epoch.
+    pub expires_at_ms: u64,
+}
+
+/// The stored form of a [`Session`].
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionRecord {
+    agent_id: AgentId,
+    origin: Origin,
+    repo: RepoRef,
+    token: String,
+    expires_at: u64,
+}
+
+impl Session {
+    /// A session issued to `identity`, expiring at `expires_at_ms`.
+    #[must_use]
+    pub fn new(identity: &Identity, token: SessionToken, expires_at_ms: u64) -> Self {
+        Self {
+            agent_id: identity.agent_id.clone(),
+            origin: identity.origin.clone(),
+            repo: identity.repo.clone(),
+            token,
+            expires_at_ms,
+        }
+    }
+
+    /// True when the session was issued to `identity`: its agent, origin and repository.
+    #[must_use]
+    pub fn issued_to(&self, identity: &Identity) -> bool {
+        self.agent_id == identity.agent_id
+            && self.origin == identity.origin
+            && self.repo == identity.repo
+    }
+
+    /// True when the session was issued to `identity` and is still valid at `now_ms`, with
+    /// [`SESSION_EXPIRY_SKEW_MS`] to spare.
+    #[must_use]
+    pub fn usable_for(&self, identity: &Identity, now_ms: u64) -> bool {
+        self.issued_to(identity)
+            && now_ms.saturating_add(SESSION_EXPIRY_SKEW_MS) < self.expires_at_ms
+    }
+
+    fn to_secret(&self) -> Option<Secret> {
+        serde_json::to_string(&SessionRecord {
+            agent_id: self.agent_id.clone(),
+            origin: self.origin.clone(),
+            repo: self.repo.clone(),
+            token: self.token.expose().to_owned(),
+            expires_at: self.expires_at_ms,
+        })
+        .ok()
+        .map(Secret::new)
+    }
+
+    /// The session a stored secret holds, or `None` when it is not a session record.
+    fn from_secret(secret: &Secret) -> Option<Self> {
+        let record: SessionRecord = serde_json::from_str(secret.expose()).ok()?;
+        Some(Self {
+            agent_id: record.agent_id,
+            origin: record.origin,
+            repo: record.repo,
+            token: SessionToken::new(record.token)?,
+            expires_at_ms: record.expires_at,
+        })
+    }
+}
+
+/// The scope of an enrollment `rh join` has started and not finished: stored before its first
+/// request and removed once it logs in or the backend refuses it, so a name enrolls one invite
+/// at a time even across a lost response or a killed process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingEnrollment {
+    /// The Railhead origin the invite names.
+    pub origin: Origin,
+    /// The repository the invite names.
+    pub repo: RepoRef,
+    /// The invite.
+    pub invite_id: String,
+    /// The OpenSSH public key the join registers.
+    pub public_key: String,
+}
+
+impl PendingEnrollment {
+    /// True when this is the enrollment of `invite_id` for `repo` on `origin`.
+    #[must_use]
+    pub fn is_for(&self, origin: &Origin, repo: &RepoRef, invite_id: &str) -> bool {
+        &self.origin == origin && &self.repo == repo && self.invite_id == invite_id
+    }
+}
+
+/// What a [`StoreLock`] serializes for one agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockKind {
+    /// An enrollment: held by `rh join` from reading the identity to storing the session.
+    Enrollment,
+    /// The session: held while a session is compared, replaced or removed, and across the login
+    /// that renews it.
+    Session,
+}
+
+impl LockKind {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Enrollment => ".enrollment.lock",
+            Self::Session => ".session.lock",
+        }
+    }
+}
+
+/// A lock on one agent in the store, held until it is dropped. Locks are advisory: they
+/// serialize the `rh` processes that take them.
+#[must_use]
+#[derive(Debug)]
+pub struct StoreLock {
+    _file: File,
+}
+
+/// The session lock on one agent, with the reads and writes made while it is held.
+#[must_use]
+#[derive(Debug)]
+pub struct SessionLock<'a> {
+    store: &'a FileStore,
+    agent: AgentName,
+    _lock: StoreLock,
+}
+
+impl SessionLock<'_> {
+    /// The stored session, as [`FileStore::load_session`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// When it exists and cannot be read safely.
+    pub fn load(&self) -> Result<Option<Session>> {
+        self.store.load_session(&self.agent)
+    }
+
+    /// Stores `session`, replacing any earlier one.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be written.
+    pub fn save(&self, session: &Session) -> Result<()> {
+        let path = self
+            .store
+            .agent_dir(&self.agent)
+            .join(SecretKind::SessionToken.file_name());
+        let secret = session.to_secret().ok_or(Error::Damaged(path))?;
+        self.store
+            .replace(&self.agent, SecretKind::SessionToken, &secret)
+    }
+}
+
 /// A kind of secret the store keeps per agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The agent's OpenSSH private key. Written once and never replaced.
-    #[allow(dead_code, reason = "the rh join entry point (#47) stores the key")]
     SigningKey,
     /// The agent's current session token.
     SessionToken,
@@ -300,10 +489,6 @@ impl SecretKind {
 }
 
 /// Where an agent's secrets are kept. The file store is the default; a keychain can stand in.
-#[allow(
-    dead_code,
-    reason = "the rh join entry point (#47) writes the key and the session"
-)]
 pub trait SecretStore {
     /// Reads a secret, or `None` when it was never stored.
     ///
@@ -372,6 +557,136 @@ impl FileStore {
         let json =
             serde_json::to_string_pretty(identity).map_err(|_| Error::Damaged(path.clone()))?;
         self.write_atomic(&identity.name, &path, json.as_bytes())
+    }
+
+    /// Takes the `kind` lock on `agent`, or returns `None` when another process holds it.
+    ///
+    /// # Errors
+    ///
+    /// When the lock file cannot be opened or locked.
+    pub fn try_lock(&self, agent: &AgentName, kind: LockKind) -> Result<Option<StoreLock>> {
+        let (path, file) = self.lock_file(agent, kind)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StoreLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(source)) => Err(io_error("locking", &path, source)),
+        }
+    }
+
+    /// Takes the `kind` lock on `agent`, waiting for another process to release it. Only for
+    /// locks whose holders bound any network work by the request timeout, so the wait stays short.
+    fn lock(&self, agent: &AgentName, kind: LockKind) -> Result<StoreLock> {
+        let (path, file) = self.lock_file(agent, kind)?;
+        file.lock()
+            .map_err(|source| io_error("locking", &path, source))?;
+        Ok(StoreLock { _file: file })
+    }
+
+    fn lock_file(&self, agent: &AgentName, kind: LockKind) -> Result<(PathBuf, File)> {
+        let path = self.ensure_agent_dir(agent)?.join(kind.file_name());
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
+            .open(&path)
+            .map_err(|source| io_error("opening", &path, source))?;
+        Ok((path, file))
+    }
+
+    /// The session stored for `agent`, or `None` when there is none or it is not a session record.
+    ///
+    /// # Errors
+    ///
+    /// When it exists and cannot be read safely.
+    pub fn load_session(&self, agent: &AgentName) -> Result<Option<Session>> {
+        Ok(self
+            .read(agent, SecretKind::SessionToken)?
+            .as_ref()
+            .and_then(Session::from_secret))
+    }
+
+    /// Stores `session` for `agent`, replacing any earlier one, under the session lock.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be written.
+    pub fn save_session(&self, agent: &AgentName, session: &Session) -> Result<()> {
+        self.lock_session(agent)?.save(session)
+    }
+
+    /// Takes the session lock on `agent`, waiting while another process compares, replaces or
+    /// renews the session.
+    ///
+    /// # Errors
+    ///
+    /// When the lock file cannot be opened or locked.
+    pub fn lock_session(&self, agent: &AgentName) -> Result<SessionLock<'_>> {
+        Ok(SessionLock {
+            store: self,
+            agent: agent.clone(),
+            _lock: self.lock(agent, LockKind::Session)?,
+        })
+    }
+
+    /// The enrollment `rh join` started for `agent` and has not finished, if any.
+    ///
+    /// # Errors
+    ///
+    /// When it exists and cannot be read safely or is not an enrollment record.
+    pub fn load_enrollment(&self, agent: &AgentName) -> Result<Option<PendingEnrollment>> {
+        if !self.check_dirs(Some(agent))? {
+            return Ok(None);
+        }
+        let path = self.agent_dir(agent).join(ENROLLMENT_FILE);
+        let Some(bytes) = read_private(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| Error::Damaged(path))
+    }
+
+    /// Stores the enrollment `rh join` is about to start for `agent`, replacing any earlier one.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be written.
+    pub fn save_enrollment(&self, agent: &AgentName, enrollment: &PendingEnrollment) -> Result<()> {
+        let path = self.agent_dir(agent).join(ENROLLMENT_FILE);
+        let json =
+            serde_json::to_string_pretty(enrollment).map_err(|_| Error::Damaged(path.clone()))?;
+        self.write_atomic(agent, &path, json.as_bytes())
+    }
+
+    /// Removes the enrollment stored for `agent`. Removing none succeeds.
+    ///
+    /// # Errors
+    ///
+    /// When it exists and cannot be removed.
+    pub fn remove_enrollment(&self, agent: &AgentName) -> Result<()> {
+        if !self.check_dirs(Some(agent))? {
+            return Ok(());
+        }
+        remove_if_present(&self.agent_dir(agent).join(ENROLLMENT_FILE))
+    }
+
+    /// Removes the session stored for `agent` only when its token is `token`, comparing and
+    /// removing under the session lock so a session stored meanwhile is kept. Returns whether it
+    /// removed one.
+    ///
+    /// # Errors
+    ///
+    /// When the session cannot be read or removed.
+    pub fn remove_session_if(&self, agent: &AgentName, token: &str) -> Result<bool> {
+        let lock = self.lock_session(agent)?;
+        let stored = lock.load()?;
+        if stored.is_some_and(|session| session.token.expose() == token) {
+            self.remove(agent, SecretKind::SessionToken)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Finds the identity `selector` names.
@@ -1226,6 +1541,215 @@ mod tests {
         let unchanged = home.path().join("agents/atlas/session");
         let checked = fs::symlink_metadata(&unchanged)?;
         check_opened(&unchanged, &checked, &File::open(&unchanged)?)?;
+        Ok(())
+    }
+
+    fn session(identity: &Identity, token: &str, expires_at_ms: u64) -> anyhow::Result<Session> {
+        let token =
+            SessionToken::new(token.to_owned()).ok_or_else(|| anyhow::anyhow!("token refused"))?;
+        Ok(Session::new(identity, token, expires_at_ms))
+    }
+
+    #[test]
+    fn a_session_is_used_only_for_its_identity_until_shortly_before_it_expires()
+    -> anyhow::Result<()> {
+        let atlas = identity("atlas", "agt_atlas01")?;
+        let expires = 1_800_000_000_000;
+        let current = session(&atlas, TOKEN, expires)?;
+        assert!(current.usable_for(&atlas, expires - SESSION_EXPIRY_SKEW_MS - 1));
+        // From the skew before expiry on, the session is not used.
+        assert!(!current.usable_for(&atlas, expires - SESSION_EXPIRY_SKEW_MS));
+        assert!(!current.usable_for(&atlas, expires + 1));
+        assert!(!current.usable_for(&atlas, u64::MAX));
+
+        let mut elsewhere = atlas.clone();
+        elsewhere.origin = "https://evil.example".parse()?;
+        let mut other_repo = atlas.clone();
+        other_repo.repo = "casqueblanc/other".parse()?;
+        for other in [identity("atlas", "agt_boreas01")?, elsewhere, other_repo] {
+            assert!(!current.usable_for(&other, 0), "{other:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_round_trip_and_anything_else_reads_as_none() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        assert_eq!(store.load_session(&atlas.name)?, None);
+        let stored = session(&atlas, TOKEN, 1_800_000_000_000)?;
+        store.save_session(&atlas.name, &stored)?;
+        assert_eq!(store.load_session(&atlas.name)?, Some(stored));
+        let raw = fs::read_to_string(home.path().join("agents/atlas/session"))?;
+        let record: serde_json::Value = serde_json::from_str(&raw)?;
+        assert_eq!(
+            record,
+            serde_json::json!({"agentId": "agt_atlas01", "origin": "https://railhead.dev",
+                "repo": "casqueblanc/demo", "token": TOKEN, "expiresAt": 1_800_000_000_000_u64})
+        );
+
+        // A bare token, a record with a malformed token, and an unknown field are not sessions.
+        for bad in [
+            TOKEN.to_owned(),
+            raw.replace(TOKEN, "a.b"),
+            raw.replace("\"token\"", "\"extra\": 1, \"token\""),
+        ] {
+            store.replace(&atlas.name, SecretKind::SessionToken, &Secret::new(bad))?;
+            assert_eq!(store.load_session(&atlas.name)?, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_is_removed_only_while_it_holds_the_refused_token() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        assert!(!store.remove_session_if(&atlas.name, TOKEN)?);
+        store.save_session(&atlas.name, &session(&atlas, TOKEN, 1_800_000_000_000)?)?;
+        assert!(!store.remove_session_if(&atlas.name, "a.b.c")?);
+        assert!(store.load_session(&atlas.name)?.is_some());
+        assert!(store.remove_session_if(&atlas.name, TOKEN)?);
+        assert_eq!(store.load_session(&atlas.name)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_erase_waits_for_a_session_being_replaced_and_keeps_the_new_one() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        store.save_session(&atlas.name, &session(&atlas, TOKEN, 1_800_000_000_000)?)?;
+        let fresh = session(&atlas, "fresh.session.token", 1_800_000_000_000)?;
+
+        // A writer holds the session lock; an erase of the old token starts meanwhile.
+        let writing = store.lock(&atlas.name, LockKind::Session)?;
+        let erase = std::thread::spawn({
+            let (store, name) = (store.clone(), atlas.name.clone());
+            move || store.remove_session_if(&name, TOKEN)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!erase.is_finished(), "the erase did not wait for the lock");
+        let secret = fresh
+            .to_secret()
+            .ok_or_else(|| anyhow::anyhow!("no record"))?;
+        store.replace(&atlas.name, SecretKind::SessionToken, &secret)?;
+        drop(writing);
+
+        let removed = erase
+            .join()
+            .map_err(|_| anyhow::anyhow!("the erase panicked"))??;
+        assert!(!removed);
+        assert_eq!(store.load_session(&atlas.name)?, Some(fresh));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unfinished_enrollment_is_stored_until_removed() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        assert_eq!(store.load_enrollment(&atlas)?, None);
+        store.remove_enrollment(&atlas)?;
+        let origin: Origin = "https://railhead.dev".parse()?;
+        let repo: RepoRef = "casqueblanc/demo".parse()?;
+        let enrollment = PendingEnrollment {
+            origin: origin.clone(),
+            repo: repo.clone(),
+            invite_id: "inv_abc123".to_owned(),
+            public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAtlas".to_owned(),
+        };
+        store.save_enrollment(&atlas, &enrollment)?;
+        assert_eq!(store.load_enrollment(&atlas)?, Some(enrollment.clone()));
+        assert!(enrollment.is_for(&origin, &repo, "inv_abc123"));
+        assert!(!enrollment.is_for(&origin, &repo, "inv_other1"));
+        assert!(!enrollment.is_for(&"https://evil.example".parse()?, &repo, "inv_abc123"));
+        assert!(!enrollment.is_for(&origin, &"casqueblanc/other".parse()?, "inv_abc123"));
+        // An enrollment holds no identity.
+        assert!(matches!(
+            store.find(&AgentSelector::Name(atlas.clone())),
+            Err(Error::NotFound(_))
+        ));
+
+        // A record the store did not write is refused, not read as no enrollment.
+        let path = home.path().join("agents/atlas/enrollment.json");
+        store.write_atomic(&atlas, &path, b"{\"inviteId\": \"inv_abc123\"}")?;
+        assert!(matches!(
+            store.load_enrollment(&atlas),
+            Err(Error::Damaged(_))
+        ));
+        store.remove_enrollment(&atlas)?;
+        assert_eq!(store.load_enrollment(&atlas)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_enrollment_lock_is_refused_until_it_is_released() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let held = store.try_lock(&atlas, LockKind::Enrollment)?;
+        assert!(held.is_some());
+        assert!(store.try_lock(&atlas, LockKind::Enrollment)?.is_none());
+        // Another name and another kind of lock are independent.
+        assert!(
+            store
+                .try_lock(&AgentName::new("boreas")?, LockKind::Enrollment)?
+                .is_some()
+        );
+        assert!(store.try_lock(&atlas, LockKind::Session)?.is_some());
+        drop(held);
+        // A child another test forks in this process can share the lock's file until it execs, so
+        // the release is awaited briefly rather than expected at once.
+        let released = std::time::Instant::now();
+        while store.try_lock(&atlas, LockKind::Enrollment)?.is_none() {
+            assert!(
+                released.elapsed() < std::time::Duration::from_secs(2),
+                "the lock was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // A name with only lock files has no identity.
+        assert!(matches!(
+            store.find(&AgentSelector::Name(atlas)),
+            Err(Error::NotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_writes_each_stage_their_own_file() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = identity("atlas", "agt_atlas01")?;
+        let writers: Vec<_> = (0..8_u64)
+            .map(|n| {
+                let (store, atlas) = (store.clone(), atlas.clone());
+                std::thread::spawn(move || -> anyhow::Result<()> {
+                    for _ in 0..20 {
+                        store.save_session(&atlas.name, &session(&atlas, TOKEN, n)?)?;
+                        store.save_identity(&atlas)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("a writer panicked"))??;
+        }
+        assert!(store.load_session(&atlas.name)?.is_some());
+        assert_eq!(store.find(&"atlas".parse()?)?, atlas);
+        let mut leftovers = Vec::new();
+        for entry in fs::read_dir(home.path().join("agents/atlas"))? {
+            let name = entry?.file_name();
+            if name.to_string_lossy().starts_with(".tmp-") {
+                leftovers.push(name);
+            }
+        }
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         Ok(())
     }
 

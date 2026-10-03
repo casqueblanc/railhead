@@ -225,10 +225,6 @@ impl<'a> Output<'a> {
     /// # Errors
     ///
     /// When writing fails.
-    #[allow(
-        dead_code,
-        reason = "the rh join and rh credential entry points (#47) print notices"
-    )]
     pub fn notice(&mut self, text: &str) -> io::Result<()> {
         writeln!(self.stderr, "rh: {}", inert(text))?;
         self.stderr.flush()
@@ -240,10 +236,6 @@ impl<'a> Output<'a> {
     ///
     /// [`CredentialError::WrongMode`] outside credential mode; an unrepresentable field is refused
     /// before anything is written.
-    #[allow(
-        dead_code,
-        reason = "the rh credential entry point (#47) answers Git with it"
-    )]
     pub fn credential(&mut self, fields: &[(&'static str, &str)]) -> Result<(), CredentialError> {
         if self.mode != Mode::Credential {
             return Err(CredentialError::WrongMode);
