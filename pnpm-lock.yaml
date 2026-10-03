@@ -200,7 +200,7 @@ overrides:
   '@types/node': 24.19.0
 
 patchedDependencies:
-  '@cloudflare/ci@0.2.0': e0c116614396a93fc155c573227062e9ae90d6962e761d2099844d0d7626438f
+  '@cloudflare/ci@0.2.0': 1d45a3a64f7ca8b8564a54544cd2a45cb84b1a4fc24d3a9af449591da0c2157d
 
 importers:
 
@@ -250,7 +250,7 @@ importers:
     dependencies:
       '@cloudflare/ci':
         specifier: 'catalog:'
-        version: 0.2.0(patch_hash=e0c116614396a93fc155c573227062e9ae90d6962e761d2099844d0d7626438f)
+        version: 0.2.0(patch_hash=1d45a3a64f7ca8b8564a54544cd2a45cb84b1a4fc24d3a9af449591da0c2157d)
       '@cloudflare/sandbox':
         specifier: 'catalog:'
         version: 0.12.1
@@ -3586,7 +3586,7 @@ snapshots:
     dependencies:
       css-tree: 3.2.1
 
-  '@cloudflare/ci@0.2.0(patch_hash=e0c116614396a93fc155c573227062e9ae90d6962e761d2099844d0d7626438f)':
+  '@cloudflare/ci@0.2.0(patch_hash=1d45a3a64f7ca8b8564a54544cd2a45cb84b1a4fc24d3a9af449591da0c2157d)':
     dependencies:
       '@cloudflare/sandbox': 0.12.1
       zod: 4.6.5

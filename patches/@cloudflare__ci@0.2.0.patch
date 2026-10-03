@@ -191,7 +191,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..7cf12df2e8a054cfc58918c6768f3475
      throw new Error(`cache(${input.label}): inputs must not be empty`);
    }
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa16552affc 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..3a618ff766ee15c7333741aa0a1e77698a896623 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
 @@ -1,5 +1,6 @@
@@ -201,7 +201,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
  
  import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
  import { posix } from 'node:path';
-@@ -33,25 +34,74 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -33,25 +34,76 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    /**
     * Copies source, runs the command, and snapshots `/workspace` after a
     * successful exit. A restored Snapshot is overlaid with the current source.
@@ -274,10 +274,12 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
 +      // Railhead patch: back up and restore only through the R2 binding. The
 +      // container has no route to R2 presigned URLs, and RPC streams those
 +      // archives instead of base64-encoding them into a single request. Without
-+      // the binding the run makes no backup and cannot restore one.
++      // the binding the run makes no backup and cannot restore one. A fenced
++      // run makes none either: it publishes no cache and no runner continues
++      // its workspace, so nothing would read the backup.
 +      const localBucket = true;
-+      const backups = this.env.BACKUP_BUCKET !== undefined;
-+      if (!backups) {
++      const backups = !fenced && this.env.BACKUP_BUCKET !== undefined;
++      if (!fenced && !backups) {
 +        console.warn('[sandbox] no BACKUP_BUCKET binding; no workspace backup', {
 +          label: input.label,
 +        });
@@ -288,7 +290,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
          // Overlay (no rm) so cached node_modules survive while tracked source
-@@ -59,20 +109,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -59,20 +111,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          // different commit's source (e.g. a reused install cache), so this is
          // what keeps it correct. Files deleted since then linger; the next
          // install/build regenerates derived output.
@@ -328,7 +330,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
        }
  
        const proc = await sandbox.startProcess(
-@@ -95,53 +152,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -95,53 +154,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          return { exitCode, logs: preview, preview };
        }
  
@@ -417,7 +419,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -157,11 +209,20 @@ async function readLog(
+@@ -157,11 +211,20 @@ async function readLog(
    sandbox: ReturnType<typeof getSandbox>,
    file: string,
    size: number
@@ -442,7 +444,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7fb229cd978297789ef19fb5d6d5efa1
  }
  
  async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
-@@ -198,43 +259,6 @@ function resolveCwd(cwd: string | undefined) {
+@@ -198,43 +261,6 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -564,7 +566,7 @@ index bf350484ff9f6a861b661800e48ed2b52a10e77b..c3bc3075d1e23912f6fcb5c725be40a1
    CLOUDFLARE_ACCOUNT_ID: string;
    SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox>;
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
-index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160fc0066e7 100644
+index a0ac164d44c2caace0a209652d181b013a2138e9..1bef17e13d9d07c182cccd5810385348a74f355e 100644
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
 @@ -1,5 +1,6 @@
@@ -574,7 +576,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160
  
  import {
    WorkflowEntrypoint,
-@@ -140,9 +141,20 @@ export abstract class CIWorkflow<
+@@ -140,9 +141,21 @@ export abstract class CIWorkflow<
      // Workflow waits.
      const invoke = (
        options: RunnerOptions,
@@ -584,19 +586,20 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160
      ): Promise<CiRunnerResult> =>
        runners.run(options, inherited, () => {
 +        // Railhead patch: a chained runner continues its parent's workspace.
-+        // Without a BACKUP_BUCKET binding the parent saved none, so the runner
-+        // fails before it starts a sandbox instead of running on a bare checkout.
++        // A fenced parent, or one without a BACKUP_BUCKET binding, saved none,
++        // so the runner fails before it starts a sandbox instead of running on
++        // a bare checkout.
 +        if (chained && inherited === undefined) {
 +          return Promise.reject(
 +            new Error(
-+              `runner(${options.name}): no BACKUP_BUCKET binding, so a chained runner cannot inherit its parent's workspace`
++              `runner(${options.name}): its parent saved no workspace (a fenced run, or no BACKUP_BUCKET binding), so a chained runner cannot inherit it`
 +            )
 +          );
 +        }
          const config = resolveRunnerConfig(options);
          return step
            .do(options.name, config.workflow, (ctx) =>
-@@ -166,7 +178,7 @@ export abstract class CIWorkflow<
+@@ -166,7 +179,7 @@ export abstract class CIWorkflow<
              Object.freeze({
                ...output,
                runner: (nextOptions: RunnerOptions) =>

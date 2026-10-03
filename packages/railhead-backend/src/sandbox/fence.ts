@@ -526,24 +526,16 @@ export class SandboxFence {
   #read(): FenceState | null {
     const value: unknown = this.#storage.kv.get(KEY);
     if (value === undefined) return null;
-    if (
-      typeof value === "object" &&
-      value !== null &&
-      "phase" in value &&
-      "deadline" in value &&
-      typeof value.deadline === "number"
-    ) {
-      const { deadline } = value;
-      if (value.phase === "live" && "policy" in value) {
-        const policy = parseSandboxPolicy(value.policy);
-        if (policy !== null) return { phase: "live", deadline, policy };
-      }
-      if (value.phase === "retired") return { phase: "retired", deadline };
-      if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
-        return { phase: "retiring", deadline, attempts: value.attempts };
-      }
+    const state = parseFenceState(value);
+    if (state === null) throw new Error("stored sandbox fence is not valid");
+    // Written when a retirement before the start recorded no deadline. Its slot was admitted before
+    // now, so no start for it can carry a later deadline than the one recorded here.
+    if (state.phase !== "live" && state.deadline === 0) {
+      const migrated = { ...state, deadline: this.#clock() + MAX_SANDBOX_LIFETIME_MS };
+      this.#write(migrated);
+      return migrated;
     }
-    throw new Error("stored sandbox fence is not valid");
+    return state;
   }
 
   #write(state: FenceState): void {
@@ -552,6 +544,32 @@ export class SandboxFence {
 }
 
 function noop(): void {}
+
+// The stored record, or null when it is not one.
+function parseFenceState(value: unknown): FenceState | null {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("phase" in value) ||
+    !("deadline" in value) ||
+    typeof value.deadline !== "number"
+  ) {
+    return null;
+  }
+  const { deadline } = value;
+  if (value.phase === "live") {
+    // Written before live records kept their policy: no join or grant can match it, so it is only
+    // ever destroyed.
+    if (!("policy" in value)) return { phase: "retiring", deadline, attempts: 0 };
+    const policy = parseSandboxPolicy(value.policy);
+    return policy === null ? null : { phase: "live", deadline, policy };
+  }
+  if (value.phase === "retired") return { phase: "retired", deadline };
+  if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
+    return { phase: "retiring", deadline, attempts: value.attempts };
+  }
+  return null;
+}
 
 // Whether two policies grant the same access. Each is parsed again, since a policy may arrive over
 // RPC; parsed policies have one field order, so equal ones serialize alike.
