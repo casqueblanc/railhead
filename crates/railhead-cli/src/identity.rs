@@ -284,7 +284,6 @@ impl SessionToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
     /// The agent's OpenSSH private key. Written once and never replaced.
-    #[allow(dead_code, reason = "the rh join entry point (#47) stores the key")]
     SigningKey,
     /// The agent's current session token.
     SessionToken,
@@ -300,10 +299,6 @@ impl SecretKind {
 }
 
 /// Where an agent's secrets are kept. The file store is the default; a keychain can stand in.
-#[allow(
-    dead_code,
-    reason = "the rh join entry point (#47) writes the key and the session"
-)]
 pub trait SecretStore {
     /// Reads a secret, or `None` when it was never stored.
     ///

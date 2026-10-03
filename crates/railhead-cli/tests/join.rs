@@ -1,0 +1,819 @@
+//! `rh join` and `rh credential` end to end.
+//!
+//! Each test runs the built binary against a temporary identity store and a wiremock server that
+//! plays the backend. The server checks what a real one would: it verifies every join and login
+//! signature against the key the request names, in the `railhead-auth` namespace, and derives the
+//! confirmation code from that key and the invite. "Sends nothing" and "signs nothing" are asserted
+//! on the server's request log.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use ssh_key::{PublicKey, SshSig};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+const PREFIX: &str = "/agent/v1/casqueblanc/demo";
+const SECRET: &str = "Xb1wU76LGAGoVdSeZlIi2Z01AeN9-MuIrwGfAO2-1ZE";
+const INVITE: &str = "inv_abc123";
+const AGENT: &str = "agt_atlas01";
+const TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2Vzc2lvbi10b2tlbg";
+const CHALLENGE: &str = "chl_3q27HkVb0nZ8pXa1";
+const EXPIRES: u64 = 1_790_000_060_000;
+
+fn json_response(status: u16, body: &Value) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_raw(body.to_string(), "application/json")
+}
+
+fn failure(status: u16, code: &str, message: &str) -> ResponseTemplate {
+    json_response(
+        status,
+        &json!({"ok": false, "error": {"code": code, "message": message,
+            "retryable": false, "retryAfterMs": null, "next": null}}),
+    )
+}
+
+fn ssh_string(bytes: &[u8]) -> Vec<u8> {
+    let mut out = u32::try_from(bytes.len())
+        .unwrap_or(u32::MAX)
+        .to_be_bytes()
+        .to_vec();
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// The confirmation code as the backend computes it, independently of the CLI's code.
+fn code(public_key: &PublicKey, invite: &str) -> String {
+    let blob = public_key.to_bytes().unwrap_or_default();
+    let mut input = ssh_string(b"railhead-confirm-v1");
+    input.extend(ssh_string(&blob));
+    input.extend(ssh_string(invite.as_bytes()));
+    let digest = Sha256::digest(&input);
+    let mut first = [0_u8; 8];
+    for (slot, byte) in first.iter_mut().zip(digest.iter()) {
+        *slot = *byte;
+    }
+    format!("{:06}", u64::from_be_bytes(first) % 1_000_000)
+}
+
+fn verifies(public_key: &PublicKey, message: &str, signature: &str) -> bool {
+    signature.parse::<SshSig>().is_ok_and(|signature| {
+        public_key
+            .verify("railhead-auth", message.as_bytes(), &signature)
+            .is_ok()
+    })
+}
+
+/// What the fake backend knows about the one enrollment it holds.
+#[derive(Default)]
+struct Backend {
+    /// Every public key a join named.
+    keys: Mutex<Vec<String>>,
+    /// Joins answered so far.
+    joins: AtomicUsize,
+}
+
+impl Backend {
+    fn key(&self) -> Option<PublicKey> {
+        let keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.first()
+            .and_then(|line| PublicKey::from_openssh(line).ok())
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Answers joins: pending for the first `pending` answers, then confirmed. A join whose signature
+/// does not verify is refused, as the backend would.
+struct Join {
+    backend: Arc<Backend>,
+    origin: String,
+    pending: usize,
+    /// Replaces the code the backend returns, to play a backend that registered another key.
+    code: Option<String>,
+}
+
+impl Respond for Join {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+            return failure(400, "invalid_request", "bad body");
+        };
+        let field = |name: &str| body.get(name).and_then(Value::as_str).unwrap_or_default();
+        let line = field("publicKey");
+        let Ok(public_key) = PublicKey::from_openssh(line) else {
+            return failure(400, "invalid_request", "bad key");
+        };
+        let message = format!(
+            "railhead-join-v1\norigin={}\nrepo=casqueblanc/demo\ninvite={}\nkey={line}\n",
+            self.origin,
+            field("inviteId")
+        );
+        if field("inviteSecret") != SECRET || !verifies(&public_key, &message, field("signature")) {
+            return failure(403, "join_refused", "This invite cannot be used.");
+        }
+        self.backend
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line.to_owned());
+        let answered = self.backend.joins.fetch_add(1, Ordering::SeqCst);
+        let state = if answered < self.pending {
+            "pending"
+        } else {
+            "confirmed"
+        };
+        let code = self
+            .code
+            .clone()
+            .unwrap_or_else(|| code(&public_key, field("inviteId")));
+        json_response(
+            200,
+            &json!({"ok": true, "data": {"agent": {"agentId": AGENT, "name": "atlas",
+                "ownerId": "usr_lemarier", "state": state}, "code": code, "pollAfterMs": 0},
+                "inbox": null, "next": "join"}),
+        )
+    }
+}
+
+/// Redeems a challenge only with a signature by the enrolled key over the exact login message.
+struct Session {
+    backend: Arc<Backend>,
+    origin: String,
+}
+
+impl Respond for Session {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        let signature = body
+            .get("signature")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message = login_message(&self.origin);
+        match self.backend.key() {
+            Some(key) if verifies(&key, &message, signature) => json_response(
+                200,
+                &json!({"ok": true, "data": {"token": TOKEN, "expiresAt": EXPIRES,
+                    "agent": {"agentId": AGENT, "name": "atlas", "ownerId": "usr_lemarier",
+                    "state": "confirmed"}, "repoId": "rep_demo0001"},
+                    "inbox": null, "next": null}),
+            ),
+            _ => failure(401, "challenge_invalid", "The challenge is invalid."),
+        }
+    }
+}
+
+fn login_message(origin: &str) -> String {
+    format!(
+        "railhead-login-v1\norigin={origin}\nrepo=casqueblanc/demo\nagent={AGENT}\nchallenge={CHALLENGE}\nexpires={EXPIRES}\n"
+    )
+}
+
+struct World {
+    server: MockServer,
+    backend: Arc<Backend>,
+    home: tempfile::TempDir,
+    outside: tempfile::TempDir,
+}
+
+impl World {
+    fn origin(&self) -> String {
+        self.server.uri()
+    }
+
+    fn invite(&self) -> String {
+        format!("{}/join/casqueblanc/demo/{INVITE}#{SECRET}", self.origin())
+    }
+
+    fn agent_dir(&self, name: &str) -> PathBuf {
+        self.home.path().join("agents").join(name)
+    }
+
+    async fn requests(&self, route: &str) -> usize {
+        let path = format!("{PREFIX}{route}");
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == path)
+            .count()
+    }
+
+    /// Mounts the backend: joins pending for `pending` answers, and a login challenge whose
+    /// message is `challenge_message` (the correct one when `None`).
+    async fn mount(&self, pending: usize, code: Option<&str>, challenge_message: Option<&str>) {
+        Mock::given(method("POST"))
+            .and(path(format!("{PREFIX}/join")))
+            .respond_with(Join {
+                backend: Arc::clone(&self.backend),
+                origin: self.origin(),
+                pending,
+                code: code.map(str::to_owned),
+            })
+            .mount(&self.server)
+            .await;
+        let message =
+            challenge_message.map_or_else(|| login_message(&self.origin()), str::to_owned);
+        Mock::given(method("POST"))
+            .and(path(format!("{PREFIX}/session/challenge")))
+            .respond_with(json_response(
+                200,
+                &json!({"ok": true, "data": {"challengeId": CHALLENGE, "expiresAt": EXPIRES,
+                    "message": message}, "inbox": null, "next": null}),
+            ))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{PREFIX}/session")))
+            .respond_with(Session {
+                backend: Arc::clone(&self.backend),
+                origin: self.origin(),
+            })
+            .mount(&self.server)
+            .await;
+    }
+}
+
+async fn world() -> anyhow::Result<World> {
+    Ok(World {
+        server: MockServer::start().await,
+        backend: Arc::new(Backend::default()),
+        home: tempfile::tempdir()?,
+        outside: tempfile::tempdir()?,
+    })
+}
+
+struct Run {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn json(&self) -> anyhow::Result<Value> {
+        Ok(serde_json::from_str(&self.stdout)?)
+    }
+}
+
+fn command(world: &World, dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rh"));
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("RAILHEAD_HOME", world.home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("RAILHEAD_AGENT")
+        .env_remove("RAILHEAD_INVITE");
+    command
+}
+
+fn finish(world: &World, output: &Output) -> anyhow::Result<Run> {
+    let run = Run {
+        code: output.status.code(),
+        stdout: String::from_utf8(output.stdout.clone())?,
+        stderr: String::from_utf8(output.stderr.clone())?,
+    };
+    let key = fs::read_to_string(world.agent_dir("inv-abc123").join("key")).unwrap_or_default();
+    let key_body = key.lines().nth(1).unwrap_or("no key yet");
+    for stream in [&run.stdout, &run.stderr] {
+        assert!(!stream.contains(SECRET), "invite secret leaked: {stream}");
+        assert!(!stream.contains(key_body), "private key leaked: {stream}");
+    }
+    Ok(run)
+}
+
+fn rh(world: &World, args: &[&str]) -> anyhow::Result<Run> {
+    let output = command(world, world.outside.path(), args)
+        .stdin(Stdio::null())
+        .output()?;
+    let run = finish(world, &output)?;
+    for stream in [&run.stdout, &run.stderr] {
+        assert!(!stream.contains(TOKEN), "session leaked: {stream}");
+    }
+    Ok(run)
+}
+
+fn join(world: &World, extra: &[&str]) -> anyhow::Result<Run> {
+    let invite = world.invite();
+    let mut args = vec!["--json", "join", invite.as_str()];
+    args.extend_from_slice(extra);
+    rh(world, &args)
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> anyhow::Result<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Ok(fs::metadata(path)?.permissions().mode() & 0o777)
+}
+
+#[tokio::test]
+async fn a_join_waits_for_confirmation_then_logs_in() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(2, None, None).await;
+    let run = join(&world, &["--wait", "30"])?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    let key = PublicKey::from_openssh(
+        world
+            .backend
+            .keys()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no join"))?,
+    )?;
+    let expected = code(&key, INVITE);
+    assert_eq!(
+        run.json()?,
+        json!({"ok": true, "data": {"name": "inv-abc123", "agentId": AGENT,
+            "displayName": "atlas", "origin": world.origin(), "repo": "casqueblanc/demo",
+            "state": "confirmed", "code": expected}, "inbox": null, "next": "rh work"})
+    );
+    // The code is shown once, on stderr, while the owner has not confirmed.
+    assert_eq!(run.stderr.matches(&expected).count(), 1, "{}", run.stderr);
+    assert!(run.stderr.contains("ask the owner to match it"));
+    assert_eq!(world.requests("/join").await, 3);
+    assert_eq!(world.requests("/session").await, 1);
+
+    let dir = world.agent_dir("inv-abc123");
+    assert_eq!(fs::read_to_string(dir.join("session"))?, TOKEN);
+    let record: Value = serde_json::from_str(&fs::read_to_string(dir.join("identity.json"))?)?;
+    assert_eq!(
+        record,
+        json!({"name": "inv-abc123", "agentId": AGENT, "origin": world.origin(),
+            "repo": "casqueblanc/demo"})
+    );
+    #[cfg(unix)]
+    for file in ["key", "session", "identity.json"] {
+        assert_eq!(mode(&dir.join(file))?, 0o600, "{file}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn joining_twice_resumes_with_the_same_key() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(0, None, None).await;
+    let first = join(&world, &["--name", "atlas"])?;
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    let key_path = world.agent_dir("atlas").join("key");
+    let key = fs::read(&key_path)?;
+
+    let second = join(&world, &["--name", "atlas"])?;
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    assert_eq!(fs::read(&key_path)?, key, "the key was replaced");
+    let keys = world.backend.keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(
+        keys.first(),
+        keys.last(),
+        "the second join sent another key"
+    );
+
+    // The invite may also come from the environment, which keeps its secret off argv.
+    let from_env = command(
+        &world,
+        world.outside.path(),
+        &["--json", "join", "--name", "atlas"],
+    )
+    .env("RAILHEAD_INVITE", world.invite())
+    .stdin(Stdio::null())
+    .output()?;
+    let run = finish(&world, &from_env)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(fs::read(&key_path)?, key);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_identity_cannot_work() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(usize::MAX, None, None).await;
+    let run = join(&world, &["--wait", "0"])?;
+    assert_eq!(run.code, Some(1));
+    let envelope = run.json()?;
+    assert_eq!(envelope.pointer("/error/code"), Some(&json!("timeout")));
+    assert_eq!(envelope.pointer("/error/retryable"), Some(&json!(true)));
+    assert_eq!(envelope.pointer("/error/next"), Some(&json!("rh join")));
+    let dir = world.agent_dir("inv-abc123");
+    assert!(dir.join("identity.json").exists() && dir.join("key").exists());
+    assert!(
+        !dir.join("session").exists(),
+        "a pending agent got a session"
+    );
+    assert_eq!(world.requests("/session/challenge").await, 0);
+
+    // Every command that acts as the agent stops before sending anything.
+    for args in [&["--json", "status"][..], &["--json", "work"]] {
+        let output = command(&world, world.outside.path(), args)
+            .env("RAILHEAD_AGENT", "inv-abc123")
+            .stdin(Stdio::null())
+            .output()?;
+        let run = finish(&world, &output)?;
+        assert_eq!(
+            run.json()?.pointer("/error/code"),
+            Some(&json!("no_session")),
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        world.requests("/status").await + world.requests("/work").await,
+        0
+    );
+
+    // A bounded wait gives up while the owner still has not confirmed.
+    let waited = join(&world, &["--wait", "1"])?;
+    assert_eq!(
+        waited.json()?.pointer("/error/code"),
+        Some(&json!("timeout"))
+    );
+    assert!(world.requests("/join").await >= 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hostile_or_malformed_invite_sends_and_stores_nothing() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(0, None, None).await;
+    let address = world.server.address().to_string();
+    let port = world.server.address().port();
+    for invite in [
+        format!("http://railhead.dev:{port}/join/casqueblanc/demo/{INVITE}#{SECRET}"),
+        format!("http://{address}/join/casqueblanc/demo/{INVITE}"),
+        format!("http://{address}/join/casqueblanc/{INVITE}#{SECRET}"),
+        format!("http://{address}/join/casqueblanc/demo/{INVITE}?next=x#{SECRET}"),
+        format!("http://{address}/join/casqueblanc/demo/clm_42abcd#{SECRET}"),
+        format!("http://user:pw@{address}/join/casqueblanc/demo/{INVITE}#{SECRET}"),
+    ] {
+        let run = rh(&world, &["--json", "join", &invite])?;
+        assert_eq!(run.code, Some(1), "{invite}");
+        assert_eq!(
+            run.json()?.pointer("/error/code"),
+            Some(&json!("invalid_input")),
+            "{invite}"
+        );
+    }
+    let bad_name = rh(
+        &world,
+        &["--json", "join", &world.invite(), "--name", "../x"],
+    )?;
+    assert_eq!(bad_name.code, Some(2));
+    let missing = rh(&world, &["--json", "join"])?;
+    assert_eq!(
+        missing.json()?.pointer("/error/message"),
+        Some(&json!("name the invite URL, or set RAILHEAD_INVITE"))
+    );
+    assert!(!world.home.path().join("agents").exists());
+    assert_eq!(
+        world
+            .server
+            .received_requests()
+            .await
+            .map_or(0, |r| r.len()),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_join_keeps_nothing() -> anyhow::Result<()> {
+    let world = world().await?;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/join")))
+        .respond_with(failure(403, "join_refused", "This invite cannot be used."))
+        .mount(&world.server)
+        .await;
+    let run = join(&world, &[])?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(
+        run.json()?.pointer("/error/code"),
+        Some(&json!("join_refused"))
+    );
+    let dir = world.agent_dir("inv-abc123");
+    assert!(!dir.join("key").exists() && !dir.join("identity.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_backend_that_answers_for_another_key_is_not_trusted() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(0, Some("000000"), None).await;
+    let run = join(&world, &[])?;
+    assert_eq!(run.code, Some(1));
+    let envelope = run.json()?;
+    assert_eq!(
+        envelope.pointer("/error/code"),
+        Some(&json!("malformed_response"))
+    );
+    assert!(!world.agent_dir("inv-abc123").join("identity.json").exists());
+    assert_eq!(world.requests("/session/challenge").await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_challenge_rh_did_not_build_is_never_signed() -> anyhow::Result<()> {
+    let world = world().await?;
+    let forged = login_message("https://evil.example");
+    world.mount(0, None, Some(&forged)).await;
+    let run = join(&world, &[])?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(
+        run.json()?.pointer("/error/code"),
+        Some(&json!("malformed_response"))
+    );
+    assert_eq!(world.requests("/session").await, 0);
+    assert!(!world.agent_dir("inv-abc123").join("session").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_name_that_joined_elsewhere_is_not_reused() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(0, None, None).await;
+    let dir = world.agent_dir("atlas");
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let record = json!({"name": "atlas", "agentId": "agt_other01",
+        "origin": "https://railhead.dev", "repo": "casqueblanc/demo"});
+    let path = dir.join("identity.json");
+    fs::write(&path, record.to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+
+    let run = join(&world, &["--name", "atlas"])?;
+    assert_eq!(
+        run.json()?.pointer("/error/code"),
+        Some(&json!("invalid_input"))
+    );
+    assert_eq!(fs::read_to_string(&path)?, record.to_string());
+    assert!(!dir.join("key").exists());
+    assert_eq!(
+        world
+            .server
+            .received_requests()
+            .await
+            .map_or(0, |r| r.len()),
+        0
+    );
+    Ok(())
+}
+
+// =======================================================================================
+// The credential helper
+
+fn git(world: &World, dir: &Path, args: &[&str]) -> anyhow::Result<Output> {
+    Ok(Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("RAILHEAD_HOME", world.home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("RAILHEAD_AGENT")
+        .output()?)
+}
+
+/// A clone bound to the joined agent, with the helper configured as `rh claim` configures it.
+fn clone(world: &World) -> anyhow::Result<tempfile::TempDir> {
+    let clone = tempfile::tempdir()?;
+    let origin = world.origin();
+    let helper = format!("!'{}' credential", env!("CARGO_BIN_EXE_rh"));
+    let fork = format!("{origin}/git/casqueblanc/demo/claims/clm_42abcd.git");
+    let upstream = format!("{origin}/git/casqueblanc/demo.git");
+    let settings: [&[&str]; 6] = [
+        &["init", "--quiet"],
+        &["config", "railhead.identity", AGENT],
+        &["remote", "add", "origin", &fork],
+        &["remote", "add", "upstream", &upstream],
+        &["config", "credential.helper", &helper],
+        &["config", "credential.useHttpPath", "true"],
+    ];
+    for args in settings {
+        let output = git(world, clone.path(), args)?;
+        anyhow::ensure!(output.status.success(), "git {args:?} failed");
+    }
+    Ok(clone)
+}
+
+fn credential(world: &World, dir: &Path, operation: &str, request: &str) -> anyhow::Result<Run> {
+    use std::io::Write as _;
+    let mut child = command(world, dir, &["credential", operation])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut input) = child.stdin.take() {
+        input.write_all(request.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    let run = finish(world, &output)?;
+    assert!(
+        !run.stderr.contains(TOKEN),
+        "session leaked: {}",
+        run.stderr
+    );
+    Ok(run)
+}
+
+async fn joined() -> anyhow::Result<World> {
+    let world = world().await?;
+    world.mount(0, None, None).await;
+    let run = join(&world, &[])?;
+    anyhow::ensure!(run.code == Some(0), "join failed: {}", run.stderr);
+    Ok(world)
+}
+
+fn request(world: &World, path: &str) -> String {
+    format!(
+        "protocol=http\nhost={}\npath={path}\n\n",
+        world.server.address()
+    )
+}
+
+#[tokio::test]
+async fn the_helper_gives_git_the_session_for_the_clone_remotes_only() -> anyhow::Result<()> {
+    let world = joined().await?;
+    let clone = clone(&world)?;
+    let answer = format!("username={AGENT}\npassword={TOKEN}\n");
+    for remote in [
+        "git/casqueblanc/demo/claims/clm_42abcd.git",
+        "git/casqueblanc/demo.git",
+    ] {
+        let run = credential(&world, clone.path(), "get", &request(&world, remote))?;
+        assert_eq!((run.code, run.stdout.as_str()), (Some(0), answer.as_str()));
+        assert_eq!(run.stderr, "");
+    }
+
+    let address = world.server.address();
+    for hostile in [
+        format!("protocol=https\nhost={address}\npath=git/casqueblanc/demo.git\n"),
+        "protocol=http\nhost=evil.example\npath=git/casqueblanc/demo.git\n".to_owned(),
+        format!("protocol=http\nhost={address}\npath=git/casqueblanc/other.git\n"),
+        format!("protocol=http\nhost={address}\npath=git/casqueblanc/demo/claims/clm_99zzzz.git\n"),
+        format!("protocol=http\nhost={address}\n"),
+        format!(
+            "protocol=http\nhost={address}\npath=git/casqueblanc/demo.git\nusername=agt_boreas01\n"
+        ),
+    ] {
+        let run = credential(&world, clone.path(), "get", &hostile)?;
+        assert_eq!((run.code, run.stdout.as_str()), (Some(1), ""), "{hostile}");
+        assert!(
+            run.stderr.starts_with("rh: Git asked for"),
+            "{}",
+            run.stderr
+        );
+    }
+
+    // Outside a clone there is no remote to answer for, even for a named agent.
+    let output = command(&world, world.outside.path(), &["credential", "get"])
+        .env("RAILHEAD_AGENT", "inv-abc123")
+        .stdin(Stdio::null())
+        .output()?;
+    let outside = finish(&world, &output)?;
+    assert_eq!((outside.code, outside.stdout.as_str()), (Some(1), ""));
+    assert!(outside.stderr.contains("only inside a claim's clone"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_helper_logs_in_when_the_session_is_gone_and_erase_drops_only_its_token()
+-> anyhow::Result<()> {
+    let world = joined().await?;
+    let clone = clone(&world)?;
+    let session = world.agent_dir("inv-abc123").join("session");
+    let fork = request(&world, "git/casqueblanc/demo/claims/clm_42abcd.git");
+    let fork = fork.trim_end_matches('\n');
+
+    // A stale erase leaves the current token alone.
+    let stale = credential(
+        &world,
+        clone.path(),
+        "erase",
+        &format!("{fork}\npassword=a.b.c\n"),
+    )?;
+    assert_eq!((stale.code, stale.stdout.as_str()), (Some(0), ""));
+    assert_eq!(fs::read_to_string(&session)?, TOKEN);
+
+    let erase = credential(
+        &world,
+        clone.path(),
+        "erase",
+        &format!("{fork}\npassword={TOKEN}\n"),
+    )?;
+    assert_eq!((erase.code, erase.stdout.as_str()), (Some(0), ""));
+    assert!(!session.exists());
+
+    let logins = world.requests("/session").await;
+    let run = credential(&world, clone.path(), "get", &format!("{fork}\n"))?;
+    assert_eq!(
+        (run.code, run.stdout.as_str()),
+        (
+            Some(0),
+            format!("username={AGENT}\npassword={TOKEN}\n").as_str()
+        )
+    );
+    assert_eq!(world.requests("/session").await, logins + 1);
+    assert_eq!(fs::read_to_string(&session)?, TOKEN);
+    Ok(())
+}
+
+/// Accepts Git's second request only with the agent's Basic credentials, after asking for them.
+struct GitGateway {
+    authorized: Arc<Mutex<Vec<String>>>,
+}
+
+impl Respond for GitGateway {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(value) => {
+                self.authorized
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(value.to_owned());
+                ResponseTemplate::new(503)
+            }
+            None => ResponseTemplate::new(401)
+                .insert_header("www-authenticate", "Basic realm=\"railhead\""),
+        }
+    }
+}
+
+#[tokio::test]
+async fn git_itself_sends_the_session_through_the_helper() -> anyhow::Result<()> {
+    let world = joined().await?;
+    let clone = clone(&world)?;
+    let authorized = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path(
+            "/git/casqueblanc/demo/claims/clm_42abcd.git/info/refs",
+        ))
+        .respond_with(GitGateway {
+            authorized: Arc::clone(&authorized),
+        })
+        .mount(&world.server)
+        .await;
+    let output = git(&world, clone.path(), &["ls-remote", "origin"])?;
+    // The fake gateway refuses the authorized request too, so Git fails; what it sent is the point.
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!stderr.contains(TOKEN), "{stderr}");
+    let expected = {
+        use base64_shim::encode;
+        format!("Basic {}", encode(format!("{AGENT}:{TOKEN}").as_bytes()))
+    };
+    let sent = authorized
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(sent, vec![expected]);
+    Ok(())
+}
+
+/// Standard base64, enough to build the header Git sends.
+mod base64_shim {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(input: &[u8]) -> String {
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let bytes = [
+                chunk.first().copied().unwrap_or(0),
+                chunk.get(1).copied().unwrap_or(0),
+                chunk.get(2).copied().unwrap_or(0),
+            ];
+            let n = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+            for index in 0..4 {
+                if index <= chunk.len() {
+                    let sextet = (n >> (18 - 6 * index)) & 0x3f;
+                    out.push(char::from(
+                        ALPHABET
+                            .get(usize::try_from(sextet).unwrap_or(0))
+                            .copied()
+                            .unwrap_or(b'A'),
+                    ));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+}
