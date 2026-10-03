@@ -6,7 +6,29 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
 const script = join(import.meta.dirname, "write-worker-secrets.mjs");
-const backendConfig = join(import.meta.dirname, "../packages/railhead-backend/wrangler.jsonc");
+const backend = join(import.meta.dirname, "../packages/railhead-backend");
+const backendConfig = join(backend, "wrangler.jsonc");
+
+/** Reads `export const <name> = <integer>;` from a backend source file, the minimum the Worker enforces. */
+const backendConstant = (file: string, name: string): number => {
+  const match = new RegExp(`^export const ${name} = (\\d+);$`, "m").exec(
+    readFileSync(join(backend, file), "utf8"),
+  );
+  assert.ok(match?.[1] !== undefined, `${name} not found in ${file}`);
+  return Number(match[1]);
+};
+
+/** Each Worker secret with a minimum length, and the minimum as the backend declares it. */
+const MINIMA: Array<[string, number]> = [
+  [
+    "SESSION_SIGNING_SECRET",
+    backendConstant("src/auth/sessionToken.ts", "MIN_SIGNING_SECRET_LENGTH"),
+  ],
+  [
+    "OWNER_BOOTSTRAP_TOKEN",
+    backendConstant("src/modules/owner/instance.ts", "MIN_BOOTSTRAP_TOKEN_LENGTH"),
+  ],
+];
 
 /** A config in the shape scripts/generate-worker-configs.ts writes, with two required secrets. */
 const FIXTURE_CONFIG =
@@ -19,8 +41,8 @@ const FIXTURE_CONFIG =
   ) +
   "\n";
 
-const SIGNING = "signing-value-7f3a";
-const BOOTSTRAP = "bootstrap-value-91c2";
+const SIGNING = "signing-value-7f3a-0123456789abcdef";
+const BOOTSTRAP = "bootstrap-value-91c2-0123456789abcdef";
 const TOKEN = "api-token-value-4d0e";
 
 interface Run {
@@ -91,7 +113,7 @@ describe("write-worker-secrets", () => {
     const { required } = secrets;
     assert.ok(Array.isArray(required) && required.length > 0);
     const env = Object.fromEntries(
-      required.map((name: unknown) => [String(name), `value-${String(name)}`]),
+      required.map((name: unknown) => [String(name), `value-${String(name)}`.padEnd(64, "x")]),
     );
     const out = fresh("secrets.json");
     const result = await run(["--config", backendConfig, "--out", out], env);
@@ -115,9 +137,70 @@ describe("write-worker-secrets", () => {
     assert.equal(existsSync(out), false);
   });
 
+  for (const [name, min] of MINIMA) {
+    const other =
+      name === "SESSION_SIGNING_SECRET" ? "OWNER_BOOTSTRAP_TOKEN" : "SESSION_SIGNING_SECRET";
+    const otherValue = other === "SESSION_SIGNING_SECRET" ? SIGNING : BOOTSTRAP;
+
+    test(`rejects an empty ${name} and writes nothing`, async () => {
+      const out = fresh("secrets.json");
+      const result = await run(["--config", config, "--out", out], {
+        [name]: "",
+        [other]: otherValue,
+      });
+      assert.equal(result.code, 1);
+      assert.equal(result.output, `write-worker-secrets: missing required secret(s): ${name}\n`);
+      assert.equal(existsSync(out), false);
+    });
+
+    test(`rejects a ${name} one character under the Worker's minimum and writes nothing`, async () => {
+      const out = fresh("secrets.json");
+      const value = "s".repeat(min - 1);
+      const result = await run(["--config", config, "--out", out], {
+        [name]: value,
+        [other]: otherValue,
+      });
+      assert.equal(result.code, 1);
+      assert.equal(
+        result.output,
+        `write-worker-secrets: ${name} is shorter than the ${min} characters the Worker accepts\n`,
+      );
+      assert.ok(!result.output.includes(value), "a secret value was printed");
+      assert.ok(!result.output.includes(String(min - 1)), "the value's length was printed");
+      assert.equal(existsSync(out), false);
+    });
+
+    test(`accepts a ${name} of exactly the Worker's minimum`, async () => {
+      const out = fresh("secrets.json");
+      const value = "s".repeat(min);
+      const result = await run(["--config", config, "--out", out], {
+        [name]: value,
+        [other]: otherValue,
+      });
+      assert.equal(result.code, 0, result.output);
+      assert.deepEqual(JSON.parse(readFileSync(out, "utf8")), {
+        [name]: value,
+        [other]: otherValue,
+      });
+    });
+  }
+
+  test("names a missing and a short secret together and writes nothing", async () => {
+    const out = fresh("secrets.json");
+    const result = await run(
+      ["--config", config, "--out", out, "--require", "CLOUDFLARE_API_TOKEN"],
+      { SESSION_SIGNING_SECRET: "short", OWNER_BOOTSTRAP_TOKEN: BOOTSTRAP },
+    );
+    assert.equal(result.code, 1);
+    assert.match(result.output, /missing required secret\(s\): CLOUDFLARE_API_TOKEN\n/);
+    assert.match(result.output, /SESSION_SIGNING_SECRET is shorter than/);
+    assert.ok(!result.output.includes("OWNER_BOOTSTRAP_TOKEN"), "a valid secret was named");
+    assert.equal(existsSync(out), false);
+  });
+
   test("keeps values with JSON and .env metacharacters intact", async () => {
     const out = fresh("secrets.json");
-    const awkward = 'a"b\\c=d\ne #f $g';
+    const awkward = 'a"b\\c=d\ne #f $g'.padEnd(40, "!");
     const result = await run(["--config", config, "--out", out], {
       SESSION_SIGNING_SECRET: awkward,
       OWNER_BOOTSTRAP_TOKEN: BOOTSTRAP,

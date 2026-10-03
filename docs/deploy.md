@@ -6,14 +6,14 @@ The workflow runs only when started by hand. CI's **Build and test** job instead
 
 ## Secrets
 
-Set these in the repository's `qualification` environment (**Settings → Environments → qualification → Environment secrets**). The workflow fails before deploying when any of them is missing or empty, and names the missing ones.
+Set these in the repository's `qualification` environment (**Settings → Environments → qualification → Environment secrets**). The workflow fails before deploying when any of them is missing or empty, or when a Worker secret is shorter than the Worker accepts, and names each such secret.
 
 | Secret                   | What it is                                                                                                                                                          |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLOUDFLARE_API_TOKEN`   | The API token Wrangler deploys with (permissions below).                                                                                                            |
 | `CLOUDFLARE_ACCOUNT_ID`  | The Cloudflare account that holds the Worker. Wrangler deploys to it, and it is also a Worker secret: check sandboxes fetch from that account's Artifacts Git host. |
 | `SESSION_SIGNING_SECRET` | Worker secret: at least 32 random characters. Agent login keys derive from it; replacing it ends every session.                                                     |
-| `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: the one-time token that opens enrollment of the first owner passkey.                                                                                 |
+| `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: at least 32 characters. The one-time token that opens enrollment of the first owner passkey.                                                         |
 
 The Worker secrets are exactly the `secrets.required` list in `packages/railhead-backend/cloudflare.config.ts`. A secret added there must also be added to the environment and to the deploy step's `env` in the workflow; until it is, the deploy fails naming it, and CI's dry run fails until its placeholder is added too.
 

@@ -146,8 +146,8 @@ jobs:
         working-directory: packages/railhead-backend
         env:
           CLOUDFLARE_ACCOUNT_ID: placeholder
-          SESSION_SIGNING_SECRET: placeholder
-          OWNER_BOOTSTRAP_TOKEN: placeholder
+          SESSION_SIGNING_SECRET: placeholder-session-signing-secret-000000
+          OWNER_BOOTSTRAP_TOKEN: placeholder-owner-bootstrap-token-0000000
         run: |
           secrets_file="$RUNNER_TEMP/worker-secrets.json"
           node ../../scripts/write-worker-secrets.mjs --config wrangler.jsonc --out "$secrets_file"

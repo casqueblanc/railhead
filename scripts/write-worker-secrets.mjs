@@ -7,17 +7,29 @@
 // cloudflare.config.ts. The config must be one scripts/generate-worker-configs.ts wrote: `//` header
 // lines, then plain JSON. Each value is read from the environment variable of the same name. A
 // `--require` name, such as CLOUDFLARE_API_TOKEN, must also be set but is not written to the file.
-// When any of them is unset or empty the script names every missing one and writes nothing, so a
-// deploy fails before it starts.
+// When any of them is unset or empty, or a Worker secret is shorter than the Worker accepts, the
+// script names each such secret and writes nothing, so a deploy fails before it starts.
 //
 // The file is JSON, created with mode 600 and never over an existing path. The caller deletes it.
-// Values are never printed. Exit codes: 0 written, 1 a secret is missing, 2 the arguments, the
+// Values are never printed. Exit codes: 0 written, 1 a secret is missing or too short, 2 the arguments, the
 // config or the output path are unusable.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 const NAME = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Fewest characters the Worker accepts for a secret; with a shorter value the feature it guards stays
+ * unavailable. The backend's source is TypeScript this script cannot import, so the values are copied
+ * and write-worker-secrets.test.ts reads them back from the named constants to catch a change.
+ */
+const MIN_LENGTH = new Map([
+  // MIN_SIGNING_SECRET_LENGTH in packages/railhead-backend/src/auth/sessionToken.ts
+  ["SESSION_SIGNING_SECRET", 32],
+  // MIN_BOOTSTRAP_TOKEN_LENGTH in packages/railhead-backend/src/modules/owner/instance.ts
+  ["OWNER_BOOTSTRAP_TOKEN", 32],
+]);
 
 const usage =
   "usage: node scripts/write-worker-secrets.mjs --config <wrangler.jsonc> --out <file> [--require <NAME>]...";
@@ -68,8 +80,17 @@ if (invalid.length > 0) {
 const missing = [...new Set([...values.require, ...required])].filter(
   (name) => (process.env[name] ?? "") === "",
 );
-if (missing.length > 0) {
-  fail(1, `missing required secret(s): ${missing.join(", ")}`);
+const short = required.filter(
+  (name) => !missing.includes(name) && process.env[name].length < (MIN_LENGTH.get(name) ?? 0),
+);
+const problems = [
+  ...(missing.length > 0 ? [`missing required secret(s): ${missing.join(", ")}`] : []),
+  ...short.map(
+    (name) => `${name} is shorter than the ${MIN_LENGTH.get(name)} characters the Worker accepts`,
+  ),
+];
+if (problems.length > 0) {
+  fail(1, problems.join("\n"));
 }
 
 const secrets = Object.fromEntries(required.map((name) => [name, process.env[name]]));
