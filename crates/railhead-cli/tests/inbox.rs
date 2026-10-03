@@ -278,7 +278,8 @@ impl Front {
     }
 
     /// Checks that `rh`, started at `started` with `wait` and gone at `exited`, kept the latest
-    /// held request open until its wait was over and exited soon after it was sent.
+    /// held request open until its wait was over, and for as long as it asked to be held, and
+    /// exited soon after it was sent.
     fn waited(&self, started: Instant, wait: Duration, exited: Instant) -> anyhow::Result<()> {
         // The front notices the close on its own thread, which a loaded machine may run late.
         let until = Instant::now() + HOLD;
@@ -298,6 +299,15 @@ impl Front {
             "closed {:?} after the start, before the {wait:?} wait was over",
             closed.duration_since(started)
         );
+        // A poll asks the backend to hold it for `waitMs`, so it stays open at least that long
+        // however late it was sent.
+        if let Some(held) = wait_ms(&hold) {
+            let kept = closed.duration_since(hold.arrived);
+            anyhow::ensure!(
+                kept >= Duration::from_millis(held).saturating_sub(EARLY),
+                "closed {kept:?} after it arrived, asking to be held for {held}ms"
+            );
+        }
         let open = exited.duration_since(hold.arrived);
         anyhow::ensure!(
             open < wait + EXIT_SLACK,
