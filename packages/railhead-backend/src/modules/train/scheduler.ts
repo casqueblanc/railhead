@@ -1195,7 +1195,8 @@ export function createTrain(
 
   function armWake(): Promise<boolean> {
     const wake = readWake(sql);
-    if (wake === null || isExhausted(wake)) return Promise.resolve(true);
+    // An exhausted wake owes its alarm only while a write to main may have landed unheard.
+    if (wake === null || (isExhausted(wake) && !owesSettlement())) return Promise.resolve(true);
     return context.wake(wake.dueAt);
   }
 

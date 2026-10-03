@@ -2,7 +2,7 @@
 // and the sandbox-backed ports are fakes: every intent, attempt count, batch and event comes from
 // the real modules.
 
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { CommitSha, RailheadEvent } from "@railhead/shared/events";
@@ -29,8 +29,15 @@ import {
   type Train,
 } from "../src/modules/train/scheduler";
 import { readEntry, readWake } from "../src/modules/train/store";
-import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
+import {
+  composeRepo,
+  resumables,
+  resumeAll,
+  type RepoContext,
+  type RepoPorts,
+} from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
+import { EarliestAlarm } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
 import { queueing, type QueueingTrain } from "./trainQueue";
 
@@ -153,22 +160,43 @@ interface Harness {
   queue(pin: ClaimPin): PortResult<{ queued: boolean }>;
   /** How many of the next composes refuse as `unavailable`. */
   composeFailures: number;
+  /** The alarm time the object's storage holds, or `null`. */
+  storedAlarm(): Promise<number | null>;
+  /**
+   * Moves the clock to the stored alarm and runs what the Repo's alarm handler runs: marks the
+   * alarm fired, resumes every module and waits for the wakes they asked for. Only with
+   * `realAlarm`.
+   */
+  fireAlarm(): Promise<void>;
+}
+
+/** The Repo a harness runs in: a fresh one by default. */
+interface RepoTarget {
+  stub: DurableObjectStub;
+  /**
+   * Whether wakes reach the object's storage alarm, as the Repo's do, rather than a list only. The
+   * clock then starts a day ahead of real time, so the runtime never fires a stored alarm itself.
+   */
+  realAlarm: boolean;
 }
 
 /**
- * Runs `body` against the real train, authorization and main writer of a fresh Repo. Claims answer
- * with the pins given, decisions require nothing, merges are clean and every check start is
- * acknowledged.
+ * Runs `body` against the real train, authorization and main writer of a fresh Repo, or of
+ * `target`. Claims answer with the pins given, decisions require nothing, merges are clean and
+ * every check start is acknowledged.
  */
 function withRepo<R>(
   ref: FakeMain,
   pins: ClaimPin[],
   body: (h: Harness) => Promise<R>,
+  target: RepoTarget = { stub: env.REPO.getByName(crypto.randomUUID()), realAlarm: false },
 ): Promise<R> {
-  const stub = env.REPO.getByName(crypto.randomUUID());
+  const { stub, realAlarm } = target;
   return runInDurableObject(stub, async (_instance, state) => {
-    let now = 1_000;
+    let now = realAlarm ? Date.now() + 24 * 60 * 60_000 : 1_000;
     const log = EventLog.open(state.storage, REPO_ID, () => now);
+    const alarm = new EarliestAlarm(state.storage, () => {});
+    if (realAlarm) await alarm.load();
     const context: RepoContext = {
       repoId: REPO_ID,
       storage: state.storage,
@@ -177,7 +205,7 @@ function withRepo<R>(
       env,
       wake: async (at) => {
         wakes.push(at);
-        return true;
+        return realAlarm ? alarm.request(at) : true;
       },
     };
     const wakes: number[] = [];
@@ -284,6 +312,17 @@ function withRepo<R>(
       },
       queue: (queued) => log.transaction((tx) => train.queue(tx, queued, 1)).value,
       composeFailures: 0,
+      storedAlarm: () => state.storage.getAlarm(),
+      async fireAlarm() {
+        if (!realAlarm) throw new Error("this harness has no storage alarm");
+        const at = await state.storage.getAlarm();
+        if (at === null) throw new Error("storage holds no alarm");
+        now = Math.max(now, at);
+        alarm.fired();
+        // The train here is this harness's, not the composition's.
+        await resumeAll(context, resumables({ ...ports, train }));
+        await alarm.settle();
+      },
     };
     return body(harness);
   });
@@ -622,6 +661,9 @@ describe("the train's settle wake", () => {
       const asked = h.wakes.length;
       await h.train.resume();
       expect(h.wakes.slice(asked)).toEqual([exhausted?.dueAt]);
+      // A repeated ready confirms the settle wake too.
+      expect(await h.train.armWake()).toBe(true);
+      expect(h.wakes.at(-1)).toBe(exhausted?.dueAt);
 
       // The settle drive finds Git still down: the row stays exhausted, an hour out again.
       await h.alarm();
@@ -746,6 +788,70 @@ describe("the train's settle wake", () => {
       expect(states(h.train)).toEqual({ clm_claim001: "dropped", clm_claim002: "landed" });
       expect(readWake(h.sql)).toBeNull();
     });
+  });
+
+  // This runs the Repo alarm handler's steps over the modules built here: the Repo's own
+  // composition has no authorization module or main ref yet, so it never owes a settlement.
+  // casqueblanc/railhead#242 tracks the test through `Repo.alarm` itself.
+  it("settles an owed intent from the stored alarm after the object restarts, with no call", async () => {
+    const target: RepoTarget = { stub: env.REPO.getByName(crypto.randomUUID()), realAlarm: true };
+    const ref = new FakeMain(MAIN, ["drop"]);
+    const { intentId, candidate, owed } = await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        await h.train.enqueue(pin(1));
+        ref.down = true;
+        const first = await pass(h);
+        const intent = latestIntent(h.train);
+        expect(h.authorization.record(intent)).toMatchObject({ status: "authorized", attempts: 1 });
+        await exhaust(h);
+        const wake = readWake(h.sql);
+        expect(wake?.failures).toBe(EXHAUSTED_FAILURES);
+        return { intentId: intent, candidate: first.candidate, owed: wake?.dueAt };
+      },
+      target,
+    );
+    // The object stops before its alarm write reached storage.
+    await runInDurableObject(target.stub, (_instance, state) => state.storage.deleteAlarm());
+    await evictDurableObject(target.stub);
+
+    ref.down = false;
+    await withRepo(
+      ref,
+      [pin(1)],
+      async (h) => {
+        // The rebuilt train asks for the settle wake once its composition returns, and storage
+        // holds it.
+        await Promise.resolve();
+        expect(owed).toBeDefined();
+        expect(await h.storedAlarm()).toBe(owed);
+
+        // Git is back and nothing calls the train: the stored alarm settles the intent.
+        await h.fireAlarm();
+        expect(ref.main).toBe(candidate);
+        expect(h.authorization.record(intentId)).toMatchObject({
+          status: "updated",
+          main: candidate,
+        });
+        expect(batchStates(h.train)).toEqual([["landed", null]]);
+        expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+        // The train owes no drive. The alarm left, no later than the landed candidate's discard,
+        // writes nothing to main when it fires.
+        expect(readWake(h.sql)).toBeNull();
+        const discard = h.sql
+          .exec<{ due_at: number }>("SELECT MIN(due_at) AS due_at FROM train_discards")
+          .one().due_at;
+        expect(await h.storedAlarm()).toBeLessThanOrEqual(discard);
+        const writes = ref.updates.length;
+        await h.fireAlarm();
+        expect(ref.updates).toHaveLength(writes);
+        expect(batchStates(h.train)).toEqual([["landed", null]]);
+        expect(readWake(h.sql)).toBeNull();
+      },
+      target,
+    );
+    await runInDurableObject(target.stub, (_instance, state) => state.storage.deleteAlarm());
   });
 
   it("settles a batch whose intent settled without the train hearing it", async () => {
