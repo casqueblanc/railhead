@@ -100,10 +100,14 @@ export const signAction = async (
   );
 };
 
-/** Asks the authenticator to create the owner's passkey for the enrollment challenge. */
+/**
+ * Asks the authenticator to create the owner's passkey for the enrollment challenge. Aborting
+ * `signal` cancels the browser's prompt.
+ */
 export const registerPasskey = async (
   authenticator: Authenticator,
   challenge: EnrollmentChallenge,
+  signal: AbortSignal,
   now: number = Date.now(),
 ): Promise<CeremonyOutcome<PasskeyRegistration>> => {
   const bytes = fromBase64Url(challenge.challenge);
@@ -120,6 +124,7 @@ export const registerPasskey = async (
   return ceremony(
     () =>
       authenticator.create({
+        signal,
         publicKey: {
           challenge: bytes,
           rp: { id: challenge.rpId, name: "Railhead" },

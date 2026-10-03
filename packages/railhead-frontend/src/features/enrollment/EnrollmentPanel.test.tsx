@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   ActionChallenge,
   BoardResult,
+  EnrollmentChallenge,
   OwnerAction,
   OwnerActionResult,
 } from "@railhead/shared/board-api";
@@ -148,29 +149,34 @@ const click = async (target: HTMLButtonElement) => {
   await act(async () => target.click());
 };
 
+const enrollmentChallenge = (): EnrollmentChallenge => ({
+  challengeId: "enr_1",
+  challenge: "AAECAw",
+  rpId: "railhead.dev",
+  userHandle: "BAUG",
+  expiresAt: Date.now() + 60_000,
+});
+
+const enrolled: BoardResult<{ ownerId: string }> = {
+  ok: true,
+  value: { ownerId: "usr_synthowner" },
+};
+
 /** An enrollment port that records each token and completed challenge. */
 const enrollmentPort = (
-  completed: () => Promise<BoardResult<{ ownerId: string }>> = async () => ({
+  completed: () => Promise<BoardResult<{ ownerId: string }>> = async () => enrolled,
+  prepared: () => Promise<BoardResult<EnrollmentChallenge>> = async () => ({
     ok: true,
-    value: { ownerId: "usr_synthowner" },
+    value: enrollmentChallenge(),
   }),
 ) => {
   const tokens: string[] = [];
   const completions: string[] = [];
   const port: EnrollmentPort = {
     kind: "available",
-    onPrepareEnrollment: async (token) => {
+    onPrepareEnrollment: (token) => {
       tokens.push(token);
-      return {
-        ok: true,
-        value: {
-          challengeId: "enr_1",
-          challenge: "AAECAw",
-          rpId: "railhead.dev",
-          userHandle: "BAUG",
-          expiresAt: Date.now() + 60_000,
-        },
-      };
+      return prepared();
     },
     onCompleteEnrollment: (challengeId) => {
       completions.push(challengeId);
@@ -596,6 +602,98 @@ describe("EnrollmentPanel", () => {
 
       expect(button("Enroll owner passkey").disabled).toBe(true);
       expect(text()).toContain("Blocked while the board is offline.");
+    });
+
+    describe("when enrollment is withdrawn mid-request", () => {
+      const offline: EnrollmentPort = { kind: "unavailable", reason: "offline" };
+
+      it("does not prompt or complete once the session is lost during prepare", async () => {
+        const preparing = deferred<BoardResult<EnrollmentChallenge>>();
+        const { owner } = recordingOwner(echo);
+        const { port, completions } = enrollmentPort(undefined, () => preparing.promise);
+        const { authenticator, creations } = fakeAuthenticator();
+        await render(live(fold([])), owner, authenticator, port);
+
+        await type(input("Bootstrap token"), "deploy-token");
+        await click(button("Enroll owner passkey"));
+        await render(live(fold([])), owner, authenticator, offline);
+        await act(async () => preparing.resolve({ ok: true, value: enrollmentChallenge() }));
+
+        expect(creations).toHaveLength(0);
+        expect(completions).toEqual([]);
+        expect(text()).toContain(
+          "Stopped: the board lost its connection before the passkey was sent. Nothing was enrolled.",
+        );
+        expect(text()).toContain("Blocked while the board is offline.");
+      });
+
+      it("cancels the passkey prompt and completes nothing once the session is lost during registration", async () => {
+        const creating = deferred<Credential | null>();
+        const prompts: CredentialCreationOptions[] = [];
+        const creator = fakeAuthenticator();
+        const authenticator: Authenticator = {
+          ...creator.authenticator,
+          create: (options) => {
+            prompts.push(options);
+            return creating.promise;
+          },
+        };
+        const { owner } = recordingOwner(echo);
+        const { port, completions } = enrollmentPort();
+        await render(live(fold([])), owner, authenticator, port);
+
+        await type(input("Bootstrap token"), "deploy-token");
+        await click(button("Enroll owner passkey"));
+        expect(prompts).toHaveLength(1);
+        await render(live(fold([])), owner, authenticator, offline);
+        expect(prompts[0]?.signal?.aborted).toBe(true);
+        const created = await creator.authenticator.create({});
+        await act(async () => creating.resolve(created));
+
+        expect(completions).toEqual([]);
+        expect(text()).toContain("Nothing was enrolled.");
+      });
+
+      it("drops a late completion from a replaced session and leaves the new one usable", async () => {
+        const completing = deferred<BoardResult<{ ownerId: string }>>();
+        const { owner } = recordingOwner(echo);
+        const first = enrollmentPort(() => completing.promise);
+        const second = enrollmentPort();
+        const { authenticator } = fakeAuthenticator();
+        await render(live(fold([])), owner, authenticator, first.port);
+
+        await type(input("Bootstrap token"), "deploy-token");
+        await click(button("Enroll owner passkey"));
+        expect(first.completions).toEqual(["enr_1"]);
+        await render(live(fold([])), owner, authenticator, second.port);
+        await act(async () => completing.resolve(enrolled));
+
+        expect(text()).not.toContain("Owner passkey enrolled.");
+        expect(text()).toContain(
+          "The board lost its connection after the passkey was sent. Try again; if enrollment is closed, the passkey was enrolled.",
+        );
+
+        await click(button("Enroll owner passkey"));
+        expect(second.tokens).toEqual(["deploy-token"]);
+        expect(second.completions).toEqual(["enr_1"]);
+        expect(text()).toContain("Owner passkey enrolled. Enrollment is now closed.");
+      });
+
+      it("prompts and completes nothing after the panel unmounts", async () => {
+        const preparing = deferred<BoardResult<EnrollmentChallenge>>();
+        const { owner } = recordingOwner(echo);
+        const { port, completions } = enrollmentPort(undefined, () => preparing.promise);
+        const { authenticator, creations } = fakeAuthenticator();
+        await render(live(fold([])), owner, authenticator, port);
+
+        await type(input("Bootstrap token"), "deploy-token");
+        await click(button("Enroll owner passkey"));
+        await act(async () => root.render(null));
+        await act(async () => preparing.resolve({ ok: true, value: enrollmentChallenge() }));
+
+        expect(creations).toHaveLength(0);
+        expect(completions).toEqual([]);
+      });
     });
   });
 });

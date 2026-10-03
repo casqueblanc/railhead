@@ -1,12 +1,11 @@
 import { Button, Input, Text } from "@cloudflare/kumo";
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 import type { EnrollmentPort } from "../board/boardPorts";
 import { BlockedNote } from "./BlockedNote";
-import { enrollOwner, type BootstrapOutcome } from "./ownerBootstrap";
+import { enrollOwner, type AvailableEnrollmentPort, type BootstrapOutcome } from "./ownerBootstrap";
 import type { EnrollmentBlock } from "./ownerActions";
+import { usePortAttempt } from "./usePortAttempt";
 import type { Authenticator } from "./webauthn";
-
-type SetupState = { kind: "idle" } | { kind: "pending" } | BootstrapOutcome;
 
 interface OwnerPasskeySetupProps {
   enrollment: EnrollmentPort;
@@ -26,32 +25,32 @@ const setupBlock = (
 
 /**
  * Enrolls the instance owner's first passkey with the one-time token the operator configured at
- * deploy. The backend closes enrollment after the first success and refuses a wrong token.
+ * deploy. The backend closes enrollment after the first success and refuses a wrong token. An
+ * attempt belongs to the enrollment port it started with; see {@link usePortAttempt}.
  */
 export const OwnerPasskeySetup = ({ enrollment, authenticator }: OwnerPasskeySetupProps) => {
   const headingId = useId();
   const [token, setToken] = useState("");
   const [invalid, setInvalid] = useState<string | null>(null);
-  const [state, setState] = useState<SetupState>({ kind: "idle" });
-  // `pending` is captured at render, so two submits in one tick would both pass it.
-  const inFlight = useRef(false);
+  const { state, start } = usePortAttempt<AvailableEnrollmentPort, BootstrapOutcome>(
+    enrollment.kind === "available" ? enrollment : null,
+  );
   const block = setupBlock(enrollment, authenticator);
   const pending = state.kind === "pending";
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (enrollment.kind !== "available" || authenticator === null || inFlight.current) return;
-    if (token.trim().length === 0) {
+    if (enrollment.kind !== "available" || authenticator === null) return;
+    const bootstrapToken = token.trim();
+    if (bootstrapToken.length === 0) {
       setInvalid("Enter the bootstrap token from the deploy.");
       return;
     }
     setInvalid(null);
-    inFlight.current = true;
-    setState({ kind: "pending" });
-    const outcome = await enrollOwner(enrollment, authenticator, token.trim());
-    inFlight.current = false;
-    if (outcome.kind === "enrolled") setToken("");
-    setState(outcome);
+    const outcome = await start(enrollment, (control) =>
+      enrollOwner(enrollment, authenticator, bootstrapToken, control),
+    );
+    if (outcome?.kind === "enrolled") setToken("");
   };
 
   return (
@@ -99,6 +98,13 @@ export const OwnerPasskeySetup = ({ enrollment, authenticator }: OwnerPasskeySet
             {state.kind === "failed" && (
               <Text variant="error" DANGEROUS_className="break-words">
                 {state.message}
+              </Text>
+            )}
+            {state.kind === "withdrawn" && (
+              <Text variant="error" DANGEROUS_className="break-words">
+                {state.sent
+                  ? "The board lost its connection after the passkey was sent. Try again; if enrollment is closed, the passkey was enrolled."
+                  : "Stopped: the board lost its connection before the passkey was sent. Nothing was enrolled."}
               </Text>
             )}
           </div>

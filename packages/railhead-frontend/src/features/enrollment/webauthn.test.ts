@@ -125,7 +125,7 @@ describe("signAction", () => {
 describe("registerPasskey", () => {
   it("creates an ES256 passkey for the owner's user handle and encodes the attestation", async () => {
     const { authenticator, creations } = fakeAuthenticator();
-    const outcome = await registerPasskey(authenticator, enrollmentChallenge(), NOW);
+    const outcome = await registerPasskey(authenticator, enrollmentChallenge(), live, NOW);
 
     expect(outcome).toEqual({
       kind: "done",
@@ -142,9 +142,18 @@ describe("registerPasskey", () => {
     expect(publicKey?.authenticatorSelection?.userVerification).toBe("required");
   });
 
+  it("hands the browser the signal that cancels its prompt", async () => {
+    const { authenticator, creations } = fakeAuthenticator();
+    const controller = new AbortController();
+    await registerPasskey(authenticator, enrollmentChallenge(), controller.signal, NOW);
+
+    controller.abort();
+    expect(creations[0]?.signal?.aborted).toBe(true);
+  });
+
   it("reports a dismissed prompt as cancelled", async () => {
     const { authenticator } = fakeAuthenticator(() => "dismiss");
-    expect(await registerPasskey(authenticator, enrollmentChallenge(), NOW)).toEqual({
+    expect(await registerPasskey(authenticator, enrollmentChallenge(), live, NOW)).toEqual({
       kind: "cancelled",
     });
   });
@@ -154,11 +163,13 @@ describe("registerPasskey", () => {
     const unreadable = await registerPasskey(
       authenticator,
       enrollmentChallenge({ userHandle: "?" }),
+      live,
       NOW,
     );
     const expired = await registerPasskey(
       authenticator,
       enrollmentChallenge({ expiresAt: NOW - 1 }),
+      live,
       NOW,
     );
     expect(unreadable.kind).toBe("failed");
@@ -168,6 +179,8 @@ describe("registerPasskey", () => {
 
   it("fails on a credential without an attestation object", async () => {
     const { authenticator } = fakeAuthenticator(() => "malformed");
-    expect((await registerPasskey(authenticator, enrollmentChallenge(), NOW)).kind).toBe("failed");
+    expect((await registerPasskey(authenticator, enrollmentChallenge(), live, NOW)).kind).toBe(
+      "failed",
+    );
   });
 });
