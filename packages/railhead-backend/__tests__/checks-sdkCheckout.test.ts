@@ -27,6 +27,8 @@ const NAMESPACE = "railhead";
 const REPO = "demo";
 const SHA = "a".repeat(40);
 const BACKUP_ID = "0b6c5f0e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
+/** The SDK's largest log returned whole; a larger one is read as its tail. */
+const INLINE_LOG_BYTES = 300_000;
 
 const SOURCE = {
   owner: NAMESPACE,
@@ -324,6 +326,12 @@ class ScriptedSandbox {
   readonly restored: unknown[] = [];
   readonly scripts: string[] = [];
   started: unknown = null;
+  /** The size every command's stdout and stderr files report. */
+  logBytes = 0;
+  /** Whether reading a log's tail exits nonzero. */
+  tailFails = false;
+  /** Whether `railheadRetire` rejects without retiring. */
+  retireFails = false;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -346,6 +354,10 @@ class ScriptedSandbox {
 
   async execWithSessionToken(command: string, _session: string, options?: { env?: object }) {
     this.envs.push({ ...options?.env });
+    if (command.startsWith(`tail -c ${INLINE_LOG_BYTES} `)) {
+      this.calls.push("log:tail");
+      return { exitCode: this.tailFails ? 1 : 0, stdout: "last lines", stderr: "" };
+    }
     if (command.startsWith("tail -c")) {
       return {
         exitCode: 0,
@@ -392,16 +404,24 @@ class ScriptedSandbox {
   }
 
   async listFiles() {
-    return { files: [] };
+    if (this.logBytes === 0) return { files: [] };
+    return {
+      files: ["/tmp/ci-step.out", "/tmp/ci-step.err"].map((absolutePath) => ({
+        absolutePath,
+        size: this.logBytes,
+      })),
+    };
   }
 
   async readFile() {
+    if (this.logBytes > 0) this.calls.push("log:read");
     return { content: "" };
   }
 
   /** `RailheadSandbox.railheadRetire`, through `fence` when the test gives one. */
   async railheadRetire() {
     this.calls.push("retire");
+    if (this.retireFails) throw new Error("retire failed");
     await this.fence?.retire();
   }
 
@@ -428,9 +448,15 @@ class RecordingArtifacts {
   }
 }
 
-/** An R2 bucket holding one install cache pointer, written by `producedBySha`, and its backup. */
+/**
+ * An R2 bucket holding one install cache pointer, written by `producedBySha`, and its backup. A
+ * pointer write is recorded through `record`.
+ */
 class CacheBucket {
-  constructor(private readonly producedBySha: string) {}
+  constructor(
+    private readonly producedBySha: string,
+    private readonly record: (call: string) => void,
+  ) {}
 
   async get(key: string) {
     if (key.startsWith("cache/")) {
@@ -454,7 +480,8 @@ class CacheBucket {
   async head() {
     return { size: 1 };
   }
-  async put() {
+  async put(key: string) {
+    if (key.startsWith("cache/")) this.record("pointer");
     return null;
   }
 }
@@ -510,6 +537,10 @@ async function run(options: {
   fence?: SandboxFence;
   /** The literal environment the test runner is given. */
   testEnv?: Record<string, string>;
+  /** The size of every command's logs; the SDK reads a log above its inline limit as its tail. */
+  logBytes?: number;
+  tailFails?: boolean;
+  retireFails?: boolean;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -522,13 +553,16 @@ async function run(options: {
     new Map([[BACKUP_ID, new Set(trees[cachedBy])]]),
     options.fence ?? null,
   );
+  sandbox.logBytes = options.logBytes ?? 0;
+  sandbox.tailFails = options.tailFails ?? false;
+  sandbox.retireFails = options.retireFails ?? false;
   const artifacts = new RecordingArtifacts();
   const bindings = {
     CF_TOKEN: "cf-secret-token",
     R2_ACCESS_KEY_ID: "r2-key-id",
     R2_SECRET_ACCESS_KEY: "r2-secret",
     ARTIFACTS: artifacts,
-    BACKUP_BUCKET: new CacheBucket(cachedBy),
+    BACKUP_BUCKET: new CacheBucket(cachedBy, (call) => sandbox.calls.push(call)),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
     SANDBOX: { idFromName: (name: string) => name, get: () => sandbox },
@@ -688,6 +722,96 @@ describe("a check run through the patched SDK", () => {
       });
     },
   );
+
+  it.each([
+    ["at the inline limit", INLINE_LOG_BYTES, ["log:read", "log:read"]],
+    ["above the inline limit", INLINE_LOG_BYTES + 1, ["log:tail", "log:tail"]],
+  ])(
+    "publishes the install cache of a check whose logs are %s only after retiring its sandbox",
+    async (_name, logBytes, reads) => {
+      // Another commit wrote the pointer, so the install runs and publishes its own.
+      const { outcome, sandbox } = await run({ cached: true, cachedBy: "c".repeat(40), logBytes });
+
+      expect(outcome).toEqual({ kind: "pass" });
+      expect(sandbox.calls.slice(0, 8)).toEqual([
+        "start",
+        "checkout",
+        "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
+        "backup",
+        ...reads,
+        "retire",
+        "pointer",
+      ]);
+      // The chained test is not cached, but still reads its logs before it retires.
+      expect(sandbox.calls.slice(-4)).toEqual(["backup", ...reads, "retire"]);
+    },
+  );
+
+  it("records a check whose large-log sandbox was not retired as an error and publishes no cache", async () => {
+    const { outcome, sandbox } = await run({
+      cached: true,
+      cachedBy: "c".repeat(40),
+      logBytes: INLINE_LOG_BYTES + 1,
+      retireFails: true,
+    });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+    });
+    expect(sandbox.calls.slice(-3)).toEqual(["log:tail", "log:tail", "retire"]);
+    expect(sandbox.calls).not.toContain("pointer");
+    expect(sandbox.calls.filter((call) => call.startsWith("command:"))).toHaveLength(1);
+  });
+
+  it("records a large-log check whose destroy failed as an error, with the grant ended and no cache", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
+    await withFence(async (fence, recorder) => {
+      recorder.failingDestroys = 1;
+      const { outcome, sandbox } = await run({
+        cached: true,
+        cachedBy: "c".repeat(40),
+        logBytes: INLINE_LOG_BYTES + 1,
+        fence,
+      });
+      const gateway = registeredGateway(fence);
+
+      const after = await gateway.serve(
+        fetchRefs(`https://${HOST}/git/railhead/demo.git`),
+        sandbox.started,
+      );
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+      });
+      expect(sandbox.calls.slice(-3)).toEqual(["log:tail", "log:tail", "retire"]);
+      expect(sandbox.calls).not.toContain("pointer");
+      expect(after.status).toBe(403);
+      expect(recorder.wakes.at(-1)).toBeGreaterThan(NOW);
+      await fence.expire();
+      expect(recorder.destroys).toBe(2);
+      expect(fence.grantCurrent(expiresAt)).toBe(false);
+    });
+  });
+
+  it("records a large log that cannot be read as an error, still retiring the sandbox", async () => {
+    const { outcome, sandbox } = await run({
+      cached: true,
+      cachedBy: "c".repeat(40),
+      logBytes: INLINE_LOG_BYTES + 1,
+      tailFails: true,
+    });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+    });
+    expect(sandbox.calls.slice(-2)).toEqual(["log:tail", "retire"]);
+    expect(sandbox.calls).not.toContain("pointer");
+  });
 
   it("runs no command when the sandbox's fence refuses to start", async () => {
     await withFence(async (fence) => {
