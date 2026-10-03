@@ -1178,6 +1178,84 @@ describe("train hung ports", () => {
       expect(fakes.main).toBe(MAIN);
     }, fakes);
   });
+
+  it.each(["duplicate ready calls", "an earlier outage"] as const)(
+    "keeps the deadline of a refused check start after %s exhaust the retries",
+    async (cause) => {
+      const fakes = new Fakes();
+      fakes.start = () => fail("unavailable", "Runner offline.");
+      await withTrain(async ({ train, sql, wakes, now, advance, restart }) => {
+        fakes.ready(pin(1), pin(2));
+        if (cause === "duplicate ready calls") {
+          await train.enqueue(pin(1));
+          for (let failures = 2; failures <= MAX_WAKE_FAILURES + 1; failures += 1) {
+            expect(await train.enqueue(pin(1))).toEqual(ok({ queued: false }));
+          }
+          expect(fakes.started).toHaveLength(MAX_WAKE_FAILURES + 1);
+        } else {
+          fakes.compose = () => fail("unavailable", "Sandbox offline.");
+          await train.enqueue(pin(1));
+          while (owed(sql).failures < MAX_WAKE_FAILURES - 1) {
+            advance(owed(sql).dueAt - now());
+            await train.resume();
+          }
+          fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
+          for (let drives = 0; drives < 2; drives += 1) {
+            advance(owed(sql).dueAt - now());
+            await train.resume();
+          }
+          expect(fakes.started).toHaveLength(2);
+        }
+        const silent = lastStarted(fakes);
+        const [requested] = train.batches(1);
+        expect(requested).toMatchObject({ state: "checking", checkStarted: false });
+        const deadline = requested?.checkDeadline ?? 0;
+        expect(deadline).toBeGreaterThan(now());
+        // Retries stopped, but the wake that expires the attempt survives exhaustion.
+        expect(owed(sql)).toEqual({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
+        expect(wakes.at(-1)).toBe(deadline);
+
+        // Later work queues behind the attempt, and its drive cannot remove the deadline either.
+        expect(await train.enqueue(pin(2))).toEqual(ok({ queued: true }));
+        expect(owed(sql)).toEqual({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
+        const starts = fakes.started.length;
+
+        // A restarted Repo asks for the deadline again; an earlier alarm requests nothing.
+        const again = restart();
+        expect(wakes.at(-1)).toBe(deadline);
+        advance(deadline - now() - 10);
+        await again.resume();
+        expect(fakes.started).toHaveLength(starts);
+        expect(wakes.at(-1)).toBe(deadline);
+
+        fakes.start = (attempt) => ok({ attemptId: attempt.attemptId });
+        advance(deadline - now());
+        await again.resume();
+        const fresh = lastStarted(fakes);
+        expect(fresh.attemptId).not.toBe(silent.attemptId);
+        expect(fakes.started.slice(starts).map((a) => a.attemptId)).toEqual([fresh.attemptId]);
+        expect(train.batches(2).map((b) => [b.state, b.failure])).toEqual([
+          ["checking", null],
+          ["failed", "check_timeout"],
+        ]);
+
+        // The expired attempt can neither authorize nor publish.
+        expect(await again.recordCheck(report(silent, "pass"))).toMatchObject({
+          ok: false,
+          code: "check_mismatch",
+        });
+        for (let landed = 0; landed < 3 && train.batches(1)[0]?.state === "checking"; landed += 1) {
+          await again.recordCheck(report(lastStarted(fakes), "pass"));
+        }
+        expect(states(train)).toEqual({ "clm_claim001@1": "landed", "clm_claim002@1": "landed" });
+        expect(fakes.authorized).not.toContain(silent.attemptId);
+        expect([...fakes.intents.values()].map((i) => i.checkAttemptId)).not.toContain(
+          silent.attemptId,
+        );
+        expect(readWake(sql)).toBeNull();
+      }, fakes);
+    },
+  );
 });
 
 describe("train attempt outcome", () => {

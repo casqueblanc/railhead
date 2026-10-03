@@ -14,6 +14,8 @@
 // from storage: it asks the alarm to drive again at once when work arrived too late for the drive,
 // waits for the active attempt's deadline while a runner's report is due, backs off when a port
 // refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it.
+// Neither a backoff nor exhaustion outlasts a requested attempt's deadline: the wake stays due by
+// then, so the attempt expires even when no port answers again.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes.
 //
@@ -128,7 +130,8 @@ export const CHECK_DEADLINE_MS = 60 * 60_000;
 /**
  * Most drives in a row the alarm runs after a port refused or a drive threw, about 85 minutes in
  * all. After that the train stops asking and logs `train.wake_exhausted`; its work stays in storage
- * and the next `enqueue` or `recordCheck` drives it again.
+ * and the next `enqueue` or `recordCheck` drives it again. A requested check attempt keeps one wake
+ * at its deadline, which expires it without a port.
  */
 export const MAX_WAKE_FAILURES = 24;
 
@@ -343,11 +346,16 @@ export function createTrain(
       if (!holds(generation)) return false;
       if (failed) {
         const failures = (readWake(sql)?.failures ?? 0) + 1;
+        // Expiring a requested attempt needs no port, so neither backoff nor exhaustion may wait
+        // past its deadline.
+        const deadline = pendingDeadline();
         if (failures > MAX_WAKE_FAILURES) {
-          clearWake(sql);
+          if (deadline === null) clearWake(sql);
+          else writeWakeIn({ dueAt: deadline, failures: MAX_WAKE_FAILURES });
           return true;
         }
-        writeWakeIn({ dueAt: now + wakeDelay(failures), failures });
+        const retryAt = now + wakeDelay(failures);
+        writeWakeIn({ dueAt: deadline === null ? retryAt : Math.min(retryAt, deadline), failures });
       } else if (hasMovableWork(sql)) {
         writeWakeIn({ dueAt: now, failures: 0 });
       } else {
