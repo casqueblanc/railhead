@@ -6,8 +6,8 @@
 //! which planned task it carries. The record is written before the claim is pinned and removed
 //! once every planned task landed, so a finished run leaves nothing to resume.
 //!
-//! A record that cannot be read, is damaged, belongs to another scenario or names an invalid
-//! claim stops the run before any agent acts: it is the only map from a live claim to its planned
+//! A record that cannot be read, is damaged, belongs to another scenario, names an invalid claim
+//! or does not fit the scenario's plan stops the run before any agent acts: it is the only map from a live claim to its planned
 //! task, so it is never dropped silently. `--discard-progress` removes it on purpose.
 //!
 //! One run at a time may use an agent's home: [`HomeLock`] holds a lock file beside the record
@@ -18,6 +18,8 @@ use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use railhead_protocol::{IdKind, is_id};
+
+use crate::plan::Edit;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -65,6 +67,20 @@ pub struct Progress {
     pub claim_id: Option<String>,
 }
 
+impl Progress {
+    /// Whether the agent could have written this record for its planned `edits`: a task of the
+    /// plan, a scaffold only with its claim and before an edit that needs it, or every task done
+    /// with only the record's removal left.
+    #[must_use]
+    pub fn fits(&self, edits: &[Edit]) -> bool {
+        let index = usize::try_from(self.round).unwrap_or(usize::MAX);
+        match edits.get(index) {
+            Some(edit) => !self.scaffold || (edit.needs_scaffold() && self.claim_id.is_some()),
+            None => index == edits.len() && !self.scaffold && self.claim_id.is_none(),
+        }
+    }
+}
+
 /// Why a progress record was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ProgressError {
@@ -85,6 +101,9 @@ pub enum ProgressError {
     /// The record names a claim id that is not one.
     #[error("the progress record {} names an invalid claim", .0.display())]
     InvalidClaim(PathBuf),
+    /// The record names a task or stage the agent's plan does not have.
+    #[error("the progress record {} does not fit the scenario's plan", .0.display())]
+    OutOfPlan(PathBuf),
 }
 
 /// One agent's progress file.
@@ -98,13 +117,13 @@ impl ProgressFile {
         Self(dir.join(format!("{name}.json")))
     }
 
-    /// The record for a run of `key`, or `None` when there is none.
+    /// The record for a run of `key` whose agent plans `edits`, or `None` when there is none.
     ///
     /// # Errors
     ///
-    /// When the file exists but cannot be read, is not a record, belongs to another run or names
-    /// an invalid claim.
-    pub fn load(&self, key: &RunKey) -> Result<Option<Progress>, ProgressError> {
+    /// When the file exists but cannot be read, is not a record, belongs to another run, names
+    /// an invalid claim or does not fit `edits` (see [`Progress::fits`]).
+    pub fn load(&self, key: &RunKey, edits: &[Edit]) -> Result<Option<Progress>, ProgressError> {
         let read = |source| ProgressError::Read {
             path: self.0.clone(),
             source,
@@ -129,6 +148,9 @@ impl ProgressFile {
             .is_some_and(|id| !is_id(IdKind::Claim, id))
         {
             return Err(ProgressError::InvalidClaim(self.0.clone()));
+        }
+        if !progress.fits(edits) {
+            return Err(ProgressError::OutOfPlan(self.0.clone()));
         }
         Ok(Some(progress))
     }
@@ -246,9 +268,28 @@ impl Drop for HomeLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::EditClass;
 
     fn key() -> RunKey {
         RunKey::new(211, b"{\"seed\": 211}")
+    }
+
+    /// Three planned tasks: a disjoint edit, then two that need the scaffold.
+    fn edits() -> Vec<Edit> {
+        [
+            EditClass::Disjoint,
+            EditClass::SameFileHunks,
+            EditClass::Overlapping,
+        ]
+        .into_iter()
+        .zip(0..)
+        .map(|(class, round)| Edit {
+            seed: 211,
+            round,
+            class,
+            token: 1,
+        })
+        .collect()
     }
 
     fn record(claim_id: Option<&str>) -> Progress {
@@ -277,15 +318,18 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let progress = dir.path().join("progress");
         let file = ProgressFile::new(&progress, "swarm-00");
-        assert_eq!(file.load(&key())?, None);
+        assert_eq!(file.load(&key(), &edits())?, None);
         file.save(&record(Some("clm_abcdef")))?;
-        assert_eq!(file.load(&key())?, Some(record(Some("clm_abcdef"))));
+        assert_eq!(
+            file.load(&key(), &edits())?,
+            Some(record(Some("clm_abcdef")))
+        );
         file.save(&record(None))?;
-        assert_eq!(file.load(&key())?, Some(record(None)));
+        assert_eq!(file.load(&key(), &edits())?, Some(record(None)));
         // No temporary file is left beside the record.
         assert_eq!(std::fs::read_dir(&progress)?.count(), 1);
         file.clear()?;
-        assert_eq!(file.load(&key())?, None);
+        assert_eq!(file.load(&key(), &edits())?, None);
         // Clearing what is not there is not an error.
         file.clear()?;
         Ok(())
@@ -308,7 +352,7 @@ mod tests {
         ] {
             std::fs::write(&path, &text)?;
             assert!(
-                matches!(file.load(&key()), Err(ProgressError::Damaged(_))),
+                matches!(file.load(&key(), &edits()), Err(ProgressError::Damaged(_))),
                 "{text}"
             );
         }
@@ -324,7 +368,10 @@ mod tests {
             RunKey::new(211, b"{\"seed\": 211} "),
             RunKey::new(212, b"{\"seed\": 211}"),
         ] {
-            assert!(matches!(file.load(&other), Err(ProgressError::Foreign(_))));
+            assert!(matches!(
+                file.load(&other, &edits()),
+                Err(ProgressError::Foreign(_))
+            ));
         }
         Ok(())
     }
@@ -335,9 +382,53 @@ mod tests {
         let file = ProgressFile::new(dir.path(), "swarm-00");
         file.save(&record(Some("../../etc")))?;
         assert!(matches!(
-            file.load(&key()),
+            file.load(&key(), &edits()),
             Err(ProgressError::InvalidClaim(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_fits_only_a_stage_its_plan_has() {
+        let at = |round, scaffold, claim_id: Option<&str>| Progress {
+            round,
+            scaffold,
+            ..record(claim_id)
+        };
+        let edits = edits();
+        // A task of the plan, with or without its claim; the scaffold before an edit needing it.
+        assert!(at(0, false, None).fits(&edits));
+        assert!(at(1, false, Some("clm_abcdef")).fits(&edits));
+        assert!(at(2, true, Some("clm_abcdef")).fits(&edits));
+        // Every task done, the record not yet removed.
+        assert!(at(3, false, None).fits(&edits));
+        // Past the plan, or done but still holding a claim or a scaffold.
+        assert!(!at(4, false, None).fits(&edits));
+        assert!(!at(u32::MAX, false, None).fits(&edits));
+        assert!(!at(3, false, Some("clm_abcdef")).fits(&edits));
+        assert!(!at(3, true, Some("clm_abcdef")).fits(&edits));
+        // A scaffold without its claim, or before an edit that does not need it.
+        assert!(!at(1, true, None).fits(&edits));
+        assert!(!at(0, true, Some("clm_abcdef")).fits(&edits));
+        // An agent with no tasks has only the finished stage.
+        assert!(at(0, false, None).fits(&[]));
+        assert!(!at(1, false, None).fits(&[]));
+    }
+
+    #[test]
+    fn a_record_outside_the_plan_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = ProgressFile::new(dir.path(), "swarm-00");
+        file.save(&Progress {
+            round: 9,
+            ..record(None)
+        })?;
+        assert!(matches!(
+            file.load(&key(), &edits()),
+            Err(ProgressError::OutOfPlan(_))
+        ));
+        // The record is kept for the operator.
+        assert!(dir.path().join("swarm-00.json").exists());
         Ok(())
     }
 

@@ -2,9 +2,11 @@
 //! each planned edit.
 //!
 //! The agent follows what `rh` answers. A retryable refusal is repeated within the retry bound,
-//! after the delay the backend asked for. An unacknowledged decision is read and acknowledged
-//! before `rh ready` is repeated. A conflict routed to its claim, or the claim reopening, makes
-//! it redo the edit on the new main and push again. A ready claim that does not land within the
+//! after the delay the backend asked for. A conflict routed to its claim, or the claim reopening,
+//! makes it acknowledge the conflict, redo the edit on the new main and push again. An owner's
+//! decision or a rework request stops it unacknowledged: its edits are scripted, so it cannot
+//! follow a decision, and acknowledging one would claim it had. An `rh ready` whose answer was lost
+//! may have pinned the commit, so the agent reads its claim before repeating it. A ready claim that does not land within the
 //! land timeout stops the agent: it still holds the claim, so it cannot take other work.
 //!
 //! A task lands only when the agent reads its claim as `merged`. A ready claim that leaves the
@@ -20,7 +22,8 @@
 //! A rerun picks up where a stopped run left off. The agent's progress record names the planned
 //! task it was on and that task's claim. When `rh work` hands back a claim an earlier run already
 //! pinned, the agent adopts it: it waits for the claim's outcome and records it before it plans
-//! any new edit.
+//! any new edit. A claim handed back still working may already hold the edit, pushed by a run that
+//! stopped before `rh ready`; the agent keeps a disjoint file that holds exactly its planned line.
 //!
 //! The agent writes only inside the clone `rh work` made under its own working directory, and
 //! only to a clone whose fork belongs to the scenario's repository. It never follows a symbolic
@@ -43,10 +46,8 @@ use crate::process::{self, AgentEnv, Envelope, Runner};
 use crate::progress::{Progress, ProgressFile, RunKey};
 use crate::scenario::Bounds;
 
-/// The plan an agent writes when it acknowledges an item.
+/// The plan an agent writes when it acknowledges a conflict, the only item it can act on.
 const CONFLICT_PLAN: &str = "Simulated agent: redo the edit on the new main and push it again.";
-const REWORK_PLAN: &str = "Simulated agent: redo the edit against the new decision.";
-const DECISION_PLAN: &str = "Simulated agent: noted; the scripted edit does not depend on it.";
 
 /// Longest pause between two retries of one step.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -121,6 +122,8 @@ struct Held {
     generation: u64,
     state: ClaimState,
     dir: PathBuf,
+    /// Whether `rh work` handed back a claim the agent already held.
+    resumed: bool,
 }
 
 /// What waiting on a ready claim ended with.
@@ -461,6 +464,7 @@ impl Run<'_> {
             generation: claim.generation.get(),
             state: claim.state,
             dir: clone.dir,
+            resumed,
         })
     }
 
@@ -513,7 +517,7 @@ impl Run<'_> {
         path: &str,
     ) -> Outcome<(Instant, Option<String>)> {
         self.state(AgentState::Editing).await;
-        let base = self.write(&held.dir, edit).await?;
+        let base = self.write(held, edit).await?;
         let commit = self.commit(held, edit, force).await?;
         self.emit(Event::Pushed {
             agent: self.name(),
@@ -523,7 +527,7 @@ impl Run<'_> {
             path: path.to_owned(),
         })
         .await;
-        self.ready(held).await?;
+        self.ready(held, &commit).await?;
         self.emit(Event::Ready {
             agent: self.name(),
             claim_id: held.claim_id.clone(),
@@ -534,9 +538,11 @@ impl Run<'_> {
     }
 
     /// Writes the edit, or every missing scaffold file, into the clone, and returns the contents
-    /// a shared edit rewrote. A disjoint edit creates its file and refuses one already there.
-    async fn write(&self, dir: &Path, edit: Option<Edit>) -> Outcome<Option<String>> {
-        let name = &self.agent.env.name;
+    /// a shared edit rewrote. A disjoint edit creates its file and refuses one already there,
+    /// unless the claim was handed back and the file holds exactly the planned line: an earlier
+    /// run pushed it and stopped before `rh ready`.
+    async fn write(&self, held: &Held, edit: Option<Edit>) -> Outcome<Option<String>> {
+        let (name, dir) = (&self.agent.env.name, held.dir.as_path());
         let written = match edit {
             None => scaffold()
                 .iter()
@@ -545,13 +551,22 @@ impl Run<'_> {
                     confined::write(dir, path, contents).map_err(|error| error.code())
                 })
                 .map(|()| None),
-            Some(edit) if !edit.needs_scaffold() => edit
-                .apply(self.agent.slot, name, None)
-                .map_err(apply_code)
-                .and_then(|contents| {
-                    confined::create(dir, &edit.path(name), &contents).map_err(|error| error.code())
-                })
-                .map(|()| None),
+            Some(edit) if !edit.needs_scaffold() => {
+                let path = edit.path(name);
+                edit.apply(self.agent.slot, name, None)
+                    .map_err(apply_code)
+                    .and_then(|contents| {
+                        if held.resumed
+                            && confined::read(dir, &path)
+                                .map_err(|error| error.code())?
+                                .is_some_and(|current| current == contents)
+                        {
+                            return Ok(());
+                        }
+                        confined::create(dir, &path, &contents).map_err(|error| error.code())
+                    })
+                    .map(|()| None)
+            }
             Some(edit) => {
                 let path = edit.path(name);
                 confined::read(dir, &path)
@@ -616,25 +631,59 @@ impl Run<'_> {
         Ok(commit)
     }
 
-    /// `rh ready`, acknowledging pending decisions first when it asks.
-    async fn ready(&self, held: &Held) -> Outcome<()> {
+    /// `rh ready` for `commit`, reading the inbox first when it names an unacknowledged item.
+    /// A retryable failure may have pinned the commit with its answer lost, so the claim is read
+    /// back before `rh ready` is repeated, and repeated only while it is still working at the
+    /// generation the agent pushed for.
+    async fn ready(&self, held: &Held, commit: &str) -> Outcome<()> {
         self.state(AgentState::Readying).await;
-        for _ in 0..=self.shared.bounds.retries {
-            let pinned = self
-                .retrying_until(Step::Ready, AgentErrorCode::UnackedDecision, || {
-                    self.shared.runner.rh::<serde_json::Value>(
-                        &self.agent.env,
-                        &held.dir,
-                        &["ready"],
-                    )
-                })
-                .await?;
-            if pinned.is_some() {
+        let bounds = &self.shared.bounds;
+        let (mut syncs, mut tries) = (0, 0);
+        loop {
+            let Err(error) = self
+                .shared
+                .runner
+                .rh::<serde_json::Value>(&self.agent.env, &held.dir, &["ready"])
+                .await
+            else {
+                return Ok(());
+            };
+            if error.agent_code() == Some(AgentErrorCode::UnackedDecision) {
+                syncs += 1;
+                if syncs > bounds.retries {
+                    return Err(self.fail(Step::Ready, error.code()).await);
+                }
+                self.sync(held).await?;
+                continue;
+            }
+            let Some(after) = error.retry().filter(|_| tries < bounds.retries) else {
+                return Err(self.fail(Step::Ready, error.code()).await);
+            };
+            tries += 1;
+            tokio::time::sleep(backoff(tries, after, bounds.poll)).await;
+            if self.reconcile(held, commit).await? == Reconciled::Settled {
                 return Ok(());
             }
-            self.sync(held).await?;
         }
-        Err(self.fail(Step::Ready, "unacked_decision".to_owned()).await)
+    }
+
+    /// Reads the claim back after an uncertain `rh ready` for `commit`.
+    async fn reconcile(&self, held: &Held, commit: &str) -> Outcome<Reconciled> {
+        let status: Envelope<Status> = self
+            .retrying(Step::Status, || {
+                self.shared
+                    .runner
+                    .rh(&self.agent.env, &held.dir, &["status"])
+            })
+            .await?;
+        let claim = status
+            .data
+            .claim
+            .filter(|claim| claim.claim_id == held.claim_id);
+        match reconciled(claim.as_ref(), held.generation, commit) {
+            Ok(reconciled) => Ok(reconciled),
+            Err(code) => Err(self.fail(Step::Ready, code.to_owned()).await),
+        }
     }
 
     /// Reads the inbox with `rh sync` and acknowledges every item on it.
@@ -648,12 +697,17 @@ impl Run<'_> {
     }
 
     /// Acknowledges `items`, reporting each routed conflict. Returns whether one asks this claim
-    /// to redo its edit.
+    /// to redo its edit. A decision or rework item stops the agent before it acknowledges
+    /// anything: it cannot change its scripted edit to follow one, so it leaves the item for the
+    /// operator.
     async fn acknowledge(&self, held: &Held, items: &[InboxItem]) -> Outcome<bool> {
+        if let Some(code) = items.iter().find_map(|item| needs_operator(&item.entry)) {
+            return Err(self.fail(Step::Inbox, code.to_owned()).await);
+        }
         let mut redo = false;
         for item in items {
             let ours = item.claim_id == held.claim_id;
-            let plan = match &item.entry {
+            match &item.entry {
                 InboxEntry::Conflict {
                     other_claim_id,
                     path,
@@ -669,16 +723,14 @@ impl Run<'_> {
                         .await;
                     }
                     redo |= ours;
-                    CONFLICT_PLAN
                 }
-                InboxEntry::Rework { .. } => {
-                    redo |= ours;
-                    REWORK_PLAN
+                // Refused above.
+                InboxEntry::Decision { .. } | InboxEntry::Rework { .. } => {
+                    return Err(self.fail(Step::Inbox, "needs_operator".to_owned()).await);
                 }
-                InboxEntry::Decision { .. } => DECISION_PLAN,
-            };
+            }
             let number = item.item.get().to_string();
-            let args = ["ack", number.as_str(), "--plan", plan];
+            let args = ["ack", number.as_str(), "--plan", CONFLICT_PLAN];
             self.retrying(Step::Inbox, || {
                 self.shared
                     .runner
@@ -858,27 +910,6 @@ impl Run<'_> {
             }
         }
     }
-
-    /// As [`Self::retrying`], but `Ok(None)` when the backend answers `halt`.
-    async fn retrying_until<T, F, Fut>(
-        &self,
-        step: Step,
-        halt: AgentErrorCode,
-        attempt: F,
-    ) -> Outcome<Option<T>>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = Result<T, process::Error>>,
-    {
-        self.retrying(step, || async {
-            match attempt().await {
-                Ok(value) => Ok(Some(value)),
-                Err(error) if error.agent_code() == Some(halt) => Ok(None),
-                Err(error) => Err(error),
-            }
-        })
-        .await
-    }
 }
 
 /// The pause before retry `tries`: the backend's delay, or the poll interval doubled per try,
@@ -886,6 +917,45 @@ impl Run<'_> {
 fn backoff(tries: u32, asked: Duration, poll: Duration) -> Duration {
     let doubled = poll.saturating_mul(2_u32.saturating_pow(tries.saturating_sub(1)));
     asked.max(doubled).min(MAX_BACKOFF)
+}
+
+/// What reading a claim back after an uncertain `rh ready` showed.
+#[derive(Debug, PartialEq, Eq)]
+enum Reconciled {
+    /// Still working at the generation the commit was pushed for: `rh ready` may be repeated.
+    Unpinned,
+    /// The pin was recorded, or the claim moved on since; waiting on it judges the outcome.
+    Settled,
+}
+
+/// Judges the held claim at `generation`, as `rh status` showed it after an uncertain `rh ready`
+/// for `commit`, or the code the agent stops with.
+fn reconciled(
+    claim: Option<&ClaimView>,
+    generation: u64,
+    commit: &str,
+) -> Result<Reconciled, &'static str> {
+    let Some(claim) = claim else {
+        // It left the status: merged or expired, which waiting reports as unverified.
+        return Ok(Reconciled::Settled);
+    };
+    match claim.state {
+        ClaimState::Working if claim.generation.get() == generation => Ok(Reconciled::Unpinned),
+        ClaimState::Ready if claim.ready_commit.as_deref() != Some(commit) => Err("foreign_pin"),
+        // Pinned, landed, sent back for a redo or expired: waiting on it says which.
+        ClaimState::Working | ClaimState::Ready | ClaimState::Merged | ClaimState::Expired => {
+            Ok(Reconciled::Settled)
+        }
+    }
+}
+
+/// The code an agent stops with on an inbox item it cannot follow, `None` for a conflict.
+const fn needs_operator(entry: &InboxEntry) -> Option<&'static str> {
+    match entry {
+        InboxEntry::Decision { .. } => Some("decision_needs_operator"),
+        InboxEntry::Rework { .. } => Some("rework_needs_operator"),
+        InboxEntry::Conflict { .. } => None,
+    }
 }
 
 /// The code a stopped agent reports when an edit cannot be applied.
@@ -1037,6 +1107,61 @@ mod tests {
         );
         // Gone from the status: merged or expired, the agent cannot tell (#237).
         assert_eq!(judge(None), Polled::Unverified);
+    }
+
+    fn claim(state: &str, generation: u64, ready: Option<&str>) -> anyhow::Result<ClaimView> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "claimId": "clm_abcdef", "issueId": "iss_abcdef", "generation": generation,
+            "base": "0".repeat(40), "state": state, "readyCommit": ready,
+            "originUrl": "https://railhead.test/git/o/r/claims/clm_abcdef.git",
+            "upstreamUrl": "https://railhead.test/git/o/r.git",
+            "task": {"title": "t", "body": "b"}
+        }))?)
+    }
+
+    #[test]
+    fn an_uncertain_ready_is_repeated_only_while_unpinned() -> anyhow::Result<()> {
+        let ours = "a".repeat(40);
+        let theirs = "b".repeat(40);
+        let check = |state, generation, ready: Option<&str>| {
+            claim(state, generation, ready).map(|claim| reconciled(Some(&claim), 2, &ours))
+        };
+        // Still working at the pushed generation: the pin did not happen.
+        assert_eq!(check("working", 2, None)?, Ok(Reconciled::Unpinned));
+        // The lost answer had pinned it, or the train moved it on since.
+        assert_eq!(check("ready", 2, Some(&ours))?, Ok(Reconciled::Settled));
+        assert_eq!(check("merged", 2, Some(&ours))?, Ok(Reconciled::Settled));
+        assert_eq!(check("working", 3, None)?, Ok(Reconciled::Settled));
+        assert_eq!(check("expired", 2, None)?, Ok(Reconciled::Settled));
+        assert_eq!(reconciled(None, 2, &ours), Ok(Reconciled::Settled));
+        // Pinned at a commit the agent did not push.
+        assert_eq!(check("ready", 2, Some(&theirs))?, Err("foreign_pin"));
+        assert_eq!(check("ready", 2, None)?, Err("foreign_pin"));
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_conflict_is_followed_without_the_operator() -> anyhow::Result<()> {
+        let entry = |value| serde_json::from_value::<InboxEntry>(value);
+        let decision = serde_json::json!({"decisionId": "dec_abcdef", "version": 2});
+        assert_eq!(
+            needs_operator(&entry(
+                serde_json::json!({"kind": "decision", "decision": decision})
+            )?),
+            Some("decision_needs_operator")
+        );
+        assert_eq!(
+            needs_operator(&entry(
+                serde_json::json!({"kind": "rework", "decision": decision})
+            )?),
+            Some("rework_needs_operator")
+        );
+        assert_eq!(
+            needs_operator(&entry(serde_json::json!({"kind": "conflict",
+                "otherClaimId": "clm_bcdefg", "path": "swarm/contested.txt"}))?),
+            None
+        );
+        Ok(())
     }
 
     #[test]

@@ -150,22 +150,24 @@ fn check_home(scenario: &Scenario, home: &Path, name: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Agent `name`'s progress file in `dir` and the record an earlier run of `key` left there, or
-/// none after removing it when `discard`.
+/// The progress file in `dir` of the agent at `index` and the record an earlier run of `key` left
+/// there for its edits in `plan`, or none after removing it when `discard`.
 fn load_progress(
     dir: &Path,
-    name: &str,
+    index: u32,
     key: &RunKey,
+    plan: &Plan,
     discard: bool,
 ) -> anyhow::Result<(ProgressFile, Option<Progress>)> {
-    let file = ProgressFile::new(dir, name);
+    let name = agent_name(index);
+    let file = ProgressFile::new(dir, &name);
     if discard {
         file.clear()
             .with_context(|| format!("discarding the progress of {name}"))?;
         return Ok((file, None));
     }
     let record = file
-        .load(key)
+        .load(key, plan.agent(usize::try_from(index)?))
         .map_err(|error| anyhow::anyhow!("{error}; run with --discard-progress to start over"))?;
     Ok((file, record))
 }
@@ -191,8 +193,14 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     let _locks = (0..scenario.agents)
         .map(|index| HomeLock::acquire(&progress, &agent_name(index)))
         .collect::<Result<Vec<_>, _>>()?;
+    let plan = Plan::new(
+        scenario.seed,
+        scenario.agents,
+        scenario.rounds,
+        scenario.mix,
+    );
     let saved = (0..scenario.agents)
-        .map(|index| load_progress(&progress, &agent_name(index), &key, cli.discard_progress))
+        .map(|index| load_progress(&progress, index, &key, &plan, cli.discard_progress))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut builder = tempfile::Builder::new();
     builder.prefix("railhead-swarm-");
@@ -225,12 +233,6 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
         repository: scenario.repository.to_string(),
     })?;
 
-    let plan = Plan::new(
-        scenario.seed,
-        scenario.agents,
-        scenario.rounds,
-        scenario.mix,
-    );
     // Every agent is prepared before any runs, so a failure here leaves nothing to stop.
     let mut prepared = Vec::with_capacity(homes.len());
     for ((slot, home), (progress, saved)) in (0..scenario.agents).zip(homes).zip(saved) {

@@ -25,6 +25,9 @@ use wiremock::{MockServer, Request, Respond, ResponseTemplate};
 
 const PREFIX: &str = "/agent/v1/casqueblanc/demo";
 const SCAFFOLD_SHARED_HEADER: &str = "# Railhead swarm demo (simulated agents)";
+/// How late the fake answers a request whose answer is lost: past every command timeout the
+/// tests that use it set.
+const LATE: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// The `rh` binary beside the driver. A workspace test run builds it; a run of this package
 /// alone builds it here, into a target directory of its own so the outer build's lock is not
@@ -142,11 +145,29 @@ struct Claim {
     ready_seq: u64,
 }
 
+/// How the fake loses the answer to a request it carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    /// It arrives after the command timeout.
+    Late,
+    /// A retryable `busy` replaces it, as from a proxy that gave up on the backend.
+    Busy,
+}
+
+/// What an inbox item asks of its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Conflict,
+    Decision,
+    Rework,
+}
+
 #[derive(Debug)]
 struct Item {
     number: u64,
     agent: usize,
     claim_id: String,
+    kind: Kind,
     other: String,
     path: String,
     plan: Option<String>,
@@ -168,6 +189,12 @@ struct State {
     held_polls: u64,
     /// Polls that saw a ready claim, for [`Status::ExpiresReady`].
     ready_polls: u64,
+    /// Whether `ready` answers nothing in time and records nothing.
+    stall_ready: bool,
+    /// How the answer to the next `ready`, which is recorded, is lost.
+    lose_ready: Option<Lost>,
+    /// An owner's item the next `ready` routes to its claim and refuses on.
+    decide_on_ready: Option<Kind>,
 }
 
 /// The fake backend.
@@ -204,9 +231,23 @@ impl Fake {
     }
 
     fn item_view(item: &Item) -> Value {
+        let kind = match item.kind {
+            Kind::Conflict => {
+                return json!({"item": item.number, "claimId": item.claim_id, "queuedAt": 1,
+                    "entry": {"kind": "conflict", "otherClaimId": item.other, "path": item.path},
+                    "decision": null});
+            }
+            Kind::Decision => "decision",
+            Kind::Rework => "rework",
+        };
+        // The owner chose an edit other than the one the agent's script writes.
         json!({"item": item.number, "claimId": item.claim_id, "queuedAt": 1,
-            "entry": {"kind": "conflict", "otherClaimId": item.other, "path": item.path},
-            "decision": null})
+            "entry": {"kind": kind, "decision": {"decisionId": "dec_swarm1", "version": 2}},
+            "decision": {"decisionId": "dec_swarm1", "version": 2, "supersedes": 1,
+                "questionId": "qst_swarm1", "question": "Which file should the edit change?",
+                "option": {"key": "other", "label": "Another file"},
+                "previous": {"key": "planned", "label": "The planned file"},
+                "scope": [item.path], "decidedBy": "usr_lemarier", "decidedAt": 1}})
     }
 
     fn digest(state: &State, agent: usize) -> Value {
@@ -323,6 +364,18 @@ impl Fake {
         let pushed = git(&self.fork(claim_id), &["rev-parse", "refs/heads/main"])?;
         if pushed != commit {
             return Ok(failure(AgentErrorCode::CommitNotFound, None));
+        }
+        if let Some(kind) = state.decide_on_ready.take() {
+            let number = u64::try_from(state.items.len())? + 1;
+            state.items.push(Item {
+                number,
+                agent,
+                claim_id: claim_id.to_owned(),
+                kind,
+                other: String::new(),
+                path: "swarm".to_owned(),
+                plan: None,
+            });
         }
         if state
             .items
@@ -463,6 +516,7 @@ impl Fake {
                 number,
                 agent,
                 claim_id: id,
+                kind: Kind::Conflict,
                 other,
                 path,
                 plan: None,
@@ -508,8 +562,16 @@ impl Fake {
             }
             ("POST", ["work"]) => self.work(&mut state, agent),
             ("POST", ["claims", claim_id, "ready"]) => {
+                if state.stall_ready {
+                    return Ok(failure(AgentErrorCode::Busy, None).set_delay(LATE));
+                }
                 let body: Value = serde_json::from_slice(&request.body)?;
-                self.ready(&mut state, agent, claim_id, &body)
+                let answer = self.ready(&mut state, agent, claim_id, &body)?;
+                Ok(match state.lose_ready.take() {
+                    Some(Lost::Late) => answer.set_delay(LATE),
+                    Some(Lost::Busy) => failure(AgentErrorCode::Busy, Some(0)),
+                    None => answer,
+                })
             }
             ("GET", ["inbox"]) => {
                 let digest = Self::digest(&state, agent);
@@ -1549,5 +1611,199 @@ async fn sequential_same_file_edits_are_not_counted_as_auto_merged() -> anyhow::
         (Some(2), Some(0), Some(0))
     );
     assert_eq!(run.of_type("conflictAutoMerged").len(), 0);
+    Ok(())
+}
+
+/// Bounds whose command timeout gives up on a late answer well before [`LATE`].
+fn short_command_bounds() -> Value {
+    json!({"retries": 3, "commandTimeoutSecs": 10, "landTimeoutSecs": 60,
+        "runTimeoutSecs": 120, "pollMs": 50})
+}
+
+#[tokio::test]
+async fn a_ready_whose_answer_was_lost_is_read_back_not_repeated() -> anyhow::Result<()> {
+    for (lost, status, outcome) in [
+        (Lost::Late, Status::ShowsMerged, "landed"),
+        (Lost::Busy, Status::ShowsMerged, "landed"),
+        (Lost::Busy, Status::HidesClosed, "unverified"),
+    ] {
+        // The fake records the pin and lands it, but `rh ready` times out or reads a retryable
+        // refusal instead of its answer.
+        let world = world_with(1, 1, false, status).await?;
+        world.state().lose_ready = Some(lost);
+        let scenario = world.scenario(
+            1,
+            "casqueblanc/demo",
+            &mix(1, 0, 0),
+            &short_command_bounds(),
+        )?;
+        let run = run(&mut world.driver(&scenario)?)?;
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{lost:?} {status:?}: {:?}",
+            run.of_type("failed")
+        );
+        assert_eq!(
+            run.steps_of("swarm-00"),
+            ["claimed", "pushed", "ready", outcome],
+            "{lost:?} {status:?}"
+        );
+        // One pin; a repeated `rh ready` would have been refused as stale.
+        let state = world.state();
+        assert_eq!(state.readies, 1, "{lost:?} {status:?}");
+        assert_eq!(state.claims.len(), 1, "{lost:?} {status:?}");
+        assert_eq!(
+            state.claims.first().map(|claim| claim.state),
+            Some(ClaimState::Merged)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_stopped_between_push_and_ready_finishes_the_pushed_edit() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    // `rh ready` never takes effect, so the run is stopped with the edit pushed and unpinned.
+    world.state().stall_ready = true;
+    let mut child = world.driver(&scenario)?.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let claim = loop {
+        let line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the run ended early"))??;
+        let event: Value = serde_json::from_str(&line)?;
+        if event.get("type") == Some(&json!("pushed"))
+            && let Some(claim) = event.get("claimId").and_then(Value::as_str)
+        {
+            break claim.to_owned();
+        }
+    };
+    let interrupted = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()?;
+    assert!(interrupted.success());
+    for line in lines {
+        line?;
+    }
+    assert_eq!(child.wait()?.code(), Some(130));
+    let path = disjoint_path("swarm-00", 0);
+    // The fork holds the edit; the claim is still working.
+    let pushed = git(&world.fake.fork(&claim), &["show", &format!("main:{path}")])?;
+    assert!(pushed.starts_with("swarm-00 round 0 "), "{pushed}");
+    assert_eq!(world.state().readies, 0);
+
+    world.state().stall_ready = false;
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
+    assert_eq!(
+        rerun.steps_of("swarm-00"),
+        ["claimed", "pushed", "ready", "landed"]
+    );
+    assert_eq!(
+        rerun
+            .of_type("claimed")
+            .first()
+            .map(|e| (e.get("claimId"), e.get("resumed"))),
+        Some((Some(&json!(claim)), Some(&json!(true))))
+    );
+    // One claim, one pin and the edit written once.
+    let state = world.state();
+    assert_eq!(state.claims.len(), 1);
+    assert_eq!(state.readies, 1);
+    drop(state);
+    assert_eq!(world.main_file(&path)?, pushed);
+    assert!(!world.progress_file("swarm-00").exists());
+    assert!(world.work_is_empty()?, "the run left clones behind");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_owner_decision_stops_the_agent_unacknowledged() -> anyhow::Result<()> {
+    for (kind, code) in [
+        (Kind::Decision, "decision_needs_operator"),
+        (Kind::Rework, "rework_needs_operator"),
+    ] {
+        // The owner decides on another edit than the scripted one before the agent pins.
+        let world = world(1, 1, false).await?;
+        world.state().decide_on_ready = Some(kind);
+        let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+        let run = run(&mut world.driver(&scenario)?)?;
+        assert_eq!(run.code, Some(1), "{kind:?}");
+        assert_eq!(
+            run.steps_of("swarm-00"),
+            ["claimed", "pushed", "failed"],
+            "{kind:?}"
+        );
+        assert_eq!(
+            run.of_type("failed")
+                .first()
+                .map(|e| (e.get("step"), e.get("code"))),
+            Some((Some(&json!("inbox")), Some(&json!(code))))
+        );
+        assert_eq!(run.of_type("acknowledged").len(), 0);
+        // The item is left for the operator and the unchanged edit was never pinned.
+        let state = world.state();
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .map(|item| item.plan.clone())
+                .collect::<Vec<_>>(),
+            [None]
+        );
+        assert_eq!(state.readies, 0);
+        assert_eq!(
+            state.claims.first().map(|claim| claim.state),
+            Some(ClaimState::Working)
+        );
+        drop(state);
+        assert!(world.main_file(&disjoint_path("swarm-00", 0)).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_progress_record_outside_the_plan_stops_the_rerun_before_any_request()
+-> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
+    world.state().paused = false;
+    let path = world.progress_file("swarm-00");
+    let mut record: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    // A two-round plan has no round 5, and a scaffold stage before a disjoint edit is not one it
+    // writes.
+    for (field, value) in [("round", json!(5)), ("scaffold", json!(true))] {
+        let mut changed = record.clone();
+        if let Some(object) = changed.as_object_mut() {
+            object.insert(field.to_owned(), value);
+            object.insert("claimId".to_owned(), Value::Null);
+        }
+        let text = changed.to_string();
+        fs::write(&path, &text)?;
+        let stderr = refused(&world, &mut world.driver(&scenario)?).await?;
+        assert!(
+            stderr.contains("does not fit the scenario's plan")
+                && stderr.contains("--discard-progress"),
+            "{stderr}"
+        );
+        // The record is kept and no claim was made or adopted.
+        assert_eq!(fs::read_to_string(&path)?, text);
+        assert_eq!(world.state().claims.len(), 1);
+    }
+    // The genuine record still resumes.
+    if let Some(object) = record.as_object_mut() {
+        object.insert("claimId".to_owned(), json!(pinned));
+    }
+    fs::write(&path, record.to_string())?;
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
     Ok(())
 }
