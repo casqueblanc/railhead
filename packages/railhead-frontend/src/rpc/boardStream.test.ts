@@ -5,6 +5,7 @@ import { SYNTH_REPO } from "../../../../fixtures/board/syntheticLog";
 import { type BoardState, emptyBoardState, foldEvents } from "../features/board/boardState";
 import {
   BoardStream,
+  HEALTHY_LIVE_MS,
   MAX_RESYNCS_WITHOUT_PROGRESS,
   type StreamPhase,
   type StreamSink,
@@ -60,6 +61,20 @@ describe("BoardStream", () => {
     stream?.[Symbol.dispose]();
     stream = null;
   });
+  /** Ends the live subscription with `restart` after `liveFor` ms, `times` times. */
+  const restarts = async (liveFor: number, times: number) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const board = new FakeBoard(SYNTH_REPO, LOG);
+    const sink = folding();
+    stream = new BoardStream(board, sink.sink, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < times; i += 1) {
+      await vi.advanceTimersByTimeAsync(liveFor);
+      await board.latest().listener.ended("restart");
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    return { board, sink };
+  };
   /** Starts a stream on fake timers over a board that holds `call` pending. */
   const stalled = (call: "readEvents" | "subscribe") => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -274,6 +289,27 @@ describe("BoardStream", () => {
 
     expect(board.subscriptions).toHaveLength(MAX_RESYNCS_WITHOUT_PROGRESS + 1);
     expect(sink.stops).toEqual(["failed"]);
+  });
+
+  describe("on an idle board whose backend restarts now and then", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+    it("keeps resubscribing when each subscription stayed live for the healthy period", async () => {
+      const times = MAX_RESYNCS_WITHOUT_PROGRESS * 3;
+      const { board, sink } = await restarts(HEALTHY_LIVE_MS, times);
+
+      expect(sink.stops).toEqual([]);
+      expect(board.subscriptions).toHaveLength(times + 1);
+      expect(sink.phases.at(-1)).toBe("live");
+    });
+
+    it("still stops when each subscription ends just short of the healthy period", async () => {
+      const { board, sink } = await restarts(HEALTHY_LIVE_MS - 1, MAX_RESYNCS_WITHOUT_PROGRESS + 2);
+
+      expect(sink.stops).toEqual(["failed"]);
+      expect(board.subscriptions).toHaveLength(MAX_RESYNCS_WITHOUT_PROGRESS + 1);
+    });
   });
 
   it("reports a repository the backend does not serve as unavailable", async () => {

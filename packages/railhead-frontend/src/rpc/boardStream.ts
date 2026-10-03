@@ -19,6 +19,9 @@ import { withDeadline } from "./deadline";
 /** Resyncs in a row that may leave the cursor where it was before the stream gives up. */
 export const MAX_RESYNCS_WITHOUT_PROGRESS = 5;
 
+/** How long a subscription must stay live before resyncs that follow it count from zero again. */
+export const HEALTHY_LIVE_MS = 60_000;
+
 /** Where the fold stands after applying a batch. */
 export interface Applied {
   /** The `seq` of the last event applied, or 0 before the first. */
@@ -111,6 +114,8 @@ export class BoardStream implements Disposable {
   #again = false;
   #resyncs = 0;
   #cursorAtResync = -1;
+  /** When the current subscription went live, or `null` while not live. */
+  #liveSince: number | null = null;
 
   /** Starts reading after `cursor`, the cursor of the board the sink already holds. */
   constructor(board: BoardSession, sink: StreamSink, cursor: number) {
@@ -176,6 +181,14 @@ export class BoardStream implements Disposable {
   }
 
   #resync(): void {
+    // An idle board's cursor never moves, so only a healthy live period tells a backend that
+    // restarts now and then from one that drops every subscription it grants.
+    const liveSince = this.#liveSince;
+    this.#liveSince = null;
+    if (liveSince !== null && Date.now() - liveSince >= HEALTHY_LIVE_MS) {
+      this.#resyncs = 0;
+      this.#cursorAtResync = -1;
+    }
     if (this.#cursor === this.#cursorAtResync) {
       this.#resyncs += 1;
       if (this.#resyncs > MAX_RESYNCS_WITHOUT_PROGRESS) {
@@ -230,6 +243,7 @@ export class BoardStream implements Disposable {
       return;
     }
     this.#subscription = result.value;
+    this.#liveSince = Date.now();
     this.#sink.onPhase({ kind: "live" });
   }
 
