@@ -391,6 +391,31 @@ describe("a ready claim whose decision is superseded", () => {
     });
   });
 
+  it("folds what the backend records for ready, a refused late push and the reopen", () => {
+    // A push refused after ready, or granted before it and landing after, records no
+    // `claim.pushed`; a repeated `ready` of the moved head records an `after_ready` refusal.
+    const steps: SyntheticStep[] = [
+      {
+        type: "claim.refused",
+        actor: SYNTH_TRAIN,
+        data: { claimId: UPLOAD.atlasClaim, generation: 1, reason: "after_ready" },
+      },
+      reopen(),
+      push(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), synthCommit(2)),
+      ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(2), [sizeDecision(2)]),
+    ];
+    let state = before;
+    for (const step of steps) {
+      state = append(state, step);
+      expect([step.type, state.stream]).toEqual([step.type, { kind: "consistent" }]);
+    }
+    expect(atlas(state)).toMatchObject({
+      phase: "ready",
+      refusal: { generation: 1, reason: "after_ready" },
+      ready: { commit: synthCommit(2), decisions: [sizeDecision(2)] },
+    });
+  });
+
   it("halts on a reopen of a claim that is not ready", () => {
     const reopened = append(before, reopen());
     const halted = append(reopened, reopen());

@@ -16,7 +16,9 @@
 // the train's read, answers only while those versions are still the current ones and the inbox
 // gate is still clear. From the pin on, `authorizeGit` refuses every push to the fork; a push
 // already granted may still move the fork's branch, but never the pin, which names a commit rather
-// than a ref.
+// than a ref. Such a late push is never recorded: a push is recorded only while
+// `workingGeneration` equals its fence's generation, and a ready claim has no working generation,
+// so the log never takes a ready claim back to working except through `claim.reopened`.
 //
 // A decision version recorded after ready supersedes the pin: the train must not take it, and the
 // holder must adapt. The first claims call that reads such a claim, whether a `ready`, the holder's
@@ -277,6 +279,11 @@ export function createClaims(
         default:
           return row.state satisfies never;
       }
+    },
+
+    workingGeneration(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      return row?.state === "working" ? row.generation : null;
     },
 
     async ready(agent, claimId, request) {

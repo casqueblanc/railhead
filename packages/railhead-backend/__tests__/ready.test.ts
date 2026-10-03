@@ -666,6 +666,46 @@ describe("pin", () => {
     }, world);
   });
 
+  it("refuses the pin and a repeated ready while an item is unacknowledged, keeping the claim ready", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      queueConflict(setup, claim.claimId);
+      const head = setup.log.head();
+
+      expectFailure(await setup.port.pin(claim.claimId), "unacked_decision");
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+      expect(setup.log.head()).toBe(head);
+
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      expectFailure(
+        await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+        "unacked_decision",
+      );
+      expect(setup.log.replay(head, 16).events).toMatchObject([
+        {
+          type: "claim.refused",
+          data: { claimId: claim.claimId, generation: 1, reason: "unacked_decision" },
+        },
+      ]);
+      expect(claimState(setup.sql, claim.claimId)).toEqual({ state: "ready", ready_commit: WORK });
+
+      await ackAll(setup);
+      expect(await setup.port.pin(claim.claimId)).toEqual(
+        ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
+      );
+      expect(await setup.port.ready(agent(1), claim.claimId, request(WORK))).toMatchObject({
+        ok: true,
+        value: { repeated: true, claim: { state: "ready", readyCommit: WORK } },
+      });
+      expect(types(setup.events())).not.toContain("claim.reopened");
+    });
+  });
+
   it("reopens a claim whose stored versions are missing or unreadable", async () => {
     await withReady(async (setup) => {
       const { claim, fork } = await setup.open();
@@ -798,6 +838,49 @@ describe("a decision superseded after ready", () => {
         ready_commit: null,
       });
       expect(types(setup.log.replay(head, 16).events)).toEqual(["claim.reopened"]);
+    });
+  });
+
+  it("fences out a push that lands after ready and reopens only the ready claim, once", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const first = await decide(setup, claim.claimId, null);
+      await ackAll(setup);
+      const access = {
+        principal: agent(1),
+        target: { kind: push.kind, claimId: claim.claimId },
+        operation: push.operation,
+      };
+      const granted = await setup.port.authorizeGit(access);
+      expect(granted).toMatchObject({
+        ok: true,
+        value: { fence: { claimId: claim.claimId, generation: 1 } },
+      });
+      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
+
+      expect((await setup.port.ready(agent(1), claim.claimId, request(WORK))).ok).toBe(true);
+      // The push granted before the pin lands now. Its fence no longer matches a working claim,
+      // so it is not recorded, and no new push is granted.
+      setup.push(fork, LATER);
+      expect(setup.port.workingGeneration(claim.claimId)).toBeNull();
+      expect(setup.port.currentGeneration(claim.claimId)).toBe(1);
+      expectFailure(await setup.port.authorizeGit(access), "after_ready");
+
+      await decide(setup, claim.claimId, 1, first.decisionId);
+      expect(await setup.port.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { state: "working", readyCommit: null },
+      });
+      // A claim that is already working is not reopened again.
+      expect((await setup.port.activeClaim(agent(1))).ok).toBe(true);
+      expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
+      expect(types(setup.events()).filter((type) => type.startsWith("claim."))).toEqual([
+        "claim.opened",
+        "claim.ready",
+        "claim.reopened",
+      ]);
     });
   });
 

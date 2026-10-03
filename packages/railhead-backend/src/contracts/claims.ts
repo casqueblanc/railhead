@@ -34,16 +34,20 @@ export interface GitGrant {
   repo: ArtifactsRepoName;
   /** The token scope the gateway mints internally for this request. */
   scope: "read" | "write";
-  /** For a push, the claim and generation the push is fenced to; `null` for a fetch. */
+  /**
+   * For a push, the claim and generation the push is fenced to; `null` for a fetch. The push is
+   * recorded only while `workingGeneration` still equals this generation, so a push that lands
+   * after the claim was marked ready is never recorded.
+   */
   fence: { claimId: ClaimId; generation: number } | null;
 }
 
 /**
  * Issues and claims.
  *
- * `currentGeneration` is a fence reader: it is synchronous and reads only the Repo's storage, so a
- * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
- * until that transaction commits. Read outside a transaction, the result may already be stale.
+ * `currentGeneration` and `workingGeneration` are fence readers: each is synchronous and reads only
+ * the Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body,
+ * and what it returns holds until that transaction commits. Read outside a transaction, the result may already be stale.
  */
 export interface ClaimsPort {
   /** The agent's active claim, or `null`. */
@@ -69,6 +73,12 @@ export interface ClaimsPort {
    * current only if its generation equals this one, and `null` is a refusal.
    */
   currentGeneration(claimId: ClaimId): number | null;
+  /**
+   * The claim's ownership generation while it is working, or `null` once it is anything else, such
+   * as ready, expired or unknown. A fence reader like `currentGeneration`: call it inside the
+   * caller's transaction. A push is recorded only while this equals the push's fence generation.
+   */
+  workingGeneration(claimId: ClaimId): number | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */
