@@ -47,6 +47,13 @@ pub enum Error {
     /// A store file or directory belongs to another user.
     #[error("{} belongs to another user; the store must be yours alone", .0.display())]
     NotOwned(PathBuf),
+    /// The file store cannot check ownership and permissions on this platform, so it refuses
+    /// to read or write anything.
+    #[error(
+        "the local agent store at {} needs a Unix system; this platform cannot check who owns it or can read it",
+        .0.display()
+    )]
+    Unsupported(PathBuf),
     /// A secret that must not be overwritten already exists.
     #[error("{} already exists and is never overwritten", .0.display())]
     AlreadyExists(PathBuf),
@@ -333,7 +340,8 @@ pub trait SecretStore {
 /// Every directory from the root down is checked before the store reads or writes in it: a real
 /// directory, not a link, owned by the current user. The root may be readable by others, since it
 /// is often a shared config directory, but never writable; `agents/` and each agent's directory
-/// must be private. An existing directory that fails is refused, never repaired.
+/// must be private. An existing directory that fails is refused, never repaired. On a platform
+/// without Unix ownership and modes every operation fails with [`Error::Unsupported`].
 #[derive(Debug, Clone)]
 pub struct FileStore {
     root: PathBuf,
@@ -439,6 +447,7 @@ impl FileStore {
     /// Checks the store's directories down to `agent`'s, or down to `agents/` without one.
     /// Returns `false` when one of them does not exist yet.
     fn check_dirs(&self, agent: Option<&AgentName>) -> Result<bool> {
+        check_platform(&self.root, cfg!(unix))?;
         if !check_dir(&self.root, 0o022)? || !check_dir(&self.agents_dir(), 0o077)? {
             return Ok(false);
         }
@@ -450,8 +459,11 @@ impl FileStore {
 
     fn ensure_agent_dir(&self, agent: &AgentName) -> Result<PathBuf> {
         let dir = self.agent_dir(agent);
+        // An existing directory, perhaps left by an interrupted attempt, must pass its check
+        // before anything is created beneath it.
+        self.check_dirs(Some(agent))?;
         create_private_dir(&dir)?;
-        // Creation leaves an existing directory as it was, so check the whole path afterwards.
+        // Another process may have changed the path meanwhile, so check it again.
         if self.check_dirs(Some(agent))? {
             Ok(dir)
         } else {
@@ -610,7 +622,11 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 
 /// Creates `dir` and its missing ancestors, top down, and passes each new directory's parent to
 /// `sync_parent` before creating the next, so a new directory's name survives a crash once this
-/// returns. An existing directory is left as it was and its parent is not synced.
+/// returns. An existing directory is left as it was.
+///
+/// The deepest existing directory's parent is synced again too: an earlier attempt may have
+/// created that directory and stopped before syncing it. Because creation runs top down and
+/// stops at a failed sync, no directory above that one can have been left unsynced.
 fn create_private_dir_with(
     dir: &Path,
     mut sync_parent: impl FnMut(&Path) -> Result<()>,
@@ -618,7 +634,12 @@ fn create_private_dir_with(
     let mut missing = Vec::new();
     for path in dir.ancestors().filter(|path| !path.as_os_str().is_empty()) {
         match fs::symlink_metadata(path) {
-            Ok(_) => break,
+            Ok(_) => {
+                if let Some(parent) = path.parent() {
+                    sync_parent(parent_or_current(parent))?;
+                }
+                break;
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(path),
             Err(source) => return Err(io_error("reading", path, source)),
         }
@@ -633,13 +654,28 @@ fn create_private_dir_with(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(io_error("creating", path, source)),
         }
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        sync_parent(parent)?;
+        sync_parent(path.parent().map_or(Path::new("."), parent_or_current))?;
     }
     Ok(())
+}
+
+/// `parent`, or `.` for the empty parent of a relative single-component path.
+fn parent_or_current(parent: &Path) -> &Path {
+    if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    }
+}
+
+/// Refuses the store at `root` unless the platform has the Unix ownership and modes its checks
+/// rely on. Checking nothing would accept a store other users can read or change.
+fn check_platform(root: &Path, unix: bool) -> Result<()> {
+    if unix {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(root.to_owned()))
+    }
 }
 
 /// Checks a store directory: a real directory, not a link, owned by the current user, with none
@@ -668,10 +704,13 @@ fn check_owner(path: &Path, metadata: &fs::Metadata, forbidden: u32) -> Result<(
         if metadata.mode() & forbidden != 0 {
             return Err(Error::InsecurePermissions(path.to_owned()));
         }
+        Ok(())
     }
     #[cfg(not(unix))]
-    let _ = (path, metadata, forbidden);
-    Ok(())
+    {
+        let _ = (metadata, forbidden);
+        Err(Error::Unsupported(path.to_owned()))
+    }
 }
 
 /// Makes a rename or link in `dir` survive a crash.
@@ -1157,7 +1196,8 @@ mod tests {
         let key = Secret::new("key".to_owned());
         let created = store.create(&atlas, SecretKind::SigningKey, &key);
         assert!(matches!(created, Err(Error::Damaged(_))));
-        assert_eq!(fs::read_dir(elsewhere.path().join("atlas"))?.count(), 0);
+        // The link is refused before anything is created through it.
+        assert_eq!(fs::read_dir(elsewhere.path())?.count(), 0);
         assert!(matches!(store.list(), Err(Error::Damaged(_))));
         assert!(matches!(
             store.read(&atlas, SecretKind::SigningKey),
@@ -1196,10 +1236,12 @@ mod tests {
         let dir = root.join("agents/atlas");
         let (created, synced) = create_recording_syncs(&dir);
         created?;
-        assert_eq!(
-            synced,
-            [home.path().to_owned(), root.clone(), root.join("agents")]
-        );
+        let outer = home.path().parent().map(Path::to_owned);
+        let expected: Vec<PathBuf> = outer
+            .into_iter()
+            .chain([home.path().to_owned(), root.clone(), root.join("agents")])
+            .collect();
+        assert_eq!(synced, expected);
         assert!(dir.is_dir());
 
         // The store's first secret write goes through the same creation.
@@ -1214,16 +1256,114 @@ mod tests {
     }
 
     #[test]
-    fn a_new_agent_syncs_only_agents_and_an_existing_one_syncs_nothing() -> anyhow::Result<()> {
+    fn an_existing_directory_has_only_its_own_entry_synced_again() -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         create_private_dir(&home.path().join("agents/atlas"))?;
         let (created, synced) = create_recording_syncs(&home.path().join("agents/boreas"));
         created?;
-        assert_eq!(synced, [home.path().join("agents")]);
+        assert_eq!(synced, [home.path().to_owned(), home.path().join("agents")]);
 
         let (created, synced) = create_recording_syncs(&home.path().join("agents/boreas"));
         created?;
-        assert_eq!(synced, Vec::<PathBuf>::new());
+        assert_eq!(synced, [home.path().join("agents")]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_parent_sync_syncs_that_parent_before_going_on() -> anyhow::Result<()>
+    {
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("railhead");
+        let dir = root.join("agents/atlas");
+        // The first attempt creates the root, then fails to make its name durable.
+        let failed = create_private_dir_with(&dir, |parent| {
+            if parent == home.path() {
+                Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(failed, Err(Error::Io { action: "syncing", path, .. }) if path == home.path())
+        );
+        assert!(root.is_dir() && !root.join("agents").exists());
+
+        let (created, synced) = create_recording_syncs(&dir);
+        created?;
+        assert_eq!(
+            synced,
+            [home.path().to_owned(), root.clone(), root.join("agents")]
+        );
+
+        // A retry whose repeated sync fails again reports it and creates nothing beneath.
+        let fresh = home.path().join("fresh");
+        create_private_dir_with(&fresh, |_| Ok(()))?;
+        let refused = create_private_dir_with(&fresh.join("agents"), |parent| {
+            Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+        });
+        assert!(
+            matches!(refused, Err(Error::Io { action: "syncing", path, .. }) if path == home.path())
+        );
+        assert!(!fresh.join("agents").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_left_by_an_interrupted_attempt_is_checked_then_reused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir()?;
+        let root = home.path().join("railhead");
+        let store = FileStore::new(&root);
+        let atlas = AgentName::new("atlas")?;
+        let key = Secret::new("key".to_owned());
+
+        // The attempt stopped after creating the root and `agents/`.
+        create_private_dir(&root.join("agents"))?;
+        store.create(&atlas, SecretKind::SigningKey, &key)?;
+        assert_eq!(fs::read(root.join("agents/atlas/key"))?, b"key");
+
+        // A leftover directory that others can open is refused before anything is made in it.
+        let boreas = AgentName::new("boreas")?;
+        fs::set_permissions(root.join("agents"), fs::Permissions::from_mode(0o777))?;
+        let refused = store.create(&boreas, SecretKind::SigningKey, &key);
+        assert!(
+            matches!(refused, Err(Error::InsecurePermissions(path)) if path == root.join("agents"))
+        );
+        assert!(!root.join("agents/boreas").exists());
+
+        // Restored to private, the same directory is reused.
+        fs::set_permissions(root.join("agents"), fs::Permissions::from_mode(0o700))?;
+        store.create(&boreas, SecretKind::SigningKey, &key)?;
+        assert_eq!(fs::read(root.join("agents/boreas/key"))?, b"key");
+        Ok(())
+    }
+
+    #[test]
+    fn a_platform_without_unix_checks_is_refused() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        assert!(check_platform(home.path(), true).is_ok());
+        let refused = check_platform(home.path(), false);
+        assert!(matches!(refused, Err(Error::Unsupported(path)) if path == home.path()));
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn the_store_refuses_every_operation_off_unix() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let key = Secret::new("key".to_owned());
+        let created = store.create(&atlas, SecretKind::SigningKey, &key);
+        assert!(matches!(created, Err(Error::Unsupported(_))));
+        assert!(matches!(store.list(), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            store.read(&atlas, SecretKind::SigningKey),
+            Err(Error::Unsupported(_))
+        ));
+        assert_eq!(fs::read_dir(home.path())?.count(), 0);
         Ok(())
     }
 
@@ -1234,12 +1374,17 @@ mod tests {
         let mut calls = 0;
         let created = create_private_dir_with(&root.join("agents/atlas"), |parent| {
             calls += 1;
-            Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+            if parent == home.path() {
+                Err(io_error("syncing", parent, io::ErrorKind::Other.into()))
+            } else {
+                Ok(())
+            }
         });
         assert!(
             matches!(created, Err(Error::Io { action: "syncing", path, .. }) if path == home.path())
         );
-        assert_eq!(calls, 1);
+        // The temporary directory's own entry, then the root's, which fails.
+        assert_eq!(calls, 2);
         assert!(root.is_dir() && !root.join("agents").exists());
 
         // The last directory's sync failing is reported too, not taken as durable.
@@ -1255,7 +1400,8 @@ mod tests {
         assert!(
             matches!(failed, Err(Error::Io { action: "syncing", path, .. }) if path == root.join("agents"))
         );
-        assert_eq!(later_calls, 2);
+        // The root's entry again, then the new `agents/`, then `atlas`, which fails.
+        assert_eq!(later_calls, 3);
         Ok(())
     }
 
