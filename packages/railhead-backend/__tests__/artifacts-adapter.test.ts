@@ -368,6 +368,23 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("reports busy while the token listing is only a page, and succeeds once it is whole", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const tokens = [1, 2, 3, 4, 5].map(() => fake.mintFor(repo, "write", 600));
+
+      // The page holds the fork's revoked initial token and the first of these five.
+      fake.pageTokens(2);
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toEqual(tokens.slice(1));
+
+      fake.pageTokens(null);
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
   it("reports busy while a mint that started first runs, and that mint returns no token", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();

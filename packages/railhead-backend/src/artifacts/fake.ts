@@ -85,6 +85,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
   #forkFaults: ForkFault[] = [];
   #revokeFails = 0;
   #revokeDelayMs = 0;
+  #tokenPage: number | null = null;
   readonly #gates = new Map<PausableCall, Gate>();
 
   constructor(now = 1_000_000) {
@@ -119,6 +120,14 @@ export class FakeArtifacts implements ArtifactsNamespace {
   /** Makes every `revokeToken` call take `ms` milliseconds of wall time before it answers. */
   slowRevocations(ms: number): void {
     this.#revokeDelayMs = ms;
+  }
+
+  /**
+   * Makes `listTokens` return at most `size` tokens, the first in creation order whatever their
+   * state, with `total` still counting every token; `null` lists them all.
+   */
+  pageTokens(size: number | null): void {
+    this.#tokenPage = size;
   }
 
   /**
@@ -252,7 +261,8 @@ export class FakeArtifacts implements ArtifactsNamespace {
           createdAt: new Date(this.#now).toISOString(),
           expiresAt: new Date(token.expiresAtMs).toISOString(),
         }));
-        return { tokens, total: tokens.length };
+        const page = this.#tokenPage;
+        return { tokens: page === null ? tokens : tokens.slice(0, page), total: tokens.length };
       },
       revokeToken: async (tokenOrId) => {
         live();

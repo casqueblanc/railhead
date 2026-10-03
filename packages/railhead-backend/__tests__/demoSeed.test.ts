@@ -595,6 +595,23 @@ describe("seed target", () => {
       { limits: { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000, sweepDeadlineMs: 200 } },
     ));
 
+  it("does not initialize while main's token listing is partial, and finishes once it is whole", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      seed.onNextPush = () => {
+        for (let i = 0; i < 10; i += 1) seed.fake.mintFor(main, "write", 300);
+      };
+      // The page shows four of the twelve tokens: the sweep revokes those and cannot confirm the rest.
+      seed.fake.pageTokens(4);
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+      expect(seed.fake.liveTokens(main)).toHaveLength(12 - 4);
+      expect(host.initialized).toBe(false);
+
+      seed.fake.pageTokens(null);
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initialized).toBe(true);
+    }));
+
   it("resets by deleting the recorded forks and then main by name, and nothing else", () =>
     withTarget(async ({ seed, target, storage, host, main }) => {
       await target.seed(HEAD, fakePack());

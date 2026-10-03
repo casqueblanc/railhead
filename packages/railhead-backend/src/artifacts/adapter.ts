@@ -632,6 +632,11 @@ export async function boundedCall<T>(
  * Revokes every live token on `handle`'s repository, within a total deadline and revocation
  * budget. Running out of either reports busy; a repeat continues where this one stopped. A binding
  * call that fails or times out throws.
+ *
+ * `listTokens` returns one page and takes no page argument, so the sweep revokes the live tokens
+ * it can see and lists again. It reports the repository clean only from a listing whose `total`
+ * the page covers; a partial listing with no live token left on it reports busy. Whether the
+ * binding's page drops revoked tokens, and so whether repeats reach later ones, is not verified.
  */
 export async function revokeActiveTokens(
   handle: Pick<ArtifactsRepo, "listTokens" | "revokeToken">,
@@ -646,7 +651,9 @@ export async function revokeActiveTokens(
     if (remaining() <= 0) return unfinished;
     const listed = await boundedCall(handle.listTokens(), remaining());
     const active = listed.tokens.filter((token) => token.state === "active");
-    if (active.length === 0) return ok(undefined);
+    if (active.length === 0) {
+      return listed.total <= listed.tokens.length ? ok(undefined) : unfinished;
+    }
     for (const token of active) {
       if (budget === 0 || remaining() <= 0) return unfinished;
       budget -= 1;
