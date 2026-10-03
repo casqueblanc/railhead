@@ -54,6 +54,8 @@ interface World {
   versions: "real" | DecisionRef[] | null;
   /** Whether the Artifacts module is installed. */
   artifacts: boolean;
+  /** When true, the inbox cannot answer the ready gate. */
+  gateUnknown?: boolean;
 }
 
 interface Setup {
@@ -100,17 +102,20 @@ function withReady<T>(
       versions === "real"
         ? createDecisions(context, () => ports)
         : { ...base.decisions, currentVersions: () => versions };
+    const inbox: InboxPort =
+      world.gateUnknown === true ? { ...base.inbox, readyGateNow: () => null } : base.inbox;
     const port: ClaimsPort = createClaims(context, () => ports);
     const ports: RepoPorts = {
       ...base,
       claims: port,
       artifacts,
       decisions,
+      inbox,
       mainWriter: { ...base.mainWriter, head: async () => ok(HEAD) },
     };
     const setup: Setup = {
       port,
-      inbox: base.inbox,
+      inbox,
       decisions,
       log,
       sql: state.storage.sql,
@@ -366,6 +371,29 @@ describe("ready", () => {
         expect(claimState(setup.sql, claim.claimId).state).toBe("working");
       },
       { fake: new FakeArtifacts(), versions: null, artifacts: true },
+    );
+  });
+
+  it("refuses when the inbox cannot answer the gate, never treating it as clear", async () => {
+    await withReady(
+      async (setup, { fake }) => {
+        const { claim, fork } = await setup.open();
+        setup.push(fork, WORK);
+        const write = fake.mintFor(fork, "write", 600);
+        const head = setup.log.head();
+        expectFailure(
+          await setup.port.ready(agent(1), claim.claimId, request(WORK)),
+          "unavailable",
+        );
+        expect(setup.log.head()).toBe(head);
+        expect(claimState(setup.sql, claim.claimId)).toEqual({
+          state: "working",
+          ready_commit: null,
+        });
+        expectFailure(await setup.port.pin(claim.claimId), "claim_closed");
+        expect(fake.accepts(write.plaintext)).toBe(true);
+      },
+      { fake: new FakeArtifacts(), versions: "real", artifacts: true, gateUnknown: true },
     );
   });
 

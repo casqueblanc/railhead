@@ -36,6 +36,7 @@ import {
   writeWake,
   type PendingWake,
 } from "../src/modules/train/store";
+import { unavailableClaims } from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
@@ -1477,18 +1478,26 @@ describe("train module", () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO_ID);
-      const ports = composeRepo({
+      const context: RepoContext = {
         repoId: REPO_ID,
         storage: state.storage,
         log,
         clock: () => 0,
         env,
         wake: () => {},
-      });
+      };
+      // The real claims module would drop a pin for a claim it never opened, so its port is the
+      // missing one here: the pin must wait for it rather than be dropped.
+      const ports: RepoPorts = { ...composeRepo(context), claims: unavailableClaims };
+      const train = createTrain(context, () => ports);
 
-      expect(await ports.train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(await train.enqueue(pin(1))).toEqual(ok({ queued: true }));
+      expect(state.storage.sql.exec("SELECT state, reason FROM train_queue").toArray()).toEqual([
+        { state: "queued", reason: null },
+      ]);
+      expect(owed(state.storage.sql).failures).toBeGreaterThanOrEqual(1);
       expect(
-        await ports.train.recordCheck({
+        await train.recordCheck({
           attemptId: "chk_attempt01",
           candidate: sha("2"),
           result: "pass",
