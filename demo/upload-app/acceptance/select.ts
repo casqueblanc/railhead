@@ -5,7 +5,7 @@
  */
 
 /** A decision option the demo app has an acceptance suite for. */
-export type UploadOption = "A" | "B";
+export type UploadOption = "a" | "b";
 
 /** One acceptance suite, tagged with its decision option and the decision version that chose it. */
 export interface AcceptanceSuite {
@@ -22,10 +22,10 @@ export interface CheckDefinitions {
   suites: AcceptanceSuite[];
 }
 
-/** Names a suite as `<option>@<version>`, for example `B@2`. Unset selects the current option. */
+/** Names a suite as `<option>@<version>`, for example `b@2`. Unset selects the current option. */
 export const SUITE_ENV = "UPLOAD_ACCEPTANCE";
 
-const SELECTION = /^([AB])@([1-9]\d{0,8})$/;
+const SELECTION = /^([ab])@([1-9]\d{0,8})$/;
 const SUITE_FILE = /^acceptance\/[a-z0-9-]+\.test\.ts$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -33,8 +33,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function parseOption(value: unknown, where: string): UploadOption {
-  if (value === "A" || value === "B") return value;
-  throw new TypeError(`${where}: option must be "A" or "B".`);
+  if (value === "a" || value === "b") return value;
+  throw new TypeError(`${where}: option must be "a" or "b".`);
 }
 
 function parseVersion(value: unknown, where: string): number {
@@ -104,7 +104,7 @@ export function selectSuite(
   }
   const match = SELECTION.exec(selection);
   if (match === null || match[1] === undefined || match[2] === undefined) {
-    throw new Error(`${SUITE_ENV} must look like A@1, got ${JSON.stringify(selection)}.`);
+    throw new Error(`${SUITE_ENV} must look like a@1, got ${JSON.stringify(selection)}.`);
   }
   return findSuite(definitions, parseOption(match[1], SUITE_ENV), Number(match[2]));
 }

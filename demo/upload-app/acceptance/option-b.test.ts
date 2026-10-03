@@ -4,7 +4,7 @@ import { checkElevenMegabytesInParts, checkNineMegabytesInOneRequest } from "./c
 import { titleFor } from "./suite";
 import { workerTarget } from "./target";
 
-describe(titleFor("B"), () => {
+describe(titleFor("b"), () => {
   it("accepts an 11 MB upload in parts and stores the original bytes", async () => {
     await checkElevenMegabytesInParts(workerTarget);
   });

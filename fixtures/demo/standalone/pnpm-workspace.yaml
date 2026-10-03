@@ -1,0 +1,13 @@
+# pnpm settings for the demo app as its own repository. Versions match Railhead's catalog, and
+# scripts/demoSeed/standalone.test.ts fails when the two drift.
+overrides:
+  # Vitest peers can resolve vite@latest; pinned to the version Railhead tests the app with.
+  vite@*: 7.3.6
+  "@types/node": 24.19.0
+
+# Reject dependency versions published within the last 24 hours, as Railhead does.
+minimumReleaseAge: 1440
+
+allowBuilds:
+  esbuild: true
+  workerd: true

@@ -4,7 +4,7 @@ import { checkElevenMegabytesRejected, checkNineMegabytesInOneRequest } from "./
 import { titleFor } from "./suite";
 import { workerTarget } from "./target";
 
-describe(titleFor("A"), () => {
+describe(titleFor("a"), () => {
   it("returns 413 with the exact message for an 11 MB upload", async () => {
     await checkElevenMegabytesRejected(workerTarget);
   });

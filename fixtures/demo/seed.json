@@ -1,0 +1,37 @@
+{
+  "org": "demo",
+  "repo": "upload-app",
+  "source": "demo/upload-app",
+  "decision": {
+    "key": "upload-size-limit",
+    "question": "What should happen to an upload above 10 MB (10,000,000 bytes)?",
+    "options": [
+      {
+        "key": "a",
+        "label": "Reject it with 413, as the app does now"
+      },
+      {
+        "key": "b",
+        "label": "Accept it in parts of at most 10 MB and reassemble it"
+      }
+    ],
+    "scope": ["src/limits.ts", "src/uploads.ts"]
+  },
+  "issues": [
+    {
+      "title": "Warn before uploading a file above the size limit",
+      "body": "The upload page sends a file of any size and only reports the server's refusal once the whole body has been sent. When the chosen file is larger than the app accepts, say so before the upload starts and do not send it.\n\nWhat happens above 10 MB is an open product decision; ask before assuming the limit stays.",
+      "touches": ["src/page.ts", "src/limits.ts"]
+    },
+    {
+      "title": "Let people upload files larger than 10 MB",
+      "body": "People need to upload video files of 30 to 50 MB. Today anything above 10 MB is refused with 413.\n\nWhether large files are accepted, and how, is an open product decision; ask before implementing it. The acceptance suites in acceptance/checks.json name the options.",
+      "touches": ["src/uploads.ts", "src/limits.ts", "src/store.ts"]
+    },
+    {
+      "title": "Let people delete an upload",
+      "body": "Add DELETE /api/uploads/<id>: 204 when the upload existed, 404 with the usual JSON error when it did not. A deleted upload then reads as 404, also after a restart. Add tests for both cases.",
+      "touches": ["src/index.ts", "src/store.ts", "__tests__/app.test.ts"]
+    }
+  ]
+}
