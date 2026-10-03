@@ -124,7 +124,17 @@ export function createClaims(
 ): ClaimsPort {
   migrateClaims(context.storage);
   const { log, repoId, clock } = context;
+
+  /** Asks the Repo's alarm for the next lapse or revocation, if any waits. */
+  const wakeForDeadline = (sql: SqlStorage): void => {
+    const at = nextClaimsDeadline(sql);
+    if (at !== null) context.wake(at);
+  };
+
   backfillLeases(context.storage.sql, clock() + CLAIM_LEASE_MS);
+  // A claim recorded before leases, or one opened before an alarm was asked for, lapses unwatched
+  // unless the alarm is asked for now.
+  wakeForDeadline(context.storage.sql);
 
   /** A step of allocation that either found the claim to finish or refused. */
   type Chosen = PortResult<{ row: ClaimRow; resumed: boolean }>;
@@ -145,12 +155,6 @@ export function createClaims(
     const row = activeClaimOf(sql, agent.agentId);
     if (row === null) throw new Error("a recorded claim intent cannot be read back");
     return ok({ row, resumed: false });
-  };
-
-  /** Asks the Repo's alarm for the next lapse or revocation, if any waits. */
-  const wakeForDeadline = (sql: SqlStorage): void => {
-    const at = nextClaimsDeadline(sql);
-    if (at !== null) context.wake(at);
   };
 
   /**
@@ -285,6 +289,8 @@ export function createClaims(
             },
           },
         );
+        // The opened lease must lapse even if its holder never calls again.
+        wakeForDeadline(tx.sql);
       }
       return activeClaimOf(tx.sql, row.agentId);
     }).value;

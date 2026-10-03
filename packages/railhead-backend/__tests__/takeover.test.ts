@@ -10,6 +10,7 @@ import {
   mainRepoName,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
+import type { ArtifactsRepoName, TokenRevocation } from "../src/contracts/artifacts";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort } from "../src/contracts/inbox";
@@ -58,6 +59,16 @@ interface Setup {
   open: () => Promise<{ claim: ClaimView; fork: string }>;
   /** Adds `commit` to the fork, as a push would. */
   push: (fork: string, commit: string) => void;
+  /**
+   * What the Artifacts double's `revokeTokens` answers. `null` passes the call to the adapter;
+   * `pending_debt` answers it without a sweep, as a partial token listing that may hide a live
+   * token; `revoked` sweeps through the adapter and reports the result as `revoked`.
+   */
+  revocation: TokenRevocation | null;
+  /** Every repository `revokeTokens` was called for, in order. */
+  revoked: ArtifactsRepoName[];
+  /** Every repository a token was minted for through the port, in order. */
+  minted: ArtifactsRepoName[];
 }
 
 /** Runs `body` in a fresh Repo with real claims, inbox and decisions, and fake Artifacts. */
@@ -79,10 +90,33 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       },
     };
     const base = composeRepo(context);
-    const artifacts = createArtifactsAdapter(
+    const adapter = createArtifactsAdapter(
       { ...context, namespace: fake },
       { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
     );
+    const artifacts: RepoPorts["artifacts"] = {
+      forkForClaim: (claimId, forkBase) => adapter.forkForClaim(claimId, forkBase),
+      commitExists: (repo, commit) => adapter.commitExists(repo, commit),
+      token(repo, scope, ttlMs) {
+        setup.minted.push(repo);
+        return adapter.token(repo, scope, ttlMs);
+      },
+      async revokeTokens(repo) {
+        setup.revoked.push(repo);
+        switch (setup.revocation) {
+          case null:
+            return adapter.revokeTokens(repo);
+          case "pending_debt":
+            return ok("pending_debt");
+          case "revoked": {
+            const swept = await adapter.revokeTokens(repo);
+            return swept.ok ? ok("revoked") : swept;
+          }
+          default:
+            return setup.revocation satisfies never;
+        }
+      },
+    };
     const decisions = createDecisions(context, () => ports);
     const port = createClaims(context, () => ports);
     const ports: RepoPorts = {
@@ -119,11 +153,34 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
         if (repo === undefined) throw new Error("no such fork");
         repo.commits.push(commit);
       },
+      revocation: null,
+      revoked: [],
+      minted: [],
     };
     const result = await body(setup);
     expect(fake.openHandles).toBe(0);
     return result;
   });
+}
+
+/**
+ * Runs the Repo's alarm as the Repo would, up to and including the first firing that needs the
+ * clock to move. Each firing happens at the earliest time any module asked for and forgets every
+ * request, after which each module asks again from `resume`; a request at or before the current
+ * time fires at once. Fails when no wake is pending, or when the alarm never settles.
+ */
+async function fireAlarm(setup: Setup): Promise<void> {
+  if (setup.wakes.length === 0) throw new Error("no alarm was asked for");
+  for (let firing = 0; firing < 8; firing += 1) {
+    if (setup.wakes.length === 0) return;
+    const at = Math.min(...setup.wakes);
+    setup.wakes.length = 0;
+    const now = setup.fake.clock();
+    if (at > now) setup.fake.advance(at - now);
+    await setup.port.resume();
+    if (at > now) return;
+  }
+  throw new Error("the alarm kept asking to fire at once");
 }
 
 function types(events: RailheadEvent[]): string[] {
@@ -271,7 +328,8 @@ describe("leases", () => {
         .toArray()[0];
       expect(unleased?.n).toBe(2);
 
-      // A restarted module backfills from its clock; nothing else is touched.
+      // A restarted module backfills from its clock and asks for the lapse; nothing else is touched.
+      const restartWakes: number[] = [];
       createClaims(
         {
           repoId: REPO,
@@ -279,7 +337,9 @@ describe("leases", () => {
           log: setup.log,
           clock: setup.fake.clock,
           env,
-          wake: () => {},
+          wake: (at) => {
+            restartWakes.push(at);
+          },
         },
         () => {
           throw new Error("ports are not read while building");
@@ -295,11 +355,62 @@ describe("leases", () => {
         setup.fake.clock() + CLAIM_LEASE_MS,
         setup.fake.clock() + CLAIM_LEASE_MS,
       ]);
+      expect(restartWakes).toEqual([setup.fake.clock() + CLAIM_LEASE_MS]);
 
       setup.fake.advance(CLAIM_LEASE_MS);
       await setup.port.resume();
       expect(stored(setup.sql, claim.claimId).state).toBe("expired");
       expect(stored(setup.sql, "clm_legacyclaim1").state).toBe("expired");
+    });
+  });
+
+  it("asks for the alarm when a claim opens, so it expires with no further calls", async () => {
+    await withTakeover(async (setup) => {
+      await setup.file("Add uploads");
+      expect(setup.wakes).toEqual([]);
+      const claimed = await setup.port.work(agent(1));
+      if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
+      const { claimId } = claimed.value.claim;
+      const fork = await forkRepoName(REPO, claimId);
+      const opened = setup.fake.clock();
+      expect(setup.wakes).toEqual([opened + CLAIM_LEASE_MS]);
+      const token = setup.fake.mintFor(fork, "write", 3600);
+
+      // The agent dies. Only the alarm runs: it fires at the lapse, expires and revokes.
+      await fireAlarm(setup);
+
+      expect(setup.fake.clock()).toBe(opened + CLAIM_LEASE_MS);
+      expect(setup.events().at(-1)).toMatchObject({
+        type: "claim.expired",
+        data: { claimId, generation: 1 },
+      });
+      expect(setup.fake.accepts(token.plaintext)).toBe(false);
+      expect(stored(setup.sql, claimId)).toMatchObject({ state: "expired", revoke_due: null });
+      // The revocation's own wake is spent; a later alarm finds nothing owed and asks for none.
+      await fireAlarm(setup);
+      expect(setup.wakes).toEqual([]);
+    });
+  });
+
+  it("moves the alarm with each renewal and expires at the last lease's end", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+      const opened = setup.fake.clock();
+      setup.fake.advance(CLAIM_LEASE_MS / 2);
+      expect(await setup.port.activeClaim(agent(1))).toEqual(ok(claim));
+      const renewed = setup.fake.clock();
+      expect(setup.wakes.at(-1)).toBe(renewed + CLAIM_LEASE_MS);
+
+      // The alarm set at opening fires first, finds the lease renewed and asks for its new end.
+      await fireAlarm(setup);
+      expect(setup.fake.clock()).toBe(opened + CLAIM_LEASE_MS);
+      expect(stored(setup.sql, claim.claimId).state).toBe("working");
+      expect(new Set(setup.wakes)).toEqual(new Set([renewed + CLAIM_LEASE_MS]));
+
+      await fireAlarm(setup);
+      expect(setup.fake.clock()).toBe(renewed + CLAIM_LEASE_MS);
+      expect(stored(setup.sql, claim.claimId).state).toBe("expired");
+      expect(types(setup.events()).filter((type) => type === "claim.expired")).toHaveLength(1);
     });
   });
 
@@ -496,6 +607,56 @@ describe("takeover", () => {
       expect(await setup.port.authorizeGit(push(agent(2), claim.claimId))).toMatchObject({
         ok: true,
         value: { scope: "write", fence: { generation: 2 } },
+      });
+    });
+  });
+
+  it("treats a partial token listing as unrevoked until a later sweep reports revoked", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const former = setup.fake.mintFor(fork, "write", 3600);
+      setup.revocation = "pending_debt";
+      setup.fake.advance(CLAIM_LEASE_MS);
+
+      // The sweep reports a debt: the former holder's token may still be live, so nobody may write.
+      expectFailure(await setup.port.work(agent(2)), "busy");
+      expectFailure(await setup.port.claim(agent(2), claim.issueId), "busy");
+      expectFailure(
+        await setup.port.authorizeGit(push(agent(2), claim.claimId)),
+        "stale_generation",
+      );
+      // The second request finds the retry not yet due and does not sweep again.
+      expect(setup.revoked).toEqual([fork]);
+      expect(setup.fake.accepts(former.plaintext)).toBe(true);
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        agent_id: "agt_agent0001",
+        generation: 1,
+        state: "expired",
+        revoke_due: setup.fake.clock() + REVOKE_RETRY_MS,
+      });
+
+      // At the retry the alarm sweeps again, still partially, and leaves the claim owed.
+      await fireAlarm(setup);
+      expect(setup.revoked).toEqual([fork, fork]);
+      expect(stored(setup.sql, claim.claimId).revoke_due).toBe(
+        setup.fake.clock() + REVOKE_RETRY_MS,
+      );
+      expectFailure(await setup.port.work(agent(2)), "busy");
+      expect(types(setup.events())).not.toContain("claim.reassigned");
+      expect(setup.minted).toEqual([]);
+
+      // The next alarm's sweep is complete; only now does the successor get the claim and a write grant.
+      setup.revocation = "revoked";
+      await fireAlarm(setup);
+      expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
+      expect(setup.fake.accepts(former.plaintext)).toBe(false);
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2 } },
+      });
+      expect(await setup.port.authorizeGit(push(agent(2), claim.claimId))).toMatchObject({
+        ok: true,
+        value: { scope: "write", fence: { claimId: claim.claimId, generation: 2 } },
       });
     });
   });
