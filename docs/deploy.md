@@ -15,9 +15,9 @@ Set these in the repository's `qualification` environment (**Settings → Enviro
 | `SESSION_SIGNING_SECRET` | Worker secret: at least 32 random characters. Agent login keys derive from it; replacing it ends every session.                                                     |
 | `OWNER_BOOTSTRAP_TOKEN`  | Worker secret: at least 32 characters. The one-time token that opens enrollment of the first owner passkey.                                                         |
 
-The Worker secrets are exactly the `secrets.required` list in `packages/railhead-backend/cloudflare.config.ts`. A secret added there must also be added to the environment and to the deploy step's `env` in the workflow; until it is, the deploy fails naming it, and CI's dry run fails until its placeholder is added too.
+The secrets file each deploy uploads holds exactly the `secrets.required` list in `packages/railhead-backend/cloudflare.config.ts`. A secret added there must also be added to the environment and to the deploy step's `env` in the workflow; until it is, the deploy fails naming it, and CI's dry run fails until its placeholder is added too.
 
-They are uploaded with the new version through `wrangler deploy --secrets-file`, not set afterwards with `wrangler secret bulk`: Wrangler refuses to create a Worker whose required secrets are not supplied in the same deploy. The file is written with mode 600 under the runner's temporary directory and deleted when the job ends, whether it succeeded or not.
+They are uploaded with the new version through `wrangler deploy --secrets-file`, not set afterwards with `wrangler secret bulk`: Wrangler refuses to create a Worker whose required secrets are not supplied in the same deploy. The file is written with mode 600 under the runner's temporary directory and deleted when the job ends, whether it succeeded or not. The upload is additive: a Worker secret the file omits keeps its deployed value. After removing a name from `secrets.required`, delete the retired secret from the Worker with `wrangler secret delete <NAME>` and from the `qualification` environment.
 
 ### API token permissions
 
