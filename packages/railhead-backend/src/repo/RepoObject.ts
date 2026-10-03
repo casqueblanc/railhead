@@ -29,6 +29,7 @@ import type {
 import { DEMO_ORG, DEMO_REPO, MAX_EVENT_PAGE } from "@railhead/shared/board-api";
 import type { CommitSha, RepoId } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../contracts/result";
+import type { CheckAttempt, CheckRunReport } from "../contracts/train";
 import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
 import type { SeedControl } from "../modules/demoSeed/control";
 import {
@@ -235,6 +236,16 @@ export class Repo extends DurableObject<Env> {
     const installed = this.#installed;
     if (installed === null) return dispatchAgent(null, call);
     return dispatchAgent({ ...installed.summary, ports: installed.ports }, call);
+  }
+
+  /**
+   * Records a check run's report, through the checks module. Only the check Workflow calls it, from
+   * outside the sandbox, with the attempt the checks module started.
+   */
+  async reportCheck(report: CheckRunReport): Promise<PortResult<CheckAttempt>> {
+    const ports = this.#ports();
+    if (ports === null) return missing();
+    return ports.checks.report(report);
   }
 
   /** Answers one Git smart-HTTP request, through the Git module. */
