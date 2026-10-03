@@ -180,15 +180,71 @@ const PATIENCE: Duration = Duration::from_secs(120);
 /// than any bound a test asserts, so a run stopped here had already failed.
 const OVERRUN: Duration = Duration::from_secs(30);
 
-/// A child process killed and reaped if the test lets go of it while it runs, so a stalled `rh`
-/// fails its test instead of hanging the job.
+/// A child process killed with its descendants and reaped if the test lets go of it while it
+/// runs, so a stalled `rh`, and any Git it started, fails its test instead of hanging the job.
 struct Reaped(Child);
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        // Already exited is the outcome wanted; the wait reaps it either way.
+        // Drop cannot report a failure: a child that already exited is the outcome wanted, and the
+        // wait reaps it either way.
+        #[cfg(unix)]
+        if matches!(self.0.try_wait(), Ok(None)) {
+            kill_tree(self.0.id());
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Sends `signal` to the process `pid`.
+#[cfg(unix)]
+fn signal(signal: &str, pid: u32) {
+    // A process that exited in the meantime is the outcome wanted.
+    let _ = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills `root` and every process descended from it. `subprocess::run` starts each Git in a
+/// process group of its own, so a group signal would miss it; the tree is walked by parent
+/// instead. Each process found is stopped first, so none starts another after the walk saw it.
+#[cfg(unix)]
+fn kill_tree(root: u32) {
+    let mut tree = vec![root];
+    signal("-STOP", root);
+    // Bounded: each round stops at least one new process or ends the walk.
+    for _ in 0..64 {
+        let Ok(table) = Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "ppid="])
+            .stderr(Stdio::null())
+            .output()
+        else {
+            break;
+        };
+        let found: Vec<u32> = String::from_utf8_lossy(&table.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace().map(str::parse::<u32>);
+                match (fields.next(), fields.next()) {
+                    (Some(Ok(pid)), Some(Ok(parent))) => Some((pid, parent)),
+                    _ => None,
+                }
+            })
+            .filter(|(pid, parent)| tree.contains(parent) && !tree.contains(pid))
+            .map(|(pid, _)| pid)
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        for pid in found {
+            signal("-STOP", pid);
+            tree.push(pid);
+        }
+    }
+    for pid in tree {
+        signal("-KILL", pid);
     }
 }
 
@@ -287,6 +343,7 @@ impl Gate {
 
 /// A shell standing in for a stalled `rh`: it records its process id in `pid`, runs `script`, then
 /// sleeps for ten minutes.
+#[cfg(unix)]
 fn stalled(pid: &Path, script: &str) -> Command {
     let mut command = Command::new("sh");
     command
@@ -301,6 +358,7 @@ fn stalled(pid: &Path, script: &str) -> Command {
 }
 
 /// Whether the process `pid` names still runs.
+#[cfg(unix)]
 fn running(pid: &Path) -> anyhow::Result<bool> {
     let pid = fs::read_to_string(pid)?;
     let status = Command::new("kill")
@@ -310,6 +368,7 @@ fn running(pid: &Path) -> anyhow::Result<bool> {
     Ok(status.success())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_that_never_reaches_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
     let gate = Gate::new()?;
@@ -329,6 +388,7 @@ fn a_run_that_never_reaches_its_wait_is_stopped_and_fails() -> anyhow::Result<()
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_that_outlives_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
     let gate = Gate::new()?;
@@ -349,6 +409,7 @@ fn a_run_that_outlives_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_that_exits_before_its_wait_fails_with_its_stderr() -> anyhow::Result<()> {
     let gate = Gate::new()?;
@@ -366,6 +427,47 @@ fn a_run_that_exits_before_its_wait_fails_with_its_stderr() -> anyhow::Result<()
         error.as_deref(),
         Some("rh exited before its wait: exit status: 3 refused\n")
     );
+    Ok(())
+}
+
+/// Whether the process `pid` names is gone within [`OVERRUN`]. A descendant orphaned by the kill
+/// is reaped by init, which may take a moment.
+#[cfg(unix)]
+fn gone(pid: &Path) -> anyhow::Result<bool> {
+    let until = Instant::now() + OVERRUN;
+    while running(pid)? {
+        if Instant::now() >= until {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stopped_run_takes_its_descendants_with_it() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let descendant = gate.dir.path().join("descendant");
+    // Like Git under `subprocess::run`, the descendant runs in a process group of its own (`set
+    // -m`). The gate opens only once it has recorded its process id.
+    let script = format!(
+        "set -m; sh -c 'echo $$ > \"$1\"; exec sleep 600' sh '{descendant}' & \
+         while [ ! -s '{descendant}' ]; do sleep 0.01; done; touch '{ready}';",
+        descendant = descendant.display(),
+        ready = gate.dir.path().join("ready").display(),
+    );
+    let error = gate
+        .run_within(stalled(&pid, &script), PATIENCE, Duration::from_millis(300))
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh still ran 300ms after its gate opened")
+    );
+    assert!(gone(&pid)?, "the stopped run still runs");
+    assert!(gone(&descendant)?, "its descendant outlived it");
     Ok(())
 }
 
