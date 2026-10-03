@@ -27,6 +27,8 @@ export class EarliestAlarm {
   #failed = false;
   // Every write issued, settled; it never rejects.
   #writes: Promise<void> = Promise.resolve();
+  // Whether the write that set `#at` reached storage.
+  #set: Promise<boolean> = Promise.resolve(true);
 
   constructor(storage: AlarmStorage, onError: (error: unknown) => void) {
     this.#storage = storage;
@@ -36,19 +38,30 @@ export class EarliestAlarm {
   /** Reads the alarm storage holds. Call once, before the first `request`. */
   async load(): Promise<void> {
     this.#at = await this.#storage.getAlarm();
+    this.#set = Promise.resolve(true);
   }
 
-  /** Sets the alarm to `at` unless it is already set no later. */
-  request(at: number): void {
-    if (this.#at !== null && this.#at <= at) return;
+  /**
+   * Sets the alarm to `at` unless it is already set no later. Resolves `true` once storage holds an
+   * alarm no later than `at`, or `false` if the write that would put it there failed. It never
+   * rejects, so a caller that does not need the write confirmed may ignore it.
+   */
+  request(at: number): Promise<boolean> {
+    if (this.#at !== null && this.#at <= at) return this.#set;
     this.#at = at;
-    const write = this.#storage.setAlarm(at).catch((error: unknown) => {
-      // Storage may hold any alarm now, so the next request writes again.
-      this.#at = null;
-      this.#failed = true;
-      this.#onError(error);
-    });
-    this.#writes = this.#writes.then(() => write);
+    const write = this.#storage.setAlarm(at).then(
+      () => true,
+      (error: unknown) => {
+        // Storage may hold any alarm now, so the next request writes again.
+        this.#at = null;
+        this.#failed = true;
+        this.#onError(error);
+        return false;
+      },
+    );
+    this.#set = write;
+    this.#writes = this.#writes.then(() => write).then(() => undefined);
+    return write;
   }
 
   /** Records that the alarm fired: none is set until a module asks again. */
