@@ -7,9 +7,9 @@
 //                       refuses --dry-run, since seed --dry-run is the preview
 //
 // The manifest, the checks and the history are all read from `--revision`; `--manifest FILE` is
-// an explicit override read from disk. `--org` and `--repo` may be given, and anything but
-// demo/upload-app is refused. Seed and reset
-// only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing
+// an explicit override read from disk. Reset reads none of them: it deletes the demo repository by
+// name, so a commit whose manifest or checks are inconsistent cannot block the way out. `--org` and
+// `--repo` may be given, and anything but demo/upload-app is refused. Seed and reset only plan: no live target exists yet, and the owner's steps are in `docs/demo-seed.md`. Nothing
 // here creates a Cloudflare resource or reads a secret.
 
 import { resolve } from "node:path";
@@ -30,7 +30,7 @@ import {
   SeedRefusal,
 } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
-import { describeIssues, describePlan, planReset, planSeed } from "./reconcile.ts";
+import { DEMO_REF, describeIssues, describePlan, planReset, planSeed } from "./reconcile.ts";
 import { STANDALONE_OVERLAY, STANDALONE_SUBJECT } from "./standalone.ts";
 
 /** The repository root, which holds the default manifest and the demo app's history. */
@@ -60,6 +60,11 @@ export async function run(argv: readonly string[]): Promise<string[]> {
   // Refused before any other work: a preview must never leave a bundle behind.
   if (command === "bundle" && values["dry-run"]) {
     throw new SeedRefusal("bundle has no dry run; use seed --dry-run to plan the import.");
+  }
+  if (command === "reset") {
+    requireDryRun(values["dry-run"], "reset");
+    const ref = { org: values.org ?? DEMO_REF.org, repo: values.repo ?? DEMO_REF.repo };
+    return [...describePlan(planReset(ref)), "note no live target exists yet"];
   }
 
   // Resolved once, so the manifest, the checks validated below and the history exported are the
@@ -104,10 +109,6 @@ export async function run(argv: readonly string[]): Promise<string[]> {
         ),
         "note planned against an empty instance: no live target exists yet",
       ];
-    }
-    case "reset": {
-      requireDryRun(values["dry-run"], "reset");
-      return [...describePlan(planReset(manifest)), "note no live target exists yet"];
     }
     case "bundle": {
       if (values.out === undefined) throw new SeedRefusal("bundle needs --out FILE.");

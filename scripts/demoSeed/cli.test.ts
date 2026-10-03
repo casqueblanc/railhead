@@ -247,9 +247,36 @@ test("the manifest is read from the selected commit, never the working tree", as
   git(repo, ["add", MANIFEST]);
   git(repo, ["commit", "--quiet", "-m", "chore: break the manifest"]);
   await assert.rejects(
-    run(["reset", "--dry-run", "--source-root", repo]),
+    run(["seed", "--dry-run", "--source-root", repo]),
     /manifest at [0-9a-f]{40}:fixtures\/demo\/seed\.json is not JSON/,
   );
+  // Reset reads no manifest, so a broken one does not block it.
+  assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), [
+    "todo delete repository demo/upload-app",
+    "note no live target exists yet",
+  ]);
+});
+
+test("reset still plans when the committed checks or the source do not match the manifest", async () => {
+  const repo = sourceRepo("reset-checks");
+  writeFileSync(join(repo, CHECKS), otherDecision());
+  git(repo, ["commit", "--quiet", "--all", "-m", "chore: rename the decision"]);
+  const expected = ["todo delete repository demo/upload-app", "note no live target exists yet"];
+
+  // Seed is refused at this commit; reset, the way out, is not.
+  await assert.rejects(run(["seed", "--dry-run", "--source-root", repo]), /different decision/);
+  assert.deepEqual(await run(["reset", "--dry-run", "--source-root", repo]), expected);
+  // Nor does it need a source repository or a revision that exists.
+  assert.deepEqual(
+    await run(["reset", "--dry-run", "--source-root", scratch, "--revision", "nowhere"]),
+    expected,
+  );
+  // The target check still applies.
+  await assert.rejects(
+    run(["reset", "--dry-run", "--source-root", scratch, "--org", "acme"]),
+    /refusing "acme\/upload-app"/,
+  );
+  await assert.rejects(run(["reset", "--source-root", scratch]), /no live target yet/);
 });
 
 test("the bundle is a repository that installs and runs its checks on its own", async () => {

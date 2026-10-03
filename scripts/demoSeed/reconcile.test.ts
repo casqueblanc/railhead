@@ -199,6 +199,56 @@ test("an issue body that differs by one byte is an owner edit, not a refusal", a
   assert.deepEqual(await edited.issues(demo), [copied]);
 });
 
+test("a seeded issue filed twice is reported with its count, not as done", async () => {
+  const [first] = manifest.issues;
+  assert.ok(first !== undefined);
+  const target = new MemoryTarget();
+  await target.seed(demo, history);
+  fileSeededIssues(target);
+  // The owner filed it again after the first response was lost: same title, same body.
+  target.fileAsOwner(demo, { title: first.title, body: first.body });
+
+  const plan = await seed(manifest, history, target, target);
+
+  assert.deepEqual(
+    plan.map(({ step, status, filed }) => [step.target, status, filed]),
+    [
+      ["demo/upload-app@main", "done", undefined],
+      ["demo/upload-app#seed-1", "duplicate", 2],
+      ["demo/upload-app#seed-2", "done", 1],
+      ["demo/upload-app#seed-3", "done", 1],
+    ],
+  );
+  assert.equal(
+    describePlan(plan)[1],
+    'dup  owner keeps one issue demo/upload-app#seed-1 with the seeded body and closes the other 1 of 2: "Warn before uploading a file above the size limit"',
+  );
+  // The payload is printed so the owner can tell which copy to keep.
+  assert.deepEqual(describeIssues(plan).slice(0, 2), [
+    "--- issue demo/upload-app#seed-1 title",
+    first.title,
+  ]);
+  assert.equal(describeIssues(plan).filter((line) => line.startsWith("--- end issue")).length, 1);
+  // Nothing is closed or filed for the owner.
+  assert.equal((await target.issues(demo)).length, 4);
+});
+
+test("a duplicate is reported even when one copy differs, and three copies count as three", async () => {
+  const [first] = manifest.issues;
+  assert.ok(first !== undefined);
+  const target = new MemoryTarget();
+  await target.seed(demo, history);
+  target.fileAsOwner(demo, { title: first.title, body: first.body });
+  target.fileAsOwner(demo, { title: first.title, body: "A hand copy." });
+
+  const twice = await planSeed(manifest, history, target, target);
+  assert.deepEqual([twice[1]?.status, twice[1]?.filed], ["duplicate", 2]);
+
+  target.fileAsOwner(demo, { title: first.title, body: first.body });
+  const thrice = await planSeed(manifest, history, target, target);
+  assert.match(describePlan(thrice)[1] ?? "", /closes the other 2 of 3:/);
+});
+
 test("issues the seed did not file are left alone", async () => {
   const target = new MemoryTarget();
   await target.seed(demo, history);

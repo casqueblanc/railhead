@@ -14,8 +14,10 @@
 // issue is an owner action on the board, so neither port can file one. The plan lists each seeded
 // issue and whether the board already shows it; the owner files the missing ones. A seeded title
 // whose body differs is a step for the owner too, editing the body, never a reason to refuse the run
-// or reset: the repository and the other issues are still right. `describeIssues` prints each
-// payload as plain text, so the owner can copy it exactly.
+// or reset: the repository and the other issues are still right. A seeded title the board shows
+// more than once, such as an issue filed again after its response was lost, is an owner step as
+// well: the demo needs each task exactly once, so the plan names the count and the owner closes the
+// extra copies. `describeIssues` prints each payload as plain text, so the owner can copy it exactly.
 //
 // Reset deletes the demo repository by name and nothing else. It never lists the target to choose
 // what to delete, so another repository cannot be swept up with it. It always calls the target,
@@ -25,7 +27,14 @@
 // The live target does not exist yet; until it does the commands only plan, and
 // `docs/demo-seed.md` gives the owner's steps.
 
-import { assertDemoTarget, SeedRefusal, type SeedIssue, type SeedManifest } from "./manifest.ts";
+import {
+  assertDemoTarget,
+  DEMO_ORG,
+  DEMO_REPO,
+  SeedRefusal,
+  type SeedIssue,
+  type SeedManifest,
+} from "./manifest.ts";
 import type { ImportedHistory, MainBundle } from "./history.ts";
 
 /** A Railhead repository, `org/repo`. */
@@ -71,7 +80,7 @@ export interface BoardIssue {
 
 /** The board's issues for one repository: the read `DemoSeedApi` does not offer. */
 export interface BoardIssues {
-  /** The repository's issues in filing order, empty when it does not exist. */
+  /** The repository's open issues in filing order, empty when it does not exist. */
   issues(ref: RepoRef): Promise<readonly BoardIssue[]>;
 }
 
@@ -88,20 +97,25 @@ export type SeedStep =
 
 /**
  * Whether the target already reflects a step: `differs` when an issue with the seeded title is on
- * the board with another body.
+ * the board with another body, `duplicate` when the board shows the seeded title more than once.
  */
-export type StepStatus = "done" | "missing" | "differs";
+export type StepStatus = "done" | "missing" | "differs" | "duplicate";
 
 /** A step and whether the target already reflects it. */
 export interface PlannedStep {
   readonly step: SeedStep;
   readonly status: StepStatus;
+  /** For an issue, how many the board shows with its title. */
+  readonly filed?: number;
 }
 
-/** The demo repository as a `RepoRef`, after checking it is the demo repository. */
-export function demoRef(manifest: SeedManifest): RepoRef {
-  assertDemoTarget(manifest.org, manifest.repo);
-  return { org: manifest.org, repo: manifest.repo };
+/** The only repository the seed and reset touch. */
+export const DEMO_REF: RepoRef = { org: DEMO_ORG, repo: DEMO_REPO };
+
+/** `ref` after checking it is the demo repository. */
+export function demoRef(ref: RepoRef): RepoRef {
+  assertDemoTarget(ref.org, ref.repo);
+  return { org: ref.org, repo: ref.repo };
 }
 
 /** Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. */
@@ -123,17 +137,21 @@ export async function planSeed(
       `${name} already has main at ${state.main}, not the import's ${history.head}. Reset it first.`,
     );
   }
-  const filed = new Map((await board.issues(ref)).map((issue) => [issue.title, issue.body]));
+  const filed = Map.groupBy(await board.issues(ref), (issue) => issue.title);
 
   return [
     {
       step: { action: "repo.seed", target: `${name}@main`, head: history.head },
       status: state === null ? "missing" : "done",
     },
-    ...manifest.issues.map((issue, index): PlannedStep => ({
-      step: { action: "issue.file", target: `${name}#seed-${index + 1}`, issue },
-      status: issueStatus(filed.get(issue.title), issue.body),
-    })),
+    ...manifest.issues.map((issue, index): PlannedStep => {
+      const copies = filed.get(issue.title) ?? [];
+      return {
+        step: { action: "issue.file", target: `${name}#seed-${index + 1}`, issue },
+        status: issueStatus(copies, issue.body),
+        filed: copies.length,
+      };
+    }),
   ];
 }
 
@@ -179,27 +197,25 @@ export async function seed(
  * Plans a reset: one deletion of the demo repository, always to do. `read` cannot see a main left
  * by a failed seed, so no read can show the deletion already done.
  */
-export function planReset(manifest: SeedManifest): PlannedStep[] {
-  const ref = demoRef(manifest);
+export function planReset(target: RepoRef): PlannedStep[] {
+  const ref = demoRef(target);
   return [{ step: { action: "repo.delete", target: `${ref.org}/${ref.repo}` }, status: "missing" }];
 }
 
 /** Deletes the demo repository; `false` when the target held nothing to delete. */
-export async function reset(manifest: SeedManifest, target: SeedTarget): Promise<boolean> {
-  return target.reset(demoRef(manifest));
+export async function reset(ref: RepoRef, target: SeedTarget): Promise<boolean> {
+  return target.reset(demoRef(ref));
 }
 
 /** One line per step, naming its target, for a dry run. */
 export function describePlan(plan: readonly PlannedStep[]): string[] {
-  return plan.map(({ step, status }) => {
+  return plan.map(({ step, status, filed }) => {
     const mark = statusMark(status);
     switch (step.action) {
       case "repo.seed":
         return `${mark} seed repository ${step.target} = ${step.head}`;
       case "issue.file":
-        return status === "differs"
-          ? `${mark} owner edits issue ${step.target} to the seeded body: ${JSON.stringify(step.issue.title)}`
-          : `${mark} owner files issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
+        return `${mark} ${issueAction(status, step.target, filed)}: ${JSON.stringify(step.issue.title)}`;
       case "repo.delete":
         return `${mark} delete repository ${step.target}`;
       default:
@@ -226,9 +242,25 @@ export function describeIssues(plan: readonly PlannedStep[]): string[] {
   });
 }
 
-function issueStatus(filed: string | undefined, seeded: string): StepStatus {
-  if (filed === undefined) return "missing";
-  return filed === seeded ? "done" : "differs";
+function issueStatus(copies: readonly BoardIssue[], seeded: string): StepStatus {
+  const [only, ...more] = copies;
+  if (only === undefined) return "missing";
+  if (more.length > 0) return "duplicate";
+  return only.body === seeded ? "done" : "differs";
+}
+
+function issueAction(status: StepStatus, target: string, filed = 0): string {
+  switch (status) {
+    case "done":
+    case "missing":
+      return `owner files issue ${target}`;
+    case "differs":
+      return `owner edits issue ${target} to the seeded body`;
+    case "duplicate":
+      return `owner keeps one issue ${target} with the seeded body and closes the other ${filed - 1} of ${filed}`;
+    default:
+      return unreachable(status);
+  }
 }
 
 function statusMark(status: StepStatus): string {
@@ -239,6 +271,8 @@ function statusMark(status: StepStatus): string {
       return "todo";
     case "differs":
       return "edit";
+    case "duplicate":
+      return "dup ";
     default:
       return unreachable(status);
   }
