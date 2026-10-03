@@ -26,8 +26,8 @@
 // restores it with a fresh count. Neither a backoff nor exhaustion outlasts a requested attempt's
 // deadline: the wake stays due by then, so the attempt expires even when no port answers again.
 // Nor does exhaustion stop the train while the active batch's merge intent is authorized with a
-// write attempt counted: that write may have moved main unheard, and no call may come to read main
-// back. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
+// write attempt counted, or settled without the batch recording it: that write may have moved main
+// unheard, and no call may come to read main back or record the outcome. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
 // exhausted, so the intent settles once Git answers or the write's outcome window has passed.
 // A thrown drive error does not undo the call's committed write: the call still returns its result.
 // A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
@@ -472,13 +472,15 @@ export function createTrain(
 
   /**
    * Whether the active batch's merge intent is authorized with a write attempt counted, so main may
-   * have moved without the train hearing it. Reads only the Repo's storage.
+   * have moved without the train hearing it, or already settled without the train recording it, as
+   * when the writer's answer outlived the port timeout. Reads only the Repo's storage.
    */
   function owesSettlement(): boolean {
     const batch = activeBatch(sql);
     if (batch?.state !== "passed" || batch.intentId === null) return false;
     const intent = ports().authorization.record(batch.intentId);
-    return intent?.status === "authorized" && intent.attempts > 0;
+    if (intent === null) return false;
+    return intent.status !== "authorized" || intent.attempts > 0;
   }
 
   /** The deadline of the active batch's started attempt, or `null`. */
