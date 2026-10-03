@@ -42,7 +42,10 @@ export interface StreamPort {
   subscribe(cursor: number, listener: StreamListener): Promise<PortResult<StreamSubscription>>;
 }
 
-/** Most live subscriptions one repository holds; past it `subscribe` fails with `quota_exceeded`. */
+/**
+ * Most subscriptions one repository holds; past it `subscribe` fails with `quota_exceeded`. An
+ * ended subscription keeps its slot until its listener calls in flight settle or time out.
+ */
 export const MAX_SUBSCRIPTIONS = 256;
 
 /**
@@ -124,6 +127,9 @@ class Subscription {
   // The head when the delivery in flight was sent.
   #sentAtHead = 0;
   #ended = false;
+  // An `ended` call is in flight.
+  #ending = false;
+  #finished = false;
 
   constructor(
     log: EventLog,
@@ -157,11 +163,11 @@ class Subscription {
   end(reason: SubscriptionEnd | null): void {
     if (this.#ended) return;
     this.#ended = true;
-    this.#onEnd();
     if (reason === null) {
-      this.#release();
+      this.#finish();
       return;
     }
+    this.#ending = true;
     // Started inside the chain, so a listener that throws synchronously is still released.
     void Promise.resolve()
       .then(() => withTimeout(this.#listener.ended(reason), this.#timeoutMs))
@@ -169,7 +175,19 @@ class Subscription {
         if (outcome === "timeout") reportFailure("stream listener ended timed out", null);
       })
       .catch((error: unknown) => reportFailure("stream listener ended failed", error))
-      .finally(() => this.#release());
+      .finally(() => {
+        this.#ending = false;
+        this.#finish();
+      });
+  }
+
+  // Frees the slot and releases the listener once the subscription has ended and no listener call
+  // is in flight, so the slot bound also bounds the calls and timers a churning subscriber leaves.
+  #finish(): void {
+    if (!this.#ended || this.#sending || this.#ending || this.#finished) return;
+    this.#finished = true;
+    this.#onEnd();
+    this.#release();
   }
 
   async #pump(): Promise<void> {
@@ -191,6 +209,7 @@ class Subscription {
       this.end("restart");
     } finally {
       this.#sending = false;
+      this.#finish();
     }
   }
 

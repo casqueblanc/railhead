@@ -379,7 +379,146 @@ describe("stream subscriptions", () => {
       await Promise.all(others.map((other) => other.cancel()));
     });
   });
+
+  it("holds a cancelled subscription's slot until its pending delivery settles", async () => {
+    await withLog(async (log) => {
+      append(log, 1);
+      const port = streamPort(log);
+      const held = Array.from({ length: MAX_SUBSCRIPTIONS }, () => new Held());
+      const handles = [];
+      for (const listener of held) handles.push(value(await port.subscribe(0, listener)));
+      await until(() => held.every((listener) => listener.batches.length === 1));
+
+      // Churn: a cancel must not admit a replacement while the cancelled delivery is outstanding.
+      for (const handle of handles) await handle.cancel();
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+      append(log, 1);
+      held[0]?.settleNext();
+      await settle();
+
+      expect(held.map((listener) => listener.released)).toEqual([
+        1,
+        ...Array<number>(MAX_SUBSCRIPTIONS - 1).fill(0),
+      ]);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({ ok: true });
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+
+      for (const listener of held) listener.settleNext();
+      await settle();
+      expect(held.every((listener) => listener.released === 1)).toBe(true);
+      expect(held.every((listener) => listener.seqs.join() === "1")).toBe(true);
+      expect(held.every((listener) => listener.ends.length === 0)).toBe(true);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({ ok: true });
+    });
+  });
+
+  it("holds a slow subscription's slot until its delivery and its ending settle", async () => {
+    await withLog(async (log) => {
+      append(log, 1);
+      const port = streamPort(log);
+      const held = Array.from({ length: MAX_SUBSCRIPTIONS }, () => new Held());
+      for (const listener of held) value(await port.subscribe(0, listener));
+      await until(() => held.every((listener) => listener.batches.length === 1));
+
+      append(log, MAX_UNACKNOWLEDGED_EVENTS + 1);
+      await until(() => held.every((listener) => listener.ends.length === 1));
+      expect(held.every((listener) => listener.ends.join() === "slow")).toBe(true);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+
+      // The deliveries settle; the endings are still in flight.
+      for (const listener of held) listener.settleNext();
+      await settle();
+      expect(held.every((listener) => listener.released === 0)).toBe(true);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+
+      for (const listener of held) listener.settleNext();
+      await settle();
+      expect(held.every((listener) => listener.released === 1)).toBe(true);
+      expect(held.every((listener) => listener.seqs.join() === "1")).toBe(true);
+      expect(await port.subscribe(0, new Recorder())).toMatchObject({ ok: true });
+    });
+  });
+
+  it("frees a cancelled slot once a delivery that never settles times out", async () => {
+    await withLog(async (log) => {
+      append(log, 1);
+      const port = streamPort(log, { deliveryTimeoutMs: 500 });
+      const stalled = new Held();
+      const handle = value(await port.subscribe(0, stalled));
+      const others = [];
+      for (let n = 1; n < MAX_SUBSCRIPTIONS; n += 1) {
+        others.push(value(await port.subscribe(1, new Recorder())));
+      }
+      await until(() => stalled.batches.length === 1);
+
+      await handle.cancel();
+      expect(await port.subscribe(1, new Recorder())).toMatchObject({
+        ok: false,
+        code: "quota_exceeded",
+      });
+      await until(() => stalled.released === 1);
+      append(log, 1);
+      await settle();
+
+      expect(stalled.released).toBe(1);
+      expect(stalled.seqs).toEqual([1]);
+      expect(stalled.ends).toEqual([]);
+      expect(await port.subscribe(1, new Recorder())).toMatchObject({ ok: true });
+      await Promise.all(others.map((other) => other.cancel()));
+    });
+  });
 });
+
+/** A listener whose calls stay pending until the test settles them, counting its releases. */
+class Held implements StreamListener {
+  readonly batches: number[][] = [];
+  readonly ends: SubscriptionEnd[] = [];
+  released = 0;
+  readonly #pending: (() => void)[] = [];
+
+  get seqs(): number[] {
+    return this.batches.flat();
+  }
+
+  events(events: RailheadEvent[]): Promise<void> {
+    this.batches.push(events.map((event) => event.seq));
+    return this.#hold();
+  }
+
+  ended(reason: SubscriptionEnd): Promise<void> {
+    this.ends.push(reason);
+    return this.#hold();
+  }
+
+  dup(): Held {
+    return this;
+  }
+
+  [Symbol.dispose](): void {
+    this.released += 1;
+  }
+
+  /** Settles the oldest call still pending. */
+  settleNext(): void {
+    this.#pending.shift()?.();
+  }
+
+  #hold(): Promise<void> {
+    return new Promise((resolve) => this.#pending.push(resolve));
+  }
+}
 
 function dispose(target: object): void {
   const fn: unknown = Reflect.get(target, Symbol.dispose);
