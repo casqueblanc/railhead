@@ -53,7 +53,11 @@ import {
   type ConflictState,
   type PendingWake,
 } from "../src/modules/train/store";
-import { unavailableChecks, unavailableClaims } from "../src/contracts/unavailable";
+import {
+  UnavailableError,
+  unavailableChecks,
+  unavailableClaims,
+} from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
@@ -124,6 +128,10 @@ class Fakes {
       const n = String(this.asked.length).padStart(4, "0");
       return ok({ questionId: `qst_question${n}`, decisionId: `dec_decision${n}` });
     };
+  /** Every decision whose question the train withdrew, oldest first. */
+  withdrawn: string[] = [];
+  /** How the decisions module answers a withdrawal. */
+  withdraw: (decisionId: string) => boolean = () => true;
   started: CheckAttempt[] = [];
   authorized: string[] = [];
   published: string[] = [];
@@ -209,6 +217,11 @@ class Fakes {
         askSystem: (_tx, question) => {
           this.asked.push(question);
           return this.answerAsk(question);
+        },
+        withdraw: (_tx, _asker, decisionId) => {
+          const withdrew = this.withdraw(decisionId);
+          this.withdrawn.push(decisionId);
+          return withdrew;
         },
         currentVersions: (claimId) => {
           this.versionReads += 1;
@@ -1101,6 +1114,7 @@ describe("train conflict questions", () => {
       await train.resume();
       expect(conflictStates(sql)).toEqual({ asked: MAX_RELEASE_READS + 1, closed: 1 });
       expect(readConflict(sql, last.batchId)?.state).toBe("closed");
+      expect(fakes.withdrawn).toEqual([last.decisionId]);
       for (const p of last.pins) {
         expect(readEntry(sql, p.claimId, p.generation)?.state).not.toBe("parked");
       }
@@ -1270,6 +1284,53 @@ describe("train conflict questions", () => {
     }, fakes);
   });
 
+  it("returns the pair unasked, each to be merged alone, when the question is invalid", async () => {
+    const fakes = conflicting();
+    fakes.answerAsk = () => fail("invalid_request", "The scope is not a repository path.");
+    await withTrain(async ({ train, sql, now, advance }) => {
+      await park(train, fakes);
+
+      expect(fakes.asked).toHaveLength(1);
+      expect(train.conflicts(1)).toMatchObject([{ state: "refused", decisionId: null }]);
+      // Claim 1 runs alone; claim 3 waits for it, also alone, so the two never merge together.
+      expect(fakes.composeCalls.map((call) => call.pins)).toEqual([[pin(1), pin(3)], [pin(1)]]);
+      expect(train.entries(64)).toMatchObject([
+        { pin: pin(1), state: "batched" },
+        { pin: pin(3), state: "queued", isolate: true },
+      ]);
+      expect(fakes.withdrawn).toEqual([]);
+
+      // Nothing is owed or asked about the pair again.
+      advance(QUESTION_MAX_MS);
+      await train.resume();
+      expect(fakes.asked).toHaveLength(1);
+      expect(readConflict(sql, 1)?.updatedAt).toBeLessThan(now());
+    }, fakes);
+  });
+
+  it("leaves released pairs asked while the decisions module cannot withdraw, and closes them later", async () => {
+    const fakes = new Fakes();
+    fakes.head = () => fail("unavailable", "Main is down.");
+    await withTrain(async ({ train, sql, now }) => {
+      const [pair] = seedAskedPairs(sql, fakes, 1, now());
+      if (pair === undefined) throw new Error("no pair was seeded");
+      for (const p of pair.pins) fakes.pins.delete(p.claimId);
+      fakes.withdraw = () => {
+        throw new UnavailableError("decisions");
+      };
+
+      await train.resume();
+      expect(readConflict(sql, pair.batchId)?.state).toBe("asked");
+      for (const p of pair.pins)
+        expect(readEntry(sql, p.claimId, p.generation)?.state).toBe("parked");
+
+      fakes.withdraw = () => true;
+      await train.resume();
+      expect(readConflict(sql, pair.batchId)?.state).toBe("closed");
+      expect(fakes.withdrawn.at(-1)).toBe(pair.decisionId);
+    }, fakes);
+  });
+
   it("returns the partner to the queue when one parked claim is ready again", async () => {
     const fakes = conflicting();
     await withTrain(async ({ train }) => {
@@ -1283,6 +1344,8 @@ describe("train conflict questions", () => {
       expect(states(train)).toEqual({ "clm_claim001@1": "queued", "clm_claim003@1": "queued" });
       expect(train.entries(64).find((e) => e.pin.claimId === pin(1).claimId)?.pin).toEqual(redone);
       expect(fakes.asked).toHaveLength(1);
+      // The question about the replaced work is withdrawn with the redo.
+      expect(fakes.withdrawn).toEqual(["dec_decision0001"]);
     }, fakes);
   });
 

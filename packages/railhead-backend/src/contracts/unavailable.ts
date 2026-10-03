@@ -80,6 +80,9 @@ export const unavailableInbox: InboxPort = {
 export const unavailableDecisions: DecisionsPort = {
   ask: refuse("decisions"),
   askSystem: () => unavailable("decisions"),
+  withdraw: () => {
+    throw new UnavailableError("decisions");
+  },
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),

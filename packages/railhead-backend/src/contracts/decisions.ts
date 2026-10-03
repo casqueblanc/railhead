@@ -101,13 +101,24 @@ export interface DecisionsPort {
     tx: EventTransaction,
     question: SystemQuestion,
   ): PortResult<{ questionId: QuestionId; decisionId: DecisionId }>;
+  /**
+   * Withdraws the open system question `asker` asked that opened `decisionId`, inside the caller's
+   * transaction, when the work it asked about has changed: its decision loses every dependency, and
+   * `record` refuses any later answer with `action_stale`. Answers whether it withdrew one; a
+   * question already answered, already withdrawn or asked by anyone else is left as it is. Throws
+   * `UnavailableError` while the module is missing, so the caller's transaction rolls back.
+   */
+  withdraw(tx: EventTransaction, asker: SystemId, decisionId: DecisionId): boolean;
   /** Reads a question the agent asked, waiting up to `waitMs` for an answer. */
   question(
     agent: AgentPrincipal,
     questionId: QuestionId,
     waitMs: number,
   ): Promise<PortResult<QuestionResult>>;
-  /** Records a version, if the grant's `expectedVersion` is still the current one. */
+  /**
+   * Records a version, if the grant's `expectedVersion` is still the current one. Refuses an answer
+   * to a withdrawn question with `action_stale`.
+   */
   record(
     grant: GrantFor<"decision.record">,
   ): Promise<PortResult<{ decisionId: DecisionId; version: number }>>;

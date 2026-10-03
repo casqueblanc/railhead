@@ -20,6 +20,9 @@
 //   decision, so the answer reaches each holder and supersedes each ready pin. Recording a version
 //   of a system question calls the train's `answered` in the same transaction, then awaits the
 //   train's wake once it commits.
+// - `withdraw` is called by the asker, inside its own transaction, when the work an open system
+//   question asked about was replaced. The question keeps its row but loses its dependencies, and
+//   `record` refuses any answer to it, so no version supersedes the replaced work.
 //
 // A decision's dependencies name the claim, and the agent and ownership generation an inbox item
 // goes to. An obligation is queued as an item only when the claims module reports that generation
@@ -133,6 +136,9 @@ const MIGRATIONS: readonly string[] = [
     CHECK ((agent_id IS NULL) = (item IS NULL)),
     PRIMARY KEY (claim_id, decision_id, version, kind)
   ) STRICT`,
+  // When the asker withdrew a system question before any answer, or `NULL`. A withdrawn question
+  // takes no answer, and its decision has no dependencies.
+  "ALTER TABLE questions ADD COLUMN withdrawn_at INTEGER",
 ];
 
 /**
@@ -240,6 +246,17 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         decisionId,
       )
       .toArray()[0];
+  }
+
+  /** Whether the asker withdrew the question that opened `decisionId`. */
+  function withdrawn(decisionId: DecisionId): boolean {
+    const row = sql
+      .exec<{ withdrawn_at: number | null }>(
+        "SELECT withdrawn_at FROM questions WHERE decision_id = ?",
+        decisionId,
+      )
+      .toArray()[0];
+    return row !== undefined && row.withdrawn_at !== null;
   }
 
   function versionOf(decisionId: DecisionId, version: number): VersionRow | undefined {
@@ -591,6 +608,26 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       return ok({ questionId, decisionId });
     },
 
+    withdraw(tx, asker, decisionId) {
+      const question = tx.sql
+        .exec<{ withdrawn_at: number | null }>(
+          "SELECT withdrawn_at FROM questions WHERE decision_id = ? AND agent_id = ?",
+          decisionId,
+          asker,
+        )
+        .toArray()[0];
+      if (question === undefined || question.withdrawn_at !== null) return false;
+      // An answered decision is part of the work that relied on it, so only an open one goes.
+      if (currentVersion(decisionId) !== 0) return false;
+      tx.sql.exec(
+        "UPDATE questions SET withdrawn_at = ? WHERE decision_id = ?",
+        clock(),
+        decisionId,
+      );
+      tx.sql.exec("DELETE FROM decision_claims WHERE decision_id = ?", decisionId);
+      return true;
+    },
+
     async question(agent, questionId, waitMs): Promise<PortResult<QuestionResult>> {
       if (foreign(agent)) return notForThisRepo();
       if (!isId("question", questionId)) {
@@ -637,6 +674,12 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             const question = questionOfDecision(decisionId);
             if (question === undefined)
               return fail("not_found", "No question opened that decision.");
+            if (withdrawn(decisionId)) {
+              return fail(
+                "action_stale",
+                "The question was withdrawn because the work it asked about changed.",
+              );
+            }
             const options = readOptions(question.options);
             if (!options.some((offered) => offered.key === option)) {
               return fail("invalid_request", "The question does not offer that option.");

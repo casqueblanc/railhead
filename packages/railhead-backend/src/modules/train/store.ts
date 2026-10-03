@@ -789,6 +789,11 @@ export type ConflictState =
   | "asking"
   /** The question is asked; the pair waits for its answer. */
   | "asked"
+  /**
+   * The decisions module refused the question as invalid, which no retry changes; the pair returned
+   * to the queue unasked, each entry to be merged alone.
+   */
+  | "refused"
   /** The owner answered, and the pair returned to the queue. */
   | "answered"
   /** A new ready of one claim arrived, and the pair returned to the queue. */
@@ -1001,12 +1006,21 @@ export function settleConflict(
   );
 }
 
-/** Returns a parked entry to the back of the queue with fresh counters; any other entry stays. */
-export function unparkEntry(sql: SqlStorage, pin: ConflictPin, now: number): void {
+/**
+ * Returns a parked entry to the back of the queue with fresh counters, to be merged alone when
+ * `isolate` is set; any other entry stays.
+ */
+export function unparkEntry(
+  sql: SqlStorage,
+  pin: ConflictPin,
+  isolate: boolean,
+  now: number,
+): void {
   sql.exec(
-    `UPDATE train_queue SET state = 'queued', isolate = 0, retries = 0, reason = NULL,
+    `UPDATE train_queue SET state = 'queued', isolate = ?, retries = 0, reason = NULL,
        position = (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), updated_at = ?
      WHERE claim_id = ? AND generation = ? AND state = 'parked'`,
+    isolate ? 1 : 0,
     now,
     pin.claimId,
     pin.generation,
@@ -1175,7 +1189,7 @@ function toConflict(row: ConflictRow): ConflictRecord {
   };
 }
 
-const CONFLICT_STATES = ["asking", "asked", "answered", "redone", "closed"] as const;
+const CONFLICT_STATES = ["asking", "asked", "refused", "answered", "redone", "closed"] as const;
 const ENTRY_STATES = ["queued", "batched", "landed", "dropped", "parked"] as const;
 const DROP_REASONS = [
   "pin_changed",

@@ -83,8 +83,10 @@
 // episode the merge composed is parked; when either was readied again during the merge, both go
 // back to the queue to be composed again, and nothing is asked about the older work. The park
 // commits first; each drive then asks the owed question through the decisions port inside its own
-// transaction, before it forms or advances a batch. A refused question, whether the decisions
-// module is missing or the claims' decision quota is spent, is never final: the pair stays parked,
+// transaction, before it forms or advances a batch. A question refused as invalid returns the pair
+// to the queue unasked, each entry to be merged alone, since asking again cannot help and the two
+// together would conflict again. Any other refused question, whether the decisions module is
+// missing or the claims' decision quota is spent, is never final: the pair stays parked,
 // the question stays owed and is due again after a delay that doubles from `QUESTION_BASE_MS` up to
 // `QUESTION_MAX_MS`, and the wake is kept for it, while the drive goes on with the rest of the
 // queue. Each retry first checks that both claims are still held, so releasing either returns the
@@ -97,12 +99,14 @@
 // merged with its partner again rather than waiting for the answer. A pair whose claim is no
 // longer held when the question would be asked returns to the queue unasked, and each `resume`
 // checks a bounded batch of asked pairs, in turn, for one whose claims are both no longer held.
+// A pair returned without its answer withdraws its question in the same transaction, so the owner
+// can no longer answer about work that has been replaced.
 
+import { isScopePath } from "@railhead/shared/agent-api";
 import {
   isCommitSha,
   isId,
   MAX_CHECK_NAME_LENGTH,
-  MAX_PATH_LENGTH,
   type Actor,
   type ClaimId,
   type CommitSha,
@@ -120,6 +124,7 @@ import {
   type PortName,
   type PortResult,
 } from "../../contracts/result";
+import { UnavailableError } from "../../contracts/unavailable";
 import type {
   AttemptOutcome,
   CheckAttempt,
@@ -628,9 +633,10 @@ export function createTrain(
 
   /**
    * Asks the owner about a parked pair, inside a transaction that records the question as asked.
-   * A pair whose claim is no longer held at its parked generation goes back to the queue unasked.
-   * A refusal leaves the pair parked and its question owed, due again after a growing delay, and
-   * the drive goes on.
+   * A pair whose claim is no longer held at its parked generation goes back to the queue unasked,
+   * and so does one whose question is refused as invalid, each entry then merged alone. Any other
+   * refusal leaves the pair parked and its question owed, due again after a growing delay, and the
+   * drive goes on.
    */
   function ask(generation: number, conflict: ConflictRecord): Step {
     const now = clock();
@@ -643,17 +649,22 @@ export function createTrain(
         (pin) => readEntry(sql, pin.claimId, pin.generation)?.state === "parked",
       );
       if (!parked) {
-        unparkPair(conflict, "redone", now);
+        unparkPair(tx, conflict, "redone", now);
         return null;
       }
       const held = conflict.pins.every(
         (pin) => ports().claims.currentGeneration(pin.claimId) === pin.generation,
       );
       if (!held) {
-        unparkPair(conflict, "closed", now);
+        unparkPair(tx, conflict, "closed", now);
         return null;
       }
       const asked = ports().decisions.askSystem(tx, conflictQuestion(conflict));
+      // An invalid question stays invalid, so the pair is not left parked behind it.
+      if (!asked.ok && asked.code === "invalid_request") {
+        unparkPair(tx, conflict, "refused", now);
+        return asked;
+      }
       if (!asked.ok) {
         // A claim's spent decision quota does not clear while it stays held at this generation, so
         // such a pair is asked again at most hourly until a claim is released (#260).
@@ -679,15 +690,23 @@ export function createTrain(
 
   /**
    * Returns each still-parked entry of the pair to the back of the queue and settles the pair as
-   * `state`, inside the caller's transaction. The returned entries may take the queue past
-   * `MAX_QUEUE` by the parked pairs it holds; none of them was counted while parked.
+   * `state`, inside the caller's transaction, each entry to be merged alone when the question was
+   * `refused` as invalid. A pair returned without its answer withdraws the
+   * question it asked, in the same transaction, so no answer about the replaced work is recorded.
+   * The returned entries may take the queue past `MAX_QUEUE` by the parked pairs it holds; none of
+   * them was counted while parked.
    */
   function unparkPair(
+    tx: EventTransaction,
     conflict: ConflictRecord,
     state: Exclude<ConflictState, "asking" | "asked">,
     now: number,
   ): void {
-    for (const pin of conflict.pins) unparkEntry(sql, pin, now);
+    if (state !== "answered" && conflict.state === "asked" && conflict.decisionId !== null) {
+      ports().decisions.withdraw(tx, TRAIN_ACTOR.id, conflict.decisionId);
+    }
+    // A pair whose question is invalid would conflict again together, so each is merged alone.
+    for (const pin of conflict.pins) unparkEntry(sql, pin, state === "refused", now);
     settleConflict(sql, conflict.batchId, state, null, now);
     recordDebt(now, { kind: "start", alarmAt: now });
   }
@@ -699,20 +718,29 @@ export function createTrain(
    */
   function unparkReleased(): void {
     const now = clock();
-    context.storage.transactionSync(() => {
-      for (const conflict of nextAskedToCheck(sql, MAX_RELEASE_READS, now)) {
-        const released = conflict.pins.every(
-          (pin) => ports().claims.currentGeneration(pin.claimId) !== pin.generation,
-        );
-        if (released) unparkPair(conflict, "closed", now);
-      }
-    });
+    try {
+      log.transaction((tx) => {
+        for (const conflict of nextAskedToCheck(sql, MAX_RELEASE_READS, now)) {
+          const released = conflict.pins.every(
+            (pin) => ports().claims.currentGeneration(pin.claimId) !== pin.generation,
+          );
+          if (released) unparkPair(tx, conflict, "closed", now);
+        }
+      });
+    } catch (error) {
+      // While the decisions module cannot withdraw a question, the pairs stay asked and are
+      // checked again on a later wake; the drive itself does not need it.
+      if (!(error instanceof UnavailableError)) throw error;
+      console.error(
+        JSON.stringify({ event: "train.release_check_unavailable", repo: context.repoId }),
+      );
+    }
   }
 
-  function answered(_tx: EventTransaction, decisionId: DecisionId): boolean {
+  function answered(tx: EventTransaction, decisionId: DecisionId): boolean {
     const conflict = askedConflictOf(sql, decisionId);
     if (conflict === null) return false;
-    unparkPair(conflict, "answered", clock());
+    unparkPair(tx, conflict, "answered", clock());
     return true;
   }
 
@@ -1101,7 +1129,10 @@ export function createTrain(
     outcome: Extract<MergeOutcome, { kind: "conflict" }>,
   ): void {
     const [first, second] = outcome.pins;
-    const path = outcome.paths.find(isRepoPath);
+    // The path becomes the question's scope, so a conflict on paths no question can name, such as
+    // one holding a control character, fails the batch as a compose it cannot use: its pins are
+    // composed again one at a time, and nothing is parked behind a question that cannot be asked.
+    const path = outcome.paths.find(isScopePath);
     const inBatch = (pin: ClaimPin) => batch.pins.some((member) => samePin(member, pin));
     if (
       path === undefined ||
@@ -1394,7 +1425,7 @@ export function createTrain(
   }
 
   function queue(
-    _tx: EventTransaction,
+    tx: EventTransaction,
     pin: ClaimPin,
     episode: number,
   ): PortResult<{ queued: boolean }> {
@@ -1455,7 +1486,7 @@ export function createTrain(
     // A redone change of a parked claim is merged with its partner again, without the answer.
     if (existing?.state === "parked") {
       const conflict = openConflictOf(sql, pin.claimId, pin.generation);
-      if (conflict !== null) unparkPair(conflict, "redone", now);
+      if (conflict !== null) unparkPair(tx, conflict, "redone", now);
     }
     // Every accepted episode is owed a drive, which also restarts a wake whose retries ran out,
     // so work it leaves runnable is never stranded. The Repo's alarm starts the drive once the
@@ -1691,12 +1722,6 @@ function validDefinition(definition: CheckDefinition, main: CommitSha): boolean 
     name.trim() !== "" &&
     name.length <= MAX_CHECK_NAME_LENGTH
   );
-}
-
-/** The `requirePath` rule of `validateEvent`, so a conflict event is never refused at append. */
-function isRepoPath(path: string): boolean {
-  if (path === "" || path.length > MAX_PATH_LENGTH || path.startsWith("/")) return false;
-  return !path.split("/").some((segment) => segment === "" || segment === "." || segment === "..");
 }
 
 /** The train's own question about a parked pair. Its key makes a repeat return the same question. */

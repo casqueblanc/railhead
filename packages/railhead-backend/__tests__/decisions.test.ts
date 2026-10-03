@@ -10,13 +10,19 @@ import {
   type DecisionView,
 } from "@railhead/shared/agent-api";
 import type { OwnerAction } from "@railhead/shared/board-api";
-import { MAX_LIST_LENGTH, type QuestionOption, type RailheadEvent } from "@railhead/shared/events";
+import {
+  MAX_LIST_LENGTH,
+  type QuestionOption,
+  type RailheadEvent,
+  type SystemId,
+} from "@railhead/shared/events";
 import type { InboxPort } from "../src/contracts/inbox";
 import type { TrainPort } from "../src/contracts/train";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../src/contracts/result";
 import type { SystemQuestion } from "../src/contracts/decisions";
 import {
+  UnavailableError,
   unavailableClaims,
   unavailableDecisions,
   unavailableInbox,
@@ -935,6 +941,72 @@ describe("askSystem", () => {
       expect(askSystem(h)).toMatchObject({ ok: false, code: "quota_exceeded" });
       expect(h.events()).toHaveLength(before);
       expect(h.count("questions")).toBe(MAX_QUESTIONS_PER_CLAIM);
+    });
+  });
+
+  function withdraw(h: Harness, decisionId: string, asker: SystemId = SYSTEM.asker): boolean {
+    return h.log.transaction((tx) => h.decisions.withdraw(tx, asker, decisionId)).value;
+  }
+
+  it("withdraws an open system question, so no answer is recorded and no claim depends on it", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { decisionId } = asked.value;
+      const train = watchTrain(h);
+
+      expect(withdraw(h, decisionId)).toBe(true);
+      expect(h.count("decision_claims")).toBe(0);
+
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "keep_first", expectedVersion: null }),
+      );
+      expect(recorded).toMatchObject({ ok: false, code: "action_stale" });
+      expect(h.count("decision_versions")).toBe(0);
+      expect(types(h.events())).toEqual(["question.asked"]);
+      expect(train).toEqual({ answered: [], armedAfter: [] });
+      expect(h.decisions.currentVersions(CLAIM)).toEqual([]);
+      // A second withdrawal finds nothing open.
+      expect(withdraw(h, decisionId)).toBe(false);
+    });
+  });
+
+  it("keeps an answered system question, and another asker's question, when asked to withdraw", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { decisionId } = asked.value;
+      watchTrain(h);
+
+      expect(withdraw(h, decisionId, "sys_claims")).toBe(false);
+      await h.decisions.record(
+        h.grant({ decisionId, option: "keep_first", expectedVersion: null }),
+      );
+      expect(withdraw(h, decisionId)).toBe(false);
+      expect(h.count("decision_claims")).toBe(2);
+      expect(h.decisions.currentVersions(CLAIM)).toEqual([{ decisionId, version: 1 }]);
+      expect(withdraw(h, "dec_unknown000")).toBe(false);
+    });
+  });
+
+  it("withdraws no agent's question", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      expect(withdraw(h, decisionId, "sys_train")).toBe(false);
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "chunk", expectedVersion: null }),
+      );
+      expect(recorded.ok).toBe(true);
+    });
+  });
+
+  it("throws from withdraw while the module is missing", async () => {
+    await withDecisions(async (h) => {
+      expect(() =>
+        h.log.transaction((tx) => unavailableDecisions.withdraw(tx, "sys_train", "dec_x00000001")),
+      ).toThrow(UnavailableError);
     });
   });
 
