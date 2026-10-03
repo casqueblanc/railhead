@@ -5,12 +5,15 @@ import { describe, expect, it } from "vitest";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
 import type {
   OwnerAction,
+  OwnerActionResult,
   PasskeyAssertion,
   PasskeyRegistration,
 } from "@railhead/shared/board-api";
 import { relyingParty, type RelyingParty } from "../src/auth/passkeyVerifier";
+import type { ClaimsPort } from "../src/contracts/claims";
+import type { DecisionsPort } from "../src/contracts/decisions";
 import type { IdentityPort } from "../src/contracts/identity";
-import type { HumanGrant } from "../src/contracts/principals";
+import type { GrantFor, HumanGrant } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
 import {
   createOwner,
@@ -483,21 +486,81 @@ describe("owner enrollment", () => {
   });
 });
 
-/** A fake identity port that records each grant and answers with `answer`. */
-function recordingIdentity(
-  base: IdentityPort,
-  grants: HumanGrant[],
-  answer: (grant: HumanGrant) => Promise<PortResult<{ agentId: string }>>,
-): IdentityPort {
+/** The five ports an owner action may be handed to. */
+type ActionPort =
+  | "identity.createInvite"
+  | "identity.confirm"
+  | "identity.revoke"
+  | "claims.fileIssue"
+  | "decisions.record";
+
+/** A grant as one port received it. */
+interface Dispatch {
+  port: ActionPort;
+  grant: HumanGrant;
+}
+
+/** How each fake action port answers. The decisions answer may read and write the event log. */
+interface Answers {
+  createInvite(grant: GrantFor<"invite.create">): ReturnType<IdentityPort["createInvite"]>;
+  confirm(grant: GrantFor<"agent.confirm">): ReturnType<IdentityPort["confirm"]>;
+  revoke(grant: GrantFor<"agent.revoke">, log: EventLog): ReturnType<IdentityPort["revoke"]>;
+  fileIssue(grant: GrantFor<"issue.file">): ReturnType<ClaimsPort["fileIssue"]>;
+  record(grant: GrantFor<"decision.record">): ReturnType<DecisionsPort["record"]>;
+}
+
+const INVITE_RESULT = {
+  inviteId: "inv_invite01",
+  inviteUrl: "https://railhead.mashin.workers.dev/join/inv_invite01#secret",
+  expiresAt: 1_900_000_000_000,
+};
+
+const DEFAULT_ANSWERS: Answers = {
+  createInvite: async () => ok(INVITE_RESULT),
+  confirm: async (grant) => ok({ agentId: grant.action.agentId }),
+  revoke: async (grant) => ok({ agentId: grant.action.agentId }),
+  fileIssue: async () => ok({ issueId: "iss_issue0001" }),
+  record: async (grant) =>
+    ok({ decisionId: grant.action.decisionId, version: (grant.action.expectedVersion ?? 0) + 1 }),
+};
+
+/** `base` with its five action ports replaced by fakes that record each grant they receive. */
+function recordingPorts(
+  base: RepoPorts,
+  dispatched: Dispatch[],
+  answers: Answers,
+  log: EventLog,
+): RepoPorts {
   return {
     ...base,
-    async confirm(grant) {
-      grants.push(grant);
-      return answer(grant);
+    identity: {
+      ...base.identity,
+      async createInvite(grant) {
+        dispatched.push({ port: "identity.createInvite", grant });
+        return answers.createInvite(grant);
+      },
+      async confirm(grant) {
+        dispatched.push({ port: "identity.confirm", grant });
+        return answers.confirm(grant);
+      },
+      async revoke(grant) {
+        dispatched.push({ port: "identity.revoke", grant });
+        return answers.revoke(grant, log);
+      },
     },
-    async revoke(grant) {
-      grants.push(grant);
-      return answer(grant);
+    claims: {
+      ...base.claims,
+      async fileIssue(grant) {
+        dispatched.push({ port: "claims.fileIssue", grant });
+        return answers.fileIssue(grant);
+      },
+    },
+    decisions: {
+      ...base.decisions,
+      async record(grant) {
+        dispatched.push({ port: "decisions.record", grant });
+        return answers.record(grant);
+      },
     },
   };
 }
@@ -508,7 +571,8 @@ interface Harness {
   userId: string;
   userHandle: string;
   repoId: string;
-  grants: HumanGrant[];
+  /** Every grant an action port received, in order. */
+  grants: Dispatch[];
   clock: Clock;
   state: DurableObjectState;
   /** A second owner module over the same storage, as after the Repo restarts. */
@@ -520,14 +584,11 @@ const REVOKE: OwnerAction = { kind: "agent.revoke", agentId: "agt_atlas01" };
 
 /**
  * Runs `body` inside a fresh repository with its owner module wired to a freshly enrolled `Owner`
- * object, and with an identity port that records the grants it receives.
+ * object, and with action ports that record the grants they receive and answer with `answers`.
  */
 async function withRepoOwner(
   body: (harness: Harness) => Promise<void>,
-  answer: (
-    grant: HumanGrant,
-    log: EventLog,
-  ) => Promise<PortResult<{ agentId: string }>> = async () => ok({ agentId: "agt_atlas01" }),
+  answers: Partial<Answers> = {},
   registerOptions: RegisterOptions = {},
 ): Promise<void> {
   const auth = await Authenticator.create();
@@ -544,12 +605,13 @@ async function withRepoOwner(
     const clock = { now: Date.now() };
     const log = EventLog.open(state.storage, repoId);
     const context = { repoId, storage: state.storage, log, clock: () => clock.now, env };
-    const composed = composeRepo(context);
-    const grants: HumanGrant[] = [];
-    const ports: RepoPorts = {
-      ...composed,
-      identity: recordingIdentity(composed.identity, grants, (grant) => answer(grant, log)),
-    };
+    const grants: Dispatch[] = [];
+    const ports = recordingPorts(
+      composeRepo(context),
+      grants,
+      { ...DEFAULT_ANSWERS, ...answers },
+      log,
+    );
     // The stub is made inside the Repo, as the module's own factory makes it.
     const dependencies: OwnerDependencies = {
       instance: env.OWNER.getByName(ownerName),
@@ -610,14 +672,156 @@ describe("owner actions", () => {
       });
       expect(grants).toEqual([
         {
-          kind: "human",
-          userId,
-          repoId,
-          grantId: grantId(challenge.challengeId),
-          action: CONFIRM,
+          port: "identity.confirm",
+          grant: {
+            kind: "human",
+            userId,
+            repoId,
+            grantId: grantId(challenge.challengeId),
+            action: CONFIRM,
+          },
         },
       ]);
     });
+  });
+
+  it("hands invites, issues and decisions to their own port, once per proof", async () => {
+    const cases: { action: OwnerAction; port: ActionPort; result: OwnerActionResult }[] = [
+      {
+        action: { kind: "invite.create", name: "atlas" },
+        port: "identity.createInvite",
+        result: { kind: "invite.create", ...INVITE_RESULT },
+      },
+      {
+        action: { kind: "issue.file", title: "Flaky upload", body: "It drops the last chunk." },
+        port: "claims.fileIssue",
+        result: { kind: "issue.file", issueId: "iss_issue0001" },
+      },
+      {
+        action: {
+          kind: "decision.record",
+          decisionId: "dec_decision1",
+          option: "b",
+          expectedVersion: 4,
+        },
+        port: "decisions.record",
+        result: { kind: "decision.record", decisionId: "dec_decision1", version: 5 },
+      },
+    ];
+    await withRepoOwner(async ({ owner, auth, userId, userHandle, repoId, grants, state }) => {
+      for (const { action, port, result } of cases) {
+        grants.length = 0;
+        const challenge = value(await owner.prepare(action));
+        const proof = await auth.assert(challenge.challenge, userHandle);
+        expect(await owner.perform(challenge.challengeId, proof), port).toEqual({
+          ok: true,
+          value: result,
+        });
+        // Exactly one grant, to exactly this port, for exactly the prepared action.
+        expect(grants, port).toEqual([
+          {
+            port,
+            grant: {
+              kind: "human",
+              userId,
+              repoId,
+              grantId: grantId(challenge.challengeId),
+              action,
+            },
+          },
+        ]);
+        expect(await owner.perform(challenge.challengeId, proof), port).toMatchObject({
+          ok: false,
+          code: "proof_expired",
+        });
+        expect(grants, port).toHaveLength(1);
+      }
+      expect(rows(state, "owner_spent_challenge")).toBe(cases.length);
+    });
+  });
+
+  it("returns an invite, issue or decision port's refusal and keeps its proof spent", async () => {
+    // A decision whose current version is 1: only `expectedVersion: 1` records the next one.
+    let current = 1;
+    await withRepoOwner(
+      async ({ owner, auth, userHandle, grants, state }) => {
+        const refusals: { action: OwnerAction; port: ActionPort; code: string }[] = [
+          {
+            action: { kind: "invite.create", name: "atlas" },
+            port: "identity.createInvite",
+            code: "unavailable",
+          },
+          {
+            action: { kind: "issue.file", title: "t", body: "" },
+            port: "claims.fileIssue",
+            code: "invalid_request",
+          },
+          {
+            action: {
+              kind: "decision.record",
+              decisionId: "dec_decision1",
+              option: "a",
+              expectedVersion: null,
+            },
+            port: "decisions.record",
+            code: "action_stale",
+          },
+        ];
+        for (const { action, port, code } of refusals) {
+          grants.length = 0;
+          const challenge = value(await owner.prepare(action));
+          const proof = await auth.assert(challenge.challenge, userHandle);
+          expect(await owner.perform(challenge.challengeId, proof), port).toEqual({
+            ok: false,
+            code,
+            message: `refused by ${port}`,
+          });
+          expect(
+            grants.map((d) => [d.port, d.grant.action]),
+            port,
+          ).toEqual([[port, action]]);
+          expect(isSpent(state, challenge.challengeId), port).toBe(true);
+          expect(await owner.perform(challenge.challengeId, proof), port).toMatchObject({
+            ok: false,
+            code: "proof_expired",
+          });
+          expect(grants, port).toHaveLength(1);
+        }
+        expect(current).toBe(1);
+
+        // The stale proof cannot be replayed into the corrected action; a fresh proof records it.
+        grants.length = 0;
+        const fresh: OwnerAction = {
+          kind: "decision.record",
+          decisionId: "dec_decision1",
+          option: "a",
+          expectedVersion: 1,
+        };
+        const challenge = value(await owner.prepare(fresh));
+        expect(
+          await owner.perform(
+            challenge.challengeId,
+            await auth.assert(challenge.challenge, userHandle),
+          ),
+        ).toEqual({
+          ok: true,
+          value: { kind: "decision.record", decisionId: "dec_decision1", version: 2 },
+        });
+        expect(grants.map((d) => d.grant.action)).toEqual([fresh]);
+        expect(current).toBe(2);
+      },
+      {
+        createInvite: async () => fail("unavailable", "refused by identity.createInvite"),
+        fileIssue: async () => fail("invalid_request", "refused by claims.fileIssue"),
+        record: async (grant) => {
+          if (grant.action.expectedVersion !== current) {
+            return fail("action_stale", "refused by decisions.record");
+          }
+          current += 1;
+          return ok({ decisionId: grant.action.decisionId, version: current });
+        },
+      },
+    );
   });
 
   it("authorizes a concurrently replayed proof once", async () => {
@@ -649,7 +853,7 @@ describe("owner actions", () => {
         });
         expect(grants).toHaveLength(1);
       },
-      undefined,
+      {},
       { longHeads: true },
     );
   });
@@ -730,19 +934,22 @@ describe("owner actions", () => {
         });
         expect(grants).toHaveLength(2);
       },
-      async (grant, log) => {
-        calls += 1;
-        if (grant.action.kind === "agent.confirm") {
+      {
+        confirm: async () => {
+          calls += 1;
           return fail("action_stale", "The code differs.");
-        }
-        log.transaction((tx) => {
-          tx.append(
-            { kind: "human", id: grant.userId },
-            { type: "issue.filed", data: { issueId: "iss_issue0001", title: "x", body: "" } },
-          );
-          throw new Error("action rolled back");
-        });
-        return ok({ agentId: "agt_atlas01" });
+        },
+        revoke: async (grant, log) => {
+          calls += 1;
+          log.transaction((tx) => {
+            tx.append(
+              { kind: "human", id: grant.userId },
+              { type: "issue.filed", data: { issueId: "iss_issue0001", title: "x", body: "" } },
+            );
+            throw new Error("action rolled back");
+          });
+          return ok({ agentId: "agt_atlas01" });
+        },
       },
     );
     expect(calls).toBe(2);
@@ -798,12 +1005,21 @@ describe("owner actions", () => {
         }),
       );
       expect(largest.challengeId.length).toBeLessThanOrEqual(MAX_SEALED_CHALLENGE_LENGTH);
-      await owner.perform(largest.challengeId, await auth.assert(largest.challenge, userHandle));
+      expect(grants).toEqual([]);
+      expect(
+        await owner.perform(largest.challengeId, await auth.assert(largest.challenge, userHandle)),
+      ).toEqual({ ok: true, value: { kind: "issue.file", issueId: "iss_issue0001" } });
       expect(isSpent(state, largest.challengeId)).toBe(true);
+      expect(grants.map(({ port, grant }) => [port, grant.action])).toEqual([
+        [
+          "claims.fileIssue",
+          { kind: "issue.file", title: "t", body: "b".repeat(MAX_ACTION_BYTES - empty) },
+        ],
+      ]);
       expect(
         await owner.prepare({ kind: "issue.file", title: "t", body: "b".repeat(70_000) }),
       ).toMatchObject({ ok: false, code: "invalid_request" });
-      expect(grants).toEqual([]);
+      expect(grants).toHaveLength(1);
     });
   });
 
