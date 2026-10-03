@@ -852,7 +852,11 @@ describe("a conflicting pair", () => {
       const queued = setup.log
         .replay(before + 2, 64)
         .events.filter((event) => event.type === "inbox.queued");
-      expect(queued.map((event) => event.data)).toMatchObject([
+      // Delivery follows the claim ids, which are random, so compare in agent order.
+      const delivered = queued
+        .map((event) => event.data)
+        .toSorted((left, right) => left.agentId.localeCompare(right.agentId));
+      expect(delivered).toMatchObject([
         { agentId: agent(1).agentId, claimId: first.claimId },
         { agentId: agent(2).agentId, claimId: second.claimId },
       ]);
