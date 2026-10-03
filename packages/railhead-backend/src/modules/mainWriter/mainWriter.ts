@@ -18,12 +18,15 @@
 // that same expected commit may start, so whichever of the two lands, the other's conditional
 // update can no longer apply and the next read-back tells them apart. Nothing here forces main.
 //
-// That window has an end. Main's ref promises that an update which has not applied within
-// `MAIN_UPDATE_LIFETIME_MS` of being sent never will, so main read back at an intent's expected
-// commit by a read that began after its last attempt was that old means the write did not land,
-// and the intent settles `reconciled` at that commit. A read that began earlier proves nothing
+// That window has an end. Main's ref promises to send an update within `MAIN_REF_TIMEOUT_MS` of
+// the call or drop it, however long it queues it, and that a sent update which has not applied
+// within `MAIN_UPDATE_LIFETIME_MS` of being sent never will. The writer records an attempt in the
+// same synchronous turn as the call, so the attempt's time is the call's, and its window ends
+// `MAIN_UPDATE_EXPIRY_MS` later: the latest send plus the lifetime. Main read back at an intent's
+// expected commit by a read that began after its last attempt was that old means the write did not
+// land, and the intent settles `reconciled` at that commit. A read that began earlier proves nothing
 // about that intent, however late it answers: the write may have applied while the read was in
-// flight. When the lifetime ends during a read, the writer reads main again. The writer applies
+// flight. When the window ends during a read, the writer reads main again. The writer applies
 // this wherever waiting would otherwise hold the train: to another intent that holds this one
 // back, and to this intent once its fence has moved. An intent whose fence still holds writes
 // again instead, conditionally, which starts a new window.
@@ -73,13 +76,19 @@ export const MAIN_REF_TIMEOUT_MS = 10_000;
 
 /**
  * How long after it is sent an update of main may still apply. `MainRefPort` promises that an
- * update which has not applied by then never will; past it, the writer reads main at an intent's
- * expected commit as proof that the intent's write did not land. This is a design value, not a
- * measurement: thirty times the writer's own wait for an answer. It must stay well inside the
- * train's alarm retries (`MAX_WAKE_FAILURES`, about 85 minutes), so a held batch is driven again
- * after the window ends.
+ * update which has not applied by then never will. This is a design value, not a measurement:
+ * thirty times the writer's own wait for an answer.
  */
 export const MAIN_UPDATE_LIFETIME_MS = 30 * MAIN_REF_TIMEOUT_MS;
+
+/**
+ * How long after an attempt is recorded its update may still apply: `MainRefPort` sends it within
+ * `MAIN_REF_TIMEOUT_MS` of the call or never, and it may apply for `MAIN_UPDATE_LIFETIME_MS` after
+ * that. Past it, the writer reads main at an intent's expected commit as proof that the intent's
+ * write did not land. It must stay well inside the train's alarm retries (`MAX_WAKE_FAILURES`,
+ * about 85 minutes), so a held batch is driven again after the window ends.
+ */
+export const MAIN_UPDATE_EXPIRY_MS = MAIN_REF_TIMEOUT_MS + MAIN_UPDATE_LIFETIME_MS;
 
 /** What the main writer needs from its Repo. */
 export interface MainWriterContext {
@@ -161,7 +170,7 @@ async function publish(
       if (record.status !== "authorized") return ok(record);
       const others = settled.value.filter((pending) => pending.intentId !== intentId);
       if (others.length > 0 && record.expectedMain !== main.value) {
-        // An earlier write whose lifetime ended during the read needs a read begun after it.
+        // An earlier write whose window ended during the read needs a read begun after it.
         const now = clock();
         if (others.some((pending) => expired(pending, now))) continue;
         return fail("unavailable", "An earlier write to main is unresolved; try again later.");
@@ -175,17 +184,18 @@ async function publish(
     if (!begun.ok) {
       // Main was read back at the expected commit, so an earlier attempt may still land: a fence
       // that moved since says nothing yet about whether this intent's work reaches main, until
-      // the last attempt outlives the update lifetime.
+      // the last attempt's window ends.
       if (record.attempts > 0 && isFenceRefusal(begun.code)) {
         if (observedAt !== null && expired(record, observedAt)) {
           return settle(log, deps, record, "reconciled", record.expectedMain);
         }
-        // The lifetime ended while main was being read: read it again before deciding.
+        // The window ended while main was being read: read it again before deciding.
         if (expired(record, clock())) continue;
         return fail("unavailable", "An earlier write of this intent may still land; try again.");
       }
       return begun;
     }
+    // Called in the turn that recorded the attempt, so the attempt's time is the call's.
     const update = await mainRef.update(begun.value.expectedMain, begun.value.candidate);
     if (!update.ok) return update;
     switch (update.value.kind) {
@@ -216,7 +226,7 @@ async function publish(
 /**
  * Settles every unsettled intent that `main` decides, each with its event, and returns the ones
  * whose write may still apply: those whose expected commit is still main. An intent other than
- * `publishing` whose last attempt had outlived the update lifetime when the read of `main` began
+ * `publishing` whose last attempt's window had ended when the read of `main` began
  * (`observedAt`) is settled as not landed; `publishing` itself may write again from the same
  * commit, so `publish` decides it.
  */
@@ -315,7 +325,7 @@ function isFenceRefusal(code: PortErrorCode): boolean {
 
 /** Whether the intent's last attempt was old enough at `at` that it could no longer apply. */
 function expired(record: MergeIntentRecord, at: number): boolean {
-  return at - record.updatedAt >= MAIN_UPDATE_LIFETIME_MS;
+  return at - record.updatedAt >= MAIN_UPDATE_EXPIRY_MS;
 }
 
 /** Passes on the refusal of an intent read that found no record. */

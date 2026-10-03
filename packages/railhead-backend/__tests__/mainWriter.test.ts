@@ -21,6 +21,8 @@ import type {
 import { unavailableAuthorization } from "../src/contracts/unavailable";
 import {
   createMainWriter,
+  MAIN_REF_TIMEOUT_MS,
+  MAIN_UPDATE_EXPIRY_MS,
   MAIN_UPDATE_LIFETIME_MS,
   MAX_QUEUED_PUBLICATIONS,
   MAX_WRITE_ATTEMPTS,
@@ -736,11 +738,11 @@ describe("publish ends the wait for an unsettled write after the update lifetime
         world.generations.set(CLAIM_B, 4);
 
         // One millisecond short of the lifetime, the write may still land.
-        world.now = NOW + MAIN_UPDATE_LIFETIME_MS - 1;
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS - 1;
         expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
         expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
 
-        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
         expect(await h.writer.publish(INTENT)).toEqual({
           ok: true,
           value: { ...settled("reconciled", 1, MAIN), updatedAt: world.now },
@@ -763,7 +765,7 @@ describe("publish ends the wait for an unsettled write after the update lifetime
       ref,
       async (h) => {
         expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
-        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
         expect(await h.writer.publish(INTENT)).toMatchObject({
           ok: true,
           value: { status: "updated", attempts: 2, main: CANDIDATE },
@@ -790,7 +792,7 @@ describe("publish ends the wait for an unsettled write after the update lifetime
         expect(await h.writer.publish(INTENT_B)).toMatchObject({ ok: false, code: "unavailable" });
 
         // A never landed, so B, composed on A's candidate, is rejected rather than held.
-        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
         expect(await h.writer.publish(INTENT_B)).toMatchObject({
           ok: true,
           value: { intentId: INTENT_B, status: "rejected", main: MAIN },
@@ -811,12 +813,65 @@ describe("publish ends the wait for an unsettled write after the update lifetime
   });
 });
 
+describe("publish waits out an update the ref sends late", () => {
+  it("does not settle the intent before a delayed send can no longer land", async () => {
+    const world = new World();
+    const ref = new FakeMain();
+    // The ref queues the update and sends it just inside its send bound; Git applies it just
+    // inside its lifetime from that send.
+    let queued: { expected: CommitSha; next: CommitSha } | undefined;
+    await withIntent(
+      ref,
+      async (h) => {
+        ref.update = (expected, next) => {
+          ref.updates.push({ expected, next });
+          queued = { expected, next };
+          return new Promise(() => undefined);
+        };
+        expect(await h.writer.publish(INTENT)).toEqual(
+          fail("unavailable", "Main did not answer in time; it will be read back first."),
+        );
+        world.generations.set(CLAIM_B, 4);
+        const sentAt = NOW + MAIN_REF_TIMEOUT_MS - 1;
+
+        // A lifetime after the call, the sent update may still apply: nothing settles.
+        world.now = NOW + MAIN_UPDATE_LIFETIME_MS;
+        expect(await h.writer.publish(INTENT)).toEqual(
+          fail("unavailable", "An earlier write of this intent may still land; try again."),
+        );
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS - 1;
+        expect(await h.writer.publish(INTENT)).toMatchObject({ ok: false, code: "unavailable" });
+        expect(h.authorization.record(INTENT)).toEqual(pendingRecord(1));
+        expect(h.log.head()).toBe(1);
+
+        // The update lands within its lifetime from the send.
+        world.now = sentAt + MAIN_UPDATE_LIFETIME_MS - 1;
+        if (queued !== undefined && ref.main === queued.expected) ref.main = queued.next;
+        world.now = NOW + MAIN_UPDATE_EXPIRY_MS;
+        expect(await h.writer.publish(INTENT)).toEqual({
+          ok: true,
+          value: { ...settled("reconciled", 1, CANDIDATE), updatedAt: world.now },
+        });
+        // The record and its event agree with main.
+        expect(h.authorization.record(INTENT)).toMatchObject({ main: ref.main });
+        expect(mainEvents(h.log)).toEqual([
+          mainEvent(2, "reconciled", CANDIDATE, INTENT, world.now),
+        ]);
+        expect(ref.updates).toHaveLength(1);
+      },
+      world,
+      freshStub(),
+      { timeoutMs: TIMEOUT_MS },
+    );
+  });
+});
+
 /** Main is read just before the lifetime ends; `apply` runs before the answer arrives after it. */
 function readAcrossExpiry(world: World, ref: FakeMain, apply: () => void): void {
-  world.now = NOW + MAIN_UPDATE_LIFETIME_MS - 1_000;
+  world.now = NOW + MAIN_UPDATE_EXPIRY_MS - 1_000;
   ref.duringRead = () => {
     apply();
-    world.now = NOW + MAIN_UPDATE_LIFETIME_MS + 500;
+    world.now = NOW + MAIN_UPDATE_EXPIRY_MS + 500;
   };
 }
 
@@ -872,8 +927,8 @@ describe("publish settles a write as not landed only from a read begun after its
         });
         // The settling read began after the lifetime ended; the one before it proved nothing.
         expect(readsBegun).toEqual([
-          NOW + MAIN_UPDATE_LIFETIME_MS - 1_000,
-          NOW + MAIN_UPDATE_LIFETIME_MS + 500,
+          NOW + MAIN_UPDATE_EXPIRY_MS - 1_000,
+          NOW + MAIN_UPDATE_EXPIRY_MS + 500,
         ]);
         expect(ref.updates).toHaveLength(1);
         expect(mainEvents(h.log)).toEqual([mainEvent(2, "reconciled", MAIN, INTENT, world.now)]);

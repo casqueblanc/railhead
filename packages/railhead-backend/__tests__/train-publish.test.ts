@@ -17,7 +17,7 @@ import type {
 } from "../src/contracts/train";
 import {
   createMainWriter,
-  MAIN_UPDATE_LIFETIME_MS,
+  MAIN_UPDATE_EXPIRY_MS,
   MAX_WRITE_ATTEMPTS,
 } from "../src/modules/mainWriter/mainWriter";
 import { createTrain, type Train } from "../src/modules/train/scheduler";
@@ -392,7 +392,7 @@ describe("the train publishes through the real main writer", () => {
     });
   });
 
-  it("lands a batch whose write lands while a read begun before its lifetime ends is answering", async () => {
+  it("lands a batch whose write lands while a read begun before its window ends is answering", async () => {
     const ref = new FakeMain(MAIN, ["hang"]);
     await withRepo(ref, [pin(1)], async (h) => {
       await h.train.enqueue(pin(1));
@@ -402,11 +402,11 @@ describe("the train publishes through the real main writer", () => {
       h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
 
       // The drive's read sees main at the expected commit; the update reaches Git within its
-      // lifetime, and the read's answer arrives after the lifetime has ended.
+      // window, and the read's answer arrives after the window has ended.
       ref.duringRead = () => {
-        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_LIFETIME_MS);
+        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_EXPIRY_MS);
         ref.release();
-        h.advance(attemptAt + MAIN_UPDATE_LIFETIME_MS + 500);
+        h.advance(attemptAt + MAIN_UPDATE_EXPIRY_MS + 500);
       };
       await h.alarm();
       expect(ref.main).toBe(first.candidate);
@@ -423,7 +423,7 @@ describe("the train publishes through the real main writer", () => {
     });
   });
 
-  it("fails the batch and requeues its work once a write that never lands outlives its lifetime", async () => {
+  it("fails the batch and requeues its work once a write that never lands outlives its window", async () => {
     const ref = new FakeMain(MAIN, ["drop"]);
     ref.fallback = "refuse";
     await withRepo(ref, [pin(1), pin(2)], async (h) => {
@@ -440,15 +440,15 @@ describe("the train publishes through the real main writer", () => {
       expect(batchStates(h.train)).toEqual([["passed", null]]);
       expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized" });
 
-      // The alarm keeps driving; once the attempt is older than the lifetime, the intent settles.
+      // The alarm keeps driving; once the attempt is older than its window, the intent settles.
       let drives = 1;
       while (batchStates(h.train)[0]?.[0] === "passed") {
-        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_LIFETIME_MS + 5 * 60_000);
+        expect(h.now() - attemptAt).toBeLessThan(MAIN_UPDATE_EXPIRY_MS + 5 * 60_000);
         await h.alarm();
         drives += 1;
       }
       expect(drives).toBeGreaterThan(2);
-      expect(h.now() - attemptAt).toBeGreaterThanOrEqual(MAIN_UPDATE_LIFETIME_MS);
+      expect(h.now() - attemptAt).toBeGreaterThanOrEqual(MAIN_UPDATE_EXPIRY_MS);
       expect(h.authorization.record(intentId)).toMatchObject({ status: "reconciled", main: MAIN });
       expect(mainOutcomes(h.events())).toEqual([{ intentId, outcome: "reconciled", main: MAIN }]);
       expect(batchStates(h.train)[0]).toEqual(["failed", "main_rejected"]);

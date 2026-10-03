@@ -225,9 +225,12 @@ export type MainUpdate =
  * it, and it never returns to a commit it left. The writer's reconciliation depends on that, since
  * it reads main anywhere but an intent's expected commit or candidate as proof the intent did not
  * land. Neither call promises a deadline or cancellation, so the main writer bounds each one and
- * treats an update that does not answer in time as uncertain. An update that has not applied
- * within `MAIN_UPDATE_LIFETIME_MS` of being sent must never apply: past that, the writer reads main
- * at the expected commit as proof the update did not land.
+ * treats an update that does not answer in time as uncertain. An implementation must send an update
+ * within `MAIN_REF_TIMEOUT_MS` of the call to `update`, including any time it holds the update in
+ * a queue or between retries, or drop it unsent; and a sent update that has not applied within
+ * `MAIN_UPDATE_LIFETIME_MS` of being sent must never apply. The writer measures both from the call:
+ * past `MAIN_UPDATE_EXPIRY_MS`, it reads main at the expected commit as proof the update did not
+ * land.
  */
 export interface MainRefPort {
   /** Reads main's current commit. */
