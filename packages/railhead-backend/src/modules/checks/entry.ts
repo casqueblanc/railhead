@@ -18,7 +18,8 @@ const ACCOUNT_ID = /^[0-9a-f]{32}$/;
 export const checks: ModuleFactory<CheckPort> = (context, ports) =>
   createChecks({
     repoId: context.repoId,
-    attempts: new AttemptTable(context.storage),
+    attempts: new AttemptTable(context.storage, (attemptId) => ports().train.holds(attemptId)),
+    log: context.log,
     main: async (): Promise<MainSource | null> => {
       const account: unknown = context.env.CLOUDFLARE_ACCOUNT_ID;
       if (typeof account !== "string" || !ACCOUNT_ID.test(account)) return null;
