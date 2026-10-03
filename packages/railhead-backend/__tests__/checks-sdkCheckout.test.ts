@@ -54,12 +54,15 @@ const SOURCE = {
   providerData: { namespace: NAMESPACE },
 };
 
+/** The one repository the adapter and its checkouts cover. */
+const REPOSITORY = { owner: NAMESPACE, repo: REPO };
+
 /** When the runner asks for the checkout in the gatewayCheckout tests. */
 const NOW = 1_800_000_000_000;
 
 describe("gatewayCheckout", () => {
   it("names the exact commit, no token, and a read-only grant for one repository", () => {
-    expect(gatewayCheckout(SOURCE, ACCOUNT, NOW)).toEqual({
+    expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW)).toEqual({
       kind: "git",
       remote: `https://${HOST}/git/railhead/demo.git`,
       sha: SHA,
@@ -77,13 +80,25 @@ describe("gatewayCheckout", () => {
     ["a branch name", { ...SOURCE, sha: "refs/heads/main" }],
     ["another namespace", { ...SOURCE, providerData: { namespace: "other" } }],
     ["missing provider data", { ...SOURCE, providerData: null }],
-    ["an invalid repository name", { ...SOURCE, repo: "../main" }],
+    ["another repository in the namespace", { ...SOURCE, repo: "other" }],
+    [
+      "another namespace with matching provider data",
+      { ...SOURCE, owner: "other", providerData: { namespace: "other" } },
+    ],
   ])("refuses %s before any sandbox starts", (_name, source) => {
-    expect(() => gatewayCheckout(source, ACCOUNT, NOW)).toThrow();
+    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT, NOW)).toThrow();
+  });
+
+  it("refuses an invalid repository name, even as the adapter's own", () => {
+    const repository = { owner: NAMESPACE, repo: "../main" };
+
+    expect(() => gatewayCheckout(repository, { ...SOURCE, repo: "../main" }, ACCOUNT, NOW)).toThrow(
+      "invalid repository",
+    );
   });
 
   it("refuses an account ID that would make another host", () => {
-    expect(() => gatewayCheckout(SOURCE, "evil.example.com/x", NOW)).toThrow(
+    expect(() => gatewayCheckout(REPOSITORY, SOURCE, "evil.example.com/x", NOW)).toThrow(
       "invalid Cloudflare account ID",
     );
   });
@@ -91,7 +106,9 @@ describe("gatewayCheckout", () => {
   it.each([Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 2])(
     "refuses a checkout time of %s, which would make a grant the gateway rejects",
     (now) => {
-      expect(() => gatewayCheckout(SOURCE, ACCOUNT, now)).toThrow("invalid checkout time");
+      expect(() => gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, now)).toThrow(
+        "invalid checkout time",
+      );
     },
   );
 });
@@ -197,7 +214,7 @@ function fetchRefs(remote: string): Request {
 function checkoutAt(at: number) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(at);
-  return gatewayCheckout(SOURCE, ACCOUNT, NOW);
+  return gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW);
 }
 
 describe("the checkout's grant at the registered Git gateway", () => {
@@ -978,6 +995,8 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   /** The failed runner's output, as the SDK stores and shows it. */
   output: string | null = null;
   cached = false;
+  /** Whether a test runner is chained on the install's workspace. */
+  chained = true;
   /** The literal environment the test runner is given. */
   testEnv: Record<string, string> = {};
 
@@ -994,7 +1013,9 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
         config,
         ...(this.cached ? { cache: { inputs: ["package.json"] } } : {}),
       });
-      await install.runner({ name: "test", command: "npm test", config, env: this.testEnv });
+      if (this.chained) {
+        await install.runner({ name: "test", command: "npm test", config, env: this.testEnv });
+      }
       this.outcome = { kind: "pass" };
     } catch (rejection) {
       this.outcome = { kind: "rejected", failure: classifyRunnerFailure(rejection) };
@@ -1017,6 +1038,10 @@ async function run(options: {
   fence?: SandboxFence;
   /** The literal environment the test runner is given. */
   testEnv?: Record<string, string>;
+  /** Whether the test runner is chained on the install; defaults to true. */
+  chained?: boolean;
+  /** Whether the Worker has a BACKUP_BUCKET binding; defaults to true. */
+  backupBucket?: boolean;
   /** The size of every command's logs; the SDK reads a log above its inline limit as its tail. */
   logBytes?: number;
   tailFails?: boolean;
@@ -1060,7 +1085,9 @@ async function run(options: {
     R2_ACCESS_KEY_ID: "r2-key-id",
     R2_SECRET_ACCESS_KEY: "r2-secret",
     ARTIFACTS: artifacts,
-    BACKUP_BUCKET: new CacheBucket(cachedBy, (call) => sandbox.calls.push(call)),
+    ...((options.backupBucket ?? true)
+      ? { BACKUP_BUCKET: new CacheBucket(cachedBy, (call) => sandbox.calls.push(call)) }
+      : {}),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
     SANDBOX: { idFromName: (name: string) => name, get: () => observed },
@@ -1072,6 +1099,7 @@ async function run(options: {
   Object.assign(workflow, {
     env: bindings,
     cached: options.cached ?? false,
+    chained: options.chained ?? true,
     testEnv: options.testEnv ?? {},
     outcome: null,
     output: null,
@@ -1523,6 +1551,59 @@ describe("a check run through the patched SDK", () => {
     expect(artifacts.calls).toEqual(["get:demo"]);
   });
 
+  it("runs a single runner without a BACKUP_BUCKET binding, with no backup or cache", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(noop);
+    const { outcome, sandbox, artifacts } = await run({
+      backupBucket: false,
+      cached: true,
+      chained: false,
+    });
+
+    expect(outcome).toEqual({ kind: "pass" });
+    // No cache lookup, restore or backup; the fence still starts and retires.
+    expect(sandbox.calls).toEqual([
+      "start",
+      "checkout",
+      "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
+      "log:read",
+      "log:read",
+      "retire",
+    ]);
+    expect(sandbox.backups).toEqual([]);
+    expect(sandbox.restored).toEqual([]);
+    expect(artifacts.calls).toEqual([]);
+    const warnings = warn.mock.calls.map(([message]) => message);
+    expect(warnings).toContain("[cache] no BACKUP_BUCKET binding; skipping cache");
+    expect(warnings).toContain("[sandbox] no BACKUP_BUCKET binding; no workspace backup");
+  });
+
+  it("records a chained runner without a BACKUP_BUCKET binding as an error before it starts", async () => {
+    vi.spyOn(console, "warn").mockImplementation(noop);
+    const { outcome, output, sandbox } = await run({ backupBucket: false });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+    });
+    expect(output).toContain("no BACKUP_BUCKET binding");
+    // The install ran and retired; the chained test never started a sandbox.
+    expect(sandbox.calls).toEqual([
+      "start",
+      "checkout",
+      "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
+      "log:read",
+      "log:read",
+      "retire",
+    ]);
+  });
+
+  it("backs up a single runner through the R2 binding when it is present", async () => {
+    const { outcome, sandbox } = await run({ chained: false });
+
+    expect(outcome).toEqual({ kind: "pass" });
+    expect(sandbox.backups).toEqual([{ localBucket: true }]);
+  });
+
   it("never restores another commit's cached workspace, so a deleted file cannot linger", async () => {
     const before = "c".repeat(40);
     const after = "d".repeat(40);
@@ -1597,6 +1678,31 @@ describe("the railheadCheckout adapter", () => {
     });
 
     expect(await provider().receiveEvent({ body, headers: new Headers() })).toBeNull();
+  });
+
+  it.each([
+    ["another repository in the namespace", { ...SOURCE, repo: "other" }],
+    [
+      "another namespace with matching provider data",
+      { ...SOURCE, owner: "other", providerData: { namespace: "other" } },
+    ],
+  ])("grants no checkout and lists no blobs for %s", async (_name, source) => {
+    const artifacts = new RecordingArtifacts();
+    const adapter = railheadCheckout(REPOSITORY);
+    const bindings = { CLOUDFLARE_ACCOUNT_ID: ACCOUNT, ARTIFACTS: artifacts };
+    const scoped: ReturnType<typeof adapter.create> = Reflect.apply(adapter.create, adapter, [
+      bindings,
+    ]);
+
+    await expect(scoped.getSourceCheckout(source)).rejects.toThrow("not the adapter's repository");
+    await expect(scoped.listTreeBlobs(source, ["package.json"])).rejects.toThrow(
+      "not the adapter's repository",
+    );
+    expect(artifacts.calls).toEqual([]);
+    // Its own repository still gets a checkout.
+    expect(await scoped.getSourceCheckout(SOURCE)).toMatchObject({
+      fence: { policy: { namespace: NAMESPACE, read: [REPO] } },
+    });
   });
 
   it("accepts only its own repository", () => {

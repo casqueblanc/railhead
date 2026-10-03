@@ -9,7 +9,9 @@
 // short-lived token outside the container. When the run ends the patched runner retires the
 // incarnation through its fence, which ends the grant before it destroys the container; a destroy
 // that fails fails the run, and the fence keeps retrying it. The patched runner also stops a run
-// whose checkout exits nonzero before the check's command starts.
+// whose checkout exits nonzero before the check's command starts. Workspace backups need a
+// `BACKUP_BUCKET` R2 binding; without one a runner runs with no backup or cache, and a chained
+// runner, which would continue its parent's workspace, ends as an error before it starts.
 //
 // `classifyRunnerFailure` then separates the change's fault from Railhead's: `fail` only when the
 // check's own command exited nonzero, `error` for everything else, so a missing commit, a refused
@@ -70,9 +72,12 @@ export function railheadCheckout(
         // The SDK asks for the checkout in the same step that starts the sandbox, so the grant
         // runs from then.
         getSourceCheckout: async (source) =>
-          gatewayCheckout(source, env.CLOUDFLARE_ACCOUNT_ID, Date.now()),
+          gatewayCheckout(repository, source, env.CLOUDFLARE_ACCOUNT_ID, Date.now()),
         // Cache fingerprints read blob hashes through the Worker's binding, outside the sandbox.
-        listTreeBlobs: (source, paths) => delegate.listTreeBlobs(source, paths),
+        listTreeBlobs: async (source, paths) => {
+          assertRepository(repository, source);
+          return delegate.listTreeBlobs(source, paths);
+        },
         getStepCredentialEnv: () => Promise.reject(new Error(NO_CREDENTIALS)),
         getPushCredentials: () => Promise.reject(new Error(NO_CREDENTIALS)),
         createPullRequest: async () => ({ status: "skipped" }),
@@ -85,12 +90,19 @@ export function railheadCheckout(
 const NO_CREDENTIALS = "railhead checks never hand repository credentials to a runner";
 
 /**
- * The checkout for `source`: the exact commit, fetched through the gateway under a read-only policy
- * for its repository that lapses `CHECKOUT_GRANT_MS` after `now`. Throws, before any sandbox
- * starts, for a SHA that is not 40 lowercase hex digits, a namespace that does not match the owner,
- * an invalid account or repository name, or a time that is not whole milliseconds.
+ * The checkout for `source` in `repository`: the exact commit, fetched through the gateway under a
+ * read-only policy for that repository that lapses `CHECKOUT_GRANT_MS` after `now`. Throws, before
+ * any sandbox starts, for a source in another repository, a SHA that is not 40 lowercase hex
+ * digits, a namespace that does not match the owner, an invalid account or repository name, or a
+ * time that is not whole milliseconds.
  */
-export function gatewayCheckout(source: Source, accountId: string, now: number): GatewayCheckout {
+export function gatewayCheckout(
+  repository: CheckRepository,
+  source: Source,
+  accountId: string,
+  now: number,
+): GatewayCheckout {
+  assertRepository(repository, source);
   if (!SHA.test(source.sha)) throw new Error("check source is not a full commit SHA");
   if (namespaceOf(source.providerData) !== source.owner) {
     throw new Error("check source namespace does not match its owner");
@@ -111,6 +123,12 @@ export function gatewayCheckout(source: Source, accountId: string, now: number):
     sha: source.sha,
     fence: { policy, expiresAt: now + CHECKOUT_GRANT_MS },
   };
+}
+
+function assertRepository(repository: CheckRepository, source: Source): void {
+  if (source.owner !== repository.owner || source.repo !== repository.repo) {
+    throw new Error("check source is not the adapter's repository");
+  }
 }
 
 function namespaceOf(providerData: unknown): string | null {

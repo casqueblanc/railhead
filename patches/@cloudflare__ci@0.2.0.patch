@@ -21,10 +21,10 @@ index 481724b271c3cd141b71d5bee1928932fdfafa00..37c54d671816e8d788752046e2b4677d
  import type { CloudflareArtifacts } from '../pipeline';
  import type { SourceControlRepositoryFilter } from '../source-control-adapter';
 diff --git a/src/ci/cache.ts b/src/ci/cache.ts
-index 433f19c0e750f2957e1c08e9c41600f90b234296..6670ed4c08159872474c5a3edf36c1a2207d2706 100644
+index 433f19c0e750f2957e1c08e9c41600f90b234296..313689a60b31712c80f6c8e703cd6d8dad70383d 100644
 --- a/src/ci/cache.ts
 +++ b/src/ci/cache.ts
-@@ -55,6 +55,11 @@ export type SnapshotCacheInput = {
+@@ -55,12 +55,25 @@ export type SnapshotCacheInput = {
    label: string;
  };
  
@@ -36,7 +36,39 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..6670ed4c08159872474c5a3edf36c1a2
  export type PublishSnapshotCacheInput = SnapshotCacheInput & {
    snapshot: DirectoryBackup;
    producedBySha: string;
-@@ -143,7 +148,7 @@ async function writeCachePointer(
+ };
+ 
+ const CACHE_PREFIX = 'cache';
++
++// Railhead patch: the binding is optional, and a step without it never caches.
++function backupBucket(env: Bindings): R2Bucket {
++  if (env.BACKUP_BUCKET === undefined) {
++    throw new Error('the snapshot cache needs a BACKUP_BUCKET binding');
++  }
++  return env.BACKUP_BUCKET;
++}
+ // Layout the @cloudflare/sandbox backup store writes under BACKUP_BUCKET.
+ const BACKUP_PREFIX = 'backups';
+ const BACKUP_META = 'meta.json';
+@@ -101,7 +114,7 @@ async function readCachePointer(
+   env: Bindings,
+   key: string
+ ): Promise<CachePointer | null> {
+-  const object = await env.BACKUP_BUCKET.get(`${CACHE_PREFIX}/${key}.json`);
++  const object = await backupBucket(env).get(`${CACHE_PREFIX}/${key}.json`);
+   if (!object) {
+     return null;
+   }
+@@ -131,7 +144,7 @@ async function writeCachePointer(
+   key: string,
+   pointer: CachePointer
+ ): Promise<void> {
+-  await env.BACKUP_BUCKET.put(
++  await backupBucket(env).put(
+     `${CACHE_PREFIX}/${key}.json`,
+     JSON.stringify(pointer)
+   );
+@@ -143,7 +156,7 @@ async function writeCachePointer(
   */
  export async function lookupSnapshotCache(
    env: Bindings,
@@ -45,7 +77,7 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..6670ed4c08159872474c5a3edf36c1a2
  ): Promise<SnapshotCacheLookup> {
    const pointer = await readCachePointer(env, input.key);
    console.log('[cache] pointer read', {
-@@ -168,12 +173,13 @@ export async function lookupSnapshotCache(
+@@ -168,12 +181,13 @@ export async function lookupSnapshotCache(
      result: pointer && metadata ? 'HIT' : 'MISS',
    });
  
@@ -61,8 +93,26 @@ index 433f19c0e750f2957e1c08e9c41600f90b234296..6670ed4c08159872474c5a3edf36c1a2
      cachePointer: { key: input.key, ...metadata },
    };
  }
+@@ -222,7 +236,7 @@ async function readBackupMetadata(
+   env: Bindings,
+   backupId: string
+ ): Promise<{ createdAt: string; sizeBytes: number } | null> {
+-  const meta = await env.BACKUP_BUCKET.get(
++  const meta = await backupBucket(env).get(
+     `${BACKUP_PREFIX}/${backupId}/${BACKUP_META}`
+   );
+   if (!meta) {
+@@ -261,7 +275,7 @@ async function readBackupMetadata(
+     });
+     return null;
+   }
+-  const archive = await env.BACKUP_BUCKET.head(
++  const archive = await backupBucket(env).head(
+     `${BACKUP_PREFIX}/${backupId}/${BACKUP_ARCHIVE}`
+   );
+   if (!archive) {
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..81af991e8ed7611a175d72cc2b6332bf9f15f705 100644
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..3465a35a439ddafe054fbaf7991ac27a11b5a360 100644
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
 @@ -1,5 +1,6 @@
@@ -72,7 +122,17 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..81af991e8ed7611a175d72cc2b6332bf
  
  import { z } from 'zod';
  import type {
-@@ -167,6 +168,7 @@ async function executeStep(
+@@ -103,7 +104,8 @@ async function prepareStep(
+   const cacheKey = await resolveStepCacheKey(
+     sourceControlProvider,
+     source,
+-    input
++    input,
++    env.BACKUP_BUCKET !== undefined
+   );
+   const extraEnv: Record<string, string> = { ...input.env };
+   if (
+@@ -167,6 +169,7 @@ async function executeStep(
      ? await lookupSnapshotCache(env, {
          key: prepared.cacheKey,
          label: input.label,
@@ -80,8 +140,44 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..81af991e8ed7611a175d72cc2b6332bf
        })
      : { status: 'miss' as const };
    if (cache.status === 'hit') {
+@@ -210,9 +213,14 @@ async function finalizeStep(
+   prepared: PreparedStep,
+   execution: CompletedStepExecution
+ ): Promise<CompletedStepExecution> {
++  // Railhead patch: a step with a cache key ran with the binding, so its
++  // runner made a backup; a missing one is an error, not a silent skip.
+   if (!prepared.cacheKey || execution.cachePointer) {
+     return execution;
+   }
++  if (!execution.snapshot) {
++    throw new Error(`${input.label} did not produce a workspace snapshot`);
++  }
+   // Write the small JSON pointer at the deterministic cache key. It records the
+   // randomly generated id of the sandbox workspace backup so a future run can
+   // rediscover it; the backup already exists, we only add the indirection.
+@@ -234,11 +242,19 @@ async function finalizeStep(
+ async function resolveStepCacheKey(
+   sourceControlProvider: SourceControlProvider,
+   source: SourceControlSource,
+-  input: CiRunStepInput
++  input: CiRunStepInput,
++  hasBackupBucket: boolean
+ ) {
+   if (!input.cachePaths) {
+     return undefined;
+   }
++  // Railhead patch: without the binding there is no backup to cache.
++  if (!hasBackupBucket) {
++    console.warn('[cache] no BACKUP_BUCKET binding; skipping cache', {
++      label: input.label,
++    });
++    return undefined;
++  }
+   if (input.cachePaths.length === 0) {
+     throw new Error(`cache(${input.label}): inputs must not be empty`);
+   }
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926f3fd8987 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..1b6bb17e3c77ed42964cd07b05ef2f1115a07c61 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
 @@ -1,5 +1,6 @@
@@ -100,7 +196,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
     */
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
-@@ -45,13 +46,30 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -45,13 +46,40 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
      });
  
@@ -130,14 +226,24 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
 +          input.source.fence.expiresAt
 +        );
 +      }
-+      // Railhead patch: always back up and restore through the R2 binding. The
++      // Railhead patch: back up and restore only through the R2 binding. The
 +      // container has no route to R2 presigned URLs, and RPC streams those
-+      // archives instead of base64-encoding them into a single request.
++      // archives instead of base64-encoding them into a single request. Without
++      // the binding the run makes no backup and cannot restore one.
 +      const localBucket = true;
++      const backups = this.env.BACKUP_BUCKET !== undefined;
++      if (!backups) {
++        console.warn('[sandbox] no BACKUP_BUCKET binding; no workspace backup', {
++          label: input.label,
++        });
++        if (input.restore) {
++          throw new Error('restoring a workspace needs a BACKUP_BUCKET binding');
++        }
++      }
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
          // Overlay (no rm) so cached node_modules survive while tracked source
-@@ -59,20 +77,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -59,20 +87,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          // different commit's source (e.g. a reused install cache), so this is
          // what keeps it correct. Files deleted since then linger; the next
          // install/build regenerates derived output.
@@ -177,10 +283,17 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
        }
  
        const proc = await sandbox.startProcess(
-@@ -102,46 +127,39 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-         ttl: input.ttlSeconds,
-         localBucket,
-       });
+@@ -95,53 +130,48 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         return { exitCode, logs: preview, preview };
+       }
+ 
+-      const snapshot = await sandbox.createBackup({
+-        dir: WORKSPACE_DIR,
+-        name: input.label,
+-        multipart: true,
+-        ttl: input.ttlSeconds,
+-        localBucket,
+-      });
 -      const rawLogs = await readLogs(sandbox);
 -      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
 -        (value): value is ReadableStream<Uint8Array> =>
@@ -188,6 +301,15 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
 -      );
 -      if (streams.length === 0) {
 -        return { exitCode, logs: rawLogs, preview, snapshot };
++      const snapshot = backups
++        ? await sandbox.createBackup({
++            dir: WORKSPACE_DIR,
++            name: input.label,
++            multipart: true,
++            ttl: input.ttlSeconds,
++            localBucket,
++          })
++        : undefined;
 +      // Railhead patch: logs are read in full before the sandbox is released,
 +      // so the run returns, and a cache pointer is published, only after its
 +      // retirement settled. A log above the inline limit keeps its tail.
@@ -250,7 +372,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -157,11 +175,20 @@ async function readLog(
+@@ -157,11 +187,20 @@ async function readLog(
    sandbox: ReturnType<typeof getSandbox>,
    file: string,
    size: number
@@ -275,7 +397,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
  }
  
  async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
-@@ -198,43 +225,6 @@ function resolveCwd(cwd: string | undefined) {
+@@ -198,43 +237,6 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  
@@ -320,7 +442,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926
    return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
  }
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
-index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..03276e31209da5da53a75d0fd583775422f13134 100644
+index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..2ccefdbb7abd707a4b947e96e45ee5daa6bc3f39 100644
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
 @@ -1,5 +1,6 @@
@@ -330,7 +452,20 @@ index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..03276e31209da5da53a75d0fd5837754
  
  import type {
    CacheSnapshotPointer,
-@@ -52,7 +53,11 @@ export async function withStepNotification(
+@@ -21,9 +22,9 @@ export type StepExecution = {
+   cacheHit: boolean;
+ };
+ 
+-export type CompletedStepExecution = StepExecution & {
+-  snapshot: DirectoryBackup;
+-};
++// Railhead patch: a run without a BACKUP_BUCKET binding completes with no
++// snapshot; the runner makes one whenever the binding is present.
++export type CompletedStepExecution = StepExecution;
+ 
+ /**
+  * Runs and finalizes a runner, then reports success or failure.
+@@ -52,17 +53,15 @@ export async function withStepNotification(
          execution.preview,
          input.sensitiveValues
        );
@@ -343,7 +478,18 @@ index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..03276e31209da5da53a75d0fd5837754
          `${input.label} failed with exit code ${execution.exitCode}\n=== stdout ===\n${stdout}\n=== stderr ===\n${stderr}`
        );
      }
-@@ -115,7 +120,13 @@ function redactPreview(
+-    if (!execution.snapshot) {
+-      throw new Error(`${input.label} did not produce a workspace snapshot`);
+-    }
+-    const completed = await finalize({
+-      ...execution,
+-      snapshot: execution.snapshot,
+-    });
++    const completed = await finalize(execution);
+     execution = completed;
+ 
+     await input.handle?.succeed({
+@@ -115,7 +114,13 @@ function redactPreview(
    };
  }
  
@@ -357,8 +503,23 @@ index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..03276e31209da5da53a75d0fd5837754
    const message = redact(
      error instanceof Error ? error.message : String(error),
      sensitiveValues
+diff --git a/src/env.ts b/src/env.ts
+index bf350484ff9f6a861b661800e48ed2b52a10e77b..c3bc3075d1e23912f6fcb5c725be40a152036644 100644
+--- a/src/env.ts
++++ b/src/env.ts
+@@ -19,7 +19,9 @@ type Secrets = {
+ // this with its Wrangler-generated CloudflareBindings for configuration checks.
+ export type Bindings = Secrets & {
+   ARTIFACTS: Artifacts;
+-  BACKUP_BUCKET: R2Bucket;
++  // Railhead patch: optional. Without it a run makes no workspace backup, so
++  // nothing is cached or restored and a chained runner cannot start.
++  BACKUP_BUCKET?: R2Bucket;
+   BACKUP_BUCKET_NAME: string;
+   CLOUDFLARE_ACCOUNT_ID: string;
+   SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox>;
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
-index a0ac164d44c2caace0a209652d181b013a2138e9..62634b64af5f164442df2462374b827b48c87c3c 100644
+index a0ac164d44c2caace0a209652d181b013a2138e9..b2322d4b117b1fe2a0a9fe980b71f160fc0066e7 100644
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
 @@ -1,5 +1,6 @@
@@ -368,6 +529,37 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..62634b64af5f164442df2462374b827b
  
  import {
    WorkflowEntrypoint,
+@@ -140,9 +141,20 @@ export abstract class CIWorkflow<
+     // Workflow waits.
+     const invoke = (
+       options: RunnerOptions,
+-      inherited: DirectoryBackup | undefined
++      inherited: DirectoryBackup | undefined,
++      chained = false
+     ): Promise<CiRunnerResult> =>
+       runners.run(options, inherited, () => {
++        // Railhead patch: a chained runner continues its parent's workspace.
++        // Without a BACKUP_BUCKET binding the parent saved none, so the runner
++        // fails before it starts a sandbox instead of running on a bare checkout.
++        if (chained && inherited === undefined) {
++          return Promise.reject(
++            new Error(
++              `runner(${options.name}): no BACKUP_BUCKET binding, so a chained runner cannot inherit its parent's workspace`
++            )
++          );
++        }
+         const config = resolveRunnerConfig(options);
+         return step
+           .do(options.name, config.workflow, (ctx) =>
+@@ -166,7 +178,7 @@ export abstract class CIWorkflow<
+             Object.freeze({
+               ...output,
+               runner: (nextOptions: RunnerOptions) =>
+-                invoke(nextOptions, output.snapshot),
++                invoke(nextOptions, output.snapshot, true),
+             })
+           );
+       });
 diff --git a/src/pipeline/failures.ts b/src/pipeline/failures.ts
 index 0de55443ec8666eab4e24d0095c70d4b5878179c..e68af6643f119c1340cba3adff708dbfb6526f79 100644
 --- a/src/pipeline/failures.ts
@@ -390,6 +582,21 @@ index 5246f0c3af3b1b2eca5ad58f50e2b7807cb7201b..b572f5d1f59522575b5f25fd03fc14f3
  
  import { CiRunnerFailure } from './failures';
  import type { CiRunnerResult, DirectoryBackup, RunnerOptions } from './types';
+diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
+index a1f5ff3aa8c30350300f3bd8d1f25cbc850aff65..33e4f26712e516fd31d2696ee5271ef774e45e93 100644
+--- a/src/pipeline/types.ts
++++ b/src/pipeline/types.ts
+@@ -141,8 +141,8 @@ export type CiRunStepOutput = {
+   // The workspace backup the sandbox writes after every successful runner. The
+   // sandbox SDK stores it under a randomly generated id, so this handle is the
+   // only way to find it again; the next chained runner restores from it.
+-  // Always present.
+-  snapshot: DirectoryBackup;
++  // Railhead patch: absent only when the Worker has no BACKUP_BUCKET binding.
++  snapshot?: DirectoryBackup;
+   // Metadata for the deterministic cache pointer, present only when the runner
+   // opted into caching. The pointer is a second-order indirection: a small R2
+   // object at a content-addressed key that records `snapshot`'s random id, so a
 diff --git a/src/shared/source-checkout.ts b/src/shared/source-checkout.ts
 index f83770cfc430aacd3c257dc90e46ae8b2fa8be51..5defe23bfdbb4cfc3ae358b0cc9a1603a3751b13 100644
 --- a/src/shared/source-checkout.ts
