@@ -1,6 +1,6 @@
 import type { RpcTarget } from "capnweb";
 import type { RepoSegment } from "./agent-api";
-import type { BoardApi, BoardResult, OwnerEnrollmentApi } from "./board-api";
+import type { BoardApi, BoardResult, DemoSeedApi, OwnerEnrollmentApi } from "./board-api";
 
 /** Path on the backend origin where the Cap'n Web session is served. */
 export const API_PATH = "/api";
@@ -24,4 +24,6 @@ export interface RailheadApi extends PublicApi {
   openBoard(org: RepoSegment, repo: RepoSegment): Promise<BoardResult<BoardApi>>;
   /** The instance owner's passkey enrollment, open only until it first succeeds. */
   ownerEnrollment(): Promise<OwnerEnrollmentApi>;
+  /** Seeding and resetting the demo repository, each action approved with the owner passkey. */
+  demoSeed(): Promise<DemoSeedApi>;
 }

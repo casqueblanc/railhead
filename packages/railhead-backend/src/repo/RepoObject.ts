@@ -6,24 +6,38 @@
 // current state. No method takes an actor or appends an arbitrary event.
 //
 // A repository exists once `initialize` has recorded it. Until then the object reads, but never
-// writes, its storage, so a request for a name nobody created leaves nothing behind. All state is
-// rebuilt from storage when the object starts, so eviction or hibernation loses nothing but live
-// subscriptions.
+// writes, its storage, so a request for a name nobody created leaves nothing behind. The two demo
+// seed objects are the exception: the demo repository's object records its seed's Artifacts
+// effects and its reset marker, and migrates the Artifacts adapter's tables to list forks, before
+// `initialize`; the seed control object keeps its seal key and spent proofs without ever being
+// initialized. All state is rebuilt from storage when the object starts, so eviction or
+// hibernation loses nothing but live subscriptions.
 
 import { DurableObject } from "cloudflare:workers";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
 import type {
   ActionChallenge,
+  DemoSeedAction,
+  DemoSeedResult,
+  DemoSeedState,
   EventPage,
   OwnerAction,
   OwnerActionResult,
   PasskeyAssertion,
   PendingJoin,
 } from "@railhead/shared/board-api";
-import { MAX_EVENT_PAGE } from "@railhead/shared/board-api";
-import type { RepoId } from "@railhead/shared/events";
+import { DEMO_ORG, DEMO_REPO, MAX_EVENT_PAGE } from "@railhead/shared/board-api";
+import type { CommitSha, RepoId } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../contracts/result";
 import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
+import type { SeedControl } from "../modules/demoSeed/control";
+import {
+  DEMO_OBJECT_NAME,
+  DEMO_SEED_CONTROL,
+  demoSeedControl,
+  demoSeedTarget,
+} from "../modules/demoSeed/entry";
+import type { SeedTarget } from "../modules/demoSeed/target";
 import type { GitTarget } from "../modules/git/entry";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
@@ -52,6 +66,9 @@ const MIGRATIONS: readonly string[] = [
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL
   ) STRICT`,
+  // The history a reset replaces. A repository recorded before this step gets one here.
+  "ALTER TABLE repo ADD COLUMN history TEXT NOT NULL DEFAULT ''",
+  "UPDATE repo SET history = lower(hex(randomblob(16))) WHERE history = ''",
 ];
 
 /** The Durable Object name of the repository `org/name`. */
@@ -61,6 +78,8 @@ export function repoObjectName(org: RepoSegment, name: RepoSegment): string {
 
 interface Installed {
   summary: RepoSummary;
+  /** The history its log belongs to, new each time the repository is recorded. */
+  history: string;
   log: EventLog;
   ports: RepoPorts;
 }
@@ -69,6 +88,8 @@ interface Installed {
 export class Repo extends DurableObject<Env> {
   #installed: Installed | null = null;
   readonly #alarm: EarliestAlarm;
+  #seedControl: SeedControl | null = null;
+  #seedTarget: SeedTarget | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -112,21 +133,29 @@ export class Repo extends DurableObject<Env> {
     }
     migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
     const summary: RepoSummary = { repoId: `rep_${this.ctx.id.toString()}`, org, name };
+    // A repository recorded again after a reset reuses its id and restarts its `seq` numbers, so
+    // only a new history tells a cursor from the deleted log apart from one in the new log.
+    const history = randomHistory();
     this.ctx.storage.sql.exec(
-      "INSERT INTO repo (id, repo_id, org, name, created_at) VALUES (1, ?, ?, ?, ?)",
+      "INSERT INTO repo (id, repo_id, org, name, created_at, history) VALUES (1, ?, ?, ?, ?, ?)",
       summary.repoId,
       org,
       name,
       Date.now(),
+      history,
     );
     this.#installed = this.#install(summary);
     return ok(summary);
   }
 
-  /** Reads up to `limit` events after `cursor`. */
-  readEvents(cursor: number, limit: number): PortResult<EventPage> {
+  /**
+   * Reads up to `limit` events after `cursor`. A `history` other than `null` must be the log's
+   * current history, or the cursor is refused as belonging to another log.
+   */
+  readEvents(cursor: number, limit: number, history: string | null): PortResult<EventPage> {
     const installed = this.#installed;
     if (installed === null) return missing();
+    if (history !== null && history !== installed.history) return replaced();
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENT_PAGE) {
       return fail(
         "invalid_request",
@@ -140,6 +169,7 @@ export class Repo extends DurableObject<Env> {
         events: page.events,
         cursor: page.events.at(-1)?.seq ?? cursor,
         head: page.head,
+        history: installed.history,
       });
     } catch (error) {
       if (!(error instanceof EventLogError)) throw error;
@@ -161,14 +191,19 @@ export class Repo extends DurableObject<Env> {
     }
   }
 
-  /** Subscribes `listener` to events after `cursor`, through the stream module. */
+  /**
+   * Subscribes `listener` to events after `cursor`, through the stream module. `history` is checked
+   * as `readEvents` checks it.
+   */
   async subscribe(
     cursor: number,
     listener: StreamListener,
+    history: string | null,
   ): Promise<PortResult<StreamSubscription>> {
-    const ports = this.#ports();
-    if (ports === null) return missing();
-    return ports.stream.subscribe(cursor, listener);
+    const installed = this.#installed;
+    if (installed === null) return missing();
+    if (history !== null && history !== installed.history) return replaced();
+    return installed.ports.stream.subscribe(cursor, listener);
   }
 
   /** The joins waiting for the owner, through the identity module. */
@@ -221,6 +256,76 @@ export class Repo extends DurableObject<Env> {
     await this.#alarm.settle();
   }
 
+  /** The demo repository and its main, on the demo repository's object only. */
+  async demoSeedState(): Promise<PortResult<DemoSeedState | null>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.read();
+  }
+
+  /** Seeds the demo repository's main, after the control spent a proof for it. */
+  async seedDemo(head: CommitSha, pack: Uint8Array): Promise<PortResult<DemoSeedResult>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.seed(head, pack);
+  }
+
+  /** Resets the demo repository, after the control spent a proof for it. */
+  async resetDemo(): Promise<PortResult<DemoSeedResult>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.reset();
+  }
+
+  /** Prepares a demo seed action, on the demo seed's control object only. */
+  async prepareDemoSeed(action: DemoSeedAction): Promise<PortResult<ActionChallenge>> {
+    const control = this.#demoSeedControl();
+    if (control === null) return missing();
+    return control.prepare(action);
+  }
+
+  /** Performs a prepared demo seed action, on the demo seed's control object only. */
+  async performDemoSeed(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+    bundle: Uint8Array | null,
+  ): Promise<PortResult<DemoSeedResult>> {
+    const control = this.#demoSeedControl();
+    if (control === null) return missing();
+    return control.perform(challengeId, assertion, bundle);
+  }
+
+  #demoSeedTarget(): SeedTarget | null {
+    if (this.ctx.id.name !== DEMO_OBJECT_NAME) return null;
+    this.#seedTarget ??= demoSeedTarget(
+      {
+        repoId: `rep_${this.ctx.id.toString()}`,
+        storage: this.ctx.storage,
+        initialized: () => this.#installed !== null,
+        initialize: () => this.initialize(DEMO_ORG, DEMO_REPO),
+        wipe: async () => {
+          // Subscribers follow the history being deleted: they end, and a board that subscribes
+          // again starts from the new history.
+          this.#installed?.ports.stream.endAll("revoked");
+          await this.ctx.storage.deleteAll();
+          // Only once storage is empty: a wipe that fails leaves the Repo installed, as storage
+          // still holds it, so a seed finds an initialized Repo without main and is refused.
+          this.#installed = null;
+          // Whether the wipe removed the alarm or not, the next wake request must see storage.
+          await this.#alarm.load();
+        },
+      },
+      this.env,
+    );
+    return this.#seedTarget;
+  }
+
+  #demoSeedControl(): SeedControl | null {
+    if (this.ctx.id.name !== DEMO_SEED_CONTROL) return null;
+    this.#seedControl ??= demoSeedControl(this.ctx.storage, this.env);
+    return this.#seedControl;
+  }
+
   #ports(): RepoPorts | null {
     return this.#installed?.ports ?? null;
   }
@@ -243,6 +348,9 @@ export class Repo extends DurableObject<Env> {
 
   #install(summary: RepoSummary): Installed {
     migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
+    const history = this.ctx.storage.sql
+      .exec<{ history: string }>("SELECT history FROM repo WHERE id = 1")
+      .one().history;
     const log = EventLog.open(this.ctx.storage, summary.repoId);
     const ports = composeRepo({
       repoId: summary.repoId,
@@ -252,8 +360,18 @@ export class Repo extends DurableObject<Env> {
       env: this.env,
       wake: (at) => this.#alarm.request(at),
     });
-    return { summary, log, ports };
+    return { summary, history, log, ports };
   }
+}
+
+/** A new history: 128 random bits in lowercase hex. */
+function randomHistory(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function replaced(): PortResult<never> {
+  return fail("cursor_ahead", "The cursor belongs to a history this repository no longer holds.");
 }
 
 function missing(): PortResult<never> {
