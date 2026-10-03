@@ -83,13 +83,13 @@ export const MAX_GATE_ITEMS = MAX_LIST_LENGTH;
 const MAX_OPTION_KEY_LENGTH = 32;
 
 /** Most UTF-8 bytes of serialized items one `pending` page carries. */
-export const MAX_INBOX_PAGE_BYTES = MAX_AGENT_RESPONSE_BYTES / 2;
+const MAX_INBOX_PAGE_BYTES = MAX_AGENT_RESPONSE_BYTES / 2;
 
 /**
  * Most UTF-8 bytes of serialized items the digest on a command result carries. With a full page
  * beside it, a quarter of the response remains for the envelope.
  */
-export const MAX_DIGEST_BYTES = MAX_AGENT_RESPONSE_BYTES / 4;
+const MAX_DIGEST_BYTES = MAX_AGENT_RESPONSE_BYTES / 4;
 
 /**
  * Largest serialized item `queue` accepts, in UTF-8 bytes. It fits either budget alone, so the

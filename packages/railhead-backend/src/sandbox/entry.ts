@@ -26,7 +26,7 @@ export type { Admission, SandboxAttemptId, SlotRecord, SlotState } from "./admis
 export type { SandboxPolicy } from "./policy";
 
 /** How long a sandbox may take to start and answer its first command. */
-export const START_TIMEOUT_MS = 90_000;
+const START_TIMEOUT_MS = 90_000;
 
 /** How long a teardown may take before the slot is recorded as uncertain. */
 export const DESTROY_TIMEOUT_MS = 30_000;
@@ -35,7 +35,7 @@ export const DESTROY_TIMEOUT_MS = 30_000;
 export const MAX_COMMAND_TIMEOUT_MS = 10 * 60_000;
 
 /** How much longer than its own timeout a command's answer may take to arrive. */
-export const EXEC_GRACE_MS = 15_000;
+const EXEC_GRACE_MS = 15_000;
 
 /**
  * The most bytes of each output stream returned from one command. The container object drops the
