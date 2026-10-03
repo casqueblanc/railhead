@@ -220,6 +220,25 @@ describe("parseCapture", () => {
     },
   );
 
+  it("copies an event type no fixture log uses yet", () => {
+    const reopened: RailheadEvent = {
+      v: 1,
+      seq: 4,
+      at: SYNTH_START_MS + 4,
+      repo: SYNTH_REPO,
+      actor: { kind: "system", id: "sys_train" },
+      type: "claim.reopened",
+      data: {
+        claimId: "clm_synthatlas",
+        generation: 2,
+        decisions: [{ decisionId: "dec_synthsize", version: 2 }],
+      },
+    };
+    const events = [...issues(3), { ...reopened, data: { ...reopened.data, note: SECRET } }];
+    const result = parseCapture(fileOf({ events, head: 4 }));
+    expect(result.ok && result.capture.events).toEqual([...issues(3), reopened]);
+  });
+
   it("reads a captured source", () => {
     const result = parseCapture(fileOf({}));
     expect(result.ok && result.capture.source).toEqual(SOURCE);
