@@ -7,7 +7,7 @@ import {
 import type { CiBindings } from "@cloudflare/ci/worker";
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CHECKOUT_OUTBOUND_HANDLER,
   classifyRunnerFailure,
@@ -15,7 +15,8 @@ import {
   railheadCheckout,
   type RunnerFailure,
 } from "../src/checks/sdkCheckout";
-import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
+import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
+import { parseSandboxGrant } from "../src/sandbox/policy";
 import { RailheadSandbox } from "../src/sandbox/sandboxObject";
 
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
@@ -32,15 +33,21 @@ const SOURCE = {
   providerData: { namespace: NAMESPACE },
 };
 
+/** When the runner asks for the checkout in the gatewayCheckout tests. */
+const NOW = 1_800_000_000_000;
+
 describe("gatewayCheckout", () => {
-  it("names the exact commit, no token, and a read-only gateway policy for one repository", () => {
-    expect(gatewayCheckout(SOURCE, ACCOUNT)).toEqual({
+  it("names the exact commit, no token, and a read-only grant for one repository", () => {
+    expect(gatewayCheckout(SOURCE, ACCOUNT, NOW)).toEqual({
       kind: "git",
       remote: `https://${HOST}/git/railhead/demo.git`,
       sha: SHA,
       outbound: {
         handler: "gitGateway",
-        params: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
+        params: {
+          policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
+          expiresAt: NOW + MAX_SANDBOX_LIFETIME_MS,
+        },
       },
     });
   });
@@ -60,73 +67,148 @@ describe("gatewayCheckout", () => {
     ["missing provider data", { ...SOURCE, providerData: null }],
     ["an invalid repository name", { ...SOURCE, repo: "../main" }],
   ])("refuses %s before any sandbox starts", (_name, source) => {
-    expect(() => gatewayCheckout(source, ACCOUNT)).toThrow();
+    expect(() => gatewayCheckout(source, ACCOUNT, NOW)).toThrow();
   });
 
   it("refuses an account ID that would make another host", () => {
-    expect(() => gatewayCheckout(SOURCE, "evil.example.com/x")).toThrow(
+    expect(() => gatewayCheckout(SOURCE, "evil.example.com/x", NOW)).toThrow(
       "invalid Cloudflare account ID",
     );
   });
+
+  it.each([Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 2])(
+    "refuses a checkout time of %s, which would make a grant the gateway rejects",
+    (now) => {
+      expect(() => gatewayCheckout(SOURCE, ACCOUNT, now)).toThrow("invalid checkout time");
+    },
+  );
 });
 
-/** Gateway dependencies that record each minted token and forwarded Authorization header. */
-function recorder(): GatewayDeps & { minted: string[]; auth: (string | null)[] } {
+/**
+ * The gitGateway handler RailheadSandbox registers, over a recording Artifacts binding and upstream
+ * fetch. Nothing is stubbed between the outbound params and the gateway: the handler parses them.
+ */
+function registeredGateway() {
+  const handler = RailheadSandbox.outboundHandlers?.[CHECKOUT_OUTBOUND_HANDLER];
+  if (handler === undefined) throw new Error("no git gateway handler");
   const minted: string[] = [];
-  const auth: (string | null)[] = [];
+  const forwarded: { url: string; auth: string | null }[] = [];
+  const bindings = {
+    ARTIFACTS: {
+      get: async (repo: string) => ({
+        createToken: async (scope: string, ttl: number) => {
+          minted.push(`${scope}:${repo}:${ttl}`);
+          return { plaintext: `minted-${scope}` };
+        },
+        [Symbol.dispose]: () => {},
+      }),
+    },
+  };
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    forwarded.push({ url: request.url, auth: request.headers.get("Authorization") });
+    return new Response("upstream");
+  });
   return {
     minted,
-    auth,
-    mint: async (repo, scope) => {
-      minted.push(`${scope}:${repo}`);
-      return `minted-${scope}`;
-    },
-    fetch: async (request) => {
-      auth.push(request.headers.get("Authorization"));
-      return new Response("ok");
+    forwarded,
+    async serve(request: Request, params: unknown): Promise<Response> {
+      const context = { containerId: "c", className: "RailheadSandbox", params };
+      // The fake binding implements only what the handler calls, not the whole Env.
+      const response: unknown = await Reflect.apply(handler, undefined, [
+        request,
+        bindings,
+        context,
+      ]);
+      if (!(response instanceof Response)) throw new Error("the handler returned no Response");
+      return response;
     },
   };
 }
 
-describe("the checkout's policy at the Git gateway", () => {
-  it("lets the checkout fetch with a read token minted outside the sandbox", async () => {
-    const { remote, outbound } = gatewayCheckout(SOURCE, ACCOUNT);
-    const deps = recorder();
+function fetchRefs(remote: string): Request {
+  return new Request(`${remote}/info/refs?service=git-upload-pack`);
+}
 
-    const response = await serveGitGateway(
-      new Request(`${remote}/info/refs?service=git-upload-pack`),
-      outbound.params,
-      deps,
-    );
+/** A checkout asked for at `NOW`, with the gateway's clock at `at`. */
+function checkoutAt(at: number) {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(at);
+  return gatewayCheckout(SOURCE, ACCOUNT, NOW);
+}
 
-    expect(response.status).toBe(200);
-    expect(deps.minted).toEqual(["read:demo"]);
-    expect(deps.auth).toEqual(["Bearer minted-read"]);
+describe("the checkout's grant at the registered Git gateway", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  it("refuses a push and another repository under the checkout's policy", async () => {
-    const { outbound } = gatewayCheckout(SOURCE, ACCOUNT);
-    const deps = recorder();
+  it("forwards the checkout's fetch with a read token minted outside the sandbox", async () => {
+    const { remote, outbound } = checkoutAt(NOW);
+    const gateway = registeredGateway();
 
-    const push = await serveGitGateway(
+    const response = await gateway.serve(fetchRefs(remote), outbound.params);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("upstream");
+    expect(gateway.minted).toEqual(["read:demo:60"]);
+    expect(gateway.forwarded).toEqual([
+      { url: `${remote}/info/refs?service=git-upload-pack`, auth: "Bearer minted-read" },
+    ]);
+  });
+
+  it("forwards one millisecond before the grant lapses and refuses at the moment it does", async () => {
+    const { remote, outbound } = checkoutAt(NOW + MAX_SANDBOX_LIFETIME_MS - 1);
+    const gateway = registeredGateway();
+
+    const before = await gateway.serve(fetchRefs(remote), outbound.params);
+    vi.setSystemTime(NOW + MAX_SANDBOX_LIFETIME_MS);
+    const at = await gateway.serve(fetchRefs(remote), outbound.params);
+
+    expect(before.status).toBe(200);
+    expect(at.status).toBe(403);
+    expect(await at.text()).toContain("policy");
+    expect(gateway.minted).toEqual(["read:demo:60"]);
+    expect(gateway.forwarded).toHaveLength(1);
+  });
+
+  it("refuses a checkout policy passed without its deadline, and no params at all", async () => {
+    const { remote, outbound } = checkoutAt(NOW);
+    const gateway = registeredGateway();
+
+    const bare = await gateway.serve(fetchRefs(remote), outbound.params.policy);
+    const missing = await gateway.serve(fetchRefs(remote), undefined);
+
+    for (const response of [bare, missing]) {
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("policy");
+    }
+    expect(gateway.minted).toEqual([]);
+    expect(gateway.forwarded).toEqual([]);
+  });
+
+  it("refuses a push and another repository under the checkout's grant", async () => {
+    const { outbound } = checkoutAt(NOW);
+    const gateway = registeredGateway();
+
+    const push = await gateway.serve(
       new Request(`https://${HOST}/git/railhead/demo.git/git-receive-pack`, {
         method: "POST",
         body: "0000",
       }),
       outbound.params,
-      deps,
     );
-    const other = await serveGitGateway(
-      new Request(`https://${HOST}/git/railhead/other.git/info/refs?service=git-upload-pack`),
+    const other = await gateway.serve(
+      fetchRefs(`https://${HOST}/git/railhead/other.git`),
       outbound.params,
-      deps,
     );
 
     expect(push.status).toBe(403);
     expect(await push.text()).toContain("read-only");
     expect(other.status).toBe(403);
     expect(await other.text()).toContain("repository");
-    expect(deps.minted).toEqual([]);
+    expect(gateway.minted).toEqual([]);
+    expect(gateway.forwarded).toEqual([]);
   });
 });
 
@@ -150,7 +232,7 @@ class ScriptedSandbox {
   readonly backups: { localBucket: unknown }[] = [];
   readonly restored: unknown[] = [];
   readonly scripts: string[] = [];
-  policy: unknown = null;
+  outboundParams: unknown = null;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -163,7 +245,7 @@ class ScriptedSandbox {
 
   async setOutboundHandler(handler: string, params: unknown) {
     this.calls.push(`outbound:${handler}`);
-    this.policy = params;
+    this.outboundParams = params;
   }
 
   async execWithSessionToken(command: string, _session: string, options?: { env?: object }) {
@@ -377,6 +459,10 @@ const SECRETS = [
 ];
 
 describe("a check run through the patched SDK", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("checks out through the gateway with no credential anywhere in the sandbox", async () => {
     const { outcome, sandbox, artifacts } = await run({});
 
@@ -394,7 +480,10 @@ describe("a check run through the patched SDK", () => {
       "backup",
       "destroy",
     ]);
-    expect(sandbox.policy).toEqual(gatewayCheckout(SOURCE, ACCOUNT).outbound.params);
+    expect(sandbox.outboundParams).toEqual({
+      policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
+      expiresAt: expect.any(Number),
+    });
     // Credential probes: the checkout script, every command's environment and Artifacts calls.
     const seen = JSON.stringify([sandbox.scripts, sandbox.envs]);
     for (const secret of SECRETS) expect(seen).not.toContain(secret);
@@ -402,6 +491,25 @@ describe("a check run through the patched SDK", () => {
     expect(artifacts.calls).toEqual([]);
     // Backups stay on the R2 binding: the container has no route to presigned URLs.
     expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
+  });
+
+  it("passes the registered gateway a grant that serves the checkout's fetch until it lapses", async () => {
+    const started = Date.now();
+    const { sandbox } = await run({});
+    const finished = Date.now();
+    const grant = parseSandboxGrant(sandbox.outboundParams);
+    const gateway = registeredGateway();
+
+    const response = await gateway.serve(
+      fetchRefs(`https://${HOST}/git/railhead/demo.git`),
+      sandbox.outboundParams,
+    );
+
+    expect(grant?.expiresAt).toBeGreaterThanOrEqual(started + MAX_SANDBOX_LIFETIME_MS);
+    expect(grant?.expiresAt).toBeLessThanOrEqual(finished + MAX_SANDBOX_LIFETIME_MS);
+    expect(response.status).toBe(200);
+    expect(gateway.minted).toEqual(["read:demo:60"]);
+    expect(gateway.forwarded.map(({ auth }) => auth)).toEqual(["Bearer minted-read"]);
   });
 
   it("records a checkout that cannot find the commit as an error and never runs the check", async () => {

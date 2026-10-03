@@ -2,9 +2,10 @@
 // `@cloudflare/ci` patched by `patches/@cloudflare__ci@0.2.0.patch`.
 //
 // No token enters the sandbox. The checkout names the Git gateway (`src/sandbox/gateway.ts`) with
-// a read-only policy for the one repository, and the patched runner selects that handler before its
-// first command; the gateway adds a short-lived token outside the container. The patched runner
-// also stops a run whose checkout exits nonzero before the check's command starts.
+// a grant: a read-only policy for the one repository that lapses after the longest sandbox
+// lifetime. The patched runner selects that handler before its first command; the gateway adds a
+// short-lived token outside the container. The patched runner also stops a run whose checkout exits
+// nonzero before the check's command starts.
 //
 // `classifyRunnerFailure` then separates the change's fault from Railhead's: `fail` only when the
 // check's own command exited nonzero, `error` for everything else, so a missing commit, a refused
@@ -12,10 +13,17 @@
 
 import { cloudflareArtifacts, isCiRunnerFailure, type CloudflareArtifacts } from "@cloudflare/ci";
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
-import { parseSandboxPolicy, type SandboxPolicy } from "../sandbox/policy";
+import { MAX_SANDBOX_LIFETIME_MS } from "../sandbox/admission";
+import { parseSandboxPolicy, type SandboxGrant } from "../sandbox/policy";
 
-/** The `RailheadSandbox` outbound handler that serves Git for a policy. */
+/** The `RailheadSandbox` outbound handler that serves Git for a grant. */
 export const CHECKOUT_OUTBOUND_HANDLER = "gitGateway";
+
+/**
+ * How long a checkout's grant lasts from the moment the runner asks for it: no sandbox outlives
+ * `MAX_SANDBOX_LIFETIME_MS`, so the gateway refuses the sandbox's Git requests after that.
+ */
+export const CHECKOUT_GRANT_MS = MAX_SANDBOX_LIFETIME_MS;
 
 /** The first line the patched runner throws when the checkout exits nonzero. */
 const CHECKOUT_FAILED = "source checkout exited with status ";
@@ -28,12 +36,12 @@ const COMMAND_FAILED = /^ failed with exit code ([1-9][0-9]{0,9})\n=== stdout ==
 type Provider = ReturnType<SourceControlAdapter<CloudflareArtifacts>["create"]>;
 type Source = Parameters<Provider["getSourceCheckout"]>[0];
 
-/** The checkout a runner receives: no token, and the gateway handler with its policy. */
+/** The checkout a runner receives: no token, and the gateway handler with its grant. */
 export interface GatewayCheckout {
   kind: "git";
   remote: string;
   sha: string;
-  outbound: { handler: typeof CHECKOUT_OUTBOUND_HANDLER; params: SandboxPolicy };
+  outbound: { handler: typeof CHECKOUT_OUTBOUND_HANDLER; params: SandboxGrant };
 }
 
 /** One Artifacts repository a check reads: `owner` is its namespace. */
@@ -57,7 +65,10 @@ export function railheadCheckout(
       return {
         // Railhead starts each run for an exact candidate; an Artifacts push never starts one.
         receiveEvent: async () => null,
-        getSourceCheckout: async (source) => gatewayCheckout(source, env.CLOUDFLARE_ACCOUNT_ID),
+        // The SDK asks for the checkout in the same step that starts the sandbox, so the grant
+        // runs from then.
+        getSourceCheckout: async (source) =>
+          gatewayCheckout(source, env.CLOUDFLARE_ACCOUNT_ID, Date.now()),
         // Cache fingerprints read blob hashes through the Worker's binding, outside the sandbox.
         listTreeBlobs: (source, paths) => delegate.listTreeBlobs(source, paths),
         getStepCredentialEnv: () => Promise.reject(new Error(NO_CREDENTIALS)),
@@ -73,15 +84,17 @@ const NO_CREDENTIALS = "railhead checks never hand repository credentials to a r
 
 /**
  * The checkout for `source`: the exact commit, fetched through the gateway under a read-only policy
- * for its repository. Throws, before any sandbox starts, for a SHA that is not 40 lowercase hex
- * digits, a namespace that does not match the owner, or an invalid account or repository name.
+ * for its repository that lapses `CHECKOUT_GRANT_MS` after `now`. Throws, before any sandbox
+ * starts, for a SHA that is not 40 lowercase hex digits, a namespace that does not match the owner,
+ * an invalid account or repository name, or a time that is not whole milliseconds.
  */
-export function gatewayCheckout(source: Source, accountId: string): GatewayCheckout {
+export function gatewayCheckout(source: Source, accountId: string, now: number): GatewayCheckout {
   if (!SHA.test(source.sha)) throw new Error("check source is not a full commit SHA");
   if (namespaceOf(source.providerData) !== source.owner) {
     throw new Error("check source namespace does not match its owner");
   }
   if (!ACCOUNT_ID.test(accountId)) throw new Error("invalid Cloudflare account ID");
+  if (!Number.isSafeInteger(now)) throw new Error("invalid checkout time");
   const host = `${accountId}.artifacts.cloudflare.net`;
   const policy = parseSandboxPolicy({
     host,
@@ -94,7 +107,10 @@ export function gatewayCheckout(source: Source, accountId: string): GatewayCheck
     kind: "git",
     remote: `https://${host}/git/${source.owner}/${source.repo}.git`,
     sha: source.sha,
-    outbound: { handler: CHECKOUT_OUTBOUND_HANDLER, params: policy },
+    outbound: {
+      handler: CHECKOUT_OUTBOUND_HANDLER,
+      params: { policy, expiresAt: now + CHECKOUT_GRANT_MS },
+    },
   };
 }
 
