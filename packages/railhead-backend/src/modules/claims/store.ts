@@ -93,6 +93,11 @@ export function activeClaimOf(sql: SqlStorage, agentId: AgentId): ClaimRow | nul
   );
 }
 
+/** The claim, or `null`. */
+export function claimById(sql: SqlStorage, claimId: ClaimId): ClaimRow | null {
+  return first(sql.exec<RawClaim>(`${SELECT_CLAIM} WHERE c.claim_id = ?`, claimId));
+}
+
 /** How many active claims the owner's agents hold. */
 export function activeClaimsOfOwner(sql: SqlStorage, ownerId: UserId): number {
   const [row] = sql

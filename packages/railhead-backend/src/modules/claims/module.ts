@@ -3,7 +3,7 @@
 // Allocation has two steps. The first is synchronous, inside one Repo transaction: it chooses the
 // issue, checks the agent's and the owner's limits and records the claim as a fork intent. Nothing
 // can run between the choice and the record, so two requests never get the same issue. The second
-// step awaits Artifacts: it reads main, records that commit as the fork's requested base, forks,
+// step awaits other ports: it reads main through the main writer, records that commit as the fork's requested base, forks,
 // and opens the claim with the fork's head as its immutable base. If a response is lost, the
 // intent stays; the agent's next `work`, `claim` or status call finishes the same claim, and the
 // Artifacts adapter reconciles a fork that was created without its response.
@@ -12,22 +12,17 @@
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
 import type { ClaimResult, ClaimView } from "@railhead/shared/agent-api";
-import {
-  isCommitSha,
-  isId,
-  type ClaimId,
-  type CommitSha,
-  type IssueId,
-} from "@railhead/shared/events";
+import { isCommitSha, isId, type ClaimId, type IssueId } from "@railhead/shared/events";
 import type { ClaimsPort } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
-import { fail, ok, unavailable, type PortResult } from "../../contracts/result";
+import { fail, ok, type PortResult } from "../../contracts/result";
 import { unavailableClaims } from "../../contracts/unavailable";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { EventLogError } from "../../repo/eventLog";
 import {
   activeClaimOf,
   activeClaimsOfOwner,
+  claimById,
   insertIntent,
   insertIssue,
   issueByGrant,
@@ -39,9 +34,6 @@ import {
   type ClaimRow,
 } from "./store";
 
-/** Reads main's current commit. `MainWriterPort.head` once #107's contract lands. */
-export type MainHead = () => Promise<PortResult<CommitSha>>;
-
 /** Limits a test may tighten. */
 export interface ClaimsLimits {
   /** Most active claims all of one person's agents may hold together. */
@@ -51,23 +43,14 @@ export interface ClaimsLimits {
 /** The production limits. */
 export const CLAIMS_LIMITS: ClaimsLimits = { maxActiveClaimsPerOwner: 16 };
 
-/** What the claims module needs besides its context and the other ports. */
-export interface ClaimsDependencies {
-  /** Main's current commit, read just before a fork. */
-  readonly mainHead: MainHead;
-  /** The limits. */
-  readonly limits: ClaimsLimits;
-}
-
 /** Builds the claims port of one repository and migrates its tables. */
 export function createClaims(
   context: RepoContext,
   ports: () => RepoPorts,
-  dependencies: ClaimsDependencies,
+  limits: ClaimsLimits = CLAIMS_LIMITS,
 ): ClaimsPort {
   migrateClaims(context.storage);
   const { log, repoId } = context;
-  const { mainHead, limits } = dependencies;
 
   /** A step of allocation that either found the claim to finish or refused. */
   type Chosen = PortResult<{ row: ClaimRow; resumed: boolean }>;
@@ -96,7 +79,7 @@ export function createClaims(
     if (row.state !== "allocating") return ok({ claim: view(row), resumed });
     let forkBase = row.forkBase;
     if (forkBase === null) {
-      const head = await mainHead();
+      const head = await ports().mainWriter.head();
       if (!head.ok) return head;
       // The base is written once, so a malformed answer must not become a claim's permanent base.
       if (!isCommitSha(head.value)) return fail("internal", "Main's head is not a commit id.");
@@ -212,14 +195,29 @@ export function createClaims(
     },
 
     // Ready, pins and Git authority belong to the next layers of this module.
+    currentGeneration(claimId) {
+      // Only an opened claim that is still held has a current generation. An allocating claim has
+      // no fork yet, and a merged or expired one has no owner, so each reads as unknown.
+      const row = claimById(context.storage.sql, claimId);
+      if (row === null) return null;
+      switch (row.state) {
+        case "working":
+        case "ready":
+          return row.generation;
+        case "allocating":
+        case "merged":
+        case "expired":
+          return null;
+        default:
+          return row.state satisfies never;
+      }
+    },
+
     ready: unavailableClaims.ready,
     pin: unavailableClaims.pin,
     authorizeGit: unavailableClaims.authorizeGit,
   };
 }
-
-/** A main reader for a composition that has none: every allocation fails closed, with no fork. */
-export const noMainHead: MainHead = () => Promise.resolve(unavailable("mainWriter"));
 
 function lost(): PortResult<never> {
   return fail("busy", "The claim changed while it was being allocated; repeat the request.");

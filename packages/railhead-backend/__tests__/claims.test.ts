@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { ClaimResult } from "@railhead/shared/agent-api";
 import type { RailheadEvent } from "@railhead/shared/events";
 import {
+  ARTIFACTS_LIMITS,
   createArtifactsAdapter,
   forkRepoName,
   mainRepoName,
@@ -23,7 +24,7 @@ const REPO = "rep_claimsrepo1";
 const ROOT = "1".repeat(40);
 const HEAD = "2".repeat(40);
 const MOVED = "3".repeat(40);
-const FAST: ArtifactsAdapterLimits = { callTimeoutMs: 50, maxCachedTokens: 256 };
+const FAST: ArtifactsAdapterLimits = { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 };
 
 function agent(n: number, ownerId = "usr_owner0001"): AgentPrincipal {
   return { kind: "agent", agentId: `agt_agent000${n}`, ownerId, repoId: REPO };
@@ -75,16 +76,17 @@ function inRepo<T>(
     const context = { repoId: REPO, storage: state.storage, log, clock: fake.clock, env };
     const artifacts = createArtifactsAdapter({ ...context, namespace: fake }, FAST);
     const base = composeRepo(context);
-    const port = createClaims(context, () => ({ ...base, artifacts }), {
-      limits,
-      mainHead: async () => {
+    // Main is read through the main writer's `head`, answered here from the fake's main.
+    const mainWriter = {
+      ...base.mainWriter,
+      head: async (): Promise<PortResult<string>> => {
         world.mainReads += 1;
         if (world.mainHead !== null) return world.mainHead;
-        const commits = fake.repos.get(main)?.commits ?? [];
-        const tip = commits.at(-1);
+        const tip = fake.repos.get(main)?.commits.at(-1);
         return tip === undefined ? fail("internal", "Main is empty.") : ok(tip);
       },
-    });
+    };
+    const port = createClaims(context, () => ({ ...base, artifacts, mainWriter }), limits);
     const result = await body({
       port,
       sql: state.storage.sql,
@@ -324,6 +326,45 @@ describe("claim", () => {
   });
 });
 
+describe("currentGeneration", () => {
+  it("reports an opened claim's generation and unknown for anything else", async () => {
+    await withClaims(async ({ port, sql }, { fake }) => {
+      await fileIssues(port, 2);
+      const held = claimed(await port.work(agent(1)));
+      fake.failNextFork("lose-response");
+      expect((await port.work(agent(2))).ok).toBe(false);
+      const [intent] = sql
+        .exec<{ claim_id: string }>("SELECT claim_id FROM claims_claims WHERE state = 'allocating'")
+        .toArray()
+        .map((row) => row.claim_id);
+
+      expect(intent).toMatch(/^clm_/);
+      expect(port.currentGeneration(held.claim.claimId)).toBe(1);
+      // An allocating claim has no fork yet, so it has no generation a pin could match.
+      expect(port.currentGeneration(intent ?? "")).toBeNull();
+      expect(port.currentGeneration("clm_nosuchclaim")).toBeNull();
+      expect(port.currentGeneration("")).toBeNull();
+    });
+  });
+
+  it("reads as unknown once a claim is no longer held", async () => {
+    await withClaims(async ({ port, sql }) => {
+      await fileIssues(port, 1);
+      const held = claimed(await port.work(agent(1)));
+      for (const state of ["merged", "expired"]) {
+        sql.exec(
+          "UPDATE claims_claims SET state = ? WHERE claim_id = ?",
+          state,
+          held.claim.claimId,
+        );
+        expect(port.currentGeneration(held.claim.claimId)).toBeNull();
+      }
+      sql.exec("UPDATE claims_claims SET state = 'ready' WHERE claim_id = ?", held.claim.claimId);
+      expect(port.currentGeneration(held.claim.claimId)).toBe(1);
+    });
+  });
+});
+
 describe("quota", () => {
   it("stops one person's agents at the limit and lets another person's agent claim", async () => {
     await withClaims(
@@ -420,7 +461,7 @@ describe("allocation failures", () => {
     });
   });
 
-  it("refuses allocation in the installed composition, which has no main reader", async () => {
+  it("refuses allocation in the installed composition, whose main writer is missing", async () => {
     await runInDurableObject(freshStub(), async (_instance, state) => {
       const log = EventLog.open(state.storage, REPO);
       const context = { repoId: REPO, storage: state.storage, log, clock: () => 1, env };
