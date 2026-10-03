@@ -27,14 +27,16 @@ import {
   type RunnerFailure,
 } from "../src/checks/sdkCheckout";
 import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
-import { SandboxFence } from "../src/sandbox/fence";
+import { MAX_TEARDOWN_ATTEMPTS, SandboxFence, teardownRetryDelay } from "../src/sandbox/fence";
 import { parseSandboxGrant, type SandboxGrant } from "../src/sandbox/policy";
 import {
   FENCED_SANDBOX_METHODS,
   LOCAL_CLIENT_MEMBERS,
+  DISPOSAL_SWEEP_MS,
   RailheadSandbox,
   admitSandboxClient,
   fenceSandbox,
+  wakeTime,
   type FencedSandboxCalls,
 } from "../src/sandbox/sandboxObject";
 
@@ -47,30 +49,58 @@ const BACKUP_ID = "0b6c5f0e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
 /** The SDK's largest log returned whole; a larger one is read as its tail. */
 const INLINE_LOG_BYTES = 300_000;
 
+/** When the runner asks for the checkout in the gatewayCheckout tests. */
+const NOW = 1_800_000_000_000;
+
+/** The sandbox the repository admitted for the run, as `sandboxName` names one. */
+const SANDBOX = `sbx-${"0".repeat(32)}`;
+
+/** The admitted slot: its sandbox, and its deadline as admission at `NOW` sets it. */
+const SLOT = { sandbox: SANDBOX, deadline: NOW + MAX_SANDBOX_LIFETIME_MS };
+
 const SOURCE = {
   owner: NAMESPACE,
   repo: REPO,
   sha: SHA,
-  providerData: { namespace: NAMESPACE },
+  providerData: { namespace: NAMESPACE, slot: SLOT },
 };
+
+/** The policy every checkout of the repository runs under, as admission records it. */
+const POLICY = { host: HOST, namespace: NAMESPACE, read: [REPO], write: null };
 
 /** The one repository the adapter and its checkouts cover. */
 const REPOSITORY = { owner: NAMESPACE, repo: REPO };
 
-/** When the runner asks for the checkout in the gatewayCheckout tests. */
-const NOW = 1_800_000_000_000;
-
 describe("gatewayCheckout", () => {
-  it("names the exact commit, no token, and a read-only grant for one repository", () => {
-    expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW)).toEqual({
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("names the exact commit, no token, the admitted sandbox and a grant ending at its deadline", () => {
+    expect(gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT)).toEqual({
       kind: "git",
       remote: `https://${HOST}/git/railhead/demo.git`,
       sha: SHA,
       fence: {
         policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
         expiresAt: NOW + MAX_SANDBOX_LIFETIME_MS,
+        sandbox: SANDBOX,
       },
     });
+  });
+
+  it("takes the grant's end from the slot, never from when it is asked", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW + 1_000);
+    const deadline = NOW + 60_000;
+
+    const checkout = gatewayCheckout(
+      REPOSITORY,
+      { ...SOURCE, providerData: { namespace: NAMESPACE, slot: { sandbox: SANDBOX, deadline } } },
+      ACCOUNT,
+    );
+
+    expect(checkout.fence).toEqual(expect.objectContaining({ expiresAt: deadline }));
   });
 
   it.each([
@@ -78,39 +108,47 @@ describe("gatewayCheckout", () => {
     ["a long SHA", { ...SOURCE, sha: "a".repeat(41) }],
     ["an uppercase SHA", { ...SOURCE, sha: "A".repeat(40) }],
     ["a branch name", { ...SOURCE, sha: "refs/heads/main" }],
-    ["another namespace", { ...SOURCE, providerData: { namespace: "other" } }],
+    ["another namespace", { ...SOURCE, providerData: { namespace: "other", slot: SLOT } }],
     ["missing provider data", { ...SOURCE, providerData: null }],
+    ["no admitted slot", { ...SOURCE, providerData: { namespace: NAMESPACE } }],
     ["another repository in the namespace", { ...SOURCE, repo: "other" }],
     [
       "another namespace with matching provider data",
-      { ...SOURCE, owner: "other", providerData: { namespace: "other" } },
+      { ...SOURCE, owner: "other", providerData: { namespace: "other", slot: SLOT } },
     ],
   ])("refuses %s before any sandbox starts", (_name, source) => {
-    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT, NOW)).toThrow();
+    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT)).toThrow();
   });
 
   it("refuses an invalid repository name, even as the adapter's own", () => {
     const repository = { owner: NAMESPACE, repo: "../main" };
 
-    expect(() => gatewayCheckout(repository, { ...SOURCE, repo: "../main" }, ACCOUNT, NOW)).toThrow(
+    expect(() => gatewayCheckout(repository, { ...SOURCE, repo: "../main" }, ACCOUNT)).toThrow(
       "invalid repository",
     );
   });
 
   it("refuses an account ID that would make another host", () => {
-    expect(() => gatewayCheckout(REPOSITORY, SOURCE, "evil.example.com/x", NOW)).toThrow(
+    expect(() => gatewayCheckout(REPOSITORY, SOURCE, "evil.example.com/x")).toThrow(
       "invalid Cloudflare account ID",
     );
   });
 
-  it.each([Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 2])(
-    "refuses a checkout time of %s, which would make a grant the gateway rejects",
-    (now) => {
-      expect(() => gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, now)).toThrow(
-        "invalid checkout time",
-      );
-    },
-  );
+  it.each([
+    ["a deadline that is not a number", { sandbox: SANDBOX, deadline: "soon" }],
+    ["a fractional deadline", { sandbox: SANDBOX, deadline: 1.5 }],
+    ["an unsafe deadline", { sandbox: SANDBOX, deadline: Number.MAX_SAFE_INTEGER + 2 }],
+    ["a zero deadline", { sandbox: SANDBOX, deadline: 0 }],
+    ["a sandbox name admission never gives", { sandbox: "chk-runner", deadline: SLOT.deadline }],
+    ["an uppercase sandbox name", { sandbox: SANDBOX.toUpperCase(), deadline: SLOT.deadline }],
+    ["no sandbox name", { deadline: SLOT.deadline }],
+  ])("refuses a slot with %s", (_name, slot) => {
+    const source = { ...SOURCE, providerData: { namespace: NAMESPACE, slot } };
+
+    expect(() => gatewayCheckout(REPOSITORY, source, ACCOUNT)).toThrow(
+      "check source names no admitted sandbox slot",
+    );
+  });
 });
 
 /**
@@ -214,7 +252,7 @@ function fetchRefs(remote: string): Request {
 function checkoutAt(at: number) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(at);
-  return gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT, NOW);
+  return gatewayCheckout(REPOSITORY, SOURCE, ACCOUNT);
 }
 
 describe("the checkout's grant at the registered Git gateway", () => {
@@ -231,7 +269,8 @@ describe("the checkout's grant at the registered Git gateway", () => {
 
       const response = await gateway.serve(fetchRefs(remote), grant);
 
-      expect(recorder.routed).toEqual([grant]);
+      // The fence routes the grant alone; the sandbox's name never reaches the gateway.
+      expect(recorder.routed).toEqual([{ policy: grant.policy, expiresAt: grant.expiresAt }]);
       expect(response.status).toBe(200);
       expect(await response.text()).toBe("upstream");
       expect(gateway.minted).toEqual(["read:demo:60"]);
@@ -548,7 +587,11 @@ function settle(): Promise<void> {
  */
 function withRailheadSandbox(
   bucket: unknown,
-  body: (sandbox: RailheadSandbox, container: RecordingContainer) => Promise<void>,
+  body: (
+    sandbox: RailheadSandbox,
+    container: RecordingContainer,
+    state: DurableObjectState,
+  ) => Promise<void>,
 ): Promise<void> {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
@@ -576,9 +619,340 @@ function withRailheadSandbox(
     // The patched runner opens each sandbox over the RPC transport.
     await sandbox.setTransport("rpc");
     // As `railheadStart` records it, which would also probe the container.
-    state.storage.kv.put("railhead:fence", { phase: "live", deadline: Date.now() + 60_000 });
-    await body(sandbox, container);
+    state.storage.kv.put("railhead:fence", {
+      phase: "live",
+      deadline: Date.now() + 60_000,
+      policy: POLICY,
+    });
+    await body(sandbox, container, state);
   });
+}
+
+describe("RailheadSandbox's storage after retirement", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // The object's fence reads the real clock, so these deadlines are a few real milliseconds away.
+  it("deletes its alarm and all its storage at the first alarm past the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      await sandbox.railheadRetire();
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(stored(state).tables).toContain("container_schedules");
+
+      await pastDeadline(deadline);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("is deleted again after a restart revives it for a late start past the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      await sandbox.alarm();
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+
+      // The object restarts: the SDK's constructor recreates its table and alarm. A late start for
+      // the incarnation runs nothing and records the retirement again.
+      const revived = new RailheadSandbox(
+        state as ConstructorParameters<typeof RailheadSandbox>[0],
+        env,
+      );
+      await state.blockConcurrencyWhile(async () => undefined);
+      const policy = { host: HOST, namespace: NAMESPACE, read: [REPO], write: null };
+      await expect(revived.railheadStart(policy, deadline)).rejects.toThrow("refused: expired");
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+
+      await revived.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("keeps its record and schedules a retry when deleting its storage fails, then finishes", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      const deleteAll = state.storage.deleteAll.bind(state.storage);
+      const failing = vi
+        .spyOn(state.storage, "deleteAll")
+        .mockRejectedValueOnce(new Error("scripted storage failure"));
+      const logged = vi.spyOn(console, "error").mockImplementation(noop);
+
+      const before = Date.now();
+      await sandbox.alarm();
+
+      // Nothing was deleted, and the object asked to be woken again to finish.
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(state.storage.kv.get("railhead:disposal-failures")).toBe(1);
+      expect(await state.storage.getAlarm()).toBeGreaterThanOrEqual(before + teardownRetryDelay(1));
+      expect(logged).toHaveBeenCalledWith(
+        JSON.stringify({ event: "sandbox.dispose_failed", failures: 1, error: "Error" }),
+      );
+
+      failing.mockImplementation(deleteAll);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("starts a new round after a long pause once its quick retries are spent, then finishes", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 30;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      await sandbox.railheadRetire();
+      await pastDeadline(deadline);
+      const deleteAll = state.storage.deleteAll.bind(state.storage);
+      const failing = vi
+        .spyOn(state.storage, "deleteAll")
+        .mockRejectedValue(new Error("scripted storage failure"));
+      vi.spyOn(console, "error").mockImplementation(noop);
+      state.storage.kv.put("railhead:disposal-failures", MAX_TEARDOWN_ATTEMPTS - 1);
+      // No wake-up of the fence's own is pending, so the alarm left is the disposal's own.
+      state.storage.sql.exec("DELETE FROM container_schedules");
+
+      const before = Date.now();
+      await sandbox.alarm();
+
+      // The round ended without stopping: the count starts over and the next try is a day away.
+      expect(state.storage.kv.get("railhead:disposal-failures")).toBeUndefined();
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(await state.storage.getAlarm()).toBeGreaterThanOrEqual(before + DISPOSAL_SWEEP_MS);
+
+      failing.mockImplementation(deleteAll);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("deletes its storage past the deadline after its last destroy attempt confirms before it", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      // Far enough that every destroy attempt confirms before it, even on a loaded machine.
+      const deadline = Date.now() + 3_000;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+      for (let failure = 1; failure < MAX_TEARDOWN_ATTEMPTS; failure += 1) {
+        destroy.mockRejectedValueOnce(new Error("scripted destroy failure"));
+        await expect(sandbox.railheadRetire()).rejects.toThrow("scripted destroy failure");
+      }
+      expect(stored(state).fence).toEqual({
+        phase: "retiring",
+        deadline,
+        attempts: MAX_TEARDOWN_ATTEMPTS - 1,
+      });
+      // The last retry wake-up is due, and no other is left: the start's ran early.
+      state.storage.sql.exec("DELETE FROM container_schedules");
+      await sandbox.schedule(new Date(Date.now() - 1_000), "railheadExpire");
+
+      await sandbox.alarm();
+
+      expect(destroy).toHaveBeenCalledTimes(MAX_TEARDOWN_ATTEMPTS);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      const wake = wakeTime(deadline).getTime();
+      expect(scheduledWakes(state)).toEqual([wake]);
+      expect(await state.storage.getAlarm()).toBe(wake);
+
+      await pastDeadline(wake);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  }, 15_000);
+
+  it("fails a release whose deadline wake-up cannot be scheduled, and the retried release schedules it", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      // Far enough that every destroy attempt confirms before it, even on a loaded machine.
+      const deadline = Date.now() + 3_000;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      state.storage.sql.exec("DELETE FROM container_schedules");
+      const wake = wakeTime(deadline).getTime();
+      const schedule = sandbox.schedule.bind(sandbox);
+      let failed = false;
+      vi.spyOn(sandbox, "schedule").mockImplementation(async (when, callback, payload) => {
+        if (!failed && when instanceof Date && when.getTime() === wake) {
+          failed = true;
+          throw new Error("scripted schedule failure");
+        }
+        return schedule(when, callback, payload);
+      });
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+
+      await expect(sandbox.railheadRetire()).rejects.toThrow("scripted schedule failure");
+
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(scheduledWakes(state)).not.toContain(wake);
+
+      // The repository keeps the slot and releases the sandbox again.
+      await sandbox.railheadRetire();
+
+      expect(scheduledWakes(state)).toContain(wake);
+      await pastDeadline(wake);
+      await sandbox.alarm();
+
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  }, 15_000);
+
+  it("keeps its record and a wake-up at an alarm before the deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() + 60_000;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline, policy: POLICY });
+      await sandbox.railheadRetire();
+
+      await sandbox.alarm();
+
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(await state.storage.getAlarm()).not.toBeNull();
+    });
+  });
+
+  it("keeps the record of a teardown it never confirmed, though the deadline passed", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const deadline = Date.now() - 1_000;
+      const retiring = { phase: "retiring", deadline, attempts: 9 };
+      state.storage.kv.put("railhead:fence", retiring);
+
+      await sandbox.alarm();
+
+      expect(stored(state).fence).toEqual(retiring);
+    });
+  });
+});
+
+describe("RailheadSandbox reopened over a fence record from before policies were kept", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("refuses a live record without a policy every use, retires it at its alarm and deletes it", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+      const deadline = Date.now() + 30;
+      // As the previous release recorded a started sandbox, with its deadline wake-up.
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+      await sandbox.schedule(new Date(deadline), "railheadExpire");
+
+      await expect(sandbox.railheadJoin(POLICY, deadline)).rejects.toThrow("refused: retired");
+      await expect(sandbox.railheadExec({ command: "true", timeoutMs: 1_000 })).rejects.toThrow(
+        "refused: retired",
+      );
+      expect(await sandbox.railheadGrantCurrent(deadline)).toBe(false);
+      expect(destroy).not.toHaveBeenCalled();
+
+      await pastDeadline(deadline);
+      await sandbox.alarm();
+
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(stored(state)).toEqual({ tables: [], fence: undefined });
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+  });
+
+  it("releases a live record without a policy, destroying its container", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      const destroy = vi.spyOn(Sandbox.prototype, "destroy");
+      const deadline = Date.now() + 60_000;
+      state.storage.kv.put("railhead:fence", { phase: "live", deadline });
+
+      await sandbox.railheadRetire();
+
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline });
+      expect(await sandbox.railheadGrantCurrent(deadline)).toBe(false);
+    });
+  });
+
+  it("keeps a retirement recorded with no deadline through the disposal alarm, refusing a delayed start", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      // As the previous release recorded a sandbox released before its start arrived, with the
+      // teardown retry wake-up its release scheduled, now due.
+      state.storage.kv.put("railhead:fence", { phase: "retired", deadline: 0 });
+      await sandbox.schedule(new Date(Date.now() - 1_000), "railheadExpire");
+      const before = Date.now();
+
+      await sandbox.alarm();
+
+      // The record now holds the latest deadline a start admitted before the upgrade can carry, and
+      // the object asked to be woken then.
+      const fence = stored(state).fence;
+      expect(fence).toEqual({ phase: "retired", deadline: expect.any(Number) });
+      const latest = storedDeadline(fence);
+      expect(latest).toBeGreaterThanOrEqual(before + MAX_SANDBOX_LIFETIME_MS);
+      expect(await state.storage.getAlarm()).not.toBeNull();
+
+      const policy = { host: HOST, namespace: NAMESPACE, read: [REPO], write: null };
+      await expect(sandbox.railheadStart(policy, Date.now() + 60_000)).rejects.toThrow(
+        "refused: retired",
+      );
+      expect(stored(state).fence).toEqual({ phase: "retired", deadline: latest });
+      expect(await sandbox.railheadGrantCurrent(Date.now() + 60_000)).toBe(false);
+    });
+  });
+
+  it("keeps an unconfirmed teardown recorded with no deadline retrying under a real deadline", async () => {
+    await withRailheadSandbox(null, async (sandbox, _container, state) => {
+      state.storage.kv.put("railhead:fence", { phase: "retiring", deadline: 0, attempts: 2 });
+      const before = Date.now();
+
+      await sandbox.railheadRetire();
+
+      const fence = stored(state).fence;
+      expect(fence).toEqual({ phase: "retired", deadline: expect.any(Number) });
+      expect(storedDeadline(fence)).toBeGreaterThanOrEqual(before + MAX_SANDBOX_LIFETIME_MS);
+    });
+  });
+});
+
+/** The object's own tables and keys: what would keep it stored. */
+function stored(state: DurableObjectState): { tables: string[]; fence: unknown } {
+  const tables = state.storage.sql
+    .exec<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'",
+    )
+    .toArray()
+    .map((row) => row.name);
+  return { tables, fence: state.storage.kv.get("railhead:fence") };
+}
+
+/** The times, in milliseconds, of the fence's wake-ups still scheduled with the SDK. */
+function scheduledWakes(state: DurableObjectState): number[] {
+  return state.storage.sql
+    .exec<{ time: number }>(
+      "SELECT time FROM container_schedules WHERE callback = 'railheadExpire' ORDER BY time",
+    )
+    .toArray()
+    .map((row) => row.time * 1_000);
+}
+
+/** The deadline of a stored fence record. */
+function storedDeadline(fence: unknown): number {
+  if (typeof fence !== "object" || fence === null || !("deadline" in fence)) {
+    throw new Error("no fence record");
+  }
+  if (typeof fence.deadline !== "number") throw new Error("the fence record has no deadline");
+  return fence.deadline;
+}
+
+/** Waits, in real time, until `deadline` has passed. */
+async function pastDeadline(deadline: number): Promise<void> {
+  while (Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 describe("RailheadSandbox's SDK transport at retirement", () => {
@@ -776,12 +1150,8 @@ class ScriptedSandbox {
   tailFails = false;
   /** Whether `railheadRetire` rejects without retiring. */
   retireFails = false;
-  /** Called when the runner asks for a restore, before the fence sees it. */
-  onRestore: () => void = noop;
-  /** When set, a restore waits on it, as the SDK's restore waits on R2, before it extracts. */
-  restoreWaits: Promise<void> | null = null;
-  /** Called once a restore is waiting on `restoreWaits`. */
-  onRestoreWaiting: () => void = noop;
+  /** Whether `createBackup` rejects. */
+  backupFails = false;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -799,13 +1169,13 @@ class ScriptedSandbox {
   /** The SDK's transport client, which sends each scripted call to the container. */
   private readonly transport = { client: { send: async () => undefined } };
 
-  /** `RailheadSandbox.railheadStart`, through `fence` when the test gives one. */
-  async railheadStart(policy: unknown, expiresAt: unknown) {
-    this.calls.push("start");
+  /** `RailheadSandbox.railheadJoin`, through `fence` when the test gives one. */
+  async railheadJoin(policy: unknown, expiresAt: unknown) {
+    this.calls.push("join");
     this.started = { policy, expiresAt };
     const grant = parseSandboxGrant(this.started);
-    if (grant === null) throw new Error("the runner started the sandbox without a valid grant");
-    await this.fence?.start(grant.policy, grant.expiresAt);
+    if (grant === null) throw new Error("the runner joined the sandbox without a valid grant");
+    await this.fence?.join(grant.policy, grant.expiresAt);
   }
 
   /**
@@ -827,7 +1197,6 @@ class ScriptedSandbox {
   }
 
   restoreBackup(backup: DirectoryBackup) {
-    this.onRestore();
     return this.sdk.restoreBackup(backup);
   }
 
@@ -857,15 +1226,12 @@ class ScriptedSandbox {
         await this.reach();
         this.calls.push("backup");
         this.backups.push({ localBucket: options.localBucket });
+        if (this.backupFails) throw new Error("scripted backup failure");
         const id = crypto.randomUUID();
         this.saved.set(id, new Set(this.workspace));
         return { id, dir: "/workspace", localBucket: options.localBucket ?? false };
       },
       restoreBackup: async (backup) => {
-        if (this.restoreWaits !== null) {
-          this.onRestoreWaiting();
-          await this.restoreWaits;
-        }
         await this.reach();
         this.calls.push("restore");
         this.restored.push(backup);
@@ -985,7 +1351,10 @@ class CacheBucket {
 
 type Outcome = { kind: "pass" } | { kind: "rejected"; failure: RunnerFailure };
 
-/** The pipeline each test runs: an install, then a test chained on its workspace. */
+/**
+ * The pipeline each test runs: an install, which a check's single runner stands for, and, when
+ * `chained`, a test chained on its workspace, which an admitted sandbox refuses.
+ */
 class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   static override getProvider() {
     return railheadCheckout({ owner: NAMESPACE, repo: REPO });
@@ -996,8 +1365,8 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
   output: string | null = null;
   cached = false;
   /** Whether a test runner is chained on the install's workspace. */
-  chained = true;
-  /** The literal environment the test runner is given. */
+  chained = false;
+  /** The literal environment the last runner is given. */
   testEnv: Record<string, string> = {};
 
   protected override async pipeline(
@@ -1012,6 +1381,7 @@ class CheckRun extends CIWorkflow<CloudflareArtifacts, CiBindings> {
         command: "npm ci",
         config,
         ...(this.cached ? { cache: { inputs: ["package.json"] } } : {}),
+        ...(this.chained ? {} : { env: this.testEnv }),
       });
       if (this.chained) {
         await install.runner({ name: "test", command: "npm test", config, env: this.testEnv });
@@ -1036,21 +1406,25 @@ async function run(options: {
   trees?: Record<string, readonly string[]>;
   /** The fence the sandbox starts through; the run must then start only one sandbox. */
   fence?: SandboxFence;
-  /** The literal environment the test runner is given. */
+  /**
+   * Whether the sandbox module admitted the slot, starting `fence` under the checkout's policy and
+   * deadline before the run; defaults to true.
+   */
+  admit?: boolean;
+  /** The literal environment the last runner is given. */
   testEnv?: Record<string, string>;
-  /** Whether the test runner is chained on the install; defaults to true. */
+  /** Whether a test runner is chained on the install; defaults to false. */
   chained?: boolean;
+  /** Whether the run carries the slot the repository admitted for it; defaults to true. */
+  admitted?: boolean;
   /** Whether the Worker has a BACKUP_BUCKET binding; defaults to true. */
   backupBucket?: boolean;
   /** The size of every command's logs; the SDK reads a log above its inline limit as its tail. */
   logBytes?: number;
   tailFails?: boolean;
   retireFails?: boolean;
-  /** Called when the runner asks for a restore, before the fence sees it. */
-  onRestore?: () => void;
-  /** A restore waits on this, as on R2, and calls `onRestoreWaiting` once it is waiting. */
-  restoreWaits?: Promise<void>;
-  onRestoreWaiting?: () => void;
+  /** Whether a backup, if one were attempted, fails. */
+  backupFails?: boolean;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -1066,9 +1440,7 @@ async function run(options: {
   sandbox.logBytes = options.logBytes ?? 0;
   sandbox.tailFails = options.tailFails ?? false;
   sandbox.retireFails = options.retireFails ?? false;
-  sandbox.onRestore = options.onRestore ?? noop;
-  sandbox.restoreWaits = options.restoreWaits ?? null;
-  sandbox.onRestoreWaiting = options.onRestoreWaiting ?? noop;
+  sandbox.backupFails = options.backupFails ?? false;
   // Every method the runner calls on the sandbox object, whatever path it takes.
   const runnerCalls = new Set<string>();
   const observed = new Proxy(sandbox, {
@@ -1080,6 +1452,8 @@ async function run(options: {
     },
   });
   const artifacts = new RecordingArtifacts();
+  // Every sandbox name the runner opens.
+  const opened: string[] = [];
   const bindings = {
     CF_TOKEN: "cf-secret-token",
     R2_ACCESS_KEY_ID: "r2-key-id",
@@ -1090,7 +1464,13 @@ async function run(options: {
       : {}),
     BACKUP_BUCKET_NAME: "backups",
     CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
-    SANDBOX: { idFromName: (name: string) => name, get: () => observed },
+    SANDBOX: {
+      idFromName: (name: string) => {
+        opened.push(name);
+        return name;
+      },
+      get: () => observed,
+    },
     CI_WORKFLOW: {},
   };
   // Workerd constructs a Workflow only for a real instance, so the test builds one from the
@@ -1099,7 +1479,7 @@ async function run(options: {
   Object.assign(workflow, {
     env: bindings,
     cached: options.cached ?? false,
-    chained: options.chained ?? true,
+    chained: options.chained ?? false,
     testEnv: options.testEnv ?? {},
     outcome: null,
     output: null,
@@ -1108,10 +1488,19 @@ async function run(options: {
     do: async (_name: string, _config: unknown, body: (ctx: { attempt: number }) => unknown) =>
       body({ attempt: 1 }),
   };
+  // The slot the repository admitted for the run, as admission now would set it.
+  const deadline = Date.now() + MAX_SANDBOX_LIFETIME_MS;
+  if (options.fence !== undefined && (options.admit ?? true)) {
+    await options.fence.start(POLICY, deadline);
+  }
+  const providerData = {
+    namespace: NAMESPACE,
+    ...((options.admitted ?? true) ? { slot: { sandbox: SANDBOX, deadline } } : {}),
+  };
   const event: WorkflowEvent<CiParams<CloudflareArtifacts>> = {
     payload: {
       provider: "cloudflare-artifacts",
-      providerData: { namespace: NAMESPACE },
+      providerData,
       event: { type: "push" },
       owner: NAMESPACE,
       repo: REPO,
@@ -1125,7 +1514,14 @@ async function run(options: {
   };
   // The fakes implement only what the engine calls, not the SDK's full binding and step types.
   await Reflect.apply(CheckRun.prototype.run, workflow, [event, step]);
-  return { outcome: workflow.outcome, output: workflow.output, sandbox, artifacts, runnerCalls };
+  return {
+    outcome: workflow.outcome,
+    output: workflow.output,
+    sandbox,
+    artifacts,
+    runnerCalls,
+    opened,
+  };
 }
 
 const SECRETS = [
@@ -1143,22 +1539,15 @@ describe("a check run through the patched SDK", () => {
   });
 
   it("checks out through the gateway with no credential anywhere in the sandbox", async () => {
-    const { outcome, sandbox, artifacts } = await run({});
+    const { outcome, sandbox, artifacts, opened } = await run({});
 
     expect(outcome).toEqual({ kind: "pass" });
+    // The runner opens the admitted slot's sandbox, never one of its own naming.
+    expect(new Set(opened)).toEqual(new Set([SANDBOX]));
     expect(sandbox.calls).toEqual([
-      "start",
+      "join",
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-      "backup",
-      "log:read",
-      "log:read",
-      "retire",
-      "start",
-      "restore",
-      "checkout:overlay",
-      "command:(npm test) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-      "backup",
       "log:read",
       "log:read",
       "retire",
@@ -1172,33 +1561,28 @@ describe("a check run through the patched SDK", () => {
     for (const secret of SECRETS) expect(seen).not.toContain(secret);
     expect(sandbox.scripts[0]).toContain(`fetch --depth=1 origin '${SHA}'`);
     expect(artifacts.calls).toEqual([]);
-    // Backups stay on the R2 binding: the container has no route to presigned URLs.
-    expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
+    // Nothing reads a fenced run's workspace afterwards, so it is never backed up.
+    expect(sandbox.backups).toEqual([]);
   });
 
   it("calls no sandbox method that bypasses the fence", async () => {
     const runs = await Promise.all([
       run({}),
-      run({ cached: true, logBytes: INLINE_LOG_BYTES + 1 }),
+      run({ logBytes: INLINE_LOG_BYTES + 1 }),
+      run({ chained: true }),
       run({ command: { exitCode: 1 } }),
       run({ checkout: () => ({ exitCode: 128 }) }),
     ]);
     const called = [...new Set(runs.flatMap((result) => [...result.runnerCalls]))].toSorted();
     // The sandbox module's own fenced entry points, and the SDK calls RailheadSandbox fences.
-    const fenced: readonly string[] = [
-      "railheadRetire",
-      "railheadStart",
-      ...FENCED_SANDBOX_METHODS,
-    ];
+    const fenced: readonly string[] = ["railheadJoin", "railheadRetire", ...FENCED_SANDBOX_METHODS];
 
     expect(called.filter((method) => !fenced.includes(method))).toEqual([]);
     expect(called).toEqual([
-      "createBackup",
       "execWithSessionToken",
       "listFiles",
+      "railheadJoin",
       "railheadRetire",
-      "railheadStart",
-      "restoreBackup",
       "startProcess",
     ]);
   });
@@ -1213,8 +1597,7 @@ describe("a check run through the patched SDK", () => {
         current.push(fence.grantCurrent(expiresAt));
         return { exitCode: 0 };
       };
-      // The cache hit skips the install, so only the test's sandbox starts.
-      const { outcome, sandbox } = await run({ cached: true, fence, command });
+      const { outcome, sandbox } = await run({ fence, command });
       const gateway = registeredGateway(fence);
 
       const after = await gateway.serve(
@@ -1230,7 +1613,7 @@ describe("a check run through the patched SDK", () => {
       expect(recorder.routed).toEqual([parseSandboxGrant(sandbox.started)]);
       expect(current).toEqual([true]);
       // The runner's own cleanup retired the fence: nothing in the test did.
-      expect(sandbox.calls.slice(-4)).toEqual(["backup", "log:read", "log:read", "retire"]);
+      expect(sandbox.calls.slice(-3)).toEqual(["log:read", "log:read", "retire"]);
       expect(sandbox.calls).not.toContain("destroy");
       expect(recorder.destroys).toBe(1);
       expect(fence.grantCurrent(expiresAt)).toBe(false);
@@ -1241,68 +1624,31 @@ describe("a check run through the patched SDK", () => {
     });
   });
 
-  it("never touches the container when a restore that began before expiry resumes after it", async () => {
+  it("refuses a runner chained on the install before it reaches the retired sandbox", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW);
     const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
     await withFence(async (fence, recorder) => {
-      const r2 = deferred();
-      const waiting = deferred();
-      // The cache hit skips the install, so the test's sandbox restores the cached workspace.
-      const pending = run({
-        cached: true,
-        fence,
-        restoreWaits: r2.promise,
-        onRestoreWaiting: waiting.resolve,
-      });
-      await waiting.promise;
+      const { outcome, output, sandbox } = await run({ chained: true, fence });
 
-      // The deadline's wake-up retires the sandbox while the restore waits on R2. It cannot confirm
-      // the teardown while the restore is unresolved.
-      vi.setSystemTime(expiresAt);
-      await expect(fence.expire()).rejects.toMatchObject({ code: "unsettled" });
-      expect(fence.grantCurrent(expiresAt)).toBe(false);
-      const destroysAtExpiry = recorder.destroys;
-      expect(destroysAtExpiry).toBeGreaterThan(0);
-
-      r2.resolve();
-      const { outcome, sandbox } = await pending;
-
+      // The install retired the slot's one incarnation; the chained test never asked to start it.
       expect(outcome).toEqual({
         kind: "rejected",
         failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
       });
-      // Nothing reached the container after the restore resumed: no extraction, checkout,
-      // command, backup or log read, and no cache pointer.
-      expect(sandbox.calls).toEqual(["start", "retire"]);
+      expect(output).toBe(
+        "runner(test): its parent saved no workspace (a fenced run, or no BACKUP_BUCKET binding), so a chained runner cannot inherit it",
+      );
+      expect(sandbox.calls).toEqual([
+        "join",
+        "checkout",
+        "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
+        "log:read",
+        "log:read",
+        "retire",
+      ]);
+      expect(recorder.routed).toHaveLength(1);
       expect(sandbox.restored).toEqual([]);
-      // The restore's settling and the runner's release each destroyed the container again, and
-      // the teardown is now confirmed.
-      expect(recorder.destroys).toBe(destroysAtExpiry + 2);
-      await fence.retire();
-      expect(fence.grantCurrent(expiresAt)).toBe(false);
-    });
-  });
-
-  it("refuses a restore asked for after the sandbox's deadline without running it", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(NOW);
-    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
-    await withFence(async (fence, recorder) => {
-      const { outcome, sandbox } = await run({
-        cached: true,
-        fence,
-        onRestore: () => vi.setSystemTime(expiresAt),
-      });
-
-      expect(outcome).toEqual({
-        kind: "rejected",
-        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
-      });
-      expect(sandbox.calls).toEqual(["start", "retire"]);
-      expect(sandbox.restored).toEqual([]);
-      expect(recorder.destroys).toBeGreaterThan(0);
-      await fence.retire();
       expect(fence.grantCurrent(expiresAt)).toBe(false);
     });
   });
@@ -1318,7 +1664,7 @@ describe("a check run through the patched SDK", () => {
       const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
       await withFence(async (fence, recorder) => {
         recorder.failingDestroys = 1;
-        const { outcome, sandbox } = await run({ cached: true, fence, command });
+        const { outcome, sandbox } = await run({ fence, command });
         const gateway = registeredGateway(fence);
 
         const after = await gateway.serve(
@@ -1330,7 +1676,7 @@ describe("a check run through the patched SDK", () => {
         // the change.
         expect(outcome).toEqual({
           kind: "rejected",
-          failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+          failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
         });
         expect(sandbox.calls.at(-1)).toBe("retire");
         expect(recorder.destroys).toBe(1);
@@ -1350,23 +1696,19 @@ describe("a check run through the patched SDK", () => {
     ["at the inline limit", INLINE_LOG_BYTES, ["log:read", "log:read"]],
     ["above the inline limit", INLINE_LOG_BYTES + 1, ["log:tail", "log:tail"]],
   ])(
-    "publishes the install cache of a check whose logs are %s only after retiring its sandbox",
+    "reads the logs of a check whose logs are %s before retiring, and publishes no cache",
     async (_name, logBytes, reads) => {
-      // Another commit wrote the pointer, so the install runs and publishes its own.
+      // The runner asks for a cache, which a fenced check never uses.
       const { outcome, sandbox } = await run({ cached: true, cachedBy: "c".repeat(40), logBytes });
 
       expect(outcome).toEqual({ kind: "pass" });
-      expect(sandbox.calls.slice(0, 8)).toEqual([
-        "start",
+      expect(sandbox.calls).toEqual([
+        "join",
         "checkout",
         "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-        "backup",
         ...reads,
         "retire",
-        "pointer",
       ]);
-      // The chained test is not cached, but still reads its logs before it retires.
-      expect(sandbox.calls.slice(-4)).toEqual(["backup", ...reads, "retire"]);
     },
   );
 
@@ -1436,17 +1778,53 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.calls).not.toContain("pointer");
   });
 
-  it("runs no command when the sandbox's fence refuses to start", async () => {
-    await withFence(async (fence) => {
-      // A retired object never starts again, as when the deadline passed before the runner began.
-      await fence.retire();
-      const { outcome, sandbox } = await run({ cached: true, fence });
+  it("starts nothing for a well-formed slot the repository never admitted", async () => {
+    await withFence(async (fence, recorder) => {
+      const { outcome, output, sandbox } = await run({ fence, admit: false });
 
       expect(outcome).toEqual({
         kind: "rejected",
-        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+        failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
       });
-      expect(sandbox.calls).toEqual(["start", "retire"]);
+      expect(output).toBe("sandbox operation refused: not_started");
+      // Nothing routed or probed: the container never started, and the name is retired.
+      expect(recorder.routed).toEqual([]);
+      expect(sandbox.calls).toEqual(["join", "retire"]);
+      expect(sandbox.scripts).toEqual([]);
+      await expect(fence.start(POLICY, Date.now() + 60_000)).rejects.toThrow("refused: retired");
+    });
+  });
+
+  it("refuses a runner whose checkout names another policy than the admitted one", async () => {
+    await withFence(async (fence, recorder) => {
+      const admitted = { ...POLICY, read: ["other"] };
+      await fence.start(admitted, Date.now() + MAX_SANDBOX_LIFETIME_MS);
+      const routed = recorder.routed.length;
+
+      const { outcome, sandbox } = await run({ fence, admit: false });
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+      });
+      // The runner never ran a command, and the admitted grant was never replaced.
+      expect(sandbox.scripts).toEqual([]);
+      expect(recorder.routed).toHaveLength(routed);
+      expect(recorder.routed.every((grant) => grant.policy.read[0] === "other")).toBe(true);
+    });
+  });
+
+  it("runs no command when the sandbox's fence refuses the runner", async () => {
+    await withFence(async (fence) => {
+      // A retired object never starts again, as when the deadline passed before the runner began.
+      await fence.retire();
+      const { outcome, sandbox } = await run({ fence, admit: false });
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+      });
+      expect(sandbox.calls).toEqual(["join", "retire"]);
     });
   });
 
@@ -1457,21 +1835,7 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "error", runner: "install", reason: "checkout" },
     });
-    expect(sandbox.calls).toEqual(["start", "checkout", "retire"]);
-  });
-
-  it("records a failed overlay checkout on a chained runner as an error before its command", async () => {
-    const { outcome, sandbox } = await run({
-      checkout: (overlay) => ({ exitCode: overlay ? 1 : 0 }),
-    });
-
-    expect(outcome).toEqual({
-      kind: "rejected",
-      failure: { conclusion: "error", runner: "test", reason: "checkout" },
-    });
-    expect(sandbox.calls.filter((call) => call.startsWith("command:"))).toEqual([
-      "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
-    ]);
+    expect(sandbox.calls).toEqual(["join", "checkout", "retire"]);
   });
 
   it("refuses a SHA that is not a full commit before any sandbox starts", async () => {
@@ -1481,6 +1845,18 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
     });
+    expect(sandbox.calls).toEqual([]);
+    expect(artifacts.calls).toEqual([]);
+  });
+
+  it("runs nothing and opens no sandbox for a run without an admitted slot", async () => {
+    const { outcome, sandbox, artifacts, opened } = await run({ admitted: false });
+
+    expect(outcome).toEqual({
+      kind: "rejected",
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
+    });
+    expect(opened).toEqual([]);
     expect(sandbox.calls).toEqual([]);
     expect(artifacts.calls).toEqual([]);
   });
@@ -1506,7 +1882,7 @@ describe("a check run through the patched SDK", () => {
   });
 
   it.each([
-    ["the runner's name", { NODE_ENV: "test" }],
+    ["the runner's name", { NODE_ENV: "install" }],
     ["the exit code", { CI: "1" }],
   ])(
     "records a failure when an env value matches %s, and still redacts it from the output",
@@ -1514,16 +1890,15 @@ describe("a check run through the patched SDK", () => {
       const value = Object.values(testEnv)[0] ?? "";
       const { outcome, output } = await run({
         testEnv,
-        command: (line) =>
-          line.includes("npm test") ? { exitCode: 1, stdout: `env=${value}` } : { exitCode: 0 },
+        command: { exitCode: 1, stdout: `env=${value}` },
       });
 
       expect(outcome).toEqual({
         kind: "rejected",
-        failure: { conclusion: "fail", runner: "test", exitCode: 1 },
+        failure: { conclusion: "fail", runner: "install", exitCode: 1 },
       });
       expect(output).toBe(
-        "test failed with exit code 1\n=== stdout ===\nenv=[REDACTED]\n=== stderr ===\n",
+        "install failed with exit code 1\n=== stdout ===\nenv=[REDACTED]\n=== stderr ===\n",
       );
     },
   );
@@ -1531,24 +1906,29 @@ describe("a check run through the patched SDK", () => {
   it("keeps a failed checkout an error when an env value redacts its message", async () => {
     const { outcome, output } = await run({
       testEnv: { STAGE: "source checkout" },
-      checkout: (overlay) => ({ exitCode: overlay ? 1 : 0 }),
+      checkout: () => ({ exitCode: 1 }),
     });
 
     expect(outcome).toEqual({
       kind: "rejected",
-      failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+      failure: { conclusion: "error", runner: "install", reason: "infrastructure" },
     });
     expect(output).toBe("[REDACTED] exited with status 1");
   });
 
-  it("restores a cached workspace through the R2 binding", async () => {
-    const { outcome, sandbox, artifacts } = await run({ cached: true });
+  it("runs the command for every check of the same commit, never passing from a cache", async () => {
+    // The bucket holds a cache pointer written by this very commit, which the SDK would reuse.
+    const first = await run({ cached: true });
+    const second = await run({ cached: true });
 
-    expect(outcome).toEqual({ kind: "pass" });
-    // The cache hit skips the install; the test restores its workspace from the binding.
-    expect(sandbox.restored).toEqual([{ id: BACKUP_ID, dir: "/workspace", localBucket: true }]);
-    expect(sandbox.calls).not.toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
-    expect(artifacts.calls).toEqual(["get:demo"]);
+    for (const { outcome, sandbox, artifacts } of [first, second]) {
+      expect(outcome).toEqual({ kind: "pass" });
+      expect(sandbox.calls).toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
+      expect(sandbox.calls).not.toContain("pointer");
+      expect(sandbox.restored).toEqual([]);
+      // No cache fingerprint was even read.
+      expect(artifacts.calls).toEqual([]);
+    }
   });
 
   it("runs a single runner without a BACKUP_BUCKET binding, with no backup or cache", async () => {
@@ -1562,7 +1942,7 @@ describe("a check run through the patched SDK", () => {
     expect(outcome).toEqual({ kind: "pass" });
     // No cache lookup, restore or backup; the fence still starts and retires.
     expect(sandbox.calls).toEqual([
-      "start",
+      "join",
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "log:read",
@@ -1573,13 +1953,15 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.restored).toEqual([]);
     expect(artifacts.calls).toEqual([]);
     const warnings = warn.mock.calls.map(([message]) => message);
-    expect(warnings).toContain("[cache] no BACKUP_BUCKET binding; skipping cache");
-    expect(warnings).toContain("[sandbox] no BACKUP_BUCKET binding; no workspace backup");
+    // A fenced check never consults the cache, with or without the binding.
+    expect(warnings.filter((message) => String(message).startsWith("[cache]"))).toEqual([]);
+    // Nor does it warn of a missing backup it would not make anyway.
+    expect(warnings).toEqual([]);
   });
 
   it("records a chained runner without a BACKUP_BUCKET binding as an error before it starts", async () => {
     vi.spyOn(console, "warn").mockImplementation(noop);
-    const { outcome, output, sandbox } = await run({ backupBucket: false });
+    const { outcome, output, sandbox } = await run({ backupBucket: false, chained: true });
 
     expect(outcome).toEqual({
       kind: "rejected",
@@ -1588,7 +1970,7 @@ describe("a check run through the patched SDK", () => {
     expect(output).toContain("no BACKUP_BUCKET binding");
     // The install ran and retired; the chained test never started a sandbox.
     expect(sandbox.calls).toEqual([
-      "start",
+      "join",
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "log:read",
@@ -1597,28 +1979,28 @@ describe("a check run through the patched SDK", () => {
     ]);
   });
 
-  it("backs up a single runner through the R2 binding when it is present", async () => {
-    const { outcome, sandbox } = await run({ chained: false });
+  it("passes a fenced check with the R2 binding bound and never attempts its backup", async () => {
+    // A backup would fail, turning the passing command into an infrastructure error.
+    const { outcome, sandbox } = await run({ chained: false, backupFails: true });
 
     expect(outcome).toEqual({ kind: "pass" });
-    expect(sandbox.backups).toEqual([{ localBucket: true }]);
+    expect(sandbox.calls).not.toContain("backup");
+    expect(sandbox.backups).toEqual([]);
   });
 
-  it("never restores another commit's cached workspace, so a deleted file cannot linger", async () => {
+  it("never reuses another commit's cached workspace, so a deleted file cannot linger", async () => {
     const before = "c".repeat(40);
     const after = "d".repeat(40);
-    // `after` deletes src/legacy.ts but keeps src/index.ts, which imports it, and package.json,
-    // the cache input, so both commits share one cache key.
+    // `after` deletes src/legacy.ts but keeps package.json, the cache input, so both commits
+    // share one cache key.
     const trees = {
       [before]: ["package.json", "src/index.ts", "src/legacy.ts"],
       [after]: ["package.json", "src/index.ts"],
     };
     const seen: string[][] = [];
-    // The test passes only while the deleted module is still on disk.
-    const command: ScriptedCommand = (line, workspace) => {
+    const command: ScriptedCommand = (_line, workspace) => {
       seen.push([...workspace].toSorted());
-      const stale = workspace.has("src/legacy.ts");
-      return { exitCode: line.includes("npm test") && !stale ? 1 : 0 };
+      return { exitCode: 0 };
     };
 
     const { outcome, sandbox } = await run({
@@ -1629,18 +2011,11 @@ describe("a check run through the patched SDK", () => {
       command,
     });
 
-    expect(outcome).toEqual({
-      kind: "rejected",
-      failure: { conclusion: "fail", runner: "test", exitCode: 1 },
-    });
-    // The install runs on a clean checkout; the test restores only that install's backup.
+    expect(outcome).toEqual({ kind: "pass" });
+    // The install runs on a clean checkout of its own commit; nothing is restored.
     expect(sandbox.calls).toContain("command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err");
-    expect(sandbox.restored).toHaveLength(1);
-    expect(sandbox.restored).not.toContainEqual(expect.objectContaining({ id: BACKUP_ID }));
-    expect(seen).toEqual([
-      ["package.json", "src/index.ts"],
-      ["package.json", "src/index.ts"],
-    ]);
+    expect(sandbox.restored).toEqual([]);
+    expect(seen).toEqual([["package.json", "src/index.ts"]]);
   });
 });
 
