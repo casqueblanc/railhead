@@ -284,6 +284,22 @@ ASK_BODY = {
     "scope": ["src/upload.ts"],
 }
 QUESTION_OPEN = {"questionId": "qst_upload1", "decisionId": "dec_upload1", "state": "open", "decision": None}
+MAX_SCOPE_BYTES = 8192
+
+
+def scope_bytes(scope: list) -> int:
+    return len(json.dumps(scope, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def full_scope(swap: str | None = None) -> list:
+    """Paths that take exactly MAX_SCOPE_BYTES as a JSON array, one holding a quote and a backslash.
+    `swap` replaces one ASCII letter, adding a byte when it is multibyte or escaped."""
+    paths = [f"src/{i}/" + "a" * 1016 for i in range(7)] + ['src/q"b\\c']
+    paths[-1] += "a" * (MAX_SCOPE_BYTES - scope_bytes(paths))
+    assert scope_bytes(paths) == MAX_SCOPE_BYTES and all(len(p) <= 1024 for p in paths)
+    if swap is not None:
+        paths[0] = paths[0].replace("a", swap, 1)
+    return paths
 
 
 def agent_fixtures() -> dict:
@@ -539,6 +555,11 @@ def agent_fixtures() -> dict:
                     success(QUESTION_OPEN, EMPTY_DIGEST, None),
                 ),
                 exchange(
+                    "accepts a scope of exactly the byte limit",
+                    request({**ASK_BODY, "requestId": "req_upload0000000002", "scope": full_scope()}, True),
+                    success(QUESTION_OPEN, EMPTY_DIGEST, None),
+                ),
+                exchange(
                     "refuses a reused request id with a different question",
                     request({**ASK_BODY, "text": "Another question?"}, True),
                     failure("idempotency_mismatch", "This request id was used for another question."),
@@ -561,6 +582,11 @@ def agent_fixtures() -> dict:
                 rejected("absolute scope path", {**ASK_BODY, "scope": ["/src/upload.ts"]}, "invariant"),
                 rejected("scope path with a dot-dot segment", {**ASK_BODY, "scope": ["src/../upload.ts"]}, "invariant"),
                 rejected("blank scope path", {**ASK_BODY, "scope": [" "]}, "invariant"),
+                rejected("scope path with a C0 control", {**ASK_BODY, "scope": ["src/\u0007.ts"]}, "invariant"),
+                rejected("scope path with DEL", {**ASK_BODY, "scope": ["src/\u007f.ts"]}, "invariant"),
+                rejected("scope path with a C1 control", {**ASK_BODY, "scope": ["src/\u0085.ts"]}, "invariant"),
+                rejected("scope a UTF-8 byte over the limit", {**ASK_BODY, "scope": full_scope("\u00e9")}, "invariant"),
+                rejected("scope an escaped byte over the limit", {**ASK_BODY, "scope": full_scope('"')}, "invariant"),
                 rejected("scope missing", {k: v for k, v in ASK_BODY.items() if k != "scope"}, "shape"),
             ],
         },

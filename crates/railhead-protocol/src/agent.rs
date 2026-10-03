@@ -37,6 +37,9 @@ pub const MAX_AGENT_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const AGENT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Longest a question long-poll holds a request open, in milliseconds.
 pub const MAX_LONG_POLL_MS: u64 = 25_000;
+/// Most UTF-8 bytes a question's scope may take as a JSON array. The scope is copied into the
+/// answer's inbox item; this keeps that item far below the inbox's size limit.
+pub const MAX_SCOPE_BYTES: usize = MAX_AGENT_REQUEST_BYTES / 2;
 /// Largest inbox page a sync returns.
 pub const MAX_INBOX_PAGE: u64 = 64;
 /// Inbox page size when the request does not name one.
@@ -875,9 +878,30 @@ impl AskRequest {
                 MAX_PATH_LENGTH,
                 "scope",
                 "a repository path that is not blank",
+            )?;
+            require(
+                !path.chars().any(char::is_control),
+                "scope",
+                "a repository path without control characters",
             )
-        })
+        })?;
+        require(
+            scope_bytes(&self.scope) <= MAX_SCOPE_BYTES,
+            "scope",
+            "paths of at most 8192 bytes together",
+        )
     }
+}
+
+/// The UTF-8 bytes of `scope` as a JSON array, as `JSON.stringify` writes it: brackets, commas,
+/// and each path quoted with `"` and `\\` escaped. Control characters, which JSON escapes longer,
+/// are refused before this is used.
+fn scope_bytes(scope: &[String]) -> usize {
+    let paths: usize = scope
+        .iter()
+        .map(|path| path.len() + 2 + path.matches(['"', '\\']).count())
+        .sum();
+    paths + scope.len().saturating_sub(1) + 2
 }
 
 /// Where a question stands.

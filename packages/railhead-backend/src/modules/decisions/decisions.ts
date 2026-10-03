@@ -23,8 +23,10 @@
 
 import {
   MAX_LONG_POLL_MS,
+  MAX_SCOPE_BYTES,
   isScopePath,
   isRequestId,
+  scopeBytes,
   type AskRequest,
   type DecisionView,
   type QuestionResult,
@@ -558,6 +560,9 @@ function invalidAsk(request: AskRequest): string | null {
     return `The scope names from 1 to ${MAX_LIST_LENGTH} repository paths.`;
   }
   if (!scope.every(isScopePath)) return "A scope entry is not a repository path.";
+  if (scopeBytes(scope) > MAX_SCOPE_BYTES) {
+    return `The scope may take at most ${MAX_SCOPE_BYTES} bytes.`;
+  }
   return null;
 }
 

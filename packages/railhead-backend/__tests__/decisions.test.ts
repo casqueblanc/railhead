@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_INBOX_PAGE,
   MAX_LONG_POLL_MS,
+  MAX_SCOPE_BYTES,
   type AskRequest,
   type ClaimView,
   type DecisionView,
@@ -314,6 +315,46 @@ describe("ask", () => {
       }
       expect(h.events()).toEqual([]);
       expect(h.count("questions")).toBe(0);
+    });
+  });
+
+  it("refuses at ask time a scope whose answer the inbox could not hold", async () => {
+    await withDecisions(async (h) => {
+      // 7 paths of 1022 bytes and one of 1013: with quotes, commas and brackets, 8192 bytes.
+      const full = [
+        ...Array.from({ length: 7 }, (_, i) => `src/${i}/${"a".repeat(1016)}`),
+        `src/z/${"a".repeat(1007)}`,
+      ];
+      expect(MAX_SCOPE_BYTES).toBe(8192);
+      const [first, ...rest] = full;
+      if (first === undefined) throw new Error("fixture");
+      const refused = [
+        // 64 paths of 1024 BEL characters: 384 KiB once JSON escapes them, beyond any inbox item.
+        Array.from({ length: 64 }, () => "\u0007".repeat(1024)),
+        ["src/\u007f.ts"],
+        ["src/\u0085.ts"],
+        ["src/\ud800.ts"],
+        // One more UTF-8 byte than the limit, in the same number of UTF-16 units.
+        [first.replace("a", "\u00e9"), ...rest],
+        // One more byte once JSON escapes the quote.
+        [first.replace("a", '"'), ...rest],
+      ];
+      for (const scope of refused) {
+        expect(await h.decisions.ask(h.agent(), CLAIM, { ...ASK, scope })).toMatchObject({
+          ok: false,
+          code: "invalid_request",
+        });
+      }
+      expect(h.count("questions")).toBe(0);
+      expect(h.events()).toEqual([]);
+
+      // A scope at the limit is asked, and its answer reaches the asking agent's inbox.
+      const { decisionId } = await h.ask({ scope: full });
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "chunk", expectedVersion: null }),
+      );
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      expect(types(h.events())).toEqual(["question.asked", "decision.recorded", "inbox.queued"]);
     });
   });
 
