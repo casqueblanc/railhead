@@ -20,12 +20,15 @@ import {
   push,
   ready,
 } from "../../../../../fixtures/board/uploadSteps";
+import type { CheckDetailPort } from "../board/boardPorts";
 import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
 import type { BoardFeed } from "../claims/boardFeed";
 import { OUTCOME_BADGE } from "./OutcomeBadge";
 import { TrainOutcomes } from "./TrainOutcomes";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const NO_CHECKS: CheckDetailPort = { kind: "unavailable", reason: "module_unavailable" };
 
 const complete = foldEvents(emptyBoardState(SYNTH_REPO), checkBeforeLand.events);
 const live = (board: BoardState): BoardFeed => ({
@@ -61,9 +64,11 @@ describe("TrainOutcomes", () => {
   const onRetry = vi.fn<() => void>();
 
   const render = async (feed: BoardFeed) => {
-    await act(async () => root.render(<TrainOutcomes feed={feed} onRetry={onRetry} />));
+    await act(async () =>
+      root.render(<TrainOutcomes feed={feed} checks={NO_CHECKS} onRetry={onRetry} />),
+    );
   };
-  const items = () => [...container.querySelectorAll("li[aria-labelledby]")];
+  const items = () => [...container.querySelectorAll("li[aria-labelledby^='run-']")];
   const text = () => container.textContent ?? "";
 
   beforeEach(() => {

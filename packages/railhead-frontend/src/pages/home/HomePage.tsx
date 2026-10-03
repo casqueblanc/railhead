@@ -42,7 +42,8 @@ const Anchor = ({ id, children }: { id: SectionId; children: ReactNode }) => (
  * slot. The page gets its data and actions only through `ports`.
  */
 export const HomePage = ({ ports }: HomePageProps) => {
-  const { board, decisions, owner, enrollment, connection, onReconnect } = gateOnConnection(ports);
+  const { board, decisions, owner, enrollment, checks, connection, onReconnect } =
+    gateOnConnection(ports);
 
   if (board.kind === "unavailable") {
     return (
@@ -75,7 +76,7 @@ export const HomePage = ({ ports }: HomePageProps) => {
             <ClaimLanes feed={feed} onRetry={onReconnect} />
           </Anchor>
           <Anchor id="train">
-            <TrainOutcomes feed={feed} onRetry={onReconnect} />
+            <TrainOutcomes feed={feed} checks={checks} onRetry={onReconnect} />
           </Anchor>
         </div>
         <div className="grid min-w-0 gap-6">
