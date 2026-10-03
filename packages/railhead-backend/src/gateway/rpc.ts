@@ -21,6 +21,10 @@ import type {
   BoardListener,
   BoardResult,
   BoardSubscription,
+  DemoSeedAction,
+  DemoSeedApi,
+  DemoSeedResult,
+  DemoSeedState,
   EnrollmentChallenge,
   EventPage,
   OwnerAction,
@@ -35,6 +39,7 @@ import type {
 import type { RailheadEvent, UserId } from "@railhead/shared/events";
 import type { PortResult } from "../contracts/result";
 import { parseEvent } from "../contracts/wireShape";
+import { demoSeedPort, type DemoSeedPort } from "../modules/demoSeed/entry";
 import { ownerEnrollment, type OwnerEnrollmentPort } from "../modules/owner/entry";
 import {
   DELIVERY_TIMEOUT_MS,
@@ -70,6 +75,10 @@ export class RailheadApiImpl extends RpcTarget implements RailheadApi {
 
   async ownerEnrollment(): Promise<OwnerEnrollmentApi> {
     return new OwnerEnrollmentApiImpl(ownerEnrollment(this.#env));
+  }
+
+  async demoSeed(): Promise<DemoSeedApi> {
+    return new DemoSeedApiImpl(demoSeedPort(this.#env));
   }
 }
 
@@ -142,6 +151,33 @@ class OwnerApiImpl extends RpcTarget implements OwnerApi {
     assertion: PasskeyAssertion,
   ): Promise<BoardResult<OwnerActionResult>> {
     return toBoard(await this.#repo.performOwnerAction(challengeId, assertion));
+  }
+}
+
+/** The owner's seed and reset of the demo repository. */
+@validateRpc<DemoSeedApi>()
+class DemoSeedApiImpl extends RpcTarget implements DemoSeedApi {
+  readonly #port: DemoSeedPort;
+
+  constructor(port: DemoSeedPort) {
+    super();
+    this.#port = port;
+  }
+
+  async read(): Promise<BoardResult<DemoSeedState | null>> {
+    return toBoard(await this.#port.read());
+  }
+
+  async prepare(action: DemoSeedAction): Promise<BoardResult<ActionChallenge>> {
+    return toBoard(await this.#port.prepare(action));
+  }
+
+  async perform(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+    bundle: Uint8Array | null,
+  ): Promise<BoardResult<DemoSeedResult>> {
+    return toBoard(await this.#port.perform(challengeId, assertion, bundle));
   }
 }
 

@@ -14,16 +14,27 @@ import { DurableObject } from "cloudflare:workers";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
 import type {
   ActionChallenge,
+  DemoSeedAction,
+  DemoSeedResult,
+  DemoSeedState,
   EventPage,
   OwnerAction,
   OwnerActionResult,
   PasskeyAssertion,
   PendingJoin,
 } from "@railhead/shared/board-api";
-import { MAX_EVENT_PAGE } from "@railhead/shared/board-api";
-import type { RepoId } from "@railhead/shared/events";
+import { DEMO_ORG, DEMO_REPO, MAX_EVENT_PAGE } from "@railhead/shared/board-api";
+import type { CommitSha, RepoId } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../contracts/result";
 import { dispatchAgent, type AgentCall, type AgentReply } from "../gateway/agentDispatch";
+import type { SeedControl } from "../modules/demoSeed/control";
+import {
+  DEMO_OBJECT_NAME,
+  DEMO_SEED_CONTROL,
+  demoSeedControl,
+  demoSeedTarget,
+} from "../modules/demoSeed/entry";
+import type { SeedTarget } from "../modules/demoSeed/target";
 import type { GitTarget } from "../modules/git/entry";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
 import { composeRepo, type RepoPorts } from "./composeRepo";
@@ -68,6 +79,8 @@ interface Installed {
 /** One repository. */
 export class Repo extends DurableObject<Env> {
   #installed: Installed | null;
+  #seedControl: SeedControl | null = null;
+  #seedTarget: SeedTarget | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -197,6 +210,69 @@ export class Repo extends DurableObject<Env> {
     const ports = this.#ports();
     if (ports === null) return new Response("Repository not found.\n", { status: 404 });
     return ports.git.serve(request, target, path);
+  }
+
+  /** The demo repository and its main, on the demo repository's object only. */
+  async demoSeedState(): Promise<PortResult<DemoSeedState | null>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.read();
+  }
+
+  /** Seeds the demo repository's main, after the control spent a proof for it. */
+  async seedDemo(head: CommitSha, pack: Uint8Array): Promise<PortResult<DemoSeedResult>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.seed(head, pack);
+  }
+
+  /** Resets the demo repository, after the control spent a proof for it. */
+  async resetDemo(): Promise<PortResult<DemoSeedResult>> {
+    const target = this.#demoSeedTarget();
+    if (target === null) return missing();
+    return target.reset();
+  }
+
+  /** Prepares a demo seed action, on the demo seed's control object only. */
+  async prepareDemoSeed(action: DemoSeedAction): Promise<PortResult<ActionChallenge>> {
+    const control = this.#demoSeedControl();
+    if (control === null) return missing();
+    return control.prepare(action);
+  }
+
+  /** Performs a prepared demo seed action, on the demo seed's control object only. */
+  async performDemoSeed(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+    bundle: Uint8Array | null,
+  ): Promise<PortResult<DemoSeedResult>> {
+    const control = this.#demoSeedControl();
+    if (control === null) return missing();
+    return control.perform(challengeId, assertion, bundle);
+  }
+
+  #demoSeedTarget(): SeedTarget | null {
+    if (this.ctx.id.name !== DEMO_OBJECT_NAME) return null;
+    this.#seedTarget ??= demoSeedTarget(
+      {
+        repoId: `rep_${this.ctx.id.toString()}`,
+        storage: this.ctx.storage,
+        initialized: () => this.#installed !== null,
+        initialize: () => this.initialize(DEMO_ORG, DEMO_REPO),
+        wipe: async () => {
+          await this.ctx.storage.deleteAll();
+          this.#installed = null;
+        },
+      },
+      this.env,
+    );
+    return this.#seedTarget;
+  }
+
+  #demoSeedControl(): SeedControl | null {
+    if (this.ctx.id.name !== DEMO_SEED_CONTROL) return null;
+    this.#seedControl ??= demoSeedControl(this.ctx.storage, this.env);
+    return this.#seedControl;
   }
 
   #ports(): RepoPorts | null {

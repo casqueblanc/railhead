@@ -1,0 +1,687 @@
+import { SELF, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { newWebSocketRpcSession } from "capnweb";
+import { describe, expect, it } from "vitest";
+import { API_PATH, type RailheadApi } from "@railhead/shared/api";
+import {
+  MAX_DEMO_BUNDLE_BYTES,
+  type DemoSeedAction,
+  type DemoSeedResult,
+  type PasskeyAssertion,
+} from "@railhead/shared/board-api";
+import { createArtifactsAdapter, mainRepoName } from "../src/artifacts/adapter";
+import { FakeArtifacts, FakeArtifactsError } from "../src/artifacts/fake";
+import { relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
+import { ok, type PortResult } from "../src/contracts/result";
+import { readBundle } from "../src/modules/demoSeed/bundle";
+import { createSeedControl, type SeedTargetCalls } from "../src/modules/demoSeed/control";
+import { DEMO_OBJECT_NAME, DEMO_SEED_CONTROL, demoRepoId } from "../src/modules/demoSeed/entry";
+import { pushMain } from "../src/modules/demoSeed/receivePack";
+import {
+  createSeedTarget,
+  SEED_TARGET_LIMITS,
+  type SeedArtifacts,
+  type SeedArtifactsRepo,
+  type SeedTarget,
+} from "../src/modules/demoSeed/target";
+import type { InstanceOwnerPort } from "../src/modules/owner/entry";
+import type { RepoStorage } from "../src/repo/storage";
+
+const HOST = "railhead.mashin.workers.dev";
+const ORIGIN = `https://${HOST}`;
+const HEAD = "a".repeat(40);
+const OTHER_HEAD = "b".repeat(40);
+const REPO_ID = "rep_demo0000000000";
+const enc = new TextEncoder();
+
+// ---------------------------------------------------------------------------------------------
+// Bundles
+
+/** A v2 bundle with `header` lines after the signature and a minimal pack. */
+function bundle(lines: string[], pack: Uint8Array = fakePack()): Uint8Array {
+  const header = enc.encode(`# v2 git bundle\n${lines.map((line) => `${line}\n`).join("")}\n`);
+  const out = new Uint8Array(header.length + pack.length);
+  out.set(header);
+  out.set(pack, header.length);
+  return out;
+}
+
+/** "PACK", version 2, zero objects, and a 20-byte trailer: the smallest pack shape. */
+function fakePack(): Uint8Array {
+  const pack = new Uint8Array(32);
+  pack.set([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2]);
+  return pack;
+}
+
+const MAIN_BUNDLE = bundle([`${HEAD} refs/heads/main`]);
+
+describe("readBundle", () => {
+  it("reads main's head and the pack that follows the header", () => {
+    const read = readBundle(MAIN_BUNDLE);
+    if (!read.ok) throw new Error(read.reason);
+    expect(read.bundle.head).toBe(HEAD);
+    expect([...read.bundle.pack]).toEqual([...fakePack()]);
+  });
+
+  it("refuses prerequisites, other refs, a second ref and a missing pack", () => {
+    expect(readBundle(bundle([`-${OTHER_HEAD}`, `${HEAD} refs/heads/main`]))).toEqual({
+      ok: false,
+      reason: "prerequisites",
+    });
+    expect(readBundle(bundle([`${HEAD} refs/heads/dev`]))).toEqual({
+      ok: false,
+      reason: "wrong_refs",
+    });
+    expect(
+      readBundle(bundle([`${HEAD} refs/heads/main`, `${OTHER_HEAD} refs/heads/main`])),
+    ).toEqual({ ok: false, reason: "wrong_refs" });
+    expect(readBundle(bundle([]))).toEqual({ ok: false, reason: "wrong_refs" });
+    expect(readBundle(bundle([`${HEAD} refs/heads/main`], new Uint8Array(40)))).toEqual({
+      ok: false,
+      reason: "no_pack",
+    });
+  });
+
+  it("refuses a v3 bundle, plain bytes and a header without an end", () => {
+    const v3 = enc.encode(`# v3 git bundle\n${HEAD} refs/heads/main\n\nPACK`);
+    expect(readBundle(v3)).toEqual({ ok: false, reason: "not_a_bundle" });
+    expect(readBundle(new Uint8Array(0))).toEqual({ ok: false, reason: "not_a_bundle" });
+    expect(readBundle(enc.encode(`# v2 git bundle\n${"x".repeat(5000)}`))).toEqual({
+      ok: false,
+      reason: "not_a_bundle",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Fake Artifacts with create, delete and a receive-pack endpoint
+
+interface Push {
+  url: string;
+  authorization: string | null;
+  command: string;
+}
+
+/** The merged `FakeArtifacts`, with the namespace calls and the Git endpoint the seed uses. */
+class SeedFake implements SeedArtifacts {
+  readonly fake = new FakeArtifacts();
+  readonly pushes: Push[] = [];
+  readonly deleted: string[] = [];
+  /** How the next push misbehaves. */
+  pushFault: "none" | "lose-response" | "drop" | "reject" = "none";
+  failNextDelete = false;
+
+  async create(name: string): Promise<unknown> {
+    if (this.fake.repos.has(name)) throw new FakeArtifactsError("ALREADY_EXISTS");
+    this.fake.seed(name, []);
+    const token = this.fake.mintFor(name, "write", 86_400);
+    return { remote: remote(name), token: token.plaintext };
+  }
+
+  async get(name: string): Promise<SeedArtifactsRepo> {
+    const handle = await this.fake.get(name);
+    return {
+      ...handle,
+      [Symbol.dispose]: () => handle[Symbol.dispose](),
+      info: async () => ({
+        id: name,
+        name,
+        description: null,
+        defaultBranch: "main",
+        createdAt: "",
+        updatedAt: "",
+        lastPushAt: null,
+        source: null,
+        readOnly: false,
+        remote: remote(name),
+      }),
+    };
+  }
+
+  async delete(name: string): Promise<boolean> {
+    if (this.failNextDelete) {
+      this.failNextDelete = false;
+      throw new FakeArtifactsError("INTERNAL_ERROR");
+    }
+    this.deleted.push(name);
+    return this.fake.repos.delete(name);
+  }
+
+  /** Artifacts' receive-pack: creates main at the command's head for a live token. */
+  readonly fetch: typeof fetch = async (input, init) => {
+    const url = String(input);
+    const authorization = new Headers(init?.headers).get("Authorization");
+    const body = init?.body;
+    if (!(body instanceof Uint8Array)) throw new TypeError("expected a byte body");
+    const length = Number.parseInt(new TextDecoder().decode(body.subarray(0, 4)), 16);
+    const command = new TextDecoder().decode(body.subarray(4, length));
+    this.pushes.push({ url, authorization, command });
+    const fault = this.pushFault;
+    this.pushFault = "none";
+    if (fault === "drop") throw new TypeError("network lost");
+    if (fault === "reject") return new Response(pkt(["unpack ok", "ng refs/heads/main denied"]));
+    const name = /\/([^/]+)\.git\/git-receive-pack$/.exec(url)?.[1];
+    const token = authorization?.replace(/^Bearer /, "") ?? "";
+    const repo = name === undefined ? undefined : this.fake.repos.get(name);
+    if (repo === undefined || !this.fake.accepts(token)) return new Response("", { status: 403 });
+    const head = command.split(" ")[1] ?? "";
+    repo.commits.splice(0, repo.commits.length, head);
+    if (fault === "lose-response") throw new TypeError("response lost");
+    return new Response(pkt(["unpack ok", "ok refs/heads/main"]));
+  };
+}
+
+/** A fetch that answers every request with `body`. */
+function answering(body: string): typeof fetch {
+  return async () => new Response(body);
+}
+
+function remote(name: string): string {
+  return `https://fake.artifacts.invalid/git/default/${name}.git`;
+}
+
+function pkt(lines: string[]): string {
+  return `${lines
+    .map((line) => `${(line.length + 5).toString(16).padStart(4, "0")}${line}\n`)
+    .join("")}0000`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// pushMain
+
+describe("pushMain", () => {
+  it("creates main from the zero id with report-status, authorized by the token", async () => {
+    const seed = new SeedFake();
+    const name = "rh-m-push";
+    await seed.create(name);
+    const token = seed.fake.mintFor(name, "write", 300).plaintext;
+    const outcome = await pushMain(
+      { remote: remote(name), token, head: HEAD, pack: fakePack() },
+      seed.fetch,
+    );
+    expect(outcome).toBe("pushed");
+    expect(seed.pushes).toEqual([
+      {
+        url: `${remote(name)}/git-receive-pack`,
+        authorization: `Bearer ${token}`,
+        command: `${"0".repeat(40)} ${HEAD} refs/heads/main\0report-status\n`,
+      },
+    ]);
+    expect(seed.fake.repos.get(name)?.commits).toEqual([HEAD]);
+  });
+
+  it("reports a refused ref, a denied token and a lost request differently", async () => {
+    const seed = new SeedFake();
+    await seed.create("rh-m-x");
+    const request = { remote: remote("rh-m-x"), token: "nope", head: HEAD, pack: fakePack() };
+    expect(await pushMain(request, seed.fetch)).toBe("refused");
+    seed.pushFault = "reject";
+    expect(await pushMain(request, seed.fetch)).toBe("refused");
+    seed.pushFault = "drop";
+    expect(await pushMain(request, seed.fetch)).toBe("uncertain");
+    expect(await pushMain(request, answering("not pkt-lines"))).toBe("uncertain");
+    expect(await pushMain(request, answering("0".repeat(10_000)))).toBe("uncertain");
+  });
+
+  it("never sends to a remote that is not plain HTTPS", async () => {
+    const seed = new SeedFake();
+    for (const bad of ["http://fake.invalid/r.git", "https://x:y@fake.invalid/r.git", "nope"]) {
+      expect(
+        await pushMain({ remote: bad, token: "t", head: HEAD, pack: fakePack() }, seed.fetch),
+      ).toBe("refused");
+    }
+    expect(seed.pushes).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The target
+
+interface TargetSetup {
+  seed: SeedFake;
+  target: SeedTarget;
+  storage: RepoStorage;
+  host: { initialized: boolean; initializeCalls: number; wipes: number };
+  main: string;
+}
+
+function withTarget(
+  body: (setup: TargetSetup) => Promise<void>,
+  options: { artifacts?: boolean } = {},
+): Promise<void> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const seed = new SeedFake();
+    const host = { initialized: false, initializeCalls: 0, wipes: 0 };
+    const target = createSeedTarget(
+      {
+        repoId: REPO_ID,
+        storage: state.storage,
+        artifacts: options.artifacts === false ? undefined : seed,
+        fetch: seed.fetch,
+        initialized: () => host.initialized,
+        initialize: () => {
+          host.initializeCalls += 1;
+          host.initialized = true;
+          return ok(undefined);
+        },
+        wipe: async () => {
+          host.wipes += 1;
+          host.initialized = false;
+        },
+      },
+      { ...SEED_TARGET_LIMITS, callTimeoutMs: 1_000 },
+    );
+    await body({ seed, target, storage: state.storage, host, main: await mainRepoName(REPO_ID) });
+    expect(seed.fake.openHandles).toBe(0);
+  });
+}
+
+describe("seed target", () => {
+  it("creates main, pushes the bundle, revokes every token and initializes the Repo", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      expect(await target.read()).toEqual(ok(null));
+      const result = await target.seed(HEAD, fakePack());
+      expect(result).toEqual(ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }));
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(seed.pushes).toHaveLength(1);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initialized).toBe(true);
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+    }));
+
+  it("succeeds again without pushing for the same head, and refuses another head", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      const other = await target.seed(OTHER_HEAD, fakePack());
+      expect(other).toMatchObject({ ok: false, code: "action_stale" });
+      expect(seed.pushes).toHaveLength(1);
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(host.initializeCalls).toBe(2);
+    }));
+
+  it("reconciles a push whose response was lost by reading main back", () =>
+    withTarget(async ({ seed, target, main }) => {
+      seed.pushFault = "lose-response";
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.pushes).toHaveLength(1);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+    }));
+
+  it("leaves the Repo uninitialized after a failed push, and finishes on the next seed", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      seed.pushFault = "drop";
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+      expect(host.initialized).toBe(false);
+      expect(seed.fake.repos.get(main)?.commits).toEqual([]);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+      // The main repository already exists: the retry mints a fresh token instead of creating it.
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
+    }));
+
+  it("refuses to seed or reset without an Artifacts binding, changing nothing", () =>
+    withTarget(
+      async ({ seed, target, host }) => {
+        expect(await target.seed(HEAD, fakePack())).toMatchObject({
+          ok: false,
+          code: "unavailable",
+        });
+        expect(await target.reset()).toMatchObject({ ok: false, code: "unavailable" });
+        expect(host).toEqual({ initialized: false, initializeCalls: 0, wipes: 0 });
+        expect(seed.pushes).toEqual([]);
+      },
+      { artifacts: false },
+    ));
+
+  it("refuses a second seed while one is running", () =>
+    withTarget(async ({ seed, target }) => {
+      const paused = seed.fake.pauseNext("get");
+      const first = target.seed(HEAD, fakePack());
+      await paused.reached;
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
+      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      paused.release();
+      expect(await first).toMatchObject({ ok: true });
+    }));
+
+  it("resets by deleting main and the recorded forks by name, and nothing else", () =>
+    withTarget(async ({ seed, target, storage, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      seed.fake.seed("rh-m-another-repo", [OTHER_HEAD]);
+      const adapter = createArtifactsAdapter({
+        repoId: REPO_ID,
+        storage,
+        clock: seed.fake.clock,
+        namespace: seed.fake,
+      });
+      const fork = await adapter.forkForClaim("clm_claim0001", HEAD);
+      if (!fork.ok) throw new Error(fork.code);
+
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(seed.deleted).toEqual([main, fork.value.repo]);
+      expect([...seed.fake.repos.keys()]).toEqual(["rh-m-another-repo"]);
+      expect(host.wipes).toBe(1);
+
+      // A reset of an absent repository deletes nothing and still succeeds.
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: false }));
+    }));
+
+  it("stops a reset whose deletion failed before wiping the Repo", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      seed.failNextDelete = true;
+      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      expect(host.wipes).toBe(0);
+      expect(seed.fake.repos.has(main)).toBe(true);
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(host.wipes).toBe(1);
+    }));
+});
+
+// ---------------------------------------------------------------------------------------------
+// The control: a software authenticator stands in for the owner's passkey
+
+function b64url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes)));
+}
+
+function derInteger(raw: Uint8Array): number[] {
+  let start = 0;
+  while (start < raw.length - 1 && raw[start] === 0) start += 1;
+  const body = [...raw.subarray(start)];
+  if ((body[0] ?? 0) & 0x80) body.unshift(0);
+  return [0x02, body.length, ...body];
+}
+
+class Authenticator {
+  #counter = 0;
+
+  private constructor(
+    readonly privateKey: CryptoKey,
+    readonly credential: StoredCredential,
+  ) {}
+
+  static async create(): Promise<Authenticator> {
+    const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+      "sign",
+      "verify",
+    ]);
+    if (!("privateKey" in pair)) throw new Error("ECDSA generateKey returned a single key");
+    const exported = await crypto.subtle.exportKey("raw", pair.publicKey);
+    if (!(exported instanceof ArrayBuffer)) throw new Error("raw export is not bytes");
+    const raw = new Uint8Array(exported);
+    const cose = Uint8Array.from([
+      0xa5,
+      0x01,
+      0x02,
+      0x03,
+      0x26,
+      0x20,
+      0x01,
+      0x21,
+      0x58,
+      32,
+      ...raw.slice(1, 33),
+      0x22,
+      0x58,
+      32,
+      ...raw.slice(33),
+    ]);
+    return new Authenticator(pair.privateKey, {
+      credentialId: b64url(crypto.getRandomValues(new Uint8Array(16))),
+      publicKey: cose,
+      userHandle: b64url(crypto.getRandomValues(new Uint8Array(16))),
+      signCount: 0,
+    });
+  }
+
+  async assert(challenge: string): Promise<PasskeyAssertion> {
+    this.#counter += 1;
+    const clientData = enc.encode(
+      JSON.stringify({ type: "webauthn.get", challenge, origin: ORIGIN, crossOrigin: false }),
+    );
+    const authData = new Uint8Array(37);
+    authData.set(await sha256(enc.encode(HOST)), 0);
+    authData[32] = 0x05;
+    new DataView(authData.buffer).setUint32(33, this.#counter, false);
+    const signed = Uint8Array.from([...authData, ...(await sha256(clientData))]);
+    const raw = new Uint8Array(
+      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.privateKey, signed),
+    );
+    const der = [...derInteger(raw.subarray(0, 32)), ...derInteger(raw.subarray(32))];
+    return {
+      credentialId: this.credential.credentialId,
+      clientDataJson: b64url(clientData),
+      authenticatorData: b64url(authData),
+      signature: b64url(Uint8Array.from([0x30, der.length, ...der])),
+      userHandle: this.credential.userHandle,
+    };
+  }
+}
+
+interface ControlSetup {
+  auth: Authenticator;
+  control: ReturnType<typeof createSeedControl>;
+  calls: { seed: { head: string; pack: number[] }[]; resets: number };
+  clock: { now: number };
+  sign: (action: DemoSeedAction) => Promise<{ challengeId: string; assertion: PasskeyAssertion }>;
+}
+
+function withControl(
+  body: (setup: ControlSetup) => Promise<void>,
+  options: { enrolled?: boolean } = {},
+): Promise<void> {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const auth = await Authenticator.create();
+    const clock = { now: Date.now() };
+    const calls: ControlSetup["calls"] = { seed: [], resets: 0 };
+    let signCount = 0;
+    const instance: InstanceOwnerPort = {
+      credential: async () =>
+        options.enrolled === false
+          ? null
+          : { userId: "usr_owner0000001", credential: auth.credential },
+      recordSignCount: async (_id, count) => {
+        if (count <= signCount) return false;
+        signCount = count;
+        return true;
+      },
+    };
+    const target: SeedTargetCalls = {
+      seed: async (head, pack): Promise<PortResult<DemoSeedResult>> => {
+        calls.seed.push({ head, pack: [...pack] });
+        return ok({ kind: "demo.seed", repo: REPO_ID, head });
+      },
+      reset: async () => {
+        calls.resets += 1;
+        return ok({ kind: "demo.reset", deleted: true });
+      },
+    };
+    const control = createSeedControl({
+      storage: state.storage,
+      clock: () => clock.now,
+      repoId: REPO_ID,
+      instance,
+      relyingParty: relyingParty(HOST),
+      target,
+    });
+    const sign = async (action: DemoSeedAction) => {
+      const prepared = await control.prepare(action);
+      if (!prepared.ok) throw new Error(`prepare failed: ${prepared.code}`);
+      return {
+        challengeId: prepared.value.challengeId,
+        assertion: await auth.assert(prepared.value.challenge),
+      };
+    };
+    await body({ auth, control, calls, clock, sign });
+  });
+}
+
+describe("seed control", () => {
+  it("hands a verified seed and its pack to the demo repository, once", () =>
+    withControl(async ({ control, calls, sign }) => {
+      const { challengeId, assertion } = await sign({ kind: "demo.seed", head: HEAD });
+      expect(await control.perform(challengeId, assertion, MAIN_BUNDLE)).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(calls.seed).toEqual([{ head: HEAD, pack: [...fakePack()] }]);
+      expect(await control.perform(challengeId, assertion, MAIN_BUNDLE)).toMatchObject({
+        ok: false,
+        code: "proof_expired",
+      });
+      expect(calls.seed).toHaveLength(1);
+    }));
+
+  it("refuses a bundle that does not match the approved head without spending the proof", () =>
+    withControl(async ({ control, calls, sign }) => {
+      const { challengeId, assertion } = await sign({ kind: "demo.seed", head: HEAD });
+      const other = bundle([`${OTHER_HEAD} refs/heads/main`]);
+      for (const wrong of [other, null, new Uint8Array(MAX_DEMO_BUNDLE_BYTES + 1), fakePack()]) {
+        expect(await control.perform(challengeId, assertion, wrong)).toMatchObject({
+          ok: false,
+          code: "invalid_request",
+        });
+      }
+      expect(calls.seed).toEqual([]);
+      expect(await control.perform(challengeId, assertion, MAIN_BUNDLE)).toMatchObject({
+        ok: true,
+      });
+    }));
+
+  it("resets only with a reset proof and no bundle", () =>
+    withControl(async ({ control, calls, sign }) => {
+      const reset = await sign({ kind: "demo.reset" });
+      expect(await control.perform(reset.challengeId, reset.assertion, MAIN_BUNDLE)).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+      expect(await control.perform(reset.challengeId, reset.assertion, null)).toEqual(
+        ok({ kind: "demo.reset", deleted: true }),
+      );
+      expect(calls.resets).toBe(1);
+    }));
+
+  it("refuses an assertion for another challenge, a forged seal and an expired challenge", () =>
+    withControl(async ({ control, calls, clock, sign }) => {
+      const seed = await sign({ kind: "demo.seed", head: HEAD });
+      const reset = await sign({ kind: "demo.reset" });
+      expect(await control.perform(reset.challengeId, seed.assertion, null)).toMatchObject({
+        ok: false,
+        code: "proof_invalid",
+      });
+
+      // The same fields under a reset action, with the seed's seal: the seal no longer checks.
+      const parts = seed.challengeId.split(".");
+      const forgedAction = b64url(enc.encode(JSON.stringify({ kind: "demo.reset" })));
+      const forged = [parts[0], parts[1], parts[2], forgedAction, parts[4]].join(".");
+      expect(await control.perform(forged, seed.assertion, null)).toMatchObject({
+        ok: false,
+        code: "proof_invalid",
+      });
+      expect(await control.perform("not-a-challenge", seed.assertion, null)).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+
+      clock.now += 3 * 60_000;
+      expect(await control.perform(seed.challengeId, seed.assertion, MAIN_BUNDLE)).toMatchObject({
+        ok: false,
+        code: "proof_expired",
+      });
+      expect(calls).toEqual({ seed: [], resets: 0 });
+    }));
+
+  it("refuses to prepare a malformed head or before an owner passkey is enrolled", async () => {
+    await withControl(async ({ control }) => {
+      expect(await control.prepare({ kind: "demo.seed", head: "HEAD" })).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+    });
+    await withControl(
+      async ({ control }) => {
+        expect(await control.prepare({ kind: "demo.reset" })).toMatchObject({
+          ok: false,
+          code: "unavailable",
+        });
+      },
+      { enrolled: false },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The deployed entry
+
+async function openSession(): Promise<WebSocket> {
+  const response = await SELF.fetch(`${ORIGIN}${API_PATH}`, { headers: { Upgrade: "websocket" } });
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  if (!socket) throw new TypeError("Expected a WebSocket response.");
+  socket.accept();
+  return socket;
+}
+
+describe("demo seed entry", () => {
+  it("reports a fresh instance's demo repository as absent and refuses without an owner", async () => {
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using seed = await api.demoSeed();
+    expect(await seed.read()).toEqual({ ok: true, value: null });
+    expect(await seed.prepare({ kind: "demo.reset" })).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+  });
+
+  it("refuses a malformed action at the RPC boundary", async () => {
+    using api = newWebSocketRpcSession<RailheadApi>(await openSession());
+    using seed = await api.demoSeed();
+    const bogus: unknown = { kind: "demo.drop" };
+    // @ts-expect-error: the boundary's own validation is under test.
+    await expect(seed.prepare(bogus)).rejects.toThrow();
+  });
+
+  it("answers each role only on its own object", async () => {
+    const other = env.REPO.getByName("acme/not-the-demo");
+    expect(await other.seedDemo(HEAD, fakePack())).toMatchObject({ ok: false, code: "not_found" });
+    expect(await other.resetDemo()).toMatchObject({ ok: false, code: "not_found" });
+    expect(await other.prepareDemoSeed({ kind: "demo.reset" })).toMatchObject({
+      ok: false,
+      code: "not_found",
+    });
+    const demo = env.REPO.getByName(DEMO_OBJECT_NAME);
+    expect(await demo.prepareDemoSeed({ kind: "demo.reset" })).toMatchObject({
+      ok: false,
+      code: "not_found",
+    });
+    const control = env.REPO.getByName(DEMO_SEED_CONTROL);
+    expect(await control.resetDemo()).toMatchObject({ ok: false, code: "not_found" });
+    // Without the binding, the deployed demo repository refuses to seed and stays absent.
+    expect(await demo.seedDemo(HEAD, fakePack())).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+    expect(await demo.describe()).toBeNull();
+  });
+
+  it("binds challenges to the demo repository's own identifier", async () => {
+    const demo = env.REPO.getByName(DEMO_OBJECT_NAME);
+    expect(await demo.initialize("demo", "upload-app")).toEqual(
+      ok({ repoId: demoRepoId(env), org: "demo", name: "upload-app" }),
+    );
+  });
+});

@@ -22,6 +22,7 @@
 import type { RpcTarget } from "capnweb";
 import type {
   AgentId,
+  CommitSha,
   DecisionId,
   InviteId,
   IssueId,
@@ -270,4 +271,56 @@ export interface OwnerEnrollmentApi extends RpcTarget {
     challengeId: string,
     registration: PasskeyRegistration,
   ): Promise<BoardResult<{ ownerId: UserId }>>;
+}
+
+/** The organisation of the demo repository the board opens by default. */
+export const DEMO_ORG = "demo";
+
+/** The name of the demo repository the board opens by default. */
+export const DEMO_REPO = "upload-app";
+
+/** The largest Git bundle, in bytes, a demo seed accepts. */
+export const MAX_DEMO_BUNDLE_BYTES = 8 * 1024 * 1024;
+
+/** An owner action on the demo repository, approved with the owner passkey like an `OwnerAction`. */
+export type DemoSeedAction =
+  /**
+   * Create `demo/upload-app` if it is missing, and import the bundle whose main is `head` as its
+   * main. A repeat with the same head succeeds; a main at another head fails with `action_stale`.
+   */
+  | { kind: "demo.seed"; head: CommitSha }
+  /** Delete `demo/upload-app` and its Artifacts repositories. Nothing else is touched. */
+  | { kind: "demo.reset" };
+
+/** What a demo seed action did. */
+export type DemoSeedResult =
+  /** The demo repository and the head its main holds. */
+  | { kind: "demo.seed"; repo: RepoId; head: CommitSha }
+  /** Whether there was a demo repository to delete. */
+  | { kind: "demo.reset"; deleted: boolean };
+
+/** The demo repository as it stands. */
+export interface DemoSeedState {
+  /** Its identifier. */
+  repo: RepoId;
+  /** The head of its main, or `null` before a main was imported. */
+  main: CommitSha | null;
+}
+
+/** Seeding and resetting the demo repository. Each action needs its own owner passkey assertion. */
+export interface DemoSeedApi extends RpcTarget {
+  /** The demo repository, or `null` when it does not exist. */
+  read(): Promise<BoardResult<DemoSeedState | null>>;
+  /** Issues a challenge bound to `action`. */
+  prepare(action: DemoSeedAction): Promise<BoardResult<ActionChallenge>>;
+  /**
+   * Performs the action the challenge names, if `assertion` verifies for it; at most once.
+   * `bundle` is the Git bundle holding main for `demo.seed`, at most `MAX_DEMO_BUNDLE_BYTES`, and
+   * `null` for `demo.reset`.
+   */
+  perform(
+    challengeId: string,
+    assertion: PasskeyAssertion,
+    bundle: Uint8Array | null,
+  ): Promise<BoardResult<DemoSeedResult>>;
 }
