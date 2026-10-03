@@ -329,7 +329,7 @@ function attempt(decisions: DecisionRef[]): CheckAttempt {
     attemptId: "chk_attempt01",
     expectedMain: MAIN,
     candidate: CANDIDATE,
-    pins: [{ claimId: CLAIM, generation: 1, commit: COMMIT }],
+    pins: [{ claimId: CLAIM, generation: 1, commit: COMMIT, episode: 1 }],
     definition: { name: "upload", source: MAIN, digest: "d".repeat(64), acceptance: null },
     decisions,
     createdAt: NOW - 60_000,

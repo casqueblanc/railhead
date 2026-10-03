@@ -52,6 +52,9 @@ export const unavailableClaims: ClaimsPort = {
   workingGeneration: () => null,
   workingEpisode: () => null,
   readyPin: () => null,
+  reopen: () => {
+    throw new UnavailableError("claims");
+  },
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
   resume: async () => {},
@@ -125,6 +128,7 @@ export const unavailableTrain: TrainPort = {
   pinView: refuse("train"),
   armWake: async () => false,
   resume: async () => {},
+  startup: async () => true,
 };
 
 /** Authorization while its module is missing: no intent is authorized. */
