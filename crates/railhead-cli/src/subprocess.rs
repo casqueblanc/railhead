@@ -37,8 +37,8 @@ pub enum RunError {
     TimedOut(Duration),
 }
 
-/// Runs `command` and waits at most `limit` from its start for it, capturing stdout when `capture`
-/// is set.
+/// Runs `command` and waits at most `limit` for it, counted from before it is started, capturing
+/// stdout when `capture` is set.
 ///
 /// A child still running at the deadline, or one whose captured stdout is still held open then by a
 /// process it started, is stopped and reaped, with its process group on Unix, before this returns.
@@ -48,19 +48,20 @@ pub enum RunError {
 /// [`RunError::Io`] when the child cannot be started or waited for, [`RunError::TimedOut`] when it
 /// or its stdout outlived `limit`.
 pub fn run(command: &mut Command, limit: Duration, capture: bool) -> Result<Finished, RunError> {
-    run_from(command, limit, capture, || Ok(()))
+    let deadline = Instant::now().checked_add(limit).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the deadline is too far away")
+    })?;
+    run_until(command, limit, capture, || Ok(deadline))
 }
 
-/// [`run`], with the deadline counted from when `started` returns once the child is running.
-fn run_from(
+/// [`run`], stopping the child at the time `deadline` returns once the child is running. Tests use
+/// it to start a deadline only once the child has set itself up.
+fn run_until(
     command: &mut Command,
     limit: Duration,
     capture: bool,
-    started: impl FnOnce() -> io::Result<()>,
+    deadline: impl FnOnce() -> io::Result<Instant>,
 ) -> Result<Finished, RunError> {
-    let too_far = || io::Error::new(io::ErrorKind::InvalidInput, "the deadline is too far away");
-    // Checked before spawning too, so a limit that cannot be met starts nothing.
-    Instant::now().checked_add(limit).ok_or_else(too_far)?;
     command.stdout(if capture {
         Stdio::piped()
     } else {
@@ -69,12 +70,8 @@ fn run_from(
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
     let mut child = command.spawn()?;
-    let deadline = match started().map(|()| Instant::now().checked_add(limit)) {
-        Ok(Some(deadline)) => deadline,
-        Ok(None) => {
-            stop(&mut child)?;
-            return Err(too_far().into());
-        }
+    let deadline = match deadline() {
+        Ok(deadline) => deadline,
         Err(error) => {
             stop(&mut child)?;
             return Err(error.into());
@@ -204,19 +201,28 @@ mod tests {
     }
 
     /// Waits until `ready` exists, so a deadline starts only once the child's processes are set up.
-    fn once_ready(ready: &Path) -> impl FnOnce() -> io::Result<()> + '_ {
-        move || {
-            let until = Instant::now() + PATIENCE;
-            while !ready.exists() {
-                if Instant::now() > until {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the child never started",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(10));
+    fn once_ready(ready: &Path) -> io::Result<()> {
+        let until = Instant::now() + PATIENCE;
+        while !ready.exists() {
+            if Instant::now() > until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the child never started",
+                ));
             }
-            Ok(())
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// A deadline `limit` from when `ready` exists.
+    fn limit_once_ready(
+        ready: &Path,
+        limit: Duration,
+    ) -> impl FnOnce() -> io::Result<Instant> + '_ {
+        move || {
+            once_ready(ready)?;
+            Ok(Instant::now() + limit)
         }
     }
 
@@ -264,7 +270,13 @@ mod tests {
         );
         let started = Instant::now();
         let limit = Duration::from_millis(300);
-        let error = run_from(&mut sh(&script), limit, true, once_ready(&grandchild)).err();
+        let error = run_until(
+            &mut sh(&script),
+            limit,
+            true,
+            limit_once_ready(&grandchild, limit),
+        )
+        .err();
         assert!(
             matches!(error, Some(RunError::TimedOut(stopped)) if stopped == limit),
             "{error:?}"
@@ -285,7 +297,13 @@ mod tests {
         let script = stubborn(&grandchild);
         let started = Instant::now();
         let limit = Duration::from_millis(300);
-        let error = run_from(&mut sh(&script), limit, true, once_ready(&grandchild)).err();
+        let error = run_until(
+            &mut sh(&script),
+            limit,
+            true,
+            limit_once_ready(&grandchild, limit),
+        )
+        .err();
         assert!(
             matches!(error, Some(RunError::TimedOut(stopped)) if stopped == limit),
             "{error:?}"
@@ -301,8 +319,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let grandchild = dir.path().join("grandchild");
         let script = format!("{} wait", stubborn(&grandchild));
-        let error = run_from(&mut sh(&script), Duration::from_secs(600), true, || {
-            once_ready(&grandchild)()?;
+        let error = run_until(&mut sh(&script), Duration::from_secs(600), true, || {
+            once_ready(&grandchild)?;
             Err(io::Error::other("set-up failed"))
         })
         .err();
@@ -315,6 +333,33 @@ mod tests {
             !alive(recorded),
             "process {recorded} outlived the failed start"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deadline_fixed_before_the_child_runs_counts_its_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let grandchild = dir.path().join("grandchild");
+        let script = format!("{} wait", stubborn(&grandchild));
+        // As `run` does, the deadline is fixed before the child starts. The child takes longer
+        // than that to get going, so it is stopped at once rather than given the whole limit then.
+        let limit = PATIENCE * 2;
+        let fixed = Instant::now() + Duration::from_millis(300);
+        let error = run_until(&mut sh(&script), limit, true, || {
+            once_ready(&grandchild)?;
+            thread::sleep(fixed.saturating_duration_since(Instant::now()));
+            Ok(fixed)
+        })
+        .err();
+        let stopped = Instant::now();
+        assert!(
+            matches!(error, Some(RunError::TimedOut(reported)) if reported == limit),
+            "{error:?}"
+        );
+        let late = stopped.duration_since(fixed);
+        assert!(late < PATIENCE, "{late:?}");
+        let recorded = pid(&grandchild)?;
+        assert!(!alive(recorded), "process {recorded} outlived the deadline");
         Ok(())
     }
 

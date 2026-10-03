@@ -6,10 +6,11 @@
 //! log, never inferred from the output.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Read, Write as _};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -175,6 +176,39 @@ fn rh_in_clone(world: &World, args: &[&str]) -> anyhow::Result<Run> {
 /// its `--wait`. Only a run that never gets there takes this long.
 const PATIENCE: Duration = Duration::from_secs(120);
 
+/// How long `rh` may run past its `--wait` once its gate opens before the test stops it. Longer
+/// than any bound a test asserts, so a run stopped here had already failed.
+const OVERRUN: Duration = Duration::from_secs(30);
+
+/// A child process killed and reaped if the test lets go of it while it runs, so a stalled `rh`
+/// fails its test instead of hanging the job.
+struct Reaped(Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // Already exited is the outcome wanted; the wait reaps it either way.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Reads `pipe` to its end on a thread of its own, so a full pipe cannot stall the child.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    })
+}
+
+fn joined(reader: JoinHandle<io::Result<Vec<u8>>>) -> anyhow::Result<Vec<u8>> {
+    Ok(reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("a pipe reader panicked"))??)
+}
+
 /// The debug-build gate `rh ask` holds its `--wait` at: `rh` writes `ready` in the directory and
 /// starts its deadline only once `go` exists there. A test times the wait from the moment it
 /// creates `go`, however long the process took to start.
@@ -191,22 +225,38 @@ impl Gate {
         })
     }
 
-    /// Runs `command` through the gate. Returns the run, when the test opened the gate, and when
-    /// `rh` exited.
-    fn run(&self, mut command: Command) -> anyhow::Result<(Run, Instant, Instant)> {
+    /// Runs `command`, whose `--wait` is `wait`, through the gate. Returns the run, when the test
+    /// opened the gate, and when `rh` exited.
+    fn run(&self, command: Command, wait: Duration) -> anyhow::Result<(Run, Instant, Instant)> {
+        self.run_within(command, PATIENCE, wait + OVERRUN)
+    }
+
+    /// [`Gate::run`], stopping `rh` and failing when it has not reached its wait within `patience`,
+    /// or still runs `limit` after the gate opened.
+    fn run_within(
+        &self,
+        mut command: Command,
+        patience: Duration,
+        limit: Duration,
+    ) -> anyhow::Result<(Run, Instant, Instant)> {
         command.env("RH_TEST_WAIT_GATE", self.dir.path());
-        let mut child = command.spawn()?;
+        let mut child = Reaped(command.spawn()?);
+        let stdout = drain(child.0.stdout.take());
+        let stderr = drain(child.0.stderr.take());
         let ready = self.dir.path().join("ready");
-        let until = Instant::now() + PATIENCE;
+        let until = Instant::now() + patience;
         while !ready.exists() {
-            if child.try_wait()?.is_some() || Instant::now() > until {
-                let output = child.wait_with_output()?;
+            if let Some(status) = child.0.try_wait()? {
+                let stderr = joined(stderr)?;
                 anyhow::bail!(
-                    "rh never reached its wait: {:?} {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
+                    "rh exited before its wait: {status} {}",
+                    String::from_utf8_lossy(&stderr)
                 );
             }
+            anyhow::ensure!(
+                Instant::now() < until,
+                "rh did not reach its wait within {patience:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let go = Instant::now();
@@ -214,10 +264,109 @@ impl Gate {
             .set(go)
             .map_err(|_| anyhow::anyhow!("a gate opens once"))?;
         fs::write(self.dir.path().join("go"), b"")?;
-        let output = child.wait_with_output()?;
+        let until = go + limit;
+        let status = loop {
+            if let Some(status) = child.0.try_wait()? {
+                break status;
+            }
+            anyhow::ensure!(
+                Instant::now() < until,
+                "rh still ran {limit:?} after its gate opened"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let exited = Instant::now();
+        let output = Output {
+            status,
+            stdout: joined(stdout)?,
+            stderr: joined(stderr)?,
+        };
         Ok((finish(&output)?, go, exited))
     }
+}
+
+/// A shell standing in for a stalled `rh`: it records its process id in `pid`, runs `script`, then
+/// sleeps for ten minutes.
+fn stalled(pid: &Path, script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            &format!("echo $$ > '{}'; {script} exec sleep 600", pid.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Whether the process `pid` names still runs.
+fn running(pid: &Path) -> anyhow::Result<bool> {
+    let pid = fs::read_to_string(pid)?;
+    let status = Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+#[test]
+fn a_run_that_never_reaches_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let started = Instant::now();
+    let error = gate
+        .run_within(stalled(&pid, ""), Duration::from_millis(300), PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh did not reach its wait within 300ms")
+    );
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    assert!(!running(&pid)?);
+    assert!(gate.go.get().is_none());
+    Ok(())
+}
+
+#[test]
+fn a_run_that_outlives_its_wait_is_stopped_and_fails() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let pid = gate.dir.path().join("pid");
+    let ready = format!("touch '{}';", gate.dir.path().join("ready").display());
+    let started = Instant::now();
+    let error = gate
+        .run_within(stalled(&pid, &ready), PATIENCE, Duration::from_millis(300))
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh still ran 300ms after its gate opened")
+    );
+    assert!(started.elapsed() < PATIENCE, "{:?}", started.elapsed());
+    assert!(!running(&pid)?);
+    assert!(gate.dir.path().join("go").exists());
+    Ok(())
+}
+
+#[test]
+fn a_run_that_exits_before_its_wait_fails_with_its_stderr() -> anyhow::Result<()> {
+    let gate = Gate::new()?;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "echo refused >&2; exit 3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let error = gate
+        .run_within(command, PATIENCE, PATIENCE)
+        .err()
+        .map(|error| error.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("rh exited before its wait: exit status: 3 refused\n")
+    );
+    Ok(())
 }
 
 /// The fixture exchange named `name`.
@@ -1652,7 +1801,10 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     // Asked and waited on: the wait ends with the question as asked, before the held answer.
     let mut args = ask_args(QUESTION, "src/upload.ts");
     args.extend(["--wait", "2"]);
-    let (run, go, exited) = Gate::new()?.run(command(&world, world.clone.path(), None, &args))?;
+    let (run, go, exited) = Gate::new()?.run(
+        command(&world, world.clone.path(), None, &args),
+        Duration::from_secs(2),
+    )?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
@@ -1672,12 +1824,15 @@ async fn a_held_poll_ends_at_the_wait_deadline() -> anyhow::Result<()> {
     assert!((1..=1_500).contains(&held), "{held}");
 
     // Resumed: nothing of the question is known, so the timeout says how to wait again.
-    let (run, go, exited) = Gate::new()?.run(command(
-        &world,
-        world.outside.path(),
-        Some("atlas"),
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
-    ))?;
+    let (run, go, exited) = Gate::new()?.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "1"],
+        ),
+        Duration::from_secs(1),
+    )?;
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
     let open = stall.open_until(exited)?;
@@ -1750,8 +1905,10 @@ async fn a_session_renewal_during_a_wait_ends_at_the_deadline() -> anyhow::Resul
 
     let args = ["--json", "ask", "--question", "qst_upload1", "--wait", "2"];
     let gate = Gate::new()?;
-    let (run, go, exited) =
-        gate.run(command(&world, world.outside.path(), Some("atlas"), &args))?;
+    let (run, go, exited) = gate.run(
+        command(&world, world.outside.path(), Some("atlas"), &args),
+        Duration::from_secs(2),
+    )?;
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
     let open = stall.open_until(exited)?;
@@ -1821,12 +1978,15 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
         .mount(&world.server)
         .await;
 
-    let (run, go, exited) = gate.run(command(
-        &world,
-        world.outside.path(),
-        Some("atlas"),
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
-    ))?;
+    let (run, go, exited) = gate.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "4"],
+        ),
+        wait,
+    )?;
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= wait, "{elapsed:?}");
     // Half a second was left when the session request arrived. A login that gave it the request
@@ -1871,12 +2031,15 @@ async fn a_wait_for_another_processs_login_ends_by_the_deadline() -> anyhow::Res
         drop(held);
     });
 
-    let (run, go, exited) = Gate::new()?.run(command(
-        &world,
-        world.outside.path(),
-        Some("atlas"),
-        &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
-    ))?;
+    let (run, go, exited) = Gate::new()?.run(
+        command(
+            &world,
+            world.outside.path(),
+            Some("atlas"),
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "2"],
+        ),
+        Duration::from_secs(2),
+    )?;
     drop(exit);
     release
         .join()
