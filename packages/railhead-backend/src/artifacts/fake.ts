@@ -1,7 +1,8 @@
 // A controllable in-memory Artifacts namespace for tests of the adapter and its consumers. It keeps
 // the binding's observable contract (initial token on fork, token states and expiry, `null` for a
 // missing commit, `ArtifactsError` codes) and adds switches for the failures a real service shows
-// rarely: a lost fork response, a hung call, and a fork still in progress. It proves nothing about
+// rarely: a lost fork response, a hung or late call, slow revocations, and a fork still in
+// progress. It proves nothing about
 // the deployed service's revocation timing or limits; that evidence is H04's.
 
 import type { ArtifactsNamespace, ArtifactsRepoHandle } from "./adapter";
@@ -51,6 +52,14 @@ export type ForkFault =
   /** The call never answers and creates nothing. */
   | "hang";
 
+/** A fake call `pauseNext` can hold. */
+export type PausableCall = "get" | "createToken" | "listTokens";
+
+interface Gate {
+  held: Promise<void>;
+  reach: () => void;
+}
+
 /** A fake Artifacts namespace whose clock, failures and contents a test controls. */
 export class FakeArtifacts implements ArtifactsNamespace {
   /** Repositories by name. */
@@ -65,7 +74,8 @@ export class FakeArtifacts implements ArtifactsNamespace {
   #nextId = 1;
   #forkFaults: ForkFault[] = [];
   #revokeFails = 0;
-  #mintGate: { held: Promise<void>; reach: () => void } | null = null;
+  #revokeDelayMs = 0;
+  readonly #gates = new Map<PausableCall, Gate>();
 
   constructor(now = 1_000_000) {
     this.#now = now;
@@ -96,23 +106,36 @@ export class FakeArtifacts implements ArtifactsNamespace {
     this.#revokeFails = count;
   }
 
+  /** Makes every `revokeToken` call take `ms` milliseconds of wall time before it answers. */
+  slowRevocations(ms: number): void {
+    this.#revokeDelayMs = ms;
+  }
+
   /**
-   * Holds the next `createToken` call after it mints, until `release` is called, so a test can act
-   * while a mint is in flight. `reached` resolves once the call is held.
+   * Holds the next `call` until `release` is called, so a test can act while it is in flight.
+   * `get` and `createToken` hold after they take effect, so a handle is open or a token minted;
+   * `listTokens` holds before it lists. `reached` resolves once the call is held.
    */
-  pauseNextMint(): { reached: Promise<void>; release: () => void } {
+  pauseNext(call: PausableCall): { reached: Promise<void>; release: () => void } {
     let release: (() => void) | undefined;
     let reach: (() => void) | undefined;
     const reached = new Promise<void>((resolve) => {
       reach = resolve;
     });
-    this.#mintGate = {
+    this.#gates.set(call, {
       held: new Promise<void>((resolve) => {
         release = resolve;
       }),
       reach: () => reach?.(),
-    };
+    });
     return { reached, release: () => release?.() };
+  }
+
+  /** Mints a live token on `name` directly, as another holder of the repository would. */
+  mintFor(name: string, scope: "read" | "write", ttlSeconds: number): FakeToken {
+    const repo = this.repos.get(name);
+    if (repo === undefined) throw new FakeArtifactsError("NOT_FOUND");
+    return this.#mint(repo, scope, ttlSeconds);
   }
 
   /** Whether `plaintext` would be accepted by the fake's Git endpoint now. */
@@ -137,7 +160,17 @@ export class FakeArtifacts implements ArtifactsNamespace {
     if (repo === undefined) throw new FakeArtifactsError("NOT_FOUND");
     if (repo.forking) throw new FakeArtifactsError("FORK_IN_PROGRESS");
     this.openHandles += 1;
-    return this.#handle(repo);
+    const handle = this.#handle(repo);
+    await this.#hold("get");
+    return handle;
+  }
+
+  async #hold(call: PausableCall): Promise<void> {
+    const gate = this.#gates.get(call);
+    if (gate === undefined) return;
+    this.#gates.delete(call);
+    gate.reach();
+    await gate.held;
   }
 
   #mint(repo: FakeRepo, scope: "read" | "write", ttlSeconds: number): FakeToken {
@@ -190,12 +223,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
         }
         this.tokensMinted += 1;
         const token = this.#mint(repo, scope, ttl);
-        const gate = this.#mintGate;
-        this.#mintGate = null;
-        if (gate !== null) {
-          gate.reach();
-          await gate.held;
-        }
+        await this.#hold("createToken");
         return {
           id: token.id,
           plaintext: token.plaintext,
@@ -205,6 +233,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
       },
       listTokens: async () => {
         live();
+        await this.#hold("listTokens");
         const tokens = repo.tokens.map((token) => ({
           id: token.id,
           scope: token.scope,
@@ -217,6 +246,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
       revokeToken: async (tokenOrId) => {
         live();
         if (tokenOrId === "") throw new FakeArtifactsError("INVALID_INPUT");
+        if (this.#revokeDelayMs > 0) await wait(this.#revokeDelayMs);
         if (this.#revokeFails > 0) {
           this.#revokeFails -= 1;
           return false;
@@ -267,4 +297,10 @@ export class FakeArtifacts implements ArtifactsNamespace {
 function tokenState(token: FakeToken, now: number): "active" | "expired" | "revoked" {
   if (token.revoked) return "revoked";
   return token.expiresAtMs > now ? "active" : "expired";
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

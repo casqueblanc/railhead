@@ -1,7 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  ARTIFACTS_LIMITS,
   createArtifactsAdapter,
   forkRepoName,
   mainRepoName,
@@ -20,7 +21,12 @@ const HEAD = "2".repeat(40);
 const MISSING = "3".repeat(40);
 const MINUTE = 60_000;
 
-const FAST: ArtifactsAdapterLimits = { callTimeoutMs: 50, maxCachedTokens: 256 };
+const FAST: ArtifactsAdapterLimits = {
+  ...ARTIFACTS_LIMITS,
+  callTimeoutMs: 50,
+  sweepDeadlineMs: 1_000,
+  mintSettleMs: MINUTE,
+};
 
 interface Setup {
   fake: FakeArtifacts;
@@ -54,6 +60,13 @@ function forkRows(
       "SELECT claim_id, state, head FROM artifacts_forks ORDER BY claim_id",
     )
     .toArray();
+}
+
+/** Forks `CLAIM` and returns the fork's name. */
+async function forkClaim(port: ArtifactsPort): Promise<string> {
+  const result = await port.forkForClaim(CLAIM, HEAD);
+  if (!result.ok) throw new Error(`fork refused: ${result.code}`);
+  return result.value.repo;
 }
 
 async function tokenValue(
@@ -303,9 +316,22 @@ describe("token", () => {
     });
   });
 
+  it("mints one token for concurrent requests with the same scope", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const values = await Promise.all(
+        Array.from({ length: 5 }, () => tokenValue(port, repo, "write")),
+      );
+      expect(new Set(values).size).toBe(1);
+      expect(fake.tokensMinted).toBe(1);
+    });
+  });
+
   it("holds a bounded number of cached tokens", async () => {
     await withArtifacts(async ({ fake, adapter, main }) => {
-      const port = adapter(REPO, { callTimeoutMs: 50, maxCachedTokens: 1 });
+      const port = adapter(REPO, { ...FAST, maxCachedTokens: 1 });
       const forked = await port.forkForClaim(CLAIM, HEAD);
       if (!forked.ok) throw new Error("fork failed");
 
@@ -338,17 +364,33 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("never caches or returns a token minted while revocation ran", async () => {
+  it("reports busy while a mint that started first runs, and that mint returns no token", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
-      const forked = await port.forkForClaim(CLAIM, HEAD);
-      if (!forked.ok) throw new Error("fork failed");
-      const repo = forked.value.repo;
+      const repo = await forkClaim(port);
 
-      const paused = fake.pauseNextMint();
+      const paused = fake.pauseNext("createToken");
       const minting = port.token(repo, "write", 10 * MINUTE);
       await paused.reached;
-      expect(await port.revokeTokens(repo)).toMatchObject({ ok: true });
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      paused.release();
+
+      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+    });
+  });
+
+  it("sweeps the fork when the token minted during revocation cannot be revoked by id", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const paused = fake.pauseNext("createToken");
+      const minting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      fake.failRevocations(1);
       paused.release();
 
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
@@ -356,22 +398,163 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("sweeps the fork when the token minted during revocation cannot be revoked by id", async () => {
+  it("mints nothing while a revocation runs, and the next token is accepted", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
-      const forked = await port.forkForClaim(CLAIM, HEAD);
-      if (!forked.ok) throw new Error("fork failed");
-      const repo = forked.value.repo;
+      const repo = await forkClaim(port);
+      const before = await tokenValue(port, repo, "write");
 
-      const paused = fake.pauseNextMint();
-      const minting = port.token(repo, "write", 10 * MINUTE);
+      const paused = fake.pauseNext("listTokens");
+      const revoking = port.revokeTokens(repo);
       await paused.reached;
-      expect(await port.revokeTokens(repo)).toMatchObject({ ok: true });
-      fake.failRevocations(1);
+      expect(await port.token(repo, "write", 60 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      expect(fake.tokensMinted).toBe(1);
+      paused.release();
+      expect(await revoking).toEqual({ ok: true, value: undefined });
+
+      const after = await tokenValue(port, repo, "write");
+      expect(after).not.toBe(before);
+      expect(fake.accepts(before)).toBe(false);
+      expect(fake.accepts(after)).toBe(true);
+    });
+  });
+
+  it("lets concurrent revocations both finish before minting again", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const before = await tokenValue(port, repo, "read");
+
+      const paused = fake.pauseNext("listTokens");
+      const first = port.revokeTokens(repo);
+      await paused.reached;
+      const second = port.revokeTokens(repo);
+      expect(await second).toEqual({ ok: true, value: undefined });
+      // The first revocation still runs, so its fence holds.
+      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({ code: "busy" });
+      paused.release();
+      expect(await first).toEqual({ ok: true, value: undefined });
+
+      expect(fake.accepts(before)).toBe(false);
+      expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
+    });
+  });
+
+  it("revokes a token whose mint answered after its timeout, and holds revocation until then", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const paused = fake.pauseNext("createToken");
+      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      // The timed-out mint created a token Artifacts may still return.
+      expect(fake.liveTokens(repo)).toHaveLength(1);
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+
+      paused.release();
+      await vi.waitFor(() => {
+        expect(fake.liveTokens(repo)).toEqual([]);
+        expect(fake.openHandles).toBe(0);
+      });
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      const retried = await tokenValue(port, repo, "write");
+      expect(fake.accepts(retried)).toBe(true);
+      expect(fake.tokensMinted).toBe(2);
+    });
+  });
+
+  it("revokes a late main token without sweeping main", async () => {
+    await withArtifacts(async ({ fake, adapter, main }) => {
+      const port = adapter();
+      const kept = await tokenValue(port, main, "read");
+      fake.advance(5 * MINUTE + 1);
+
+      const paused = fake.pauseNext("createToken");
+      expect(await port.token(main, "read", 10 * MINUTE)).toMatchObject({ code: "busy" });
       paused.release();
 
-      expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      await vi.waitFor(() => {
+        expect(fake.liveTokens(main).map((token) => token.plaintext)).toEqual([kept]);
+        expect(fake.openHandles).toBe(0);
+      });
+    });
+  });
+
+  it("holds revocation after a restart until an unanswered mint is taken as abandoned", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const before = adapter();
+      const repo = await forkClaim(before);
+      const paused = fake.pauseNext("createToken");
+      expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
+
+      // A fresh adapter on the same storage, as after the Durable Object restarts.
+      const after = adapter();
+      expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      fake.advance(MINUTE - 1);
+      expect(await after.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      fake.advance(1);
+      expect(await after.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
       expect(fake.liveTokens(repo)).toEqual([]);
+
+      paused.release();
+      await vi.waitFor(() => {
+        expect(fake.openHandles).toBe(0);
+      });
+    });
+  });
+
+  it("disposes a repository handle that opens after its timeout", async () => {
+    await withArtifacts(async ({ fake, adapter, main }) => {
+      const port = adapter();
+      const paused = fake.pauseNext("get");
+
+      expect(await port.commitExists(main, HEAD)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.openHandles).toBe(1);
+      paused.release();
+      await vi.waitFor(() => {
+        expect(fake.openHandles).toBe(0);
+      });
+      expect(await port.commitExists(main, HEAD)).toEqual({ ok: true, value: true });
+    });
+  });
+
+  it("stops after its revocation budget and continues on a repeat", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter(REPO, { ...FAST, maxRevokesPerSweep: 2 });
+      const repo = await forkClaim(port);
+      for (let i = 0; i < 5; i += 1) fake.mintFor(repo, "write", 600);
+
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toHaveLength(3);
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.liveTokens(repo)).toHaveLength(1);
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("stops at its deadline when every revocation is slow", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter(REPO, { ...FAST, sweepDeadlineMs: 100 });
+      const repo = await forkClaim(port);
+      for (let i = 0; i < 20; i += 1) fake.mintFor(repo, "write", 600);
+      fake.slowRevocations(30);
+
+      const started = Date.now();
+      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      expect(Date.now() - started).toBeLessThan(500);
+      const left = fake.liveTokens(repo).length;
+      expect(left).toBeGreaterThan(0);
+      expect(left).toBeLessThan(20);
+
+      fake.slowRevocations(0);
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
     });
   });
 

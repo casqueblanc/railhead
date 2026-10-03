@@ -1,7 +1,10 @@
 // The Artifacts adapter behind `ArtifactsPort`: one fork per claim, commit lookups, and short-lived
-// tokens minted inside the Worker. Every binding call is bounded by a timeout. A fork whose
-// response was lost is recorded as pending before the call and reconciled on the next request, and
-// the token Artifacts returns with a new fork is revoked before the fork is used.
+// tokens minted inside the Worker. Every binding call is bounded by a timeout, and a result that
+// arrives after its timeout is still cleaned up: a late handle is disposed and a late token revoked.
+// A fork whose response was lost is recorded as pending before the call and reconciled on the next
+// request, and the token Artifacts returns with a new fork is revoked before the fork is used. A
+// fork's token mint is recorded before the call too, so a revocation never reports success while a
+// mint that started before it may still create a token.
 //
 // Tokens never leave this module except through `token`, whose caller streams them to Artifacts.
 // Nothing here logs a token, a repository name or a binding error's message.
@@ -45,12 +48,24 @@ export interface ArtifactsAdapterLimits {
   readonly callTimeoutMs: number;
   /** How many tokens the cache holds before it drops the oldest. */
   readonly maxCachedTokens: number;
+  /** How long one token sweep may run, across all its calls, before it reports the repository busy. */
+  readonly sweepDeadlineMs: number;
+  /** How many tokens one sweep revokes before it reports the repository busy. */
+  readonly maxRevokesPerSweep: number;
+  /**
+   * How long after it started a mint that never answered still blocks revocation. After this the
+   * call is taken as abandoned: an unverified assumption about Artifacts that H04 must qualify.
+   */
+  readonly mintSettleMs: number;
 }
 
 /** The production limits. */
 export const ARTIFACTS_LIMITS: ArtifactsAdapterLimits = {
   callTimeoutMs: 10_000,
   maxCachedTokens: 256,
+  sweepDeadlineMs: 30_000,
+  maxRevokesPerSweep: 64,
+  mintSettleMs: 60_000,
 };
 
 /** The shortest token lifetime Artifacts accepts. */
@@ -68,6 +83,11 @@ const MIGRATIONS = [
     head TEXT,
     state TEXT NOT NULL CHECK (state IN ('pending', 'ready')),
     created_at INTEGER NOT NULL
+  ) STRICT`,
+  `CREATE TABLE artifacts_mints (
+    id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    started_at INTEGER NOT NULL
   ) STRICT`,
 ];
 
@@ -109,6 +129,13 @@ interface CachedToken {
   claimId: ClaimId | null;
 }
 
+interface BoundedOptions<T> {
+  /** Takes ownership of the call's eventual outcome when the call times out. */
+  late?: (pending: Promise<T>) => void;
+  /** A shorter limit than the per-call timeout. */
+  timeoutMs?: number;
+}
+
 /** A binding call that did not answer in time. Its effect, if any, is unknown. */
 class CallTimedOut extends Error {
   constructor() {
@@ -127,6 +154,10 @@ class ArtifactsAdapter implements ArtifactsPort {
   readonly #cache = new Map<string, CachedToken>();
   // Bumped by `revokeTokens`, so a token minted while a revocation ran is never cached or returned.
   readonly #epochs = new Map<ArtifactsRepoName, number>();
+  // How many revocations of each repository are running. While one runs, no mint starts there.
+  readonly #revoking = new Map<ArtifactsRepoName, number>();
+  // The latest mint per cache key, so concurrent misses for one key mint one token at a time.
+  readonly #minting = new Map<string, Promise<void>>();
   #mainName: Promise<ArtifactsRepoName> | null = null;
 
   constructor(context: ArtifactsAdapterContext, limits: ArtifactsAdapterLimits) {
@@ -175,17 +206,68 @@ class ArtifactsAdapter implements ArtifactsPort {
       if (target.kind === "main" && scope === "write") {
         return invalid("main is written only through the main writer");
       }
-      const claimId = target.kind === "fork" ? target.claimId : null;
-      const key = cacheKey(repo, scope, claimId);
-      const now = this.#context.clock();
-      const cached = this.#cache.get(key);
-      // A cached token is reused while at least half the requested lifetime remains.
-      if (cached !== undefined && cached.token.expiresAt - now >= ttlMs / 2) {
-        return ok({ ...cached.token });
+      const key = cacheKey(repo, scope, target.kind === "fork" ? target.claimId : null);
+      return await this.#oneAtATime(key, () => this.#issue(repo, target, scope, ttlMs, key));
+    });
+  }
+
+  async revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<void>> {
+    return guarded(async () => {
+      const target = await this.#resolve(repo);
+      if (target === null) return unknownRepo();
+      if (target.kind === "main") return invalid("main's tokens are not revoked through a claim");
+      this.#revoking.set(repo, (this.#revoking.get(repo) ?? 0) + 1);
+      try {
+        // Forget cached tokens and invalidate running mints before revoking, so none is handed out
+        // even if revocation fails.
+        this.#epochs.set(repo, this.#epoch(repo) + 1);
+        for (const [key, entry] of this.#cache) {
+          if (entry.token.repo === repo) this.#cache.delete(key);
+        }
+        // A mint that has not answered could create a token after the sweep lists, so sweep only
+        // once none is running. New mints are refused until this revocation returns.
+        if (this.#mintsRunning(repo)) {
+          return fail("busy", "A token for the repository is still being minted; try again.");
+        }
+        using handle = await this.#open(repo);
+        return await this.#revokeActive(handle);
+      } finally {
+        const running = (this.#revoking.get(repo) ?? 1) - 1;
+        if (running === 0) this.#revoking.delete(repo);
+        else this.#revoking.set(repo, running);
       }
-      const epoch = this.#epoch(repo);
+    });
+  }
+
+  async #issue(
+    repo: ArtifactsRepoName,
+    target: Target,
+    scope: "read" | "write",
+    ttlMs: number,
+    key: string,
+  ): Promise<PortResult<ArtifactsToken>> {
+    if (this.#revoking.has(repo)) {
+      return fail("busy", "The repository's tokens are being revoked; try again.");
+    }
+    const claimId = target.kind === "fork" ? target.claimId : null;
+    const now = this.#context.clock();
+    const cached = this.#cache.get(key);
+    // A cached token is reused while at least half the requested lifetime remains.
+    if (cached !== undefined && cached.token.expiresAt - now >= ttlMs / 2) {
+      return ok({ ...cached.token });
+    }
+    const epoch = this.#epoch(repo);
+    // Recorded in the same step as the fence check above, so a revocation that starts later sees it.
+    const mint = target.kind === "fork" ? this.#recordMint(repo) : null;
+    let settled = true;
+    try {
       using handle = await this.#open(repo);
-      const created = await this.#bounded(handle.createToken(scope, Math.ceil(ttlMs / 1000)));
+      const created = await this.#bounded(handle.createToken(scope, Math.ceil(ttlMs / 1000)), {
+        late: (pending) => {
+          settled = false;
+          void this.#discardLate(repo, pending, mint);
+        },
+      });
       const expiresAt = Date.parse(created.expiresAt);
       if (this.#epoch(repo) !== epoch || Number.isNaN(expiresAt)) {
         // Revoked while minting, or unusable: this token must not stay live. A fork's tokens may all
@@ -205,21 +287,80 @@ class ArtifactsAdapter implements ArtifactsPort {
       const token: ArtifactsToken = { value: created.plaintext, scope, repo, expiresAt };
       this.#remember(key, { token, claimId }, now);
       return ok({ ...token });
+    } finally {
+      // Once the call has answered, any token it created exists, and a revocation's sweep finds it.
+      if (settled && mint !== null) this.#forgetMint(mint);
+    }
+  }
+
+  /** Revokes a token whose mint answered after its timeout. Nobody waits for this. */
+  async #discardLate(
+    repo: ArtifactsRepoName,
+    pending: Promise<ArtifactsCreateTokenResult>,
+    mint: string | null,
+  ): Promise<void> {
+    try {
+      const created = await pending;
+      using handle = await this.#open(repo);
+      await this.#bounded(handle.revokeToken(created.id));
+    } catch {
+      // No caller remains to report to. A fork's token left live is revoked by the next sweep, as
+      // `revokeTokens` waits for this mint; any token expires within its requested lifetime.
+    } finally {
+      if (mint !== null) this.#forgetMint(mint);
+    }
+  }
+
+  /** Runs `work` after the previous work for `key` has finished. */
+  async #oneAtATime<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const current = (this.#minting.get(key) ?? Promise.resolve()).then(work);
+    const finished = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#minting.set(key, finished);
+    try {
+      return await current;
+    } finally {
+      if (this.#minting.get(key) === finished) this.#minting.delete(key);
+    }
+  }
+
+  #recordMint(repo: ArtifactsRepoName): string {
+    const id = crypto.randomUUID();
+    atomically(this.#context.storage, () => {
+      this.#context.storage.sql.exec(
+        "INSERT INTO artifacts_mints (id, repo, started_at) VALUES (?, ?, ?)",
+        id,
+        repo,
+        this.#context.clock(),
+      );
+    });
+    return id;
+  }
+
+  #forgetMint(id: string): void {
+    atomically(this.#context.storage, () => {
+      this.#context.storage.sql.exec("DELETE FROM artifacts_mints WHERE id = ?", id);
     });
   }
 
-  async revokeTokens(repo: ArtifactsRepoName): Promise<PortResult<void>> {
-    return guarded(async () => {
-      const target = await this.#resolve(repo);
-      if (target === null) return unknownRepo();
-      if (target.kind === "main") return invalid("main's tokens are not revoked through a claim");
-      // Forget cached tokens before revoking, so none is handed out even if revocation fails.
-      this.#epochs.set(repo, this.#epoch(repo) + 1);
-      for (const [key, entry] of this.#cache) {
-        if (entry.token.repo === repo) this.#cache.delete(key);
-      }
-      using handle = await this.#open(repo);
-      return await this.#revokeActive(handle);
+  /**
+   * Whether a mint for `repo` may still create a token. A record outlives its adapter, so a mint
+   * started before a restart counts until `mintSettleMs` has passed.
+   */
+  #mintsRunning(repo: ArtifactsRepoName): boolean {
+    const abandonedBefore = this.#context.clock() - this.#limits.mintSettleMs;
+    return atomically(this.#context.storage, () => {
+      const sql = this.#context.storage.sql;
+      sql.exec(
+        "DELETE FROM artifacts_mints WHERE repo = ? AND started_at <= ?",
+        repo,
+        abandonedBefore,
+      );
+      return (
+        sql.exec("SELECT 1 FROM artifacts_mints WHERE repo = ? LIMIT 1", repo).toArray().length > 0
+      );
     });
   }
 
@@ -309,14 +450,28 @@ class ArtifactsAdapter implements ArtifactsPort {
     return latest.hash;
   }
 
+  /**
+   * Revokes every live token on `handle`'s repository, within a total deadline and revocation
+   * budget. Running out of either reports busy; a repeat continues where this one stopped.
+   */
   async #revokeActive(handle: ArtifactsRepoHandle): Promise<PortResult<void>> {
+    const unfinished = fail("busy", "The repository still has live tokens; try again.");
+    // Wall time, like the per-call timer; the injected clock need not move while calls run.
+    const deadline = Date.now() + this.#limits.sweepDeadlineMs;
+    const remaining = (): number => Math.min(this.#limits.callTimeoutMs, deadline - Date.now());
+    let budget = this.#limits.maxRevokesPerSweep;
     for (let round = 0; round < MAX_REVOKE_ROUNDS; round += 1) {
-      const listed = await this.#bounded(handle.listTokens());
+      if (remaining() <= 0) return unfinished;
+      const listed = await this.#bounded(handle.listTokens(), { timeoutMs: remaining() });
       const active = listed.tokens.filter((token) => token.state === "active");
       if (active.length === 0) return ok(undefined);
-      for (const token of active) await this.#bounded(handle.revokeToken(token.id));
+      for (const token of active) {
+        if (budget === 0 || remaining() <= 0) return unfinished;
+        budget -= 1;
+        await this.#bounded(handle.revokeToken(token.id), { timeoutMs: remaining() });
+      }
     }
-    return fail("busy", "The repository still has live tokens; try again.");
+    return unfinished;
   }
 
   async #resolve(repo: ArtifactsRepoName): Promise<Target | null> {
@@ -352,7 +507,15 @@ class ArtifactsAdapter implements ArtifactsPort {
   }
 
   #open(name: ArtifactsRepoName): Promise<ArtifactsRepoHandle> {
-    return this.#bounded(this.#context.namespace.get(name));
+    return this.#bounded(this.#context.namespace.get(name), {
+      // A handle that opens after its timeout has no owner but this.
+      late: (pending) => {
+        void pending.then(
+          (handle) => handle[Symbol.dispose](),
+          () => undefined,
+        );
+      },
+    });
   }
 
   #epoch(repo: ArtifactsRepoName): number {
@@ -372,10 +535,17 @@ class ArtifactsAdapter implements ArtifactsPort {
     }
   }
 
-  async #bounded<T>(work: Promise<T>): Promise<T> {
+  /**
+   * Waits for `work` up to the per-call timeout. On timeout the call keeps running, so `late` takes
+   * over any result that holds a resource.
+   */
+  async #bounded<T>(work: Promise<T>, options: BoundedOptions<T> = {}): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new CallTimedOut()), this.#limits.callTimeoutMs);
+      timer = setTimeout(() => {
+        options.late?.(work);
+        reject(new CallTimedOut());
+      }, options.timeoutMs ?? this.#limits.callTimeoutMs);
     });
     try {
       return await Promise.race([work, timeout]);
