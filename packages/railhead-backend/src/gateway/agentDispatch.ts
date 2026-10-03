@@ -141,7 +141,8 @@ async function runSessionCommand(
       if (!view.ok) return view;
       const claim = await ports.claims.activeClaim(agent);
       if (!claim.ok) return claim;
-      return ok({ agent: view.value, claim: claim.value });
+      if (claim.value === null) return ok({ agent: view.value, claim: null });
+      return located(remotes, ok({ agent: view.value, claim: claim.value }));
     }
     case "work":
       return located(remotes, await ports.claims.work(agent));

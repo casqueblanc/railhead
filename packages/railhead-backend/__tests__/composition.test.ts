@@ -374,7 +374,9 @@ describe("agent dispatch", () => {
   });
 
   it("answers status with the identity's view and the active claim", async () => {
-    await withFakePorts({ activeClaim: ok(claim.claim) }, async (ports, calls) => {
+    // The port's URLs are replaced by ones on the origin the agent called, as for work.
+    const foreign = { ...claim.claim, originUrl: "https://evil.invalid/x.git", upstreamUrl: "" };
+    await withFakePorts({ activeClaim: ok(foreign) }, async (ports, calls) => {
       const reply = await dispatchAgent(
         { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
         { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
@@ -387,6 +389,22 @@ describe("agent dispatch", () => {
         next: null,
       });
       expect(calls).toEqual(["authenticate", "view", "activeClaim", "digest"]);
+    });
+  });
+
+  it("answers status without a claim when the agent holds none", async () => {
+    await withFakePorts({}, async (ports) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, org: "acme", name: "widgets", ports },
+          { command: { route: "status" }, token: TOKEN, origin: ORIGIN },
+        ),
+      ).toEqual({
+        ok: true,
+        data: { agent: VIEW, claim: null },
+        inbox: { items: [], pending: 0 },
+        next: null,
+      });
     });
   });
 
