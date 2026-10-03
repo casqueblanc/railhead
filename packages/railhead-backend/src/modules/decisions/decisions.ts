@@ -106,8 +106,9 @@ const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
 export interface Decisions extends DecisionsPort {
   /**
    * The current version of every recorded decision the claim depends on, oldest question first, or
-   * `null` for a value that is not a claim identifier. Synchronous: call it inside the caller's
-   * transaction, where its answer holds until that transaction commits.
+   * `null` when the claims module's fence reader does not know the claim, including when that
+   * module is missing. Synchronous: call it inside the caller's transaction, where its answer holds
+   * until that transaction commits.
    */
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
 }
@@ -501,7 +502,10 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
     },
 
     currentVersions(claimId) {
-      return isId("claim", claimId) ? dependencies(claimId) : null;
+      // This module cannot tell an unknown claim from one with no decisions; claims can.
+      if (!isId("claim", claimId) || ports().claims.currentGeneration(claimId) === null)
+        return null;
+      return dependencies(claimId);
     },
   };
 }

@@ -68,7 +68,7 @@ interface Harness {
     action: Omit<Extract<OwnerAction, { kind: "decision.record" }>, "kind">,
     grantId?: string,
   ): GrantFor<"decision.record">;
-  /** Sets what the claims module answers for `activeClaim`. */
+  /** Sets what the claims module answers for `activeClaim` and, for that claim, `currentGeneration`. */
   holds(answer: PortResult<ClaimView | null>): void;
   /** Replaces the inbox the decisions module queues through. */
   useInbox(inbox: InboxPort): void;
@@ -106,7 +106,12 @@ async function withDecisions<R>(
     let inbox: InboxPort = realInbox;
     const ports = (): RepoPorts => ({
       ...composed,
-      claims: { ...unavailableClaims, activeClaim: async () => active },
+      claims: {
+        ...unavailableClaims,
+        activeClaim: async () => active,
+        currentGeneration: (claimId) =>
+          active.ok && active.value?.claimId === claimId ? active.value.generation : null,
+      },
       inbox,
     });
     const decisions = createDecisions(context, ports);
@@ -544,7 +549,10 @@ describe("requirements and currentVersions", () => {
       expect(h.log.transaction(() => h.decisions.currentVersions(CLAIM)).value).toEqual([
         { decisionId, version: 1 },
       ]);
-      expect(h.decisions.currentVersions("clm_claim002")).toEqual([]);
+      // A claim the claims module does not know is unknown, never an empty requirement list.
+      expect(h.decisions.currentVersions("clm_claim002")).toBeNull();
+      h.holds(unavailable("claims"));
+      expect(h.decisions.currentVersions(CLAIM)).toBeNull();
       expect(h.decisions.currentVersions("iss_issue001")).toBeNull();
       expect(await h.decisions.requirements("iss_issue001")).toMatchObject({
         ok: false,
