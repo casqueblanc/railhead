@@ -636,6 +636,119 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
     Ok(())
 }
 
+/// Makes the fork's upload pack run `interloper` once, before the first fetch is answered, so it
+/// fills the target while that run is still building its clone.
+#[cfg(unix)]
+fn interrupt_first_fetch(world: &World, interloper: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let marker = world.work.path().join("interrupted");
+    let shim = world.work.path().join("upload-pack.sh");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\n(cd '{}' && {interloper}) \
+             </dev/null >/dev/null 2>&1\nfi\nexec git upload-pack \"$@\"\n",
+            marker.display(),
+            world.outside().display()
+        ),
+    )?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    point_fork_at(world, &world.fork)?;
+    let pointed = fs::read_to_string(&world.git_config)?;
+    fs::write(
+        &world.git_config,
+        format!(
+            "{pointed}[remote \"origin\"]\n\tuploadpack = {}\n",
+            shim.display()
+        ),
+    )?;
+    Ok(())
+}
+
+fn staging_left(world: &World) -> anyhow::Result<Vec<String>> {
+    Ok(fs::read_dir(world.work.path())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("rh-partial"))
+        .collect())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_that_publishes_second_keeps_the_first_clone_and_reuses_it() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    // While this run fetches, a second run of the same claim publishes its clone at the target
+    // and an agent starts editing it.
+    let edit = world.clone_dir().join("notes.txt");
+    interrupt_first_fetch(
+        &world,
+        &format!(
+            "'{}' --json work && echo draft > '{}'",
+            env!("CARGO_BIN_EXE_rh"),
+            edit.display()
+        ),
+    )?;
+
+    let second = rh(&world, &world.outside(), Some("atlas"), &["--json", "work"])?;
+    assert_eq!(second.code, Some(0), "{}", second.stdout);
+    assert_eq!(
+        second.json()?.pointer("/data/clone/state"),
+        Some(&json!("reused"))
+    );
+    assert_eq!(fs::read_to_string(&edit)?, "draft\n");
+    assert_eq!(
+        git_in(&world, &world.clone_dir(), &["rev-parse", "HEAD"])?,
+        world.fork_head
+    );
+    assert_eq!(
+        git_config_value(&world, &world.clone_dir(), "railhead.generation")?,
+        "1"
+    );
+    let partial = staging_left(&world)?;
+    assert!(partial.is_empty(), "{partial:?}");
+    assert_eq!(requests(&world).await, 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_target_filled_during_the_fetch_is_kept_and_refused() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    let target = world.clone_dir();
+    interrupt_first_fetch(
+        &world,
+        &format!(
+            "mkdir '{}' && echo mine > '{}/notes.txt'",
+            target.display(),
+            target.display()
+        ),
+    )?;
+
+    let refused = rh(&world, &world.outside(), Some("atlas"), &["--json", "work"])?;
+    assert_eq!(refused.code, Some(1), "{}", refused.stdout);
+    assert_eq!(refused.error_code()?, json!("workspace_conflict"));
+    assert_eq!(fs::read_to_string(target.join("notes.txt"))?, "mine\n");
+    assert_eq!(fs::read_dir(&target)?.count(), 1);
+    let partial = staging_left(&world)?;
+    assert!(partial.is_empty(), "{partial:?}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_invalid_git_timeout_is_refused() -> anyhow::Result<()> {
     let world = world().await?;

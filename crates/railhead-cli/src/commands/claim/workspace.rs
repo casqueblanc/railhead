@@ -2,7 +2,9 @@
 //!
 //! A new clone is built in a staging directory that this run creates beside its target and alone
 //! owns, and is renamed into place only once its fork is fetched and checked out, so a failed
-//! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. An existing clone of the same claim and agent is reused:
+//! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. The rename never
+//! replaces another run's clone: when a run of the same claim published first, this run's clone is
+//! discarded and that one reused. An existing clone of the same claim and agent is reused:
 //! its Railhead settings are refreshed and its working tree, index and refs are never touched.
 //!
 //! Every Git process has an overall deadline, [`DEFAULT_GIT_TIMEOUT`] unless
@@ -170,11 +172,7 @@ pub fn open(
 ) -> Result<CloneState> {
     match occupant(dir)? {
         Occupant::Clone(binding) => {
-            let ours = binding.identity == identity.agent_id
-                && binding.origin == identity.origin
-                && binding.repo == identity.repo
-                && binding.claim_id == claim.claim_id;
-            if !ours {
+            if !is_clone_of(&binding, identity, claim) {
                 return Err(conflict(dir, "is a clone of another claim"));
             }
             configure(dir, identity, claim.generation, remotes)?;
@@ -182,10 +180,21 @@ pub fn open(
         }
         Occupant::Other => Err(conflict(dir, "is not empty")),
         Occupant::Nothing => {
-            create(dir, identity, claim, remotes)?;
-            Ok(CloneState::Created)
+            let state = create(dir, identity, claim, remotes)?;
+            if state == CloneState::Reused {
+                configure(dir, identity, claim.generation, remotes)?;
+            }
+            Ok(state)
         }
     }
+}
+
+/// Whether `binding` is this agent's clone of `claim`.
+fn is_clone_of(binding: &CloneBinding, identity: &Identity, claim: &ClaimView) -> bool {
+    binding.identity == identity.agent_id
+        && binding.origin == identity.origin
+        && binding.repo == identity.repo
+        && binding.claim_id == claim.claim_id
 }
 
 /// The ownership generation a clone recorded.
@@ -264,7 +273,14 @@ fn occupant(dir: &Path) -> Result<Occupant> {
     })
 }
 
-fn create(dir: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes) -> Result<()> {
+/// Builds a new clone and publishes it at `dir`. When another run of the same claim published
+/// first, its clone is kept and this run's is discarded: the result is then `Reused`.
+fn create(
+    dir: &Path,
+    identity: &Identity,
+    claim: &ClaimView,
+    remotes: &Remotes,
+) -> Result<CloneState> {
     let name = dir
         .file_name()
         .ok_or_else(|| conflict(dir, "is not a directory a clone can be created in"))?;
@@ -272,25 +288,41 @@ fn create(dir: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes)
     fs::create_dir_all(parent).map_err(|error| io_error("creating", parent, &error))?;
     let staging = stage(parent, name)?;
 
-    let built = build(&staging, identity, claim, remotes);
-    let placed = built.and_then(|()| {
-        // An empty target directory is replaced by the finished clone. Renaming a directory onto
-        // a non-empty one fails, so when two runs race for the same target the first one to
-        // publish keeps it and the other fails without touching it.
-        if dir.exists() {
-            fs::remove_dir(dir).map_err(|error| io_error("replacing", dir, &error))?;
-        }
-        fs::rename(&staging, dir).map_err(|error| io_error("moving the clone to", dir, &error))
-    });
-    if let Err(error) = placed {
-        // Only this run's own staging directory is removed; it never held anything an agent wrote.
-        if staging.exists() {
-            fs::remove_dir_all(&staging)
-                .map_err(|cleanup| io_error("removing", &staging, &cleanup))?;
-        }
-        return Err(error);
+    let placed =
+        build(&staging, identity, claim, remotes).and_then(|()| match publish(&staging, dir) {
+            Ok(()) => Ok(CloneState::Created),
+            Err(error) => match occupant(dir)? {
+                Occupant::Clone(binding) if is_clone_of(&binding, identity, claim) => {
+                    Ok(CloneState::Reused)
+                }
+                Occupant::Clone(_) | Occupant::Other => Err(conflict(
+                    dir,
+                    "was filled by something else while the clone was fetched",
+                )),
+                Occupant::Nothing => Err(io_error("moving the clone to", dir, &error)),
+            },
+        });
+    // Only this run's own staging directory is removed; it never held anything an agent wrote.
+    // A published clone has left it.
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|cleanup| io_error("removing", &staging, &cleanup))?;
     }
-    Ok(())
+    placed
+}
+
+/// Moves the finished clone in `staging` to `dir` in one step. A rename replaces a missing or
+/// empty directory and fails on any other, so when two runs race for `dir` the first to publish
+/// keeps it and nothing it holds is removed.
+fn publish(staging: &Path, dir: &Path) -> io::Result<()> {
+    // Elsewhere a rename never replaces a directory, so an empty one is removed first;
+    // `remove_dir` refuses once another run has published into it.
+    #[cfg(not(unix))]
+    match fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(staging, dir)
 }
 
 /// How many staging names `stage` tries before giving up.
