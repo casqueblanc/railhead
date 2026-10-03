@@ -15,9 +15,10 @@ import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { run } from "./cli.ts";
-import { SeedRefusal } from "./manifest.ts";
+import { loadManifest, SeedRefusal } from "./manifest.ts";
 
 const root = join(import.meta.dirname, "..", "..");
+const manifest = loadManifest(join(root, "fixtures", "demo", "seed.json"));
 const scratch = mkdtempSync(join(tmpdir(), "railhead-demo-cli-test-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
@@ -78,6 +79,19 @@ test("seed --dry-run names the repository, its main, every issue and the decisio
     lines.filter((line) => line.startsWith("todo owner files issue demo/upload-app#")).length,
     3,
   );
+  // Each issue's payload as plain text: the body's paragraph breaks are blank lines, not `\\n`.
+  const [, second] = manifest.issues;
+  assert.ok(second !== undefined);
+  const start = lines.indexOf("--- issue demo/upload-app#seed-2 title");
+  const end = lines.indexOf("--- end issue demo/upload-app#seed-2");
+  assert.deepEqual(lines.slice(start, end + 1), [
+    "--- issue demo/upload-app#seed-2 title",
+    second.title,
+    "--- issue demo/upload-app#seed-2 body",
+    ...second.body.split("\n"),
+    "--- end issue demo/upload-app#seed-2",
+  ]);
+  assert.equal(lines.filter((line) => line.startsWith("--- end issue")).length, 3);
   assert.deepEqual(lines.slice(-2), [
     "note decision upload-size-limit (a, b) is opened by an agent's question, not seeded",
     "note planned against an empty instance: no live target exists yet",

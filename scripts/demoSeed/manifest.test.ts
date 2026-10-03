@@ -324,6 +324,29 @@ test("a title at the shared limit passes and one character more is refused", () 
   );
 });
 
+test("issue text may break body lines and carries no other control character", () => {
+  const base = fixture();
+  const [first, second, third] = issues(base);
+  assert.ok(first !== undefined && second !== undefined && third !== undefined);
+
+  const parsed = parseManifest({
+    ...base,
+    issues: [{ ...first, body: "One.\n\nTwo.\n" }, second, third],
+  });
+  assert.equal(parsed.issues[0]?.body, "One.\n\nTwo.\n");
+  for (const issue of [
+    { ...first, body: "Red \u001b[31mtext" },
+    { ...first, body: "Carriage\r\nreturn" },
+    { ...first, title: "Two\nlines" },
+    { ...first, title: "Tab\there" },
+  ]) {
+    assert.throws(
+      () => parseManifest({ ...base, issues: [issue, second, third] }),
+      /issues\[0\] holds a control character; only a body may break lines/,
+    );
+  }
+});
+
 test("a scope directory covers the paths below it and nothing beside it", () => {
   assert.equal(overlaps(["src/upload/limits.ts"], ["src/upload"]), true);
   assert.equal(overlaps(["src/uploads.ts"], ["src/upload"]), false);

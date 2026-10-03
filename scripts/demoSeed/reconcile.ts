@@ -12,7 +12,10 @@
 //
 // Issues are read through `BoardIssues`, a separate port: `DemoSeedApi` has no issue read. Filing an
 // issue is an owner action on the board, so neither port can file one. The plan lists each seeded
-// issue and whether the board already shows it; the owner files the missing ones.
+// issue and whether the board already shows it; the owner files the missing ones. A seeded title
+// whose body differs is a step for the owner too, editing the body, never a reason to refuse the run
+// or reset: the repository and the other issues are still right. `describeIssues` prints each
+// payload as plain text, so the owner can copy it exactly.
 //
 // Reset deletes the demo repository by name and nothing else. It never lists the target to choose
 // what to delete, so another repository cannot be swept up with it. It always calls the target,
@@ -83,10 +86,16 @@ export type SeedStep =
   | { readonly action: "issue.file"; readonly target: string; readonly issue: SeedIssue }
   | { readonly action: "repo.delete"; readonly target: string };
 
+/**
+ * Whether the target already reflects a step: `differs` when an issue with the seeded title is on
+ * the board with another body.
+ */
+export type StepStatus = "done" | "missing" | "differs";
+
 /** A step and whether the target already reflects it. */
 export interface PlannedStep {
   readonly step: SeedStep;
-  readonly status: "done" | "missing";
+  readonly status: StepStatus;
 }
 
 /** The demo repository as a `RepoRef`, after checking it is the demo repository. */
@@ -115,14 +124,6 @@ export async function planSeed(
     );
   }
   const filed = new Map((await board.issues(ref)).map((issue) => [issue.title, issue.body]));
-  for (const issue of manifest.issues) {
-    const body = filed.get(issue.title);
-    if (body !== undefined && body !== issue.body) {
-      throw new SeedRefusal(
-        `${name} has an issue titled like a seeded one with another body. Reset it first.`,
-      );
-    }
-  }
 
   return [
     {
@@ -131,15 +132,15 @@ export async function planSeed(
     },
     ...manifest.issues.map((issue, index): PlannedStep => ({
       step: { action: "issue.file", target: `${name}#seed-${index + 1}`, issue },
-      status: filed.has(issue.title) ? "done" : "missing",
+      status: issueStatus(filed.get(issue.title), issue.body),
     })),
   ];
 }
 
 /**
  * Seeds the repository with main from `bundle`, the bytes the target receives, when a fresh plan
- * finds it missing, and returns the plan with the steps it applied marked done. Missing issues
- * stay missing: the owner files them.
+ * finds it missing, and returns the plan with the steps it applied marked done. Missing and
+ * differing issues stay as planned: the owner files or edits them.
  */
 export async function seed(
   manifest: SeedManifest,
@@ -152,7 +153,7 @@ export async function seed(
   const applied: PlannedStep[] = [];
   for (const planned of plan) {
     const { step, status } = planned;
-    if (status === "done") {
+    if (status !== "missing") {
       applied.push(planned);
       continue;
     }
@@ -162,7 +163,7 @@ export async function seed(
         applied.push({ step, status: "done" });
         break;
       case "issue.file":
-        // The owner's step; the seed holds no authority to file an issue.
+        // The owner's step; the seed holds no authority to file or edit an issue.
         applied.push(planned);
         break;
       case "repo.delete":
@@ -191,18 +192,56 @@ export async function reset(manifest: SeedManifest, target: SeedTarget): Promise
 /** One line per step, naming its target, for a dry run. */
 export function describePlan(plan: readonly PlannedStep[]): string[] {
   return plan.map(({ step, status }) => {
-    const mark = status === "done" ? "ok  " : "todo";
+    const mark = statusMark(status);
     switch (step.action) {
       case "repo.seed":
         return `${mark} seed repository ${step.target} = ${step.head}`;
       case "issue.file":
-        return `${mark} owner files issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
+        return status === "differs"
+          ? `${mark} owner edits issue ${step.target} to the seeded body: ${JSON.stringify(step.issue.title)}`
+          : `${mark} owner files issue ${step.target}: ${JSON.stringify(step.issue.title)}`;
       case "repo.delete":
         return `${mark} delete repository ${step.target}`;
       default:
         return unreachable(step);
     }
   });
+}
+
+/**
+ * The exact title and body of each issue the owner still has to file or edit, as plain text
+ * between marker lines, so it can be copied onto the board without unescaping. The manifest
+ * refuses control characters other than a body's line breaks, so the text is inert in a terminal.
+ */
+export function describeIssues(plan: readonly PlannedStep[]): string[] {
+  return plan.flatMap(({ step, status }) => {
+    if (step.action !== "issue.file" || status === "done") return [];
+    return [
+      `--- issue ${step.target} title`,
+      step.issue.title,
+      `--- issue ${step.target} body`,
+      ...step.issue.body.split("\n"),
+      `--- end issue ${step.target}`,
+    ];
+  });
+}
+
+function issueStatus(filed: string | undefined, seeded: string): StepStatus {
+  if (filed === undefined) return "missing";
+  return filed === seeded ? "done" : "differs";
+}
+
+function statusMark(status: StepStatus): string {
+  switch (status) {
+    case "done":
+      return "ok  ";
+    case "missing":
+      return "todo";
+    case "differs":
+      return "edit";
+    default:
+      return unreachable(status);
+  }
 }
 
 function unreachable(value: never): never {

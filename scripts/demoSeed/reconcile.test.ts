@@ -4,7 +4,15 @@ import { test } from "node:test";
 import type { MainBundle } from "./history.ts";
 import { loadManifest, SeedRefusal, type SeedManifest } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
-import { ActionStale, describePlan, planReset, planSeed, reset, seed } from "./reconcile.ts";
+import {
+  ActionStale,
+  describeIssues,
+  describePlan,
+  planReset,
+  planSeed,
+  reset,
+  seed,
+} from "./reconcile.ts";
 
 const manifest = loadManifest(
   join(import.meta.dirname, "..", "..", "fixtures", "demo", "seed.json"),
@@ -155,21 +163,40 @@ test("seeding from a bundle that is not main alone at the approved head writes n
   assert.equal(await target.read(demo), null);
 });
 
-test("a seed over another main or an edited issue is refused and writes nothing", async () => {
+test("a seed over another main is refused and writes nothing", async () => {
   const target = new MemoryTarget();
   await seed(manifest, bundleOf("b".repeat(40)), target, target);
   const before = await target.read(demo);
 
   await assert.rejects(seed(manifest, history, target, target), /already has main at b{40}/);
   assert.deepEqual(await target.read(demo), before);
+});
 
+test("an issue body that differs by one byte is an owner edit, not a refusal", async () => {
+  const [first] = manifest.issues;
+  assert.ok(first !== undefined);
   const edited = new MemoryTarget();
   await edited.seed(demo, history);
-  edited.fileAsOwner(demo, { title: manifest.issues[0]?.title ?? "", body: "Changed." });
-  await assert.rejects(seed(manifest, history, edited, edited), /another body/);
-  assert.deepEqual(await edited.issues(demo), [
-    { title: manifest.issues[0]?.title ?? "", body: "Changed." },
-  ]);
+  // A hand copy that lost the trailing period.
+  const copied = { title: first.title, body: first.body.slice(0, -1) };
+  edited.fileAsOwner(demo, copied);
+
+  const plan = await seed(manifest, history, edited, edited);
+  assert.deepEqual(
+    plan.map(({ step, status }) => [step.target, status]),
+    [
+      ["demo/upload-app@main", "done"],
+      ["demo/upload-app#seed-1", "differs"],
+      ["demo/upload-app#seed-2", "missing"],
+      ["demo/upload-app#seed-3", "missing"],
+    ],
+  );
+  assert.equal(
+    describePlan(plan)[1],
+    'edit owner edits issue demo/upload-app#seed-1 to the seeded body: "Warn before uploading a file above the size limit"',
+  );
+  assert.equal((await edited.read(demo))?.main, history.head);
+  assert.deepEqual(await edited.issues(demo), [copied]);
 });
 
 test("issues the seed did not file are left alone", async () => {
@@ -266,6 +293,47 @@ test("a manifest pointed at another repository is refused before the target is r
   await assert.rejects(reset(other, target), SeedRefusal);
   await assert.rejects(planSeed(other, history, target, target), /refusing "acme\/upload-app"/);
   assert.deepEqual(target.names(), ["acme/upload-app"]);
+});
+
+test("the issue payloads print verbatim for every issue the owner still has to file or edit", async () => {
+  const [first, second, third] = manifest.issues;
+  assert.ok(first !== undefined && second !== undefined && third !== undefined);
+  const target = new MemoryTarget();
+  await target.seed(demo, history);
+  target.fileAsOwner(demo, { title: first.title, body: first.body });
+  target.fileAsOwner(demo, { title: second.title, body: `${second.body} ` });
+
+  const lines = describeIssues(await planSeed(manifest, history, target, target));
+  assert.deepEqual(lines, [
+    "--- issue demo/upload-app#seed-2 title",
+    second.title,
+    "--- issue demo/upload-app#seed-2 body",
+    // The manifest's body, which the owner pastes over the board's.
+    ...second.body.split("\n"),
+    "--- end issue demo/upload-app#seed-2",
+    "--- issue demo/upload-app#seed-3 title",
+    third.title,
+    "--- issue demo/upload-app#seed-3 body",
+    ...third.body.split("\n"),
+    "--- end issue demo/upload-app#seed-3",
+  ]);
+  // The printed body is the manifest's, unescaped, with its paragraph breaks as blank lines.
+  const body = lines.slice(
+    lines.indexOf("--- issue demo/upload-app#seed-2 body") + 1,
+    lines.indexOf("--- end issue demo/upload-app#seed-2"),
+  );
+  assert.equal(body.join("\n"), second.body);
+  assert.ok(body.includes(""));
+  assert.ok(body.every((line) => !line.includes("\\n") && !line.startsWith('"')));
+});
+
+test("no payload prints once every issue is filed as seeded", async () => {
+  const target = new MemoryTarget();
+  await target.seed(demo, history);
+  for (const { title, body } of manifest.issues) target.fileAsOwner(demo, { title, body });
+
+  assert.deepEqual(describeIssues(await planSeed(manifest, history, target, target)), []);
+  assert.deepEqual(describeIssues(planReset(manifest)), []);
 });
 
 test("a dry run names every target", async () => {

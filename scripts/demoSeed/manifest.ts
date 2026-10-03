@@ -141,9 +141,17 @@ export function parseManifest(value: unknown): SeedManifest {
 
   const issues = list(root["issues"], "issues").map((entry, index) => {
     const issue = record(entry, `issues[${index}]`);
+    const title = text(issue, "title", MAX_TITLE_LENGTH);
+    const body = text(issue, "body", MAX_ISSUE_BODY_LENGTH);
+    // The seed prints both for the owner to copy, so neither may carry a terminal control.
+    if (UNPRINTABLE.test(title) || body.split("\n").some((line) => UNPRINTABLE.test(line))) {
+      throw new SeedRefusal(
+        `issues[${index}] holds a control character; only a body may break lines.`,
+      );
+    }
     return {
-      title: text(issue, "title", MAX_TITLE_LENGTH),
-      body: text(issue, "body", MAX_ISSUE_BODY_LENGTH),
+      title,
+      body,
       touches: paths(issue["touches"], `issues[${index}].touches`),
     };
   });

@@ -38,9 +38,9 @@ Seed and reset reconcile against a target through the `SeedTarget` port in `scri
 
 - Seed reads the target, then seeds only when the repository is missing. A second seed writes nothing.
 - `seed` receives the bundle's bytes and the head it was approved for, the input `demo.seed` takes. The bundle carries `refs/heads/main` alone, with no prerequisites, and at most 8 MiB. The repository is initialized only after main is in place, so a seed that fails after importing main leaves that main behind a repository `read` does not report. A repeat at the same head completes it; a seed at another head is refused as `action_stale` until a reset. Main is only ever created: a repeat at the same head succeeds without writing, so a seed whose response was lost is safe to run again.
-- Seed refuses, writing nothing, when main already holds another head, when the repository exists without a main (a reset that did not finish; the backend answers `action_stale`), or when a seeded title carries a different body. Reset first.
+- Seed refuses, writing nothing, when main already holds another head, when the repository exists without a main (a reset that did not finish; the backend answers `action_stale`), Reset first. A seeded title with a different body is not a refusal: the plan marks that issue `edit`, and the owner edits its body on the board.
 - Each backend write needs its own owner passkey assertion. The live adapter obtains it ([#148](https://github.com/casqueblanc/railhead/issues/148)); the port does not carry one.
-- `DemoSeedApi` has no issue read, so issues are read through a second port, `BoardIssues`. Filing an issue is an owner action on the board, so neither port can file one. The plan lists each seeded issue as done when the board shows its title and as an owner step otherwise.
+- `DemoSeedApi` has no issue read, so issues are read through a second port, `BoardIssues`. Filing an issue is an owner action on the board, so neither port can file one. The plan lists each seeded issue as done when the board shows its title and body, `edit` when it shows the title with another body, and an owner step to file otherwise. After the plan, `seed --dry-run` prints the exact title and body of every issue still to file or edit as plain text between `--- issue` marker lines, paragraph breaks as blank lines.
 - Other issues are left alone.
 - The port takes no lock: run one seed at a time.
 - Reset deletes `demo/upload-app` by name. It never lists repositories to choose what to delete, so no other repository can go with it. Reset always calls the target, because `read` cannot see a main left by a failed seed; the target reports whether anything was deleted.
@@ -55,7 +55,7 @@ The owner's steps for H03 ([#68](https://github.com/casqueblanc/railhead/issues/
 
 1. From a full clone at the revision to seed, check the plan and build the bundle: `node scripts/demoSeed/cli.ts seed --dry-run`, then `node scripts/demoSeed/cli.ts bundle --out main.bundle`. Note the printed head. The bundle names no `HEAD`, so inspect it with `git clone --branch main main.bundle`.
 2. Seed `demo/upload-app` from `main.bundle` through the entry #142 adds, and confirm its main is the printed head.
-3. On the board, signed in with the owner passkey, file the three issues with the titles and bodies in `fixtures/demo/seed.json`. Filing is an owner action, so each needs a passkey assertion. File only titles the board does not already show.
+3. On the board, signed in with the owner passkey, file each issue `seed --dry-run` prints, copying the title and the body between its marker lines; do not copy from the JSON in `fixtures/demo/seed.json`, which escapes the line breaks. Filing is an owner action, so each needs a passkey assertion. File only titles the board does not already show; for an issue the plan marks `edit`, correct its body instead.
 4. Invite and confirm the three agents (H03).
 
 To start over, reset `demo/upload-app` through the same entry and repeat from step 2. The bundle can be reused: the head changes only when the app or a file the overlay copies changes.

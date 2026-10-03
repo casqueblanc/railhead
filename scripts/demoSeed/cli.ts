@@ -1,6 +1,7 @@
 // `node scripts/demoSeed/cli.ts <seed|reset|bundle> ...`: the demo seed and reset commands.
 //
-//   seed --dry-run      plan the seed of demo/upload-app and name every target
+//   seed --dry-run      plan the seed of demo/upload-app, name every target and print each issue's
+//                       exact title and body for the owner to file
 //   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else
 //   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
 //                       refuses --dry-run, since seed --dry-run is the preview
@@ -21,7 +22,7 @@ import {
 } from "./history.ts";
 import { assertDemoTarget, assertMatchesChecks, loadManifest, SeedRefusal } from "./manifest.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
-import { describePlan, planReset, planSeed } from "./reconcile.ts";
+import { describeIssues, describePlan, planReset, planSeed } from "./reconcile.ts";
 import { STANDALONE_OVERLAY, STANDALONE_SUBJECT } from "./standalone.ts";
 
 /** The repository root, which holds the default manifest and the demo app's history. */
@@ -67,9 +68,11 @@ export async function run(argv: readonly string[]): Promise<string[]> {
       requireDryRun(values["dry-run"], "seed");
       const history = planHistory(request);
       const empty = new MemoryTarget();
+      const plan = await planSeed(manifest, history, empty, empty);
       return [
         ...header(history),
-        ...describePlan(await planSeed(manifest, history, empty, empty)),
+        ...describePlan(plan),
+        ...describeIssues(plan),
         ...decisionLines(
           manifest.decision.key,
           manifest.decision.options.map((o) => o.key),
