@@ -185,6 +185,9 @@ pub enum EventPayload {
     /// A claim moved to another agent.
     #[serde(rename = "claim.reassigned")]
     ClaimReassigned(ClaimReassigned),
+    /// A claim's landed work passed the acceptance check of a decision version it depended on.
+    #[serde(rename = "claim.adapted")]
+    ClaimAdapted(ClaimAdapted),
     /// An agent asked the owner a question.
     #[serde(rename = "question.asked")]
     QuestionAsked(QuestionAsked),
@@ -239,6 +242,7 @@ impl EventPayload {
             Self::ClaimReopened(_) => "claim.reopened",
             Self::ClaimExpired(_) => "claim.expired",
             Self::ClaimReassigned(_) => "claim.reassigned",
+            Self::ClaimAdapted(_) => "claim.adapted",
             Self::QuestionAsked(_) => "question.asked",
             Self::DecisionRecorded(_) => "decision.recorded",
             Self::InboxQueued(_) => "inbox.queued",
@@ -263,6 +267,7 @@ impl EventPayload {
             | Self::ClaimReopened(_)
             | Self::ClaimExpired(_)
             | Self::ClaimReassigned(_)
+            | Self::ClaimAdapted(_)
             | Self::InboxQueued(_)
             | Self::InboxDelivered(_)
             | Self::TrainCheck(_)
@@ -294,6 +299,7 @@ impl EventPayload {
             | Self::ClaimReopened(_)
             | Self::ClaimExpired(_)
             | Self::ClaimReassigned(_)
+            | Self::ClaimAdapted(_)
             | Self::QuestionAsked(_)
             | Self::DecisionRecorded(_)
             | Self::InboxQueued(_)
@@ -318,6 +324,7 @@ impl EventPayload {
             Self::ClaimReopened(data) => data.validate(),
             Self::ClaimExpired(data) => data.validate(),
             Self::ClaimReassigned(data) => data.validate(),
+            Self::ClaimAdapted(data) => data.validate(),
             Self::QuestionAsked(data) => data.validate(),
             Self::DecisionRecorded(data) => data.validate(),
             Self::InboxQueued(data) => data.validate(),

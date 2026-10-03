@@ -120,6 +120,11 @@ export interface ClaimState {
   refusal: { generation: number; reason: RefusalReason } | null;
   /** Intents that landed this claim on main, oldest first. */
   landings: readonly IntentId[];
+  /**
+   * The decision versions the backend recorded this claim's landed work as adapted to, in log
+   * order. See `isClaimAdapted`.
+   */
+  adaptations: readonly DecisionRef[];
 }
 
 /** A question asked from a claim. Text and option labels are untrusted. */
@@ -328,17 +333,15 @@ export const currentDecisionVersion = (
 ): DecisionVersionState | undefined => own(state.decisions, decisionId)?.versions.at(-1);
 
 /**
- * True only when the claim's work for the decision's current version is on main and proven. All of
- * these must hold for one intent that landed the claim:
- *
- * - the intent landed: main moved to its candidate;
- * - the intent was authorised against the decision's current version;
- * - the latest acceptance result recorded on that exact candidate, for the current version and its
- *   chosen option, is `pass`.
+ * True only when the backend recorded the claim's landed work as adapted to the decision's current
+ * version (`claim.adapted`). The backend records it per claim: the intent landed, the acceptance
+ * check it rests on passed the version's chosen option on the landed commit, and this claim depended
+ * on that version when it landed. The board does not derive it from the intent, whose decisions are
+ * the batch's combined ones.
  *
  * A passing check on a candidate that has not landed, a pass for an older version or another option,
  * and the agent's own acknowledgement all leave the claim not adapted. Superseding the decision
- * removes the badge until the new version's work lands and passes.
+ * removes the badge until the new version's work lands and is recorded adapted.
  */
 export const isClaimAdapted = (
   state: BoardState,
@@ -348,19 +351,9 @@ export const isClaimAdapted = (
   const current = currentDecisionVersion(state, decisionId);
   const claim = own(state.claims, claimId);
   if (current === undefined || claim === undefined) return false;
-  return claim.landings.some((intentId) => {
-    // `landings` holds only intents that moved main to their candidate.
-    const intent = own(state.intents, intentId);
-    if (intent === undefined) return false;
-    const authorised = intent.decisions.some(
-      (ref) => ref.decisionId === decisionId && ref.version === current.version,
-    );
-    return (
-      authorised &&
-      latestAcceptance(state, intent.candidate, decisionId, current.version, current.option) ===
-        "pass"
-    );
-  });
+  return claim.adaptations.some(
+    (ref) => ref.decisionId === decisionId && ref.version === current.version,
+  );
 };
 
 /** One agent's progress on the current version of a decision. */
@@ -594,32 +587,6 @@ const currentGeneration = (claim: ClaimState, generation: number): void =>
     `claim ${claim.claimId} is at generation ${claim.generation}, not ${generation}`,
   );
 
-const latestAcceptance = (
-  state: BoardState,
-  candidate: CommitSha,
-  decisionId: DecisionId,
-  version: number,
-  option: string,
-): CheckResult | null => {
-  let latest: CheckEntryState | null = null;
-  for (const run of Object.values(state.checkRuns)) {
-    if (run.candidate !== candidate) continue;
-    for (const entry of run.results) {
-      const { acceptance } = entry;
-      if (
-        acceptance !== null &&
-        acceptance.decision.decisionId === decisionId &&
-        acceptance.decision.version === version &&
-        acceptance.option === option &&
-        (latest === null || entry.seq > latest.seq)
-      ) {
-        latest = entry;
-      }
-    }
-  }
-  return latest?.result ?? null;
-};
-
 const landingOf = (intent: IntentState, outcome: MainOutcome, main: CommitSha): IntentLanding => {
   switch (outcome) {
     case "updated":
@@ -714,6 +681,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           pushes: [],
           refusal: null,
           landings: [],
+          adaptations: [],
         }),
       };
     }
@@ -790,6 +758,25 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           generation,
           phase: "working",
           ready: null,
+        }),
+      };
+    }
+    case "claim.adapted": {
+      const { claimId, intentId, decision } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      const intent = known(state.intents, intentId, "intent");
+      check(intent.landing.kind === "landed", `intent ${intentId} did not land`);
+      check(intent.claims.includes(claimId), `intent ${intentId} did not land claim ${claimId}`);
+      knownDecisionVersion(state, decision);
+      const repeated = claim.adaptations.some(
+        (ref) => ref.decisionId === decision.decisionId && ref.version === decision.version,
+      );
+      if (repeated) return state;
+      return {
+        ...state,
+        claims: draft.put(state.claims, claimId, {
+          ...claim,
+          adaptations: draft.append(claim.adaptations, decision),
         }),
       };
     }
