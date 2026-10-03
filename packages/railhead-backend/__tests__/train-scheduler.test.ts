@@ -36,7 +36,7 @@ import {
   writeWake,
   type PendingWake,
 } from "../src/modules/train/store";
-import { unavailableClaims } from "../src/contracts/unavailable";
+import { unavailableChecks, unavailableClaims } from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
@@ -162,6 +162,8 @@ class Fakes {
           if (this.startGate !== null) await this.startGate();
           return this.start(attempt);
         },
+        // Reports reach the train through `recordCheck` in these tests.
+        report: unavailableChecks.report,
       },
       authorization: {
         authorize: async (attemptId) => {
