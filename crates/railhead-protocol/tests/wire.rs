@@ -455,15 +455,28 @@ fn validates_requests_before_they_are_sent() -> TestResult {
         key: key.to_owned(),
         label: "L".to_owned(),
     };
-    let ask = |options: Vec<QuestionOption>, text: &str| AskRequest {
+    let ask_in = |options: Vec<QuestionOption>, text: &str, scope: Vec<String>| AskRequest {
         generation: SafeInteger::new(1).unwrap_or(SafeInteger::ZERO),
         request_id: format!("req_{}", "a".repeat(16)),
         text: text.to_owned(),
         options,
+        scope,
+    };
+    let ask = |options: Vec<QuestionOption>, text: &str| {
+        ask_in(options, text, vec!["src/upload.ts".to_owned()])
     };
     ask(vec![option("a"), option("b")], "Which?").validate()?;
     let eight: Vec<_> = ["a", "b", "c", "d", "e", "f", "g", "h"].map(option).into();
     ask(eight.clone(), &"x".repeat(2000)).validate()?;
+    let sixty_four: Vec<String> = (0..64).map(|i| format!("src/f{i}.ts")).collect();
+    ask_in(vec![option("a"), option("b")], "Which?", sixty_four).validate()?;
+    // Whitespace inside a path is a valid Git filename; only a blank path is refused.
+    ask_in(
+        vec![option("a"), option("b")],
+        "Which?",
+        vec!["docs/ notes.md".to_owned()],
+    )
+    .validate()?;
     let mut nine = eight;
     nine.push(option("i"));
     for request in [
@@ -472,6 +485,22 @@ fn validates_requests_before_they_are_sent() -> TestResult {
         ask(vec![option("a"), option("a")], "Which?"),
         ask(vec![option("a"), option("b")], "   "),
         ask(vec![option("a"), option("b")], &"x".repeat(2001)),
+        ask_in(vec![option("a"), option("b")], "Which?", vec![]),
+        ask_in(
+            vec![option("a"), option("b")],
+            "Which?",
+            vec!["/src".to_owned()],
+        ),
+        ask_in(
+            vec![option("a"), option("b")],
+            "Which?",
+            vec!["\u{feff}".to_owned()],
+        ),
+        ask_in(
+            vec![option("a"), option("b")],
+            "Which?",
+            (0..65).map(|i| format!("src/f{i}.ts")).collect(),
+        ),
     ] {
         assert!(request.validate().is_err(), "accepted {request:?}");
     }

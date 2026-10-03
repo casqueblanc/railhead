@@ -16,11 +16,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::error::Result;
 use crate::events::{InboxEntry, QuestionOption};
 use crate::integer::{SafeInteger, nullable};
-use crate::payloads::require_options;
+use crate::payloads::{require_options, require_scope};
 use crate::rules::{
-    IdKind, MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, is_armored_signature, is_challenge_id,
-    is_commit_sha, is_ed25519_public_key, is_invite_secret, is_request_id, require, require_id,
-    require_positive, require_text,
+    IdKind, MAX_PATH_LENGTH, MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, is_armored_signature,
+    is_challenge_id, is_commit_sha, is_ed25519_public_key, is_invite_secret, is_request_id,
+    require, require_id, require_positive, require_text,
 };
 
 /// The agent protocol version, the `v1` in every route path.
@@ -37,6 +37,9 @@ pub const MAX_AGENT_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const AGENT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Longest a question long-poll holds a request open, in milliseconds.
 pub const MAX_LONG_POLL_MS: u64 = 25_000;
+/// Most UTF-8 bytes a question's scope may take as a JSON array. The scope is copied into the
+/// answer's inbox item; this keeps that item far below the inbox's size limit.
+pub const MAX_SCOPE_BYTES: usize = MAX_AGENT_REQUEST_BYTES / 2;
 /// Largest inbox page a sync returns.
 pub const MAX_INBOX_PAGE: u64 = 64;
 /// Inbox page size when the request does not name one.
@@ -842,6 +845,8 @@ pub struct AskRequest {
     pub text: String,
     /// The answers offered.
     pub options: Vec<QuestionOption>,
+    /// The repository paths the answer applies to, the recorded decision's scope.
+    pub scope: Vec<String>,
 }
 
 impl AskRequest {
@@ -863,8 +868,40 @@ impl AskRequest {
             "text",
             "a question of 1 to 2000 characters",
         )?;
-        require_options(&self.options)
+        require_options(&self.options)?;
+        require_scope(&self.scope)?;
+        // The inbox refuses blank scope text, so an answer naming a blank path could never be
+        // delivered.
+        self.scope.iter().try_for_each(|path| {
+            require_text(
+                path,
+                MAX_PATH_LENGTH,
+                "scope",
+                "a repository path that is not blank",
+            )?;
+            require(
+                !path.chars().any(char::is_control),
+                "scope",
+                "a repository path without control characters",
+            )
+        })?;
+        require(
+            scope_bytes(&self.scope) <= MAX_SCOPE_BYTES,
+            "scope",
+            "paths of at most 8192 bytes together",
+        )
     }
+}
+
+/// The UTF-8 bytes of `scope` as a JSON array, as `JSON.stringify` writes it: brackets, commas,
+/// and each path quoted with `"` and `\\` escaped. Control characters, which JSON escapes longer,
+/// are refused before this is used.
+fn scope_bytes(scope: &[String]) -> usize {
+    let paths: usize = scope
+        .iter()
+        .map(|path| path.len() + 2 + path.matches(['"', '\\']).count())
+        .sum();
+    paths + scope.len().saturating_sub(1) + 2
 }
 
 /// Where a question stands.
