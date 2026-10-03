@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { ClaimView } from "@railhead/shared/agent-api";
@@ -28,8 +28,9 @@ import {
   type Train,
 } from "../src/modules/train/scheduler";
 import { insertEntry, readWake } from "../src/modules/train/store";
-import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
+import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
+import { EarliestAlarm } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
 
 const REPO = "rep_handoff0001";
@@ -76,6 +77,23 @@ interface Setup {
   advance(ms: number): void;
   /** The Repo's clock. */
   now(): number;
+  /** The alarm time the object's storage holds, or `null`. */
+  storedAlarm(): Promise<number | null>;
+  /**
+   * Runs what the Repo's alarm handler runs: marks the alarm fired, resumes every module that owes
+   * work and waits for the wakes they asked for. Only with `realAlarm`.
+   */
+  fireAlarm(): Promise<void>;
+}
+
+/** Where a harness runs, for a test that stops the object and builds the modules again. */
+interface HandoffOptions {
+  /** The Repo object whose storage the modules use. */
+  stub: DurableObjectStub;
+  /** The Artifacts fake, kept across a restart since it stands for a remote service. */
+  fake: FakeArtifacts;
+  /** Whether wakes reach the object's storage alarm, as the Repo's do, rather than a list only. */
+  realAlarm: boolean;
 }
 
 /**
@@ -86,20 +104,31 @@ interface Setup {
 function withHandoff<T>(
   body: (setup: Setup) => Promise<T>,
   install: (train: TrainPort) => TrainPort = (train) => train,
+  options: HandoffOptions = {
+    stub: env.REPO.getByName(crypto.randomUUID()),
+    fake: new FakeArtifacts(),
+    realAlarm: false,
+  },
 ): Promise<T> {
-  const stub = env.REPO.getByName(crypto.randomUUID());
+  const { stub, fake, realAlarm } = options;
   return runInDurableObject(stub, async (_instance, state) => {
-    const fake = new FakeArtifacts();
-    fake.seed(await mainRepoName(REPO), [ROOT, MAIN]);
+    const mainRepo = await mainRepoName(REPO);
+    if (!fake.repos.has(mainRepo)) fake.seed(mainRepo, [ROOT, MAIN]);
     const log = EventLog.open(state.storage, REPO, fake.clock);
     const wakes: number[] = [];
+    // A failed alarm write fails `fireAlarm`, since `settle` throws for it.
+    const alarm = new EarliestAlarm(state.storage, () => {});
+    if (realAlarm) await alarm.load();
     const context = {
       repoId: REPO,
       storage: state.storage,
       log,
       clock: fake.clock,
       env,
-      wake: (at: number) => wakes.push(at),
+      wake: (at: number) => {
+        wakes.push(at);
+        if (realAlarm) void alarm.request(at);
+      },
     };
     const composed: ClaimPin[][] = [];
     const started: CheckAttempt[] = [];
@@ -227,6 +256,13 @@ function withHandoff<T>(
       mainUp: true,
       advance: (ms) => fake.advance(ms),
       now: () => fake.clock(),
+      storedAlarm: () => state.storage.getAlarm(),
+      async fireAlarm() {
+        if (!realAlarm) throw new Error("this harness has no storage alarm");
+        alarm.fired();
+        await resumeAll(REPO, resumables(ports));
+        await alarm.settle();
+      },
     };
     return body(setup);
   });
@@ -263,6 +299,60 @@ describe("ready hands its pin to the train", () => {
       expect(setup.started[0]).toMatchObject({ expectedMain: MAIN, pins: [pin], decisions: [] });
       expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
     });
+  });
+
+  it("drives a committed pin from the Repo's alarm after the object restarts before any drive", async () => {
+    // The clock runs an hour ahead, so the runtime never fires the stored alarm on its own; the
+    // test fires it as the Repo's handler does, once the object has been rebuilt from storage.
+    const options: HandoffOptions = {
+      stub: env.REPO.getByName(crypto.randomUUID()),
+      fake: new FakeArtifacts(Date.now() + 60 * 60_000),
+      realAlarm: true,
+    };
+    const { claimId, readyAt } = await withHandoff(
+      async (setup) => {
+        const claim = await setup.open(WORK);
+        const at = setup.now();
+        const ready = await setup.claims.ready(agent(1), claim.claimId, {
+          generation: 1,
+          commit: WORK,
+        });
+        expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+        expect(setup.composed).toEqual([]);
+        expect(setup.started).toEqual([]);
+        return { claimId: claim.claimId, readyAt: at };
+      },
+      undefined,
+      options,
+    );
+
+    // The object stops after ready committed and before anything drove the train.
+    await evictDurableObject(options.stub);
+
+    await withHandoff(
+      async (setup) => {
+        // The alarm was written with ready's transaction and survived the restart.
+        const stored = await setup.storedAlarm();
+        expect(stored).not.toBeNull();
+        expect(stored).toBeLessThanOrEqual(readyAt);
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+
+        await setup.fireAlarm();
+
+        const pin: ClaimPin = { claimId, generation: 1, commit: WORK };
+        expect(setup.composed).toEqual([[pin]]);
+        expect(setup.started).toHaveLength(1);
+        expect(setup.started[0]).toMatchObject({ expectedMain: MAIN, pins: [pin] });
+        expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+
+        // A later alarm while the check runs neither batches the pin again nor starts another run.
+        await setup.fireAlarm();
+        expect(setup.composed).toHaveLength(1);
+        expect(setup.started).toHaveLength(1);
+      },
+      undefined,
+      options,
+    );
   });
 
   it("queues nothing for a repeated ready of the same pin", async () => {

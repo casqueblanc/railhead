@@ -887,11 +887,7 @@ describe("train wake", () => {
       expect(owed(sql)).toEqual({ dueAt: now() + WAKE_BASE_MS, failures: 1 });
       // The alarm due at once, set with the queue entry, the drive's own lease, then the backoff
       // that moved the alarm earlier.
-      expect(wakes).toEqual([
-        accepted,
-        accepted + 1 + DRIVE_LEASE_MS,
-        now() + WAKE_BASE_MS,
-      ]);
+      expect(wakes).toEqual([accepted, accepted + 1 + DRIVE_LEASE_MS, now() + WAKE_BASE_MS]);
 
       // An alarm set by another module fires early: nothing is driven, and the wake is asked again.
       fakes.compose = (main, pins) => ok({ kind: "clean", candidate: candidateOf(main, pins) });
