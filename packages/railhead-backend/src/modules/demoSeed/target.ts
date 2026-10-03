@@ -21,23 +21,27 @@
 // timeout does not settle it: every later seed and reset is refused as busy until the call answers,
 // so a create that lands late cannot follow a reset that reported success. A late handle is
 // disposed and a late token revoked. A call a previous incarnation never saw answered cannot answer
-// here; the next seed or reset settles it. A create is settled by reading main back: it took effect
-// if main exists, and otherwise it is forgotten, since a create that lands later leaves an empty
-// main whose token nobody received, which the next seed sweeps. A mint is forgotten once its token's
-// lifetime and the clock skew margin have passed, when any token it made has expired. A delete
-// stands until its repository is gone. Until then, and while Artifacts cannot be read, seed and
-// reset report `busy`. A create or mint record that took effect also stands for the token it may
-// have left: the seed sweeps main's tokens before it initializes the Repo, on a retry that finds
-// main already in place as well, and clears the record only once no live token is left. Tokens
-// stay in this module and are never logged or returned.
+// here; the next seed or reset settles it. Artifacts offers no way to cancel such a call or to learn
+// when it can no longer land, so a lost call is settled only by what Artifacts shows. A create is
+// settled once main is read back in place, since it can no longer create main while main exists.
+// While main is missing it may still land, so a reset reports `busy` until a seed has created main;
+// the seed's own create settles it. A mint is settled only when its repository is gone: the token
+// it may still make is not known by when it is issued, so no wait bounds it. A seed reports `busy`
+// while main holds a lost mint, until a reset deletes main. A delete stands until its repository is
+// gone. Until then, and while Artifacts cannot be read, seed and reset report `busy`. A create or
+// mint record that took effect also stands for the token it may have left: the seed sweeps main's
+// tokens before it initializes the Repo, on a retry that finds main already in place as well, and
+// clears the record only once no live token is left. Tokens stay in this module and are never
+// logged or returned.
 //
 // A push answered with a status report or a refusal cannot land later. One that timed out or lost
 // its answer may, so every push is recorded before it is sent and its record stands until it is
 // answered or main holds a commit, which a push creating main from the zero id can no longer
 // change. A reset refuses while a push record stands; seeding again settles it. After its
 // deletions the reset reads main back and reports failure if anything recreated it. This assumes a
-// late push applies to the repository it authenticated against, not to a later repository of the
-// same name; that is not measured.
+// late push or mint applies to the repository it authenticated against or opened, not to a later
+// repository of the same name, and that a create that has not landed by the time main exists does
+// not land after a reset deletes main; neither is measured.
 
 import type { DemoSeedResult, DemoSeedState } from "@railhead/shared/board-api";
 import { isCommitSha, type CommitSha, type RepoId } from "@railhead/shared/events";
@@ -45,7 +49,6 @@ import {
   ARTIFACTS_LIMITS,
   artifactsCode,
   boundedCall,
-  MINT_CLOCK_SKEW_MS,
   mainRepoName,
   recordedForks,
   revokeActiveTokens,
@@ -104,12 +107,6 @@ export interface SeedTargetLimits extends TokenSweepLimits {
 /** The lifetime of the token minted for a push into an existing, empty main repository. */
 const PUSH_TOKEN_TTL_SECONDS = 300;
 
-/**
- * How long after a previous incarnation's mint started any token it made has expired: the token's
- * lifetime and the adapter's clock skew margin, a design margin rather than a measured bound.
- */
-const ORPHAN_MINT_EXPIRY_MS = PUSH_TOKEN_TTL_SECONDS * 1000 + MINT_CLOCK_SKEW_MS;
-
 /** The production limits. */
 export const SEED_TARGET_LIMITS: SeedTargetLimits = {
   callTimeoutMs: ARTIFACTS_LIMITS.callTimeoutMs,
@@ -165,8 +162,6 @@ interface Orphan {
   readonly kind: EffectKind;
   /** The repository it changes; `null` on a record written before names were kept. */
   readonly name: string | null;
-  /** When it started, in milliseconds since the Unix epoch. */
-  readonly startedAt: number;
 }
 
 /** Builds the seed target of the demo repository's `Repo`. */
@@ -276,15 +271,16 @@ export function createSeedTarget(
   /**
    * Refuses while an earlier binding call may still change Artifacts. A call of this incarnation is
    * waited for until it answers. One a previous incarnation started and never saw answered cannot
-   * answer here, and Artifacts offers no way to cancel it, so it is settled from Artifacts read back
-   * or from its age, as `settleOrphan` describes; one that cannot be settled yet refuses as `busy`.
+   * answer here, and Artifacts offers no way to cancel it, so it is settled from Artifacts read back,
+   * as `settleOrphan` describes; one that cannot be settled yet refuses as `busy`. A create or mint
+   * left unsettled stays unanswered for the seed and reset to weigh.
    */
   async function pendingEffects(artifacts: SeedArtifacts): Promise<PortResult<never> | null> {
     migrate(context.storage, SEED_OWNER, MIGRATIONS);
     if (unanswered.size > 0) return busy();
     const orphans = sql
-      .exec<{ id: number; kind: string; name: string | null; started_at: number }>(
-        `SELECT id, kind, name, started_at FROM demo_seed_effects
+      .exec<{ id: number; kind: string; name: string | null }>(
+        `SELECT id, kind, name FROM demo_seed_effects
          WHERE answered = 0 AND incarnation != ?`,
         incarnation,
       )
@@ -299,12 +295,12 @@ export function createSeedTarget(
   }
 
   /**
-   * Settles `record`, or refuses while it cannot. A create took effect if main exists, since main
-   * was missing when it started and no other create runs while its record stands; its record then
-   * stays for the token it may have left. If main is missing the create is forgotten: should it land
-   * later, it leaves an empty main whose token reached nobody, which the next seed sweeps. A mint is
-   * forgotten once any token it made has expired. A delete is forgotten once its repository is gone,
-   * since the reset deletes only a repository it found and nothing else deletes one.
+   * Settles `record`, or refuses while it cannot. A create is settled once main exists, since it
+   * cannot create main again while main stands; its record then stays for the token it may have
+   * left. While main is missing the create may still land, so its record stays unanswered and the
+   * reset refuses over it. A mint stays unanswered: only the seed and the reset know whether its
+   * repository is gone. A delete is forgotten once its repository is gone, since the reset deletes
+   * only a repository it found and nothing else deletes one.
    */
   async function settleOrphan(
     artifacts: SeedArtifacts,
@@ -320,13 +316,9 @@ export function createSeedTarget(
         if (!found.ok) return unsettled();
         if (found.value)
           sql.exec("UPDATE demo_seed_effects SET answered = 1 WHERE id = ?", record.id);
-        else sql.exec("DELETE FROM demo_seed_effects WHERE id = ?", record.id);
         return null;
       }
       case "mint":
-        // A token nobody saw minted cannot be told from the others main holds, but it expires.
-        if (context.clock() - record.startedAt < ORPHAN_MINT_EXPIRY_MS) return unsettled();
-        sql.exec("DELETE FROM demo_seed_effects WHERE id = ?", record.id);
         return null;
       case "delete": {
         if (record.name === null) return unconfirmed();
@@ -368,6 +360,24 @@ export function createSeedTarget(
     return (
       sql.exec("SELECT 1 FROM demo_seed_effects WHERE kind IN ('create', 'mint') LIMIT 1").toArray()
         .length > 0
+    );
+  }
+
+  /** Whether a create no object saw answered may still create main. Read after `pendingEffects`. */
+  function createLost(): boolean {
+    return (
+      sql
+        .exec("SELECT 1 FROM demo_seed_effects WHERE kind = 'create' AND answered = 0 LIMIT 1")
+        .toArray().length > 0
+    );
+  }
+
+  /** Whether a mint no object saw answered may still make a token. Read after `pendingEffects`. */
+  function mintLost(): boolean {
+    return (
+      sql
+        .exec("SELECT 1 FROM demo_seed_effects WHERE kind = 'mint' AND answered = 0 LIMIT 1")
+        .toArray().length > 0
     );
   }
 
@@ -441,7 +451,9 @@ export function createSeedTarget(
   /**
    * Revokes every live token on main with the Artifacts adapter's sweep, which lists until none is
    * left within its deadline and revocation budget; a sweep that runs out leaves the rest to the
-   * next seed, and one whose listing cannot cover every token fails. Clears the create and mint records once main is clean. Tokens are owed only between
+   * next seed, and one whose listing cannot cover every token fails. Clears the create and mint
+   * records once main is clean; a missing main keeps them, since a lost create may still make it.
+   * Tokens are owed only between
    * a seed's create or mint and the sweep that must precede initialization, and an initialized Repo
    * is never created or minted on, so while any are owed no other module holds a token on main:
    * every one is the seed's.
@@ -453,7 +465,7 @@ export function createSeedTarget(
       if (!swept.ok) return false;
     } catch (error) {
       // No repository holds no token.
-      if (artifactsCode(error) !== "NOT_FOUND") return false;
+      return artifactsCode(error) === "NOT_FOUND";
     }
     sql.exec("DELETE FROM demo_seed_effects WHERE kind IN ('create', 'mint')");
     return true;
@@ -481,6 +493,11 @@ export function createSeedTarget(
         const name = await mainRepoName(context.repoId);
         const before = await readMain(artifacts, name);
         if (!before.ok) return before;
+        if (mintLost()) {
+          // A lost mint may still leave a live token on main; only main's deletion ends it.
+          if (before.value !== "missing") return mintUnsettled();
+          sql.exec("DELETE FROM demo_seed_effects WHERE kind = 'mint' AND answered = 0");
+        }
         settlePushes(before.value);
         let outcome: PushOutcome | null = null;
         if (before.value !== head) {
@@ -535,6 +552,8 @@ export function createSeedTarget(
         if (artifacts === undefined) return noArtifacts();
         const pending = await pendingEffects(artifacts);
         if (pending !== null) return pending;
+        // A lost mint needs nothing more: deleting main ends any token it makes.
+        if (createLost()) return createUnsettled();
         const main = await mainRepoName(context.repoId);
         if (pushPending()) {
           const current = await readMain(artifacts, main);
@@ -606,17 +625,12 @@ function noArtifacts(): PortResult<never> {
 }
 
 /** Reads one effect record, or `null` when its kind is not one this code wrote. */
-function orphan(row: {
-  id: number;
-  kind: string;
-  name: string | null;
-  started_at: number;
-}): Orphan | null {
+function orphan(row: { id: number; kind: string; name: string | null }): Orphan | null {
   switch (row.kind) {
     case "create":
     case "mint":
     case "delete":
-      return { id: row.id, kind: row.kind, name: row.name, startedAt: row.started_at };
+      return { id: row.id, kind: row.kind, name: row.name };
     default:
       return null;
   }
@@ -633,6 +647,20 @@ function unsettled(): PortResult<never> {
   return fail(
     "busy",
     "An earlier change to Artifacts never answered and has not settled yet; try again in a few minutes.",
+  );
+}
+
+function createUnsettled(): PortResult<never> {
+  return fail(
+    "busy",
+    "An earlier create of main never answered and may still land; seed again before resetting.",
+  );
+}
+
+function mintUnsettled(): PortResult<never> {
+  return fail(
+    "busy",
+    "An earlier token request on main never answered and may still mint a token; reset the demo repository, then seed it.",
   );
 }
 

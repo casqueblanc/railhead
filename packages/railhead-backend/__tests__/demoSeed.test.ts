@@ -399,8 +399,22 @@ const ORPHAN_BUSY = {
     "An earlier change to Artifacts never answered and has not settled yet; try again in a few minutes.",
 };
 
-/** A push token's lifetime plus the clock skew margin, after which a lost mint's token has expired. */
-const ORPHAN_MINT_EXPIRY_MS = 300_000 + MINT_CLOCK_SKEW_MS;
+const CREATE_UNSETTLED = {
+  ok: false,
+  code: "busy",
+  message:
+    "An earlier create of main never answered and may still land; seed again before resetting.",
+};
+
+const MINT_UNSETTLED = {
+  ok: false,
+  code: "busy",
+  message:
+    "An earlier token request on main never answered and may still mint a token; reset the demo repository, then seed it.",
+};
+
+/** A push token's lifetime plus the clock skew margin, which once bounded a lost mint. */
+const PUSH_TOKEN_EXPIRY_MS = 300_000 + MINT_CLOCK_SKEW_MS;
 
 /** The seed's effect records, oldest first. */
 function effectRows(storage: RepoStorage): { kind: string; answered: number }[] {
@@ -670,7 +684,7 @@ describe("seed target", () => {
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, forgets a create that never took effect, and a reset finishes", () =>
+  it("after a restart, refuses a reset while a lost create may land, even after its answer", () =>
     withTarget(
       async ({ storage, seed, target, host, main, restart }) => {
         seed.hangAfterNextCreate = true;
@@ -679,24 +693,24 @@ describe("seed target", () => {
         await create.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
-        // Main is missing, so the create the old object lost has not taken effect: its record is
-        // settled at once, with no wait and nothing done by hand.
+        // Main is missing, but the create the old object lost may still land: the reset refuses
+        // and keeps its record.
         const restarted = restart();
-        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: false }));
-        expect(host.wipes).toBe(1);
-        expect(effectRows(storage)).toEqual([]);
+        expect(await restarted.reset()).toEqual(CREATE_UNSETTLED);
+        expect(host.wipes).toBe(0);
+        expect(seed.deleted).toEqual([]);
+        expect(effectRows(storage)).toEqual([{ kind: "create", answered: 0 }]);
 
-        // The lost create lands afterwards and leaves an empty main with a token nobody received.
-        // The next seed takes that main, pushes, and revokes the stray token before initializing.
+        // The lost create lands after the reset answered. Nothing was reported reset, and the
+        // next reset reads main back, deletes it with its token, and leaves nothing to land.
         create.release();
         await eventually(async () => (seed.fake.repos.has(main) ? ok(true) : busyResult()));
         expect(seed.fake.liveTokens(main)).toHaveLength(1);
-        expect(await restarted.seed(HEAD, fakePack())).toEqual(
-          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
-        );
-        expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
-        expect(seed.fake.liveTokens(main)).toEqual([]);
-        expect(host.initialized).toBe(true);
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+        expect(host.wipes).toBe(1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(seed.fake.repos.size).toBe(0);
       },
       { limits: SHORT_CALLS },
     ));
@@ -710,9 +724,11 @@ describe("seed target", () => {
         await create.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
-        // The new object's own create answers; the held one has not reached Artifacts yet.
+        // The new object's own create answers; the held one has not reached Artifacts yet. Only a
+        // seed may run over it: a reset would leave main free for the create to land on.
         seed.hangAfterNextCreate = false;
         const restarted = restart();
+        expect(await restarted.reset()).toEqual(CREATE_UNSETTLED);
         expect(await restarted.seed(HEAD, fakePack())).toEqual(
           ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
         );
@@ -724,6 +740,10 @@ describe("seed target", () => {
         await new Promise((resolve) => setTimeout(resolve, 10));
         expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
         expect(seed.fake.liveTokens(main)).toEqual([]);
+
+        // Main settled the create, so the reset runs.
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+        expect(seed.fake.repos.has(main)).toBe(false);
       },
       { limits: SHORT_CALLS },
     ));
@@ -785,60 +805,73 @@ describe("seed target", () => {
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, reports busy for a lost token mint until its token has expired", () =>
+  it("after a restart, refuses to seed over a lost token mint, however old, until a reset", () =>
     withTarget(
       async ({ storage, seed, target, host, main, clock, restart }) => {
         seed.fake.seed(main, []);
         const mint = seed.fake.pauseNext("createTokenBeforeMint");
+        const answer = seed.fake.pauseNext("createToken");
         const first = target.seed(HEAD, fakePack());
         await mint.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
-        // A minted token cannot be told apart from the others, but it expires: until its lifetime
-        // and the clock skew margin have passed, the mint may still leave a live token.
+        // The mint may still be issued, with its lifetime counted from then, so no age settles it.
         const restarted = restart();
-        clock.now += ORPHAN_MINT_EXPIRY_MS - 1;
-        expect(await restarted.reset()).toEqual(ORPHAN_BUSY);
-        expect(await restarted.seed(HEAD, fakePack())).toEqual(ORPHAN_BUSY);
+        clock.now += PUSH_TOKEN_EXPIRY_MS + 1;
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(MINT_UNSETTLED);
         expect(seed.pushes).toEqual([]);
-        expect(host.wipes).toBe(0);
+        expect(host.initialized).toBe(false);
         expect(effectRows(storage)).toEqual([{ kind: "mint", answered: 0 }]);
 
-        // From then on any token it made has expired, so its record is cleared and the seed runs.
-        clock.now += 1;
+        // It is issued late and leaves a live write token on main, which still refuses the seed.
+        // Its call never answers, as the object that made it is gone.
+        mint.release();
+        await answer.reached;
+        const [late] = seed.fake.liveTokens(main);
+        if (late === undefined) throw new Error("the late mint left no token");
+        expect(late.scope).toBe("write");
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(MINT_UNSETTLED);
+        expect(host.initialized).toBe(false);
+
+        // The reset deletes main and the token with it; the seed then finishes on a clean main.
+        expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
         expect(await restarted.seed(HEAD, fakePack())).toEqual(
           ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
         );
         expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
         expect(seed.fake.liveTokens(main)).toEqual([]);
-        expect(effectRows(storage)).toEqual([]);
+        expect(seed.fake.accepts(late.plaintext)).toBe(false);
         expect(host.initialized).toBe(true);
-
-        // Let the held call finish so its handle closes.
-        mint.release();
-        await eventually(async () => (seed.fake.openHandles === 0 ? ok(true) : busyResult()));
       },
       { limits: SHORT_CALLS },
     ));
 
-  it("after a restart, a reset clears a lost token mint once its token has expired", () =>
+  it("after a restart, a reset settles a lost token mint at once by deleting main", () =>
     withTarget(
-      async ({ seed, target, host, main, clock, restart }) => {
+      async ({ seed, target, host, main, restart }) => {
         seed.fake.seed(main, []);
         const mint = seed.fake.pauseNext("createTokenBeforeMint");
+        const answer = seed.fake.pauseNext("createToken");
         const first = target.seed(HEAD, fakePack());
         await mint.reached;
         expect(await first).toMatchObject({ ok: false, code: "internal" });
 
         const restarted = restart();
-        expect(await restarted.reset()).toEqual(ORPHAN_BUSY);
-        clock.now += ORPHAN_MINT_EXPIRY_MS;
         expect(await restarted.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
         expect(seed.fake.repos.has(main)).toBe(false);
         expect(host.wipes).toBe(1);
 
+        // Issued after the reset, the lost mint's token belongs to the deleted repository: the
+        // next seed finishes, and the token opens nothing on the new main.
         mint.release();
-        await eventually(async () => (seed.fake.openHandles === 0 ? ok(true) : busyResult()));
+        await answer.reached;
+        expect(seed.fake.tokensMinted).toBe(1);
+        expect(seed.fake.repos.has(main)).toBe(false);
+        expect(await restarted.seed(HEAD, fakePack())).toEqual(
+          ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+        );
+        expect(seed.fake.liveTokens(main)).toEqual([]);
+        expect(host.initialized).toBe(true);
       },
       { limits: SHORT_CALLS },
     ));
