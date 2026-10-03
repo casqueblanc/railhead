@@ -51,6 +51,7 @@ export const unavailableClaims: ClaimsPort = {
   currentGeneration: () => null,
   workingGeneration: () => null,
   workingEpisode: () => null,
+  holder: () => null,
   authorizeGit: refuse("claims"),
   fileIssue: refuse("claims"),
 };
@@ -69,10 +70,11 @@ export const unavailableInbox: InboxPort = {
 
 /**
  * Decisions while its module is missing: no requirement list, so nothing is authorized, and no
- * dependency is moved or relied on, so its caller's transaction rolls back.
+ * question is asked, and no dependency is moved or relied on, so its caller's transaction rolls back.
  */
 export const unavailableDecisions: DecisionsPort = {
   ask: refuse("decisions"),
+  askSystem: () => unavailable("decisions"),
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),

@@ -14,7 +14,12 @@ import { MAX_LIST_LENGTH, type QuestionOption, type RailheadEvent } from "@railh
 import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../src/contracts/result";
-import { unavailableClaims, unavailableInbox } from "../src/contracts/unavailable";
+import type { SystemQuestion } from "../src/contracts/decisions";
+import {
+  unavailableClaims,
+  unavailableDecisions,
+  unavailableInbox,
+} from "../src/contracts/unavailable";
 import {
   createDecisions,
   MAX_QUESTIONS_PER_CLAIM,
@@ -30,6 +35,9 @@ const NOW = 1_790_000_000_000;
 const CLAIM = "clm_claim001";
 const AGENT = "agt_atlas01";
 const OWNER = "usr_lemarier";
+/** The agent holding every claim other than `CLAIM`. */
+const OTHER_AGENT = "agt_basil01";
+const OTHER_CLAIM = "clm_claim002";
 
 const clock = (): number => NOW;
 
@@ -87,6 +95,8 @@ interface Harness {
   events(): RailheadEvent[];
   /** Counts rows of a decisions table. */
   count(table: "questions" | "decision_versions" | "decision_claims"): number;
+  /** Every time the module asked for the Repo's alarm, oldest first. */
+  wakes: number[];
 }
 
 async function freshRepo(): Promise<{ stub: DurableObjectStub<Repo>; repoId: string }> {
@@ -108,13 +118,25 @@ async function withDecisions<R>(
   const { stub, repoId } = repo ?? (await freshRepo());
   return runInDurableObject(stub, async (_instance, state) => {
     const log = EventLog.open(state.storage, repoId, clock);
-    const context = { repoId, storage: state.storage, log, clock, env, wake: () => {} };
+    const wakes: number[] = [];
+    const context = {
+      repoId,
+      storage: state.storage,
+      log,
+      clock,
+      env,
+      wake: (at: number) => wakes.push(at),
+    };
     const composed = composeRepo(context);
     const realInbox = createInbox(context);
     let active: PortResult<ClaimView | null> = ok(claimView());
     let fence: ((claimId: string) => number | null) | null = null;
     let whileReading: (() => void) | null = null;
     let inbox: InboxPort = realInbox;
+    const currentGeneration = (claimId: string): number | null => {
+      if (fence !== null) return fence(claimId);
+      return active.ok && active.value?.claimId === claimId ? active.value.generation : null;
+    };
     const ports = (): RepoPorts => ({
       ...composed,
       claims: {
@@ -124,9 +146,11 @@ async function withDecisions<R>(
           whileReading?.();
           return snapshot;
         },
-        currentGeneration: (claimId) => {
-          if (fence !== null) return fence(claimId);
-          return active.ok && active.value?.claimId === claimId ? active.value.generation : null;
+        currentGeneration,
+        holder: (claimId) => {
+          const generation = currentGeneration(claimId);
+          if (generation === null) return null;
+          return { agentId: claimId === CLAIM ? AGENT : OTHER_AGENT, claimId, generation };
         },
       },
       inbox,
@@ -169,6 +193,7 @@ async function withDecisions<R>(
         return asked.value;
       },
       events: () => log.replay(0, 256).events,
+      wakes,
       count: (table) =>
         state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0]
           ?.n ?? 0,
@@ -668,6 +693,175 @@ describe("record fence", () => {
       ).toEqual(ok({ decisionId, version: 1 }));
       expect(types(h.events())).toEqual(["question.asked", "decision.recorded", "inbox.queued"]);
       expect(await h.inbox.readyGate(CLAIM, 1)).toEqual(ok({ kind: "blocked", items: [1] }));
+    });
+  });
+});
+
+describe("askSystem", () => {
+  const SYSTEM: SystemQuestion = {
+    asker: "sys_train",
+    key: "conflict_1",
+    claims: [
+      { claimId: CLAIM, generation: 1 },
+      { claimId: OTHER_CLAIM, generation: 1 },
+    ],
+    text: "Both claims changed src/upload.ts. Which change should main keep?",
+    options: [
+      { key: "keep_first", label: "Keep the first change" },
+      { key: "keep_second", label: "Keep the second change" },
+    ],
+    scope: ["src/upload.ts"],
+  };
+
+  /** Holds both claims at generation 1. */
+  function holdBoth(h: Harness): void {
+    h.fence((claimId) => (claimId === CLAIM || claimId === OTHER_CLAIM ? 1 : null));
+  }
+
+  function askSystem(h: Harness, question: SystemQuestion = SYSTEM) {
+    return h.log.transaction((tx) => h.decisions.askSystem(tx, question)).value;
+  }
+
+  it("records a question with the asker as actor and both claims as dependencies", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { questionId, decisionId } = asked.value;
+
+      const events = h.events();
+      expect(types(events)).toEqual(["question.asked"]);
+      expect(events[0]).toMatchObject({
+        actor: { kind: "system", id: "sys_train" },
+        data: {
+          questionId,
+          claimId: CLAIM,
+          decisionId,
+          text: SYSTEM.text,
+          options: SYSTEM.options,
+        },
+      });
+      expect(h.count("decision_claims")).toBe(2);
+      // No agent asked it, so no agent can read it.
+      expect(await h.decisions.question(h.agent(), questionId, 0)).toMatchObject({
+        ok: false,
+        code: "not_found",
+      });
+
+      // A repeat of the key returns the same question and records nothing.
+      expect(askSystem(h)).toEqual(ok({ questionId, decisionId }));
+      expect(types(h.events())).toEqual(["question.asked"]);
+      expect(h.count("questions")).toBe(1);
+    });
+  });
+
+  it("delivers the answer to both holders, supersedes both claims and asks for the alarm", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h);
+      if (!asked.ok) throw new Error(asked.code);
+      const { decisionId } = asked.value;
+      expect(h.wakes).toEqual([]);
+
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "keep_second", expectedVersion: null }),
+      );
+
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      expect(h.events().slice(1)).toMatchObject([
+        { type: "decision.recorded", actor: { kind: "human", id: OWNER } },
+        { type: "inbox.queued", data: { agentId: AGENT, claimId: CLAIM } },
+        { type: "inbox.queued", data: { agentId: OTHER_AGENT, claimId: OTHER_CLAIM } },
+      ]);
+      expect(h.decisions.currentVersions(CLAIM)).toEqual([{ decisionId, version: 1 }]);
+      expect(h.decisions.currentVersions(OTHER_CLAIM)).toEqual([{ decisionId, version: 1 }]);
+      expect(h.wakes).toEqual([NOW]);
+    });
+  });
+
+  it("asks for no alarm when an agent's question is answered", async () => {
+    await withDecisions(async (h) => {
+      const { decisionId } = await h.ask();
+      const recorded = await h.decisions.record(
+        h.grant({ decisionId, option: "chunk", expectedVersion: null }),
+      );
+      expect(recorded.ok).toBe(true);
+      expect(h.wakes).toEqual([]);
+    });
+  });
+
+  it("refuses an invalid question and records nothing", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const [first] = SYSTEM.claims;
+      if (first === undefined) throw new Error("no claim");
+      const invalid: SystemQuestion[] = [
+        { ...SYSTEM, asker: AGENT },
+        { ...SYSTEM, asker: "sys_" },
+        { ...SYSTEM, key: "" },
+        { ...SYSTEM, key: "k".repeat(129) },
+        { ...SYSTEM, claims: [] },
+        { ...SYSTEM, claims: [first, first] },
+        { ...SYSTEM, claims: [{ claimId: "not-a-claim", generation: 1 }] },
+        { ...SYSTEM, claims: [{ claimId: CLAIM, generation: 0 }] },
+        { ...SYSTEM, text: " " },
+        { ...SYSTEM, options: [{ key: "only", label: "Only" }] },
+        { ...SYSTEM, scope: ["../escape"] },
+      ];
+      for (const question of invalid) {
+        expect(askSystem(h, question)).toMatchObject({ ok: false, code: "invalid_request" });
+      }
+      expect(h.events()).toEqual([]);
+      expect(h.count("questions")).toBe(0);
+      expect(h.count("decision_claims")).toBe(0);
+    });
+  });
+
+  it("refuses a key reused for another question", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      expect(askSystem(h).ok).toBe(true);
+      expect(askSystem(h, { ...SYSTEM, text: "Another question?" })).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+      expect(askSystem(h, { ...SYSTEM, claims: SYSTEM.claims.slice(0, 1) })).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+      expect(h.count("questions")).toBe(1);
+    });
+  });
+
+  it("refuses a claim not held at its generation and records nothing", async () => {
+    await withDecisions(async (h) => {
+      // The second claim is released.
+      h.fence((claimId) => (claimId === CLAIM ? 1 : null));
+      expect(askSystem(h)).toMatchObject({ ok: false, code: "claim_closed" });
+      // The first claim moved to generation 2.
+      h.fence((claimId) => (claimId === CLAIM ? 2 : 1));
+      expect(askSystem(h)).toMatchObject({ ok: false, code: "claim_closed" });
+      expect(h.events()).toEqual([]);
+      expect(h.count("questions")).toBe(0);
+    });
+  });
+
+  it("refuses a claim that already depends on MAX_QUESTIONS_PER_CLAIM decisions", async () => {
+    await withDecisions(async (h) => {
+      for (let n = 0; n < MAX_QUESTIONS_PER_CLAIM; n += 1) await h.ask({ requestId: requestId(n) });
+      holdBoth(h);
+      const before = h.events().length;
+      expect(askSystem(h)).toMatchObject({ ok: false, code: "quota_exceeded" });
+      expect(h.events()).toHaveLength(before);
+      expect(h.count("questions")).toBe(MAX_QUESTIONS_PER_CLAIM);
+    });
+  });
+
+  it("refuses with unavailable while the module is missing", async () => {
+    await withDecisions(async (h) => {
+      const refused = h.log.transaction((tx) => unavailableDecisions.askSystem(tx, SYSTEM)).value;
+      expect(refused).toEqual(unavailable("decisions"));
+      expect(h.events()).toEqual([]);
     });
   });
 });

@@ -5,6 +5,7 @@
 import type { ClaimResult, ClaimView, ReadyRequest, ReadyResult } from "@railhead/shared/agent-api";
 import type { ClaimId, CommitSha, IssueId } from "@railhead/shared/events";
 import type { ArtifactsRepoName } from "./artifacts";
+import type { InboxTarget } from "./inbox";
 import type { AgentPrincipal, GrantFor } from "./principals";
 import type { PortResult } from "./result";
 
@@ -89,6 +90,11 @@ export interface ClaimsPort {
    * the push's fence episode. A fence reader like `workingGeneration`.
    */
   workingEpisode(claimId: ClaimId): number | null;
+  /**
+   * The agent holding the claim and its current generation, or `null` whenever `currentGeneration`
+   * is `null`. A fence reader like `currentGeneration`: call it inside the caller's transaction.
+   */
+  holder(claimId: ClaimId): InboxTarget | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */

@@ -18,11 +18,24 @@
 // `next_episode` that of `next_commit`; a drive that read an entry settles it only while its
 // episode is unchanged, so a ready episode queued during the drive's reads is kept.
 //
+// `train_conflicts` holds one row per conflicting pair the train parked, keyed by the batch whose
+// merge found it. While its state is `asking`, the train owes the owner a question about the pair,
+// so the row is work it owes a drive; once asked, it waits for the answer. The pair returns to the
+// queue when the question is answered, when a new ready of either claim arrives, or when either
+// claim is no longer held before the question is asked.
+//
 // `train_drive` holds at most one row: the generation of the latest drive and when its lease ends.
 // Each drive takes the next generation, and every write a drive makes checks it still holds the
 // latest one, so a drive that outlived its lease and was taken over cannot change state again.
 
-import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
+import type {
+  CheckResult,
+  CheckRunId,
+  ClaimId,
+  CommitSha,
+  DecisionId,
+  DecisionRef,
+} from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
 import type { CheckDefinition } from "../../contracts/train";
 import type { RepoStorage } from "../../repo/storage";
@@ -82,6 +95,22 @@ const MIGRATIONS: readonly string[] = [
   "ALTER TABLE train_queue ADD COLUMN next_commit TEXT",
   "ALTER TABLE train_queue ADD COLUMN episode INTEGER NOT NULL DEFAULT 0 CHECK (episode >= 0)",
   "ALTER TABLE train_queue ADD COLUMN next_episode INTEGER",
+  `CREATE TABLE train_conflicts (
+    batch_id INTEGER PRIMARY KEY,
+    first_claim TEXT NOT NULL,
+    first_generation INTEGER NOT NULL CHECK (first_generation > 0),
+    second_claim TEXT NOT NULL,
+    second_generation INTEGER NOT NULL CHECK (second_generation > 0),
+    path TEXT NOT NULL,
+    state TEXT NOT NULL
+      CHECK (state IN ('asking', 'asked', 'refused', 'answered', 'redone', 'closed')),
+    decision_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (first_claim <> second_claim),
+    CHECK (state NOT IN ('asked', 'answered') OR decision_id IS NOT NULL)
+  ) STRICT`,
+  "CREATE INDEX train_conflicts_by_state ON train_conflicts (state)",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -99,7 +128,10 @@ export type EntryState =
   | "landed"
   /** Removed from the train; `reason` says why. */
   | "dropped"
-  /** Held with the claim it conflicts with. Nothing returns it to the queue yet (#118). */
+  /**
+   * Held with the claim it conflicts with until the owner answers the train's question about the
+   * pair, a new ready of either claim arrives, or either claim is no longer held.
+   */
   | "parked";
 
 /** Why a pin left the queue without landing. */
@@ -606,6 +638,178 @@ export function settleBatch(
   );
 }
 
+/** Where one parked pair stands. */
+export type ConflictState =
+  /** The train owes the owner a question about the pair. */
+  | "asking"
+  /** The question is asked; the pair waits for its answer. */
+  | "asked"
+  /** The decisions module refused the question; the pair waits for a new ready of either claim. */
+  | "refused"
+  /** The owner answered, and the pair returned to the queue. */
+  | "answered"
+  /** A new ready of one claim arrived, and the pair returned to the queue. */
+  | "redone"
+  /** A claim was no longer held before the question was asked; the pair returned to the queue. */
+  | "closed";
+
+/** One parked pair. */
+export interface ConflictRecord {
+  /** The batch whose merge found the conflict. */
+  batchId: number;
+  /** The two parked entries, as the merge named them. */
+  pins: [ConflictPin, ConflictPin];
+  /** The first conflicting path. */
+  path: string;
+  /** Where it stands. */
+  state: ConflictState;
+  /** The decision the question opened, once asked. */
+  decisionId: DecisionId | null;
+  /** When it was recorded. */
+  createdAt: number;
+  /** When it last changed. */
+  updatedAt: number;
+}
+
+/** The queue entry a parked pair holds: a claim at one generation. */
+export interface ConflictPin {
+  /** The claim. */
+  claimId: ClaimId;
+  /** The generation of its parked entry. */
+  generation: number;
+}
+
+/** States in which a pair is still parked. */
+const OPEN_CONFLICT = "('asking', 'asked', 'refused')";
+
+type ConflictRow = {
+  batch_id: number;
+  first_claim: string;
+  first_generation: number;
+  second_claim: string;
+  second_generation: number;
+  path: string;
+  state: string;
+  decision_id: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+const CONFLICT_COLUMNS =
+  "batch_id, first_claim, first_generation, second_claim, second_generation, path, state, decision_id, created_at, updated_at";
+
+/** Records a pair the batch's merge found conflicting, owing the owner a question about it. */
+export function insertConflict(
+  sql: SqlStorage,
+  batchId: number,
+  pins: readonly [ConflictPin, ConflictPin],
+  path: string,
+  now: number,
+): void {
+  const [first, second] = pins;
+  sql.exec(
+    `INSERT INTO train_conflicts (batch_id, first_claim, first_generation, second_claim,
+       second_generation, path, state, decision_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'asking', NULL, ?, ?)`,
+    batchId,
+    first.claimId,
+    first.generation,
+    second.claimId,
+    second.generation,
+    path,
+    now,
+    now,
+  );
+}
+
+/** The pair recorded for `batchId`, or `null`. */
+export function readConflict(sql: SqlStorage, batchId: number): ConflictRecord | null {
+  const row = sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE batch_id = ?`,
+      batchId,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConflict(row);
+}
+
+/** Up to `limit` pairs in `state`, oldest first. */
+export function conflictsIn(
+  sql: SqlStorage,
+  state: ConflictState,
+  limit: number,
+): ConflictRecord[] {
+  return sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE state = ? ORDER BY batch_id LIMIT ?`,
+      state,
+      limit,
+    )
+    .toArray()
+    .map(toConflict);
+}
+
+/** The still-parked pair holding the claim's entry at `generation`, or `null`. */
+export function openConflictOf(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+): ConflictRecord | null {
+  const row = sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts WHERE state IN ${OPEN_CONFLICT}
+         AND ((first_claim = ? AND first_generation = ?) OR (second_claim = ? AND second_generation = ?))
+       ORDER BY batch_id DESC LIMIT 1`,
+      claimId,
+      generation,
+      claimId,
+      generation,
+    )
+    .toArray()[0];
+  return row === undefined ? null : toConflict(row);
+}
+
+/** Up to `limit` pairs, newest first. */
+export function recentConflicts(sql: SqlStorage, limit: number): ConflictRecord[] {
+  return sql
+    .exec<ConflictRow>(
+      `SELECT ${CONFLICT_COLUMNS} FROM train_conflicts ORDER BY batch_id DESC LIMIT ?`,
+      limit,
+    )
+    .toArray()
+    .map(toConflict);
+}
+
+/** Moves a pair to `state`, recording the decision its question opened when there is one. */
+export function settleConflict(
+  sql: SqlStorage,
+  batchId: number,
+  state: Exclude<ConflictState, "asking">,
+  decisionId: DecisionId | null,
+  now: number,
+): void {
+  sql.exec(
+    `UPDATE train_conflicts SET state = ?, decision_id = COALESCE(?, decision_id), updated_at = ?
+     WHERE batch_id = ?`,
+    state,
+    decisionId,
+    now,
+    batchId,
+  );
+}
+
+/** Returns a parked entry to the back of the queue with fresh counters; any other entry stays. */
+export function unparkEntry(sql: SqlStorage, pin: ConflictPin, now: number): void {
+  sql.exec(
+    `UPDATE train_queue SET state = 'queued', isolate = 0, retries = 0, reason = NULL,
+       position = (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue), updated_at = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'parked'`,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+}
+
 /** A drive the train owes. */
 export interface PendingWake {
   /** When it is due, in milliseconds since the Unix epoch. */
@@ -667,25 +871,30 @@ export function writeDrive(sql: SqlStorage, lease: DriveLease): void {
   );
 }
 
-/** Whether storage holds work the train owes a drive: an active batch or a queued pin. */
+/**
+ * Whether storage holds work the train owes a drive: an active batch, a queued pin or a question
+ * about a parked pair.
+ */
 export function owesWork(sql: SqlStorage): boolean {
   const row = sql
     .exec<{ owes: number }>(
       `SELECT EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
-         OR EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued') AS owes`,
+         OR EXISTS (SELECT 1 FROM train_queue WHERE state = 'queued')
+         OR EXISTS (SELECT 1 FROM train_conflicts WHERE state = 'asking') AS owes`,
     )
     .toArray()[0];
   return row?.owes === 1;
 }
 
 /**
- * Whether storage holds work a drive could move now: an active batch that is not waiting for a
- * runner's report, or a waiting pin with no batch active.
+ * Whether storage holds work a drive could move now: a question owed about a parked pair, an active
+ * batch that is not waiting for a runner's report, or a waiting pin with no batch active.
  */
 export function hasMovableWork(sql: SqlStorage): boolean {
   const row = sql
     .exec<{ movable: number }>(
       `SELECT CASE
+         WHEN EXISTS (SELECT 1 FROM train_conflicts WHERE state = 'asking') THEN 1
          WHEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1)
            THEN EXISTS (SELECT 1 FROM train_batches WHERE active = 1
              AND (state IN ('composing', 'passed') OR (state = 'checking' AND check_started = 0)))
@@ -736,6 +945,22 @@ function toBatch(row: BatchRow): BatchRecord {
   };
 }
 
+function toConflict(row: ConflictRow): ConflictRecord {
+  return {
+    batchId: row.batch_id,
+    pins: [
+      { claimId: row.first_claim, generation: row.first_generation },
+      { claimId: row.second_claim, generation: row.second_generation },
+    ],
+    path: row.path,
+    state: member(CONFLICT_STATES, row.state, "conflict state"),
+    decisionId: row.decision_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+const CONFLICT_STATES = ["asking", "asked", "refused", "answered", "redone", "closed"] as const;
 const ENTRY_STATES = ["queued", "batched", "landed", "dropped", "parked"] as const;
 const DROP_REASONS = [
   "pin_changed",

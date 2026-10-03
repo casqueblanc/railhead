@@ -372,6 +372,66 @@ describe("currentGeneration", () => {
   });
 });
 
+describe("holder", () => {
+  it("names the agent and generation of a working claim", async () => {
+    await withClaims(async ({ port }) => {
+      await fileIssues(port, 2);
+      const first = claimed(await port.work(agent(1)));
+      const second = claimed(await port.work(agent(2)));
+
+      expect(port.holder(first.claim.claimId)).toEqual({
+        agentId: agent(1).agentId,
+        claimId: first.claim.claimId,
+        generation: 1,
+      });
+      expect(port.holder(second.claim.claimId)).toEqual({
+        agentId: agent(2).agentId,
+        claimId: second.claim.claimId,
+        generation: 1,
+      });
+    });
+  });
+
+  it("names the holder of a ready claim", async () => {
+    await withClaims(async ({ port, sql }) => {
+      await fileIssues(port, 1);
+      const held = claimed(await port.work(agent(1)));
+      sql.exec("UPDATE claims_claims SET state = 'ready' WHERE claim_id = ?", held.claim.claimId);
+
+      expect(port.holder(held.claim.claimId)).toEqual({
+        agentId: agent(1).agentId,
+        claimId: held.claim.claimId,
+        generation: 1,
+      });
+    });
+  });
+
+  it("is null for an unknown, allocating, merged or expired claim", async () => {
+    await withClaims(async ({ port, sql }, { fake }) => {
+      await fileIssues(port, 2);
+      const held = claimed(await port.work(agent(1)));
+      fake.failNextFork("lose-response");
+      expect((await port.work(agent(2))).ok).toBe(false);
+      const [intent] = sql
+        .exec<{ claim_id: string }>("SELECT claim_id FROM claims_claims WHERE state = 'allocating'")
+        .toArray()
+        .map((row) => row.claim_id);
+
+      expect(port.holder(intent ?? "")).toBeNull();
+      expect(port.holder("clm_nosuchclaim")).toBeNull();
+      expect(port.holder("")).toBeNull();
+      for (const state of ["merged", "expired"]) {
+        sql.exec(
+          "UPDATE claims_claims SET state = ? WHERE claim_id = ?",
+          state,
+          held.claim.claimId,
+        );
+        expect(port.holder(held.claim.claimId)).toBeNull();
+      }
+    });
+  });
+});
+
 describe("workingGeneration and workingEpisode", () => {
   it("report a working claim's generation and episode, and unknown for an allocating or missing one", async () => {
     await withClaims(async ({ port, sql }, { fake }) => {

@@ -14,6 +14,12 @@
 //   of the same grant returns the version it recorded; a stale `expectedVersion` records nothing,
 //   so a person who answered against an older version never overwrites a newer one.
 //
+// - `askSystem` records a question a system module raises on its own authority, such as the train
+//   when two claims conflict, inside the caller's transaction. Its asker is stored in place of an
+//   agent, so no agent can read it with `question`, and every claim it names is a dependency of its
+//   decision, so the answer reaches each holder and supersedes each ready pin. Recording a version
+//   of a system question asks for the Repo's alarm, which resumes the asker to read the answer.
+//
 // A decision's dependencies name the claim, and the agent and ownership generation an inbox item
 // goes to. An obligation is queued as an item only when the claims module reports that generation
 // as current, inside the transaction that records it. A dependency whose claim was merged, expired,
@@ -57,7 +63,12 @@ import {
   type QuestionId,
   type QuestionOption,
 } from "@railhead/shared/events";
-import type { DecisionObligation, DecisionsPort } from "../../contracts/decisions";
+import {
+  MAX_SYSTEM_QUESTION_KEY_LENGTH,
+  type DecisionObligation,
+  type DecisionsPort,
+  type SystemQuestion,
+} from "../../contracts/decisions";
 import type { InboxTarget } from "../../contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../../contracts/result";
@@ -134,6 +145,12 @@ export const MAX_WAITERS = 256;
 
 /** Longest option key a question may offer, as the event log's option key format allows. */
 const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * A system module's actor id. No agent id has this form, so a system question is never an agent's
+ * question, whose rows are keyed by the agent that asked.
+ */
+const SYSTEM_ID = /^sys_[a-z0-9_]{1,32}$/;
 
 /**
  * The decisions port, with the fence reader the train's authorization calls inside its own
@@ -489,6 +506,90 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       }).value;
     },
 
+    askSystem(tx, sent) {
+      const invalid = invalidSystemQuestion(sent);
+      if (invalid !== null) return fail("invalid_request", invalid);
+      const request = ownedSystemQuestion(sent);
+      const { asker, key } = request;
+      const existing = tx.sql
+        .exec<QuestionRow>(
+          `SELECT question_id, decision_id, agent_id, claim_id, generation, text, options, scope
+           FROM questions WHERE agent_id = ? AND request_id = ?`,
+          asker,
+          key,
+        )
+        .toArray()[0];
+      if (existing !== undefined) {
+        if (!sameSystemQuestion(tx.sql, existing, request)) {
+          return fail("invalid_request", "That key was used for another question.");
+        }
+        return ok({ questionId: existing.question_id, decisionId: existing.decision_id });
+      }
+      const holders: InboxTarget[] = [];
+      for (const { claimId, generation } of request.claims) {
+        const holder = ports().claims.holder(claimId);
+        if (holder === null || holder.generation !== generation) {
+          return fail("claim_closed", "A claim is not held at the generation the question names.");
+        }
+        const depends = tx.sql
+          .exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM decision_claims WHERE claim_id = ?",
+            claimId,
+          )
+          .toArray()[0];
+        if ((depends?.n ?? 0) >= MAX_QUESTIONS_PER_CLAIM) {
+          return fail(
+            "quota_exceeded",
+            `A claim may depend on at most ${MAX_QUESTIONS_PER_CLAIM} decisions.`,
+          );
+        }
+        holders.push(holder);
+      }
+      const [first] = holders;
+      if (first === undefined) throw new Error("a validated system question names no claim");
+      const questionId = newId("qst_");
+      const decisionId = newId("dec_");
+      tx.sql.exec(
+        `INSERT INTO questions (question_id, decision_id, agent_id, request_id, claim_id,
+           generation, text, options, scope, asked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        questionId,
+        decisionId,
+        asker,
+        key,
+        first.claimId,
+        first.generation,
+        request.text,
+        JSON.stringify(request.options),
+        JSON.stringify(request.scope),
+        clock(),
+      );
+      for (const holder of holders) {
+        tx.sql.exec(
+          `INSERT INTO decision_claims (decision_id, claim_id, agent_id, generation)
+           VALUES (?, ?, ?, ?)`,
+          decisionId,
+          holder.claimId,
+          holder.agentId,
+          holder.generation,
+        );
+      }
+      tx.append(
+        { kind: "system", id: asker },
+        {
+          type: "question.asked",
+          data: {
+            questionId,
+            claimId: first.claimId,
+            decisionId,
+            text: request.text,
+            options: request.options,
+          },
+        },
+      );
+      return ok({ questionId, decisionId });
+    },
+
     async question(agent, questionId, waitMs): Promise<PortResult<QuestionResult>> {
       if (foreign(agent)) return notForThisRepo();
       if (!isId("question", questionId)) {
@@ -590,6 +691,8 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                 target.relied !== null && target.relied < version ? "rework" : "decision";
               owe(tx, target, { decisionId, version }, kind);
             }
+            // The system module that asked reads the answer when the Repo's alarm resumes it.
+            if (SYSTEM_ID.test(question.agent_id)) context.wake(decidedAt);
             return ok({ decisionId, version });
           },
         );
@@ -802,6 +905,32 @@ function invalidAsk(request: AskRequest): string | null {
     return "The generation must be a whole number from 1.";
   }
   if (!isRequestId(request.requestId)) return "The requestId is not an idempotency key.";
+  return invalidContent(request);
+}
+
+function invalidSystemQuestion(question: SystemQuestion): string | null {
+  if (!SYSTEM_ID.test(question.asker)) return "The asker is not a system module.";
+  if (question.key === "" || question.key.length > MAX_SYSTEM_QUESTION_KEY_LENGTH) {
+    return `The key must be non-empty and at most ${MAX_SYSTEM_QUESTION_KEY_LENGTH} characters.`;
+  }
+  const { claims } = question;
+  if (claims.length === 0 || claims.length > MAX_OPTIONS) {
+    return `A system question names from 1 to ${MAX_OPTIONS} claims.`;
+  }
+  const seen = new Set<string>();
+  for (const { claimId, generation } of claims) {
+    if (!isId("claim", claimId)) return "A claim is not a claim identifier.";
+    if (!Number.isSafeInteger(generation) || generation < 1) {
+      return "A generation is not a whole number from 1.";
+    }
+    if (seen.has(claimId)) return "A claim is named twice.";
+    seen.add(claimId);
+  }
+  return invalidContent(question);
+}
+
+/** Checks the text, options and scope every question shares. */
+function invalidContent(request: Pick<AskRequest, "text" | "options" | "scope">): string | null {
   if (request.text.trim() === "" || request.text.length > MAX_QUESTION_LENGTH) {
     return `The question must be non-blank and at most ${MAX_QUESTION_LENGTH} characters.`;
   }
@@ -841,6 +970,43 @@ function ownedAsk(request: AskRequest): AskRequest {
     options: request.options.map(({ key, label }) => ({ key, label })),
     scope: [...request.scope],
   };
+}
+
+/** `ownedAsk` for a system question. */
+function ownedSystemQuestion(question: SystemQuestion): SystemQuestion {
+  return {
+    asker: question.asker,
+    key: question.key,
+    claims: question.claims.map(({ claimId, generation }) => ({ claimId, generation })),
+    text: question.text,
+    options: question.options.map(({ key, label }) => ({ key, label })),
+    scope: [...question.scope],
+  };
+}
+
+/** Whether a stored system question was asked with exactly `request`'s content and claims. */
+function sameSystemQuestion(sql: SqlStorage, row: QuestionRow, request: SystemQuestion): boolean {
+  const [first] = request.claims;
+  if (
+    first === undefined ||
+    row.claim_id !== first.claimId ||
+    row.generation !== first.generation ||
+    row.text !== request.text ||
+    row.options !== JSON.stringify(request.options) ||
+    row.scope !== JSON.stringify(request.scope)
+  ) {
+    return false;
+  }
+  // A takeover may have moved a dependency since, so only the claims are compared.
+  const claims = sql
+    .exec<{ claim_id: string }>(
+      "SELECT claim_id FROM decision_claims WHERE decision_id = ? ORDER BY claim_id",
+      row.decision_id,
+    )
+    .toArray()
+    .map((dependency) => dependency.claim_id);
+  const asked = request.claims.map(({ claimId }) => claimId).toSorted();
+  return claims.length === asked.length && claims.every((claimId, i) => claimId === asked[i]);
 }
 
 function sameAsk(row: QuestionRow, claimId: ClaimId, request: AskRequest): boolean {

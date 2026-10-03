@@ -38,8 +38,8 @@ const PORTS: [PortName, object][] = [
 
 /**
  * The synchronous methods, and what each does while its module is missing: a fence reader reports
- * `null`, and a writer that runs inside the caller's transaction throws so the transaction rolls
- * back.
+ * `null`, a writer that runs inside the caller's transaction throws so the transaction rolls back,
+ * and the system question refuses with `unavailable` so its caller can keep its own change.
  */
 const SYNC = new Map<string, unknown>([
   ["authorization.record", null],
@@ -48,6 +48,8 @@ const SYNC = new Map<string, unknown>([
   ["claims.currentGeneration", null],
   ["claims.workingGeneration", null],
   ["claims.workingEpisode", null],
+  ["claims.holder", null],
+  ["decisions.askSystem", unavailable("decisions")],
   ["decisions.currentVersions", null],
   ["decisions.transfer", "throws"],
   ["decisions.relied", "throws"],

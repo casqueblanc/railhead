@@ -65,10 +65,14 @@ interface Setup {
   entries(): { commit: string; state: string; next: string | null }[];
   /** Files an issue and claims it for agent 1, with `commits` pushed to its fork. */
   open(...commits: string[]): Promise<ClaimView>;
+  /** Files an issue and claims it for agent `n`, with `commits` pushed to its fork. */
+  openFor(n: number, ...commits: string[]): Promise<ClaimView>;
   /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
   decide(claimId: string, decisionId?: string): Promise<DecisionRef>;
-  /** Acknowledges every inbox item agent 1 has pending. */
-  ackAll(): Promise<void>;
+  /** Acknowledges every inbox item agent `n`, 1 unless given, has pending. */
+  ackAll(n?: number): Promise<void>;
+  /** While true, the merge finds the first two pins of any batch of two or more conflicting. */
+  conflicting: boolean;
   /** Pushes `commit` to the claim's fork. */
   push(claimId: string, commit: string): Promise<void>;
   /**
@@ -195,6 +199,10 @@ function withHandoff<T>(
       merge: {
         compose: async (_main, pins) => {
           composed.push(pins);
+          const [first, second] = pins;
+          if (setup.conflicting && first !== undefined && second !== undefined) {
+            return ok({ kind: "conflict", pins: [first, second], paths: ["src/upload.ts"] });
+          }
           return ok({ kind: "clean", candidate: candidateOf(pins) });
         },
       },
@@ -221,7 +229,8 @@ function withHandoff<T>(
           state: entry.state,
           next: entry.nextCommit,
         })),
-      async open(...commits) {
+      open: (...commits) => setup.openFor(1, ...commits),
+      async openFor(n, ...commits) {
         const grant: GrantFor<"issue.file"> = {
           kind: "human",
           userId: OWNER,
@@ -231,7 +240,7 @@ function withHandoff<T>(
         };
         const filed = await claims.fileIssue(grant);
         if (!filed.ok) throw new Error(`filing refused: ${filed.code}`);
-        const claimed = await claims.work(agent(1));
+        const claimed = await claims.work(agent(n));
         if (!claimed.ok) throw new Error(`claim refused: ${claimed.code}`);
         for (const commit of commits) await push(claimed.value.claim.claimId, commit);
         return claimed.value.claim;
@@ -271,11 +280,11 @@ function withHandoff<T>(
         if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
         return recorded.value;
       },
-      async ackAll() {
-        const delivered = await inbox.pending(agent(1), 16);
+      async ackAll(n = 1) {
+        const delivered = await inbox.pending(agent(n), 16);
         if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
         for (const { item } of delivered.value.items) {
-          const acked = await inbox.ack(agent(1), item, "Follow the decision.");
+          const acked = await inbox.ack(agent(n), item, "Follow the decision.");
           if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
         }
       },
@@ -299,6 +308,7 @@ function withHandoff<T>(
         };
       },
       mainUp: true,
+      conflicting: false,
       advance: (ms) => fake.advance(ms),
       now: () => fake.clock(),
       storedAlarm: () => state.storage.getAlarm(),
@@ -483,6 +493,95 @@ async function readyUnderFirst(setup: Setup) {
   expect(ready.ok).toBe(true);
   return { claim, first };
 }
+
+describe("a conflicting pair", () => {
+  const OTHER = "6".repeat(40);
+  const REDONE = "9".repeat(40);
+
+  it("asks the owner once, and the answer returns both claims to their agents and the train", async () => {
+    await withHandoff(async (setup) => {
+      const first = await setup.openFor(1, WORK);
+      const second = await setup.openFor(2, OTHER);
+      setup.conflicting = true;
+      for (const [n, claim, commit] of [
+        [1, first, WORK],
+        [2, second, OTHER],
+      ] as const) {
+        const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+        expect(ready.ok).toBe(true);
+      }
+      const before = setup.log.head();
+
+      await setup.train.resume();
+
+      const asked = setup.log.replay(before, 64).events;
+      expect(asked.map((event) => event.type)).toEqual(["train.conflict", "question.asked"]);
+      expect(asked[1]).toMatchObject({
+        actor: { kind: "system", id: "sys_train" },
+        data: { claimId: first.claimId },
+      });
+      const [conflict] = setup.train.conflicts(1);
+      expect(conflict).toMatchObject({ state: "asked" });
+      const decisionId = conflict?.decisionId;
+      if (decisionId == null) throw new Error("no question was asked");
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["parked", "parked"]);
+      // Another alarm asks nothing more.
+      await setup.train.resume();
+      expect(setup.log.head()).toBe(before + 2);
+
+      const wakes = setup.wakes.length;
+      const recorded = await setup.decisions.record({
+        kind: "human",
+        userId: OWNER,
+        repoId: REPO,
+        grantId: crypto.randomUUID(),
+        action: {
+          kind: "decision.record",
+          decisionId,
+          option: "keep_first",
+          expectedVersion: null,
+        },
+      });
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      // The answer asks for the alarm and reaches both agents.
+      expect(setup.wakes.length).toBeGreaterThan(wakes);
+      const queued = setup.log
+        .replay(before + 2, 64)
+        .events.filter((event) => event.type === "inbox.queued");
+      expect(queued.map((event) => event.data)).toMatchObject([
+        { agentId: agent(1).agentId, claimId: first.claimId },
+        { agentId: agent(2).agentId, claimId: second.claimId },
+      ]);
+
+      // The alarm returns the pair to the queue; reading the superseded pins reopens both claims.
+      await setup.train.resume();
+      expect(setup.train.conflicts(1)).toMatchObject([{ state: "answered" }]);
+      expect(claimState(setup.sql, first.claimId)).toBe("working");
+      expect(claimState(setup.sql, second.claimId)).toBe("working");
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["dropped", "dropped"]);
+
+      // The first agent keeps its change; the second redoes its own to fit. Both land together.
+      setup.conflicting = false;
+      await setup.ackAll(1);
+      await setup.ackAll(2);
+      await setup.push(second.claimId, REDONE);
+      expect(
+        (await setup.claims.ready(agent(1), first.claimId, { generation: 1, commit: WORK })).ok,
+      ).toBe(true);
+      expect(
+        (await setup.claims.ready(agent(2), second.claimId, { generation: 1, commit: REDONE })).ok,
+      ).toBe(true);
+      await setup.train.resume();
+
+      const answer = { decisionId, version: 1 };
+      expect(setup.composed.at(-1)).toEqual([
+        { claimId: first.claimId, generation: 1, commit: WORK },
+        { claimId: second.claimId, generation: 1, commit: REDONE },
+      ]);
+      expect(setup.started.at(-1)).toMatchObject({ decisions: [answer] });
+    });
+  });
+});
 
 describe("a re-ready after a superseded decision", () => {
   it("queues the same commit again after the train dropped the superseded pin", async () => {

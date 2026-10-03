@@ -7,6 +7,8 @@ import type {
   DecisionId,
   DecisionRef,
   QuestionId,
+  QuestionOption,
+  SystemId,
 } from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
 import type { InboxTarget } from "./inbox";
@@ -38,6 +40,31 @@ export interface DecisionObligation {
   recordedAt: number;
 }
 
+/** A question a system module asks the owner on its own authority, about claims it holds pins of. */
+export interface SystemQuestion {
+  /** The module asking, recorded as the system actor of `question.asked`. */
+  asker: SystemId;
+  /**
+   * The asker's idempotency key, at most `MAX_SYSTEM_QUESTION_KEY_LENGTH` characters: a repeat
+   * with the same key returns the question it asked and records nothing.
+   */
+  key: string;
+  /**
+   * The claims whose work depends on the answer, each at the generation the asker read it at, all
+   * different. The first is the question's claim in `question.asked`.
+   */
+  claims: { claimId: ClaimId; generation: number }[];
+  /** The question, as an agent's question is bounded. */
+  text: string;
+  /** The answers the owner chooses from. */
+  options: QuestionOption[];
+  /** The repository paths the answer covers. */
+  scope: string[];
+}
+
+/** Longest `SystemQuestion.key`. */
+export const MAX_SYSTEM_QUESTION_KEY_LENGTH = 128;
+
 /**
  * Questions and decisions. Only a human grant records a decision version.
  *
@@ -58,6 +85,21 @@ export interface DecisionsPort {
     claimId: ClaimId,
     request: AskRequest,
   ): Promise<PortResult<QuestionResult>>;
+  /**
+   * Asks the owner a system question inside the caller's transaction, which also records the change
+   * that raised it, and appends `question.asked` with the asker as actor. Each claim becomes a
+   * dependency of the question's decision, held by the agent holding the claim at its generation, so
+   * the answer reaches each holder's inbox and supersedes each claim's ready pin. Recording a version
+   * of a system question also asks for the Repo's alarm, so the asker's `resume` sees the answer. A
+   * repeat of the asker's `key` returns the question it asked and records nothing. Refuses without
+   * writing anything: `invalid_request` for an invalid question or a key used for another question,
+   * `claim_closed` for a claim not held at its generation, `quota_exceeded` for a claim that already
+   * depends on `MAX_LIST_LENGTH` decisions, and `unavailable` while the module is missing.
+   */
+  askSystem(
+    tx: EventTransaction,
+    question: SystemQuestion,
+  ): PortResult<{ questionId: QuestionId; decisionId: DecisionId }>;
   /** Reads a question the agent asked, waiting up to `waitMs` for an answer. */
   question(
     agent: AgentPrincipal,
