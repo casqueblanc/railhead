@@ -69,7 +69,9 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// A store with `atlas` (with a session) and `boreas` (without one), a fork with one commit on
 /// `main`, and Git configured to reach the fork's Railhead URL on disk.
 async fn world() -> anyhow::Result<World> {
-    let server = MockServer::start().await;
+    // A server of its own rather than one from wiremock's pool: a pooled server keeps its port from
+    // test to test, so a request a process from an earlier test sends late would be counted here.
+    let server = MockServer::builder().start().await;
     let home = tempfile::tempdir()?;
     for (name, id) in [("atlas", "agt_atlas01"), ("boreas", "agt_boreas01")] {
         let dir = home.path().join("agents").join(name);
@@ -254,6 +256,18 @@ async fn requests(world: &World) -> usize {
         .map_or(0, |requests| requests.len())
 }
 
+/// Each request the server received, as `METHOD path`, in arrival order.
+async fn routes(world: &World) -> Vec<String> {
+    world
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .collect()
+}
+
 fn git_config_value(world: &World, dir: &Path, key: &str) -> anyhow::Result<String> {
     git_in(world, dir, &["config", "--local", "--get", key])
 }
@@ -359,10 +373,10 @@ async fn status_inside_a_clone_prints_the_task_and_the_inbox() -> anyhow::Result
     let run = rh(&world, &clone, None, &["status"])?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let expected = format!(
-        "agent atlas (agt_atlas01), confirmed\nclaim clm_42abcd\n\
-         issue iss_upload1, working, generation 1\ntask: Handle large uploads\n\
-         \x20 Uploads above 10 MB fail. Follow the decision.\nclone: {}\n\
-         inbox item 17: rework for decision dec_upload1 v2\n\
+        "agent \"atlas\" (\"agt_atlas01\"), confirmed\nclaim \"clm_42abcd\"\n\
+         issue \"iss_upload1\", working, generation 1\ntask: \"Handle large uploads\"\n\
+         \x20 \"Uploads above 10 MB fail. Follow the decision.\"\nclone: {}\n\
+         inbox item 17: rework for decision \"dec_upload1\" v2\n\
          inbox: 1 unacknowledged; read them with rh sync\nnext: rh sync\n",
         clone.display()
     );
@@ -388,12 +402,12 @@ async fn a_repeated_claim_resumes_the_same_clone_and_keeps_edits() -> anyhow::Re
     )?;
     assert_eq!(first.code, Some(0), "{}", first.stderr);
     assert!(
-        first.stdout.starts_with("claimed clm_42abcd\n"),
+        first.stdout.starts_with("claimed \"clm_42abcd\"\n"),
         "{}",
         first.stdout
     );
     assert!(
-        first.stdout.contains("task: Handle large uploads"),
+        first.stdout.contains("task: \"Handle large uploads\""),
         "{}",
         first.stdout
     );
@@ -587,15 +601,18 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
     fs::create_dir(&beside)?;
     fs::write(beside.join("notes.txt"), "draft\n")?;
 
+    // The limit applies to every Git step of the run, not only the fetch: the init and the config
+    // writes before it must each finish within it on a loaded machine, so it leaves them a wide
+    // margin. Only the upload pack is meant to reach it.
     let started = Instant::now();
     let stopped = rh_with(
         &world,
         &world.outside(),
         Some("atlas"),
-        &[("RAILHEAD_GIT_TIMEOUT", "2")],
+        &[("RAILHEAD_GIT_TIMEOUT", "10")],
         &["--json", "work"],
     )?;
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(60));
     assert_eq!(stopped.code, Some(1), "{}", stopped.stdout);
     let envelope = stopped.json()?;
     assert_eq!(envelope.pointer("/error/code"), Some(&json!("git")));
@@ -606,7 +623,7 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
         .unwrap_or_default();
     assert!(
         message.starts_with(
-            "fetching the claim's fork: git was still running after 2 seconds and was stopped"
+            "fetching the claim's fork: git was still running after 10 seconds and was stopped"
         ) && message.contains("running the command again resumes the claim"),
         "{message}"
     );
@@ -642,7 +659,8 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
         git_in(&world, &world.clone_dir(), &["rev-parse", "HEAD"])?,
         world.fork_head
     );
-    assert_eq!(requests(&world).await, 2);
+    let work = format!("POST {PREFIX}/work");
+    assert_eq!(routes(&world).await, [work.as_str(), work.as_str()]);
     Ok(())
 }
 
@@ -1021,7 +1039,7 @@ async fn ready_pins_head_with_the_clone_generation() -> anyhow::Result<()> {
     );
     assert!(
         run.stdout
-            .contains("issue iss_upload1, ready, generation 1"),
+            .contains("issue \"iss_upload1\", ready, generation 1"),
         "{}",
         run.stdout
     );
@@ -1123,7 +1141,7 @@ async fn status_without_a_claim_points_at_work_and_a_revoked_agent_fails() -> an
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(
         run.stdout,
-        "agent atlas (agt_atlas01), confirmed\nno claim\nnext: rh work\n"
+        "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\nnext: rh work\n"
     );
 
     world.server.reset().await;
