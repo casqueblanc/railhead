@@ -239,6 +239,13 @@ class GitGateway implements GitPort {
       await parsed.body.cancel();
       return gitResult(route.service, new Uint8Array(0));
     }
+    if (reportFraming(head.capabilities) === "none") {
+      // Git would take a push it sent without asking for a report as applied, so it is refused as an
+      // HTTP error rather than in a report the client never asked for.
+      deadline.clear();
+      await parsed.body.cancel();
+      return text(403, "railhead: pushes must request report-status");
+    }
     const reasons = new Map<RefUpdate, string>();
     // A ref named twice could be reported both updated and refused, so its outcome is unknowable.
     const named = new Set<string>();
@@ -252,21 +259,11 @@ class GitGateway implements GitPort {
     if (reasons.size > 0) {
       deadline.clear();
       await parsed.body.cancel();
-      return gitResult(
-        route.service,
-        receivePackRefusal(
-          head,
-          "railhead: push refused; nothing was updated",
-          (update) => reasons.get(update) ?? "refused with the rest of this push",
-        ),
+      return pushRefusal(
+        head,
+        "railhead: push refused; nothing was updated",
+        (update) => reasons.get(update) ?? "refused with the rest of this push",
       );
-    }
-    if (reportFraming(head.capabilities) === "none") {
-      // Git would take a push it sent without asking for a report as applied, so it is refused as an
-      // HTTP error rather than in a report the client never asked for.
-      deadline.clear();
-      await parsed.body.cancel();
-      return text(403, "railhead: pushes must request report-status");
     }
     return this.#forward(request, route, grant, {
       head,
@@ -298,17 +295,16 @@ class GitGateway implements GitPort {
     const current = await this.#context.ports().claims.authorizeGit(access);
     if (!current.ok) {
       if (!pushRefusable(current)) return refusal(route, current);
-      const message = `railhead: ${current.message}`;
-      return gitResult(
-        route.service,
-        receivePackRefusal(head, message, () => current.message),
-      );
+      return pushRefusal(head, `railhead: ${current.message}`, () => current.message);
     }
     if (sameGrant(current.value, grant)) return null;
     return claimChanged(head);
   }
 
-  /** Answers a push refused by the claims module in Git's own report, read from its head. */
+  /**
+   * Answers a push refused by the claims module in Git's own report, read from its head. Git's
+   * probe gets the refusal as an HTTP error, as does a push that asked for no report.
+   */
   async #refusePush(request: Request, message: string): Promise<Response> {
     if (request.body === null) return text(403, `railhead: ${message}`);
     const deadline = new Deadline(this.#limits.maxDurationMs);
@@ -316,10 +312,7 @@ class GitGateway implements GitPort {
     deadline.clear();
     if (parsed.kind !== "complete") return text(403, `railhead: ${message}`);
     await parsed.body.cancel();
-    return gitResult(
-      "git-receive-pack",
-      receivePackRefusal(parsed.head, `railhead: ${message}`, () => message),
-    );
+    return pushRefusal(parsed.head, `railhead: ${message}`, () => message);
   }
 
   /**
@@ -533,7 +526,8 @@ class GitGateway implements GitPort {
   }
 
   /**
-   * Records each ref the upstream reported updated; a deleted ref names no commit and is skipped.
+   * Records each ref the upstream reported updated. Deletions are refused before a push is
+   * forwarded, since `claim.pushed` cannot express one; one that got this far is not recorded.
    * Nothing is recorded unless the claim is still working at the push's generation when the record
    * is written: a claim that expired, changed hands or went ready while the push was in flight
    * keeps its own history. A record that fails is tried again up to `RECORD_ATTEMPTS` times in
@@ -664,10 +658,22 @@ function sameGrant(current: GitGrant, original: GitGrant): boolean {
 
 /** Refuses every ref of a push whose claim changed after it was admitted. */
 function claimChanged(head: ReceivePackHead): Response {
-  return gitResult(
-    "git-receive-pack",
-    receivePackRefusal(head, `railhead: ${CLAIM_CHANGED}`, () => CLAIM_CHANGED),
-  );
+  return pushRefusal(head, `railhead: ${CLAIM_CHANGED}`, () => CLAIM_CHANGED);
+}
+
+/**
+ * Refuses every ref of `head` in Git's report. Git's probe names no ref and a push that asked for
+ * no report reads none, so either would take an empty result as success: both get an HTTP 403.
+ */
+function pushRefusal(
+  head: ReceivePackHead,
+  message: string,
+  reasonFor: (update: RefUpdate) => string,
+): Response {
+  if (head.updates.length === 0 || reportFraming(head.capabilities) === "none") {
+    return text(403, message);
+  }
+  return gitResult("git-receive-pack", receivePackRefusal(head, message, reasonFor));
 }
 
 /** Why one update of an otherwise authorized push is refused, or `null` to allow it. */
@@ -683,6 +689,8 @@ function refRefusal(update: RefUpdate): string | null {
   if (update.kind !== "delete" && !isCommitSha(update.newId)) {
     return "only SHA-1 repositories are supported";
   }
+  // A `claim.pushed` event names the commit a branch moved to, so a deletion could not be recorded.
+  if (update.kind === "delete") return "branches cannot be deleted through Railhead";
   return null;
 }
 

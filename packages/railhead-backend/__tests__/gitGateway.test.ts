@@ -566,7 +566,7 @@ describe("a push larger than Git's post buffer", () => {
     });
   });
 
-  it("refuses the push after the probe when the agent does not hold the claim", async () => {
+  it("refuses the probe as an HTTP error when the agent does not hold the claim", async () => {
     await withGateway(async (world) => {
       world.claim.agentId = OTHER.agentId;
       const probed = await world.gateway.serve(
@@ -574,17 +574,10 @@ describe("a push larger than Git's post buffer", () => {
         FORK,
         "/git-receive-pack",
       );
-      // Git reads the refusal from the report of the push that follows, beside each ref.
-      expect(probed.status).toBe(200);
-      expect(await bytesOf(probed)).toEqual(new Uint8Array(0));
-      const pushed = await world.gateway.serve(
-        rpc("git-receive-pack", PUSH_REQUEST),
-        FORK,
-        "/git-receive-pack",
-      );
-      expect(decoder.decode(await bytesOf(pushed))).toContain(
-        "ng refs/heads/feature This agent does not hold the claim.",
-      );
+      // An empty result would tell Git the probe passed; the refusal ends the push here instead.
+      expect(probed.status).toBe(403);
+      expect(probed.headers.get("content-type")).not.toBe("application/x-git-receive-pack-result");
+      expect(await probed.text()).toBe("railhead: This agent does not hold the claim.\n");
       expect(world.seen).toEqual([]);
       expect(world.minted()).toBe(0);
       expect(world.events()).toEqual([]);
@@ -721,6 +714,25 @@ describe("authority", () => {
       expect(world.live()).toEqual([]);
       expect(pushedEvents(world)).toEqual([]);
     });
+  });
+
+  it("refuses a push without a report as an HTTP error when the agent does not hold the claim", async () => {
+    for (const caps of ["side-band-64k", "", "ofs-delta"]) {
+      await withGateway(async (world) => {
+        world.claim.agentId = OTHER.agentId;
+        const pushed = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody([`${ZERO} ${HEAD} refs/heads/topic`], caps)),
+          FORK,
+          "/git-receive-pack",
+        );
+        // Git takes an empty result for a push that asked for no report as applied.
+        expect(pushed.status, caps).toBe(403);
+        expect(await pushed.text(), caps).toBe("railhead: This agent does not hold the claim.\n");
+        expect(world.seen, caps).toEqual([]);
+        expect(world.minted(), caps).toBe(0);
+        expect(world.events(), caps).toEqual([]);
+      });
+    }
   });
 
   it("refuses with 500 a grant that does not fit the request, before minting a token", async () => {
@@ -945,6 +957,56 @@ describe("authority", () => {
     }
   });
 
+  it("refuses a branch deletion, alone or beside an update, before minting a token", async () => {
+    const cases: [string, string[]][] = [
+      ["delete alone", [`${HEAD} ${ZERO} refs/heads/topic`]],
+      [
+        "delete beside an update",
+        [`${ZERO} ${HEAD} refs/heads/x`, `${HEAD} ${ZERO} refs/heads/topic`],
+      ],
+    ];
+    for (const [label, commands] of cases) {
+      await withGateway(async (world) => {
+        // An upstream that would apply anything, so only the gateway can keep the delete out.
+        world.respond = () =>
+          gitResponse(
+            "git-receive-pack",
+            "result",
+            sideBand(`${pkt("unpack ok\n")}${pkt("ok refs/heads/topic\n")}0000`),
+          );
+        const response = await world.gateway.serve(
+          rpc("git-receive-pack", pushBody(commands)),
+          FORK,
+          "/git-receive-pack",
+        );
+        expect(response.status, label).toBe(200);
+        const report = decoder.decode(await bytesOf(response));
+        expect(report, label).toContain(
+          "ng refs/heads/topic branches cannot be deleted through Railhead",
+        );
+        expect(report, label).not.toContain("ok refs/heads/");
+        expect(world.seen, label).toEqual([]);
+        expect(world.minted(), label).toBe(0);
+        expect(world.events(), label).toEqual([]);
+      });
+    }
+  });
+
+  it("refuses a deletion that asks for no report as an HTTP error", async () => {
+    await withGateway(async (world) => {
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${HEAD} ${ZERO} refs/heads/topic`], "side-band-64k")),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(403);
+      expect(await response.text()).toBe("railhead: pushes must request report-status\n");
+      expect(world.seen).toEqual([]);
+      expect(world.minted()).toBe(0);
+      expect(world.events()).toEqual([]);
+    });
+  });
+
   it("forwards and records a branch name exactly at the event limit", async () => {
     const longest = `refs/heads/${"b".repeat(1013)}`;
     expect(encoder.encode(longest).length).toBe(1024);
@@ -983,6 +1045,20 @@ describe("authority", () => {
         expect(world.events(), caps).toEqual([]);
       });
     }
+  });
+
+  it("refuses a push with a refused ref and no report as an HTTP error, never an empty result", async () => {
+    await withGateway(async (world) => {
+      const response = await world.gateway.serve(
+        rpc("git-receive-pack", pushBody([`${ZERO} ${HEAD} refs/tags/v1`], "side-band-64k")),
+        FORK,
+        "/git-receive-pack",
+      );
+      expect(response.status).toBe(403);
+      expect(await response.text()).toBe("railhead: pushes must request report-status\n");
+      expect(world.seen).toEqual([]);
+      expect(world.minted()).toBe(0);
+    });
   });
 
   it("forwards a push that asks only for report-status-v2", async () => {
