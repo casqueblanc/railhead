@@ -8,9 +8,7 @@ import { createTrain } from "./scheduler";
 
 /** Builds the train module of one repository. */
 export const train: ModuleFactory<TrainPort> = (context, ports) => {
-  const { queue, recordCheck, attemptOutcome, holdsLiveEntry, armWake, resume } = createTrain(
-    context,
-    ports,
-  );
-  return { queue, recordCheck, attemptOutcome, holdsLiveEntry, armWake, resume };
+  const { queue, recordCheck, attemptOutcome, holdsLiveEntry, pinView, armWake, resume } =
+    createTrain(context, ports);
+  return { queue, recordCheck, attemptOutcome, holdsLiveEntry, pinView, armWake, resume };
 };

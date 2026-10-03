@@ -3,8 +3,8 @@
 use railhead_protocol::Error;
 use railhead_protocol::{
     Actor, AgentErrorCode, AgentResponse, AskRequest, EventPayload, InboxResult, JoinRequest,
-    MAX_SAFE_INTEGER, QuestionOption, ReadyRequest, SafeInteger, StatusResult, decode_event,
-    decode_response,
+    MAX_SAFE_INTEGER, PinBatchState, PinResult, PinTrainState, QuestionOption, ReadyRequest,
+    SafeInteger, StatusResult, decode_event, decode_response,
 };
 use serde_json::{Value, json};
 
@@ -617,5 +617,74 @@ fn never_echoes_wire_text_or_secrets() -> TestResult {
         serde_json::to_string(&join)?.contains(secret),
         "the wire body still carries it"
     );
+    Ok(())
+}
+
+fn pin_response() -> Value {
+    json!({
+        "ok": true,
+        "data": {"pin": {
+            "claimId": "clm_42abcd", "generation": 1, "commit": "b".repeat(40), "nextCommit": null,
+            "state": {"kind": "batched", "batchId": 7, "batch": "held", "checkRunId": "chk_run0001"},
+        }},
+        "inbox": {"items": [], "pending": 0},
+        "next": null,
+    })
+}
+
+#[test]
+fn decodes_a_pin_in_a_held_batch() -> TestResult {
+    let response: AgentResponse<PinResult> = serde_json::from_value(pin_response())?;
+    let AgentResponse::Success(success) = &response else {
+        return Err("not a success".into());
+    };
+    let pin = success.data.pin.as_ref().ok_or("no pin")?;
+    assert_eq!(
+        pin.state,
+        PinTrainState::Batched {
+            batch_id: SafeInteger::new(7).ok_or("unsafe")?,
+            batch: PinBatchState::Held,
+            check_run_id: Some("chk_run0001".to_owned()),
+        }
+    );
+    assert_eq!(serde_json::to_value(&response)?, pin_response());
+    Ok(())
+}
+
+#[test]
+fn refuses_a_pin_with_an_unknown_state_or_an_omitted_null() -> TestResult {
+    for (pointer, value) in [
+        ("/data/pin/state/kind", json!("checking")),
+        ("/data/pin/state/batch", json!("composing")),
+        ("/data/pin/state/batchId", json!(MAX_SAFE_INTEGER + 1)),
+    ] {
+        let mut body = pin_response();
+        set(&mut body, pointer, value)?;
+        assert!(
+            serde_json::from_value::<AgentResponse<PinResult>>(body).is_err(),
+            "accepted {pointer}"
+        );
+    }
+    for (parent, key) in [
+        ("/data/pin/state", "checkRunId"),
+        ("/data/pin", "nextCommit"),
+    ] {
+        let mut body = pin_response();
+        body.pointer_mut(parent)
+            .and_then(Value::as_object_mut)
+            .and_then(|object| object.remove(key))
+            .ok_or("no key")?;
+        assert!(
+            serde_json::from_value::<AgentResponse<PinResult>>(body).is_err(),
+            "accepted without {key}"
+        );
+    }
+    let mut parked = pin_response();
+    set(
+        &mut parked,
+        "/data/pin/state",
+        json!({"kind": "parked", "reason": "lost"}),
+    )?;
+    assert!(serde_json::from_value::<AgentResponse<PinResult>>(parked).is_err());
     Ok(())
 }

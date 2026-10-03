@@ -190,6 +190,7 @@ function toCommand(
       return pair;
     case "status":
     case "work":
+    case "pin":
       return { route: pair.route };
     case "ready":
       return { route: "ready", claimId: idParam(params, "claimId", "claim"), body: pair.body };
