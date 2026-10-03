@@ -3,7 +3,10 @@
 // up to the head, subscribe from the cursor, and on a gap or a `slow` or `restart` end, page over
 // the gap and subscribe again. Every read and subscribe carries a deadline: one that stays pending
 // stops the stream as failed. The stream never holds board state; its sink folds and reports the
-// cursor, which is what a later session resumes from.
+// cursor, which is what a later session resumes from, together with the history the cursor was read
+// under. Every call after the first page carries that history, so once the owner resets the
+// repository the backend refuses the old cursor and the stream stops as failed instead of folding
+// the new history's events onto the old board.
 
 import { RpcTarget } from "capnweb";
 import {
@@ -21,6 +24,14 @@ export const MAX_RESYNCS_WITHOUT_PROGRESS = 5;
 
 /** How long a subscription must stay live before resyncs that follow it count from zero again. */
 export const HEALTHY_LIVE_MS = 60_000;
+
+/** Where a board read in an earlier session stands. */
+export interface Resume {
+  /** The `seq` of the last event the board applied. */
+  cursor: number;
+  /** The `EventPage.history` that cursor was read under. */
+  history: string;
+}
 
 /** Where the fold stands after applying a batch. */
 export interface Applied {
@@ -49,8 +60,11 @@ export type StreamPhase =
 
 /** Where the stream sends what it reads. Called only while the stream is not disposed. */
 export interface StreamSink {
-  /** The log's repository, from the first page, before any of its events are applied. */
-  onRepo(repo: RepoId): void;
+  /**
+   * The log's repository and the history its cursors belong to, from the first page of each catch-up,
+   * before any of its events are applied.
+   */
+  onRepo(repo: RepoId, history: string): void;
   /** Folds `events`, which may repeat or skip events, and reports the resulting cursor. */
   onEvents(events: readonly RailheadEvent[]): Applied;
   onPhase(phase: StreamPhase): void;
@@ -106,6 +120,8 @@ export class BoardStream implements Disposable {
   readonly #board: BoardSession;
   readonly #sink: StreamSink;
   #cursor: number;
+  /** The history `#cursor` belongs to, or `null` before the first page of a board read from 0. */
+  #history: string | null;
   #disposed = false;
   #stopped = false;
   #listener: Listener | null = null;
@@ -117,11 +133,15 @@ export class BoardStream implements Disposable {
   /** When the current subscription went live, or `null` while not live. */
   #liveSince: number | null = null;
 
-  /** Starts reading after `cursor`, the cursor of the board the sink already holds. */
-  constructor(board: BoardSession, sink: StreamSink, cursor: number) {
+  /**
+   * Starts reading after `from`, where the board the sink already holds stands, or from the start
+   * of the log when `from` is `null`.
+   */
+  constructor(board: BoardSession, sink: StreamSink, from: Resume | null) {
     this.#board = board;
     this.#sink = sink;
-    this.#cursor = cursor;
+    this.#cursor = from?.cursor ?? 0;
+    this.#history = from?.history ?? null;
     void this.#sync();
   }
 
@@ -231,9 +251,12 @@ export class BoardStream implements Disposable {
     }
     const listener = new Listener(this);
     this.#listener = listener;
-    const result = await withDeadline(this.#board.subscribe(this.#cursor, listener), (late) => {
-      if (late.ok) late.value[Symbol.dispose]();
-    });
+    const result = await withDeadline(
+      this.#board.subscribe(this.#cursor, listener, this.#history ?? undefined),
+      (late) => {
+        if (late.ok) late.value[Symbol.dispose]();
+      },
+    );
     if (!this.#isCurrent(listener)) {
       if (result.ok) result.value[Symbol.dispose]();
       return;
@@ -254,12 +277,17 @@ export class BoardStream implements Disposable {
   async #catchUp(): Promise<StreamStop | null> {
     let head: number | null = null;
     for (;;) {
-      const page = await withDeadline(this.#board.readEvents(this.#cursor, MAX_EVENT_PAGE));
+      const page = await withDeadline(
+        this.#board.readEvents(this.#cursor, MAX_EVENT_PAGE, this.#history ?? undefined),
+      );
       if (this.#disposed || this.#stopped) return null;
       if (!page.ok) return stopFor(page.code);
+      // The backend refuses a cursor from another history, so a page from one is a broken backend.
+      if (this.#history !== null && page.value.history !== this.#history) return "failed";
+      this.#history = page.value.history;
       if (head === null) {
         head = page.value.head;
-        this.#sink.onRepo(page.value.repo);
+        this.#sink.onRepo(page.value.repo, page.value.history);
       }
       const before = this.#cursor;
       if (!this.#apply(page.value.events)) return null;

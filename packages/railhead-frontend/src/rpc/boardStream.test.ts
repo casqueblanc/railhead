@@ -66,7 +66,7 @@ describe("BoardStream", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const board = new FakeBoard(SYNTH_REPO, LOG);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await vi.advanceTimersByTimeAsync(0);
     for (let i = 0; i < times; i += 1) {
       await vi.advanceTimersByTimeAsync(liveFor);
@@ -81,7 +81,7 @@ describe("BoardStream", () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     board.stalls.names.add(call);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     return { board, sink };
   };
 
@@ -89,7 +89,7 @@ describe("BoardStream", () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     board.pageSize = 2;
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     expect(board.reads).toEqual(LOG.filter((_, i) => i % 2 === 0).map((e) => e.seq - 1));
@@ -102,7 +102,7 @@ describe("BoardStream", () => {
   it("applies pushed events after the subscription's cursor", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, HEAD - 2));
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     await board.latest().listener.events([event(HEAD - 1), event(HEAD)]);
@@ -114,7 +114,7 @@ describe("BoardStream", () => {
   it("subscribes at 0 to an empty log and still reports its repository", async () => {
     const board = new FakeBoard(SYNTH_REPO, []);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     expect(sink.board()).toEqual(emptyBoardState(SYNTH_REPO));
@@ -125,19 +125,81 @@ describe("BoardStream", () => {
   it("resumes from a cursor it already holds without rereading earlier events", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     const sink = folding();
-    sink.sink.onRepo(SYNTH_REPO);
+    sink.sink.onRepo(SYNTH_REPO, "history-1");
     sink.sink.onEvents(LOG.slice(0, 3));
-    stream = new BoardStream(board, sink.sink, 3);
+    stream = new BoardStream(board, sink.sink, { cursor: 3, history: "history-1" });
     await settle();
 
     expect(board.reads).toEqual([3]);
     expect(sink.board().cursor).toBe(HEAD);
   });
 
+  it("sends the history of its first page with every later read and subscription", async () => {
+    const board = new FakeBoard(SYNTH_REPO, LOG);
+    board.pageSize = 2;
+    const sink = folding();
+    stream = new BoardStream(board, sink.sink, null);
+    await settle();
+    await board.latest().listener.ended("restart");
+    await settle();
+
+    expect(board.readHistories[0]).toBeUndefined();
+    expect(board.readHistories.slice(1)).toEqual(
+      Array.from({ length: board.reads.length - 1 }, () => "history-1"),
+    );
+    expect(board.subscriptions.map((s) => s.history)).toEqual(["history-1", "history-1"]);
+    expect(sink.phases.at(-1)).toBe("live");
+  });
+
+  it("stops as failed when it resumes into a history the owner has since reset", async () => {
+    const board = new FakeBoard(SYNTH_REPO, LOG);
+    const sink = folding();
+    sink.sink.onRepo(SYNTH_REPO, "history-1");
+    sink.sink.onEvents(LOG.slice(0, 3));
+    board.reset(LOG);
+    stream = new BoardStream(board, sink.sink, { cursor: 3, history: "history-1" });
+    await settle();
+
+    expect(board.readHistories).toEqual(["history-1"]);
+    expect(sink.board().cursor).toBe(3);
+    expect(board.subscriptions).toEqual([]);
+    expect(sink.stops).toEqual(["failed"]);
+  });
+
+  it("stops as failed when a reset lands between catching up and subscribing", async () => {
+    const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 3));
+    board.stalls.names.add("subscribe");
+    const sink = folding();
+    stream = new BoardStream(board, sink.sink, null);
+    await settle();
+    board.reset(LOG);
+    board.stalls.resume();
+    await settle();
+
+    expect(sink.board().cursor).toBe(3);
+    expect(board.subscriptions).toEqual([]);
+    expect(sink.stops).toEqual(["failed"]);
+  });
+
+  it("stops as failed when a resync after a reset finds the old history gone", async () => {
+    const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 3));
+    const sink = folding();
+    stream = new BoardStream(board, sink.sink, null);
+    await settle();
+    board.reset(LOG);
+    await board.latest().listener.ended("restart");
+    await settle();
+
+    expect(board.readHistories.at(-1)).toBe("history-1");
+    expect(sink.board().cursor).toBe(3);
+    expect(board.subscriptions).toHaveLength(1);
+    expect(sink.stops).toEqual(["failed"]);
+  });
+
   it("closes a gap in pushed events by paging over it and subscribing again", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
     const first = board.latest();
 
@@ -155,7 +217,7 @@ describe("BoardStream", () => {
   it("resubscribes after a slow end and ignores the ended listener's late events", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
     const first = board.latest();
 
@@ -170,7 +232,7 @@ describe("BoardStream", () => {
   it("stops without resubscribing when access is revoked", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     await board.latest().listener.ended("revoked");
@@ -185,7 +247,7 @@ describe("BoardStream", () => {
     it("leaves live, catches up and subscribes again", async () => {
       const board = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
       const sink = folding();
-      stream = new BoardStream(board, sink.sink, 0);
+      stream = new BoardStream(board, sink.sink, null);
       await settle();
       const first = board.latest();
 
@@ -203,7 +265,7 @@ describe("BoardStream", () => {
     it("ignores the late release of a listener it already replaced", async () => {
       const board = new FakeBoard(SYNTH_REPO, LOG);
       const sink = folding();
-      stream = new BoardStream(board, sink.sink, 0);
+      stream = new BoardStream(board, sink.sink, null);
       await settle();
       const first = board.latest();
       await first.listener.ended("restart");
@@ -234,7 +296,7 @@ describe("BoardStream", () => {
         });
       };
       const sink = folding();
-      stream = new BoardStream(board, sink.sink, 0);
+      stream = new BoardStream(board, sink.sink, null);
       await settle();
       if (gate.answer === undefined) throw new Error("the stream never subscribed");
       gate.answer();
@@ -249,7 +311,7 @@ describe("BoardStream", () => {
     it("stops after a bounded number of releases that make no progress", async () => {
       const board = new FakeBoard(SYNTH_REPO, LOG);
       const sink = folding();
-      stream = new BoardStream(board, sink.sink, 0);
+      stream = new BoardStream(board, sink.sink, null);
       await settle();
 
       for (let i = 0; i <= MAX_RESYNCS_WITHOUT_PROGRESS + 2; i += 1) {
@@ -264,7 +326,7 @@ describe("BoardStream", () => {
     it("ignores the release that follows its own disposal", async () => {
       const board = new FakeBoard(SYNTH_REPO, LOG);
       const sink = folding();
-      const disposed = new BoardStream(board, sink.sink, 0);
+      const disposed = new BoardStream(board, sink.sink, null);
       await settle();
 
       disposed[Symbol.dispose]();
@@ -279,7 +341,7 @@ describe("BoardStream", () => {
   it("stops after a bounded number of restarts that make no progress", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     for (let i = 0; i <= MAX_RESYNCS_WITHOUT_PROGRESS + 2; i += 1) {
@@ -316,7 +378,7 @@ describe("BoardStream", () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     board.readFault = "unavailable";
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     expect(sink.stops).toEqual(["unavailable"]);
@@ -326,11 +388,11 @@ describe("BoardStream", () => {
   it("fails on a cursor ahead of the log, and on a session that breaks", async () => {
     const ahead = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
     const aheadSink = folding();
-    stream = new BoardStream(ahead, aheadSink.sink, 5);
+    stream = new BoardStream(ahead, aheadSink.sink, { cursor: 5, history: "history-1" });
     const broken = new FakeBoard(SYNTH_REPO, LOG);
     broken.subscribeFault = "throw";
     const brokenSink = folding();
-    const brokenStream = new BoardStream(broken, brokenSink.sink, 0);
+    const brokenStream = new BoardStream(broken, brokenSink.sink, null);
     await settle();
 
     expect(aheadSink.stops).toEqual(["failed"]);
@@ -343,7 +405,7 @@ describe("BoardStream", () => {
     const forged = { ...event(2), seq: 2, v: 99 } as const satisfies RailheadEvent;
     const board = new FakeBoard(SYNTH_REPO, [event(1), forged]);
     const sink = folding();
-    stream = new BoardStream(board, sink.sink, 0);
+    stream = new BoardStream(board, sink.sink, null);
     await settle();
 
     expect(sink.stops).toEqual(["halted"]);
@@ -397,7 +459,7 @@ describe("BoardStream", () => {
   it("folds nothing once disposed, even when a page was already requested", async () => {
     const board = new FakeBoard(SYNTH_REPO, LOG);
     const sink = folding();
-    const disposed = new BoardStream(board, sink.sink, 0);
+    const disposed = new BoardStream(board, sink.sink, null);
     disposed[Symbol.dispose]();
     await settle();
 
@@ -416,7 +478,7 @@ describe("BoardStream", () => {
         gate.answer = () => resolve(subscribe(cursor, listener));
       });
     const sink = folding();
-    const disposed = new BoardStream(board, sink.sink, 0);
+    const disposed = new BoardStream(board, sink.sink, null);
     await settle();
     disposed[Symbol.dispose]();
     if (gate.answer === undefined) throw new Error("the stream never subscribed");

@@ -161,6 +161,8 @@ export class FakeEnrollment implements EnrollmentSession {
 /** One subscription the board opened, with the listener the client passed. */
 export interface Subscribed {
   cursor: number;
+  /** The history the client sent, or `undefined` when it sent none. */
+  history: string | undefined;
   listener: BoardListener;
   handle: FakeSubscription;
 }
@@ -175,14 +177,28 @@ export class FakeBoard implements BoardSession {
   readonly stalls = new Stalls<"readEvents" | "subscribe" | "owner">();
   /** The cursor of every `readEvents` call. */
   readonly reads: number[] = [];
+  /** The history every `readEvents` call sent, or `undefined` when it sent none. */
+  readonly readHistories: (string | undefined)[] = [];
   readonly subscriptions: Subscribed[] = [];
   readonly ownerStub = new FakeOwner();
   readonly #repo: RepoId;
-  readonly #log: RailheadEvent[];
+  #log: RailheadEvent[];
+  #history = "history-1";
+  #resets = 0;
 
   /** `log` is gapless from seq 1. */
   constructor(repo: RepoId, log: readonly RailheadEvent[]) {
     this.#repo = repo;
+    this.#log = [...log];
+  }
+
+  /**
+   * Replaces the log with `log` under a new history, as the owner's reset and a reseed do, without
+   * ending any subscription.
+   */
+  reset(log: readonly RailheadEvent[]): void {
+    this.#resets += 1;
+    this.#history = `history-${this.#resets + 1}`;
     this.#log = [...log];
   }
 
@@ -191,14 +207,24 @@ export class FakeBoard implements BoardSession {
     this.#log.push(...events);
   }
 
-  readEvents(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
+  readEvents(cursor: number, limit: number, history?: string): Promise<BoardResult<EventPage>> {
     this.reads.push(cursor);
-    return this.stalls.gate("readEvents", () => this.#page(cursor, limit));
+    this.readHistories.push(history);
+    return this.stalls.gate("readEvents", () => this.#page(cursor, limit, history));
   }
 
-  #page(cursor: number, limit: number): Promise<BoardResult<EventPage>> {
+  /** Whether the backend refuses `cursor` read under `history`. */
+  #ahead(cursor: number, history: string | undefined): boolean {
+    return (history !== undefined && history !== this.#history) || cursor > this.#log.length;
+  }
+
+  #page(
+    cursor: number,
+    limit: number,
+    history: string | undefined,
+  ): Promise<BoardResult<EventPage>> {
     return fault(this.readFault, (): BoardResult<EventPage> => {
-      if (cursor > this.#log.length) return failure("cursor_ahead");
+      if (this.#ahead(cursor, history)) return failure("cursor_ahead");
       const events = this.#log.slice(cursor, cursor + Math.min(limit, this.pageSize));
       return {
         ok: true,
@@ -207,17 +233,22 @@ export class FakeBoard implements BoardSession {
           events,
           cursor: events.at(-1)?.seq ?? cursor,
           head: this.#log.length,
-          history: "fake",
+          history: this.#history,
         },
       };
     });
   }
 
-  subscribe(cursor: number, listener: BoardListener): Promise<BoardResult<SubscriptionSession>> {
+  subscribe(
+    cursor: number,
+    listener: BoardListener,
+    history?: string,
+  ): Promise<BoardResult<SubscriptionSession>> {
     return this.stalls.gate("subscribe", () =>
-      fault(this.subscribeFault, () => {
+      fault(this.subscribeFault, (): BoardResult<SubscriptionSession> => {
+        if (this.#ahead(cursor, history)) return failure("cursor_ahead");
         const handle = new FakeSubscription(listener);
-        this.subscriptions.push({ cursor, listener, handle });
+        this.subscriptions.push({ cursor, history, listener, handle });
         return { ok: true, value: handle };
       }),
     );
