@@ -16,15 +16,15 @@ export const DEMO_ORG = "demo";
 export const DEMO_REPO = "upload-app";
 
 /** `MAX_TITLE_LENGTH` in `@railhead/shared/events`. */
-const MAX_TITLE_LENGTH = 256;
+export const MAX_TITLE_LENGTH = 256;
 /** `MAX_ISSUE_BODY_LENGTH` in `@railhead/shared/events`. */
-const MAX_ISSUE_BODY_LENGTH = 16 * 1024;
+export const MAX_ISSUE_BODY_LENGTH = 16 * 1024;
 /** `MAX_QUESTION_LENGTH` in `@railhead/shared/events`. */
-const MAX_QUESTION_LENGTH = 2000;
+export const MAX_QUESTION_LENGTH = 2000;
 /** `MAX_OPTION_LABEL_LENGTH` in `@railhead/shared/events`. */
-const MAX_OPTION_LABEL_LENGTH = 200;
+export const MAX_OPTION_LABEL_LENGTH = 200;
 /** `MAX_LIST_LENGTH` in `@railhead/shared/events`. */
-const MAX_LIST_LENGTH = 64;
+export const MAX_LIST_LENGTH = 64;
 /** `MIN_OPTIONS` in `@railhead/shared/events`. */
 export const MIN_OPTIONS = 2;
 /** `MAX_OPTIONS` in `@railhead/shared/events`. */
@@ -40,8 +40,10 @@ const SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 /** `OPTION_KEY` in `@railhead/shared/events` and `agent-api`: lowercase only. */
 export const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
 const DECISION_KEY = /^[a-z][a-z0-9-]{0,63}$/;
-// Relative, slash-separated, no empty, `.` or `..` segment and no control character.
-const UNPRINTABLE = /[\p{Cc}\p{Cs}]/u;
+// Relative, slash-separated, no empty, `.` or `..` segment and no control character. Format
+// characters (bidi controls, zero-width) count as unprintable: they make text display differently
+// from what is filed.
+const UNPRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 /** One answer the decision offers. */
 export interface SeedOption {

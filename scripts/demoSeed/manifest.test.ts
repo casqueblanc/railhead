@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+// `events.ts` has no imports and only erasable syntax, so it loads under plain `node`.
+import * as sharedEvents from "../../packages/railhead-shared/src/events.ts";
 import {
   assertAskable,
   assertDemoTarget,
@@ -9,8 +11,13 @@ import {
   DEMO_ORG,
   DEMO_REPO,
   loadManifest,
+  MAX_ISSUE_BODY_LENGTH,
+  MAX_LIST_LENGTH,
+  MAX_OPTION_LABEL_LENGTH,
   MAX_OPTIONS,
   MAX_PATH_LENGTH,
+  MAX_QUESTION_LENGTH,
+  MAX_TITLE_LENGTH,
   MIN_OPTIONS,
   OPTION_KEY,
   overlaps,
@@ -239,6 +246,11 @@ test("the restated wire rules match @railhead/shared", () => {
   assert.ok(events.includes(`export const MIN_OPTIONS = ${MIN_OPTIONS};`));
   assert.ok(events.includes(`export const MAX_OPTIONS = ${MAX_OPTIONS};`));
   assert.ok(events.includes(`export const MAX_PATH_LENGTH = ${MAX_PATH_LENGTH};`));
+  assert.equal(MAX_TITLE_LENGTH, sharedEvents.MAX_TITLE_LENGTH);
+  assert.equal(MAX_ISSUE_BODY_LENGTH, sharedEvents.MAX_ISSUE_BODY_LENGTH);
+  assert.equal(MAX_QUESTION_LENGTH, sharedEvents.MAX_QUESTION_LENGTH);
+  assert.equal(MAX_OPTION_LABEL_LENGTH, sharedEvents.MAX_OPTION_LABEL_LENGTH);
+  assert.equal(MAX_LIST_LENGTH, sharedEvents.MAX_LIST_LENGTH);
   // MAX_SCOPE_BYTES is half the request limit; the scope-bytes vectors above check the sum.
   assert.ok(agentApi.includes("export const MAX_AGENT_REQUEST_BYTES = 16 * 1024;"));
   assert.ok(agentApi.includes("export const MAX_SCOPE_BYTES = MAX_AGENT_REQUEST_BYTES / 2;"));
@@ -313,14 +325,19 @@ test("a title at the shared limit passes and one character more is refused", () 
   const [first, second, third] = issues(base);
   assert.ok(first !== undefined && second !== undefined && third !== undefined);
 
+  const limit = sharedEvents.MAX_TITLE_LENGTH;
   const atLimit = parseManifest({
     ...base,
-    issues: [{ ...first, title: "t".repeat(256) }, second, third],
+    issues: [{ ...first, title: "t".repeat(limit) }, second, third],
   });
-  assert.equal(atLimit.issues[0]?.title.length, 256);
+  assert.equal(atLimit.issues[0]?.title.length, limit);
   assert.throws(
-    () => parseManifest({ ...base, issues: [{ ...first, title: "t".repeat(257) }, second, third] }),
-    /title is longer than 256 characters/,
+    () =>
+      parseManifest({
+        ...base,
+        issues: [{ ...first, title: "t".repeat(limit + 1) }, second, third],
+      }),
+    new RegExp(`title is longer than ${limit} characters`),
   );
 });
 
@@ -339,6 +356,11 @@ test("issue text may break body lines and carries no other control character", (
     { ...first, body: "Carriage\r\nreturn" },
     { ...first, title: "Two\nlines" },
     { ...first, title: "Tab\there" },
+    // Format characters: a bidi override and isolate, and a zero-width space and joiner.
+    { ...first, title: "Fix \u202Etxt.exe" },
+    { ...first, body: "Line \u2066hidden\u2069 text" },
+    { ...first, title: "Zero\u200Bwidth" },
+    { ...first, body: "Join\u200Dme" },
   ]) {
     assert.throws(
       () => parseManifest({ ...base, issues: [issue, second, third] }),
