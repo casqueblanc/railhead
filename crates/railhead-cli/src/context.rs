@@ -57,6 +57,10 @@ pub enum Error {
     /// Git could not be run.
     #[error("running git: {0}")]
     Git(#[source] std::io::Error),
+    /// The directory is in a Git repository whose binding Git could not read, so whether it is a
+    /// claim's clone is unknown.
+    #[error("git could not read this repository's configuration; repair it or run rh elsewhere")]
+    GitInspection,
     /// No per-user config directory exists and `RAILHEAD_HOME` is unset.
     #[error("no config directory found; set {HOME_ENV}")]
     NoHome,
@@ -224,17 +228,20 @@ impl CloneBinding {
     /// # Errors
     ///
     /// [`Error::InvalidClone`] when the clone names an identity but its remote is not a claim's
-    /// fork, or [`Error::Git`] when Git cannot be run.
+    /// fork, [`Error::GitInspection`] when `dir` is in a repository Git cannot read, or
+    /// [`Error::Git`] when Git cannot be run.
     pub fn read(dir: &Path) -> Result<Option<Self>> {
+        let Some(top) = repository_top(dir)? else {
+            return Ok(None);
+        };
         let Some(identity) = git_config(dir, GIT_IDENTITY_CONFIG_KEY)? else {
             return Ok(None);
         };
         let identity = AgentId::new(&identity).map_err(|_| Error::InvalidClone)?;
         let remote = git_config(dir, "remote.origin.url")?.ok_or(Error::InvalidClone)?;
         let (origin, repo, claim_id) = parse_claim_remote(&remote).ok_or(Error::InvalidClone)?;
-        let top = git_output(dir, &["rev-parse", "--show-toplevel"])?.ok_or(Error::InvalidClone)?;
         Ok(Some(Self {
-            dir: PathBuf::from(top),
+            dir: top,
             identity,
             origin,
             repo,
@@ -276,24 +283,53 @@ fn parse_claim_remote(remote: &str) -> Option<(Origin, RepoRef, String)> {
     Some((origin, repo, claim_id.to_owned()))
 }
 
-/// Reads one local Git setting, or `None` when it is unset or `dir` is not in a repository.
-fn git_config(dir: &Path, key: &str) -> Result<Option<String>> {
-    git_output(dir, &["config", "--local", "--get", key])
+/// The top of the work tree containing `dir`, or `None` when `dir` is positively outside any
+/// repository: Git says so and no `.git` entry or `GIT_DIR` suggests otherwise.
+///
+/// Any other failure is [`Error::GitInspection`], so a repository whose binding cannot be read is
+/// never mistaken for an unbound directory.
+fn repository_top(dir: &Path) -> Result<Option<PathBuf>> {
+    match run_git(dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) if output.status.success() => Ok(Some(PathBuf::from(stdout_line(output)?))),
+        Ok(_) if !may_be_repository(dir) => Ok(None),
+        Ok(_) => Err(Error::GitInspection),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !may_be_repository(dir) => {
+            Ok(None)
+        }
+        Err(error) => Err(Error::Git(error)),
+    }
 }
 
-/// Runs Git in `dir`; `None` when it exits unsuccessfully or is not installed.
-fn git_output(dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = match Command::new("git").arg("-C").arg(dir).args(args).output() {
-        Ok(output) => output,
-        // Without Git there is no clone to be bound to.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Git(error)),
-    };
-    if !output.status.success() {
-        return Ok(None);
+/// True unless `dir` and every ancestor positively lack a `.git` entry and `GIT_DIR` is unset.
+fn may_be_repository(dir: &Path) -> bool {
+    std::env::var_os("GIT_DIR").is_some()
+        || dir.ancestors().any(|ancestor| {
+            !matches!(
+                std::fs::symlink_metadata(ancestor.join(".git")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+}
+
+/// Reads one local Git setting of the repository containing `dir`, or `None` when it is unset.
+///
+/// Git exits with 1 only for an unset key; any other failure is [`Error::GitInspection`].
+fn git_config(dir: &Path, key: &str) -> Result<Option<String>> {
+    let output = run_git(dir, &["config", "--local", "--get", key]).map_err(Error::Git)?;
+    match output.status.code() {
+        Some(0) => stdout_line(output).map(Some),
+        Some(1) => Ok(None),
+        _ => Err(Error::GitInspection),
     }
+}
+
+fn run_git(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("git").arg("-C").arg(dir).args(args).output()
+}
+
+fn stdout_line(output: std::process::Output) -> Result<String> {
     let value = String::from_utf8(output.stdout).map_err(|_| Error::InvalidClone)?;
-    Ok(Some(value.trim_end_matches(['\n', '\r']).to_owned()))
+    Ok(value.trim_end_matches(['\n', '\r']).to_owned())
 }
 
 /// Everything a command knows before it sends anything.
@@ -586,6 +622,38 @@ mod tests {
         let fixture = fixture("https://evil.example/steal.git")?;
         let error = load(&fixture, fixture.clone.path(), None).err();
         assert!(matches!(error, Some(Error::InvalidClone)), "{error:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_clone_whose_config_git_cannot_read_is_refused() -> anyhow::Result<()> {
+        let fixture = fixture(REMOTE)?;
+        let config = fixture.clone.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config)?;
+        text.push_str("[broken\n");
+        std::fs::write(&config, text)?;
+        let subdir = fixture.clone.path().join("src");
+        std::fs::create_dir(&subdir)?;
+        for dir in [fixture.clone.path(), subdir.as_path()] {
+            for agent in [None, Some("boreas"), Some("agt_boreas01")] {
+                let error = load(&fixture, dir, agent).err();
+                assert!(
+                    matches!(error, Some(Error::GitInspection)),
+                    "{agent:?}: {error:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unbound_repository_uses_the_named_agent() -> anyhow::Result<()> {
+        let fixture = fixture(REMOTE)?;
+        let plain = tempfile::tempdir()?;
+        git(plain.path(), &["init", "--quiet"])?;
+        let context = load(&fixture, plain.path(), Some("boreas"))?;
+        assert!(context.clone_binding().is_none());
+        assert_eq!(context.identity()?.agent_id.as_str(), "agt_boreas01");
         Ok(())
     }
 

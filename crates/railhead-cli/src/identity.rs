@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use railhead_protocol::{IdKind, MAX_AGENT_NAME_LENGTH, MAX_SESSION_TOKEN_LENGTH, is_id};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,12 @@ const MAX_STORED_BYTES: u64 = 64 * 1024;
 
 /// Most identities the store looks through when finding one by agent id.
 const MAX_IDENTITIES: usize = 256;
+
+/// Most names a write tries for its temporary file before giving up.
+const MAX_TEMP_ATTEMPTS: u32 = 16;
+
+/// Distinguishes the temporary files of writes made by this process.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A store or identity failure. No variant carries a secret or file contents.
 #[derive(Debug, thiserror::Error)]
@@ -299,11 +306,12 @@ pub trait SecretStore {
     /// [`Error::AlreadyExists`] when it does, or when it cannot be written.
     fn create(&self, agent: &AgentName, kind: SecretKind, secret: &Secret) -> Result<()>;
 
-    /// Stores a secret, replacing any earlier value atomically.
+    /// Stores a secret, replacing any earlier value atomically. A signing key is never replaced:
+    /// for one, this behaves as [`SecretStore::create`].
     ///
     /// # Errors
     ///
-    /// When it cannot be written.
+    /// [`Error::AlreadyExists`] for a signing key that exists, or when it cannot be written.
     fn replace(&self, agent: &AgentName, kind: SecretKind, secret: &Secret) -> Result<()>;
 
     /// Removes a secret. Removing one that does not exist succeeds.
@@ -418,15 +426,57 @@ impl FileStore {
     }
 
     fn write_atomic(&self, agent: &AgentName, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.stage(agent, bytes)?.publish(path)
+    }
+
+    /// Writes `bytes` to a temporary file in the agent's directory that no other write uses.
+    fn stage(&self, agent: &AgentName, bytes: &[u8]) -> Result<Staged> {
         let dir = self.ensure_agent_dir(agent)?;
-        let temp = dir.join(".tmp-write");
-        // A leftover from an interrupted write is ours to discard.
-        remove_if_present(&temp)?;
-        let mut file = create_private_file(&temp)?;
+        let mut attempt = 0;
+        let (temp, mut file) = loop {
+            let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let temp = dir.join(format!(".tmp-{}-{n}", std::process::id()));
+            match create_private_file(&temp) {
+                Ok(file) => break (temp, file),
+                // A file left by an earlier process with the same id; try the next name.
+                Err(Error::AlreadyExists(_)) if attempt + 1 < MAX_TEMP_ATTEMPTS => attempt += 1,
+                Err(error) => return Err(error),
+            }
+        };
+        let staged = Staged {
+            temp,
+            published: false,
+        };
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
-            .map_err(|source| io_error("writing", &temp, source))?;
-        fs::rename(&temp, path).map_err(|source| io_error("replacing", path, source))
+            .map_err(|source| io_error("writing", &staged.temp, source))?;
+        Ok(staged)
+    }
+}
+
+/// A complete file written under a name only its own write uses, not yet at its destination.
+/// Dropping it unpublished removes it.
+#[derive(Debug)]
+struct Staged {
+    temp: PathBuf,
+    published: bool,
+}
+
+impl Staged {
+    /// Renames the file over `path`, which then holds exactly the staged bytes.
+    fn publish(mut self, path: &Path) -> Result<()> {
+        fs::rename(&self.temp, path).map_err(|source| io_error("replacing", path, source))?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.published {
+            // The write already failed or was abandoned; a file left behind is never read.
+            let _ = fs::remove_file(&self.temp);
+        }
     }
 }
 
@@ -450,8 +500,13 @@ impl SecretStore for FileStore {
     }
 
     fn replace(&self, agent: &AgentName, kind: SecretKind, secret: &Secret) -> Result<()> {
-        let path = self.agent_dir(agent).join(kind.file_name());
-        self.write_atomic(agent, &path, secret.expose().as_bytes())
+        match kind {
+            SecretKind::SigningKey => self.create(agent, kind, secret),
+            SecretKind::SessionToken => {
+                let path = self.agent_dir(agent).join(kind.file_name());
+                self.write_atomic(agent, &path, secret.expose().as_bytes())
+            }
+        }
     }
 
     fn remove(&self, agent: &AgentName, kind: SecretKind) -> Result<()> {
@@ -650,6 +705,97 @@ mod tests {
         );
         assert!(matches!(second, Err(Error::AlreadyExists(_))));
         assert_eq!(store.read(&atlas, SecretKind::SigningKey)?, Some(first));
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_signing_key_keeps_the_original() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let first = Secret::new("first key".to_owned());
+        store.replace(&atlas, SecretKind::SigningKey, &first)?;
+        let second = store.replace(
+            &atlas,
+            SecretKind::SigningKey,
+            &Secret::new("second".to_owned()),
+        );
+        assert!(matches!(second, Err(Error::AlreadyExists(_))));
+        assert_eq!(
+            fs::read(home.path().join("agents/atlas/key"))?,
+            b"first key"
+        );
+        Ok(())
+    }
+
+    /// The files in atlas's directory, in name order.
+    fn atlas_files(home: &Path) -> anyhow::Result<Vec<String>> {
+        let mut names = fs::read_dir(home.join("agents/atlas"))?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    #[test]
+    fn interleaved_writes_publish_only_their_own_bytes() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+
+        // An identity write and a session write, both staged before either is published.
+        let record = store.stage(&atlas, b"identity record")?;
+        let session = store.stage(&atlas, b"session one")?;
+        record.publish(&dir.join("identity.json"))?;
+        assert_eq!(fs::read(dir.join("identity.json"))?, b"identity record");
+        assert!(!dir.join("session").exists());
+        session.publish(&dir.join("session"))?;
+        assert_eq!(fs::read(dir.join("identity.json"))?, b"identity record");
+        assert_eq!(fs::read(dir.join("session"))?, b"session one");
+
+        // Two session replacements: a staged one is invisible until published, and each
+        // publication is one whole value.
+        let two = store.stage(&atlas, b"session two")?;
+        let three = store.stage(&atlas, b"session three")?;
+        assert_eq!(fs::read(dir.join("session"))?, b"session one");
+        three.publish(&dir.join("session"))?;
+        assert_eq!(fs::read(dir.join("session"))?, b"session three");
+        two.publish(&dir.join("session"))?;
+        assert_eq!(fs::read(dir.join("session"))?, b"session two");
+
+        // An abandoned write leaves its destination alone and removes its file.
+        drop(store.stage(&atlas, b"never published")?);
+        assert_eq!(fs::read(dir.join("session"))?, b"session two");
+        assert_eq!(atlas_files(home.path())?, ["identity.json", "session"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_leftover_temporary_file_is_neither_reused_nor_published() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = FileStore::new(home.path());
+        let atlas = AgentName::new("atlas")?;
+        let dir = home.path().join("agents/atlas");
+        fs::create_dir_all(&dir)?;
+        let next = NEXT_TEMP.load(Ordering::Relaxed);
+        // Fewer leftovers than attempts, at the names this process takes next; concurrent tests can
+        // only move the counter past them.
+        let leftovers: Vec<String> = (next..next + 3)
+            .map(|n| format!(".tmp-{}-{n}", std::process::id()))
+            .collect();
+        for name in &leftovers {
+            fs::write(dir.join(name), b"stale")?;
+        }
+        store.replace(
+            &atlas,
+            SecretKind::SessionToken,
+            &Secret::new("fresh".to_owned()),
+        )?;
+        assert_eq!(fs::read(dir.join("session"))?, b"fresh");
+        for name in &leftovers {
+            assert_eq!(fs::read(dir.join(name))?, b"stale");
+        }
         Ok(())
     }
 

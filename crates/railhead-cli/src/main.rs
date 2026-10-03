@@ -185,9 +185,9 @@ impl Error {
                 context::Error::InvalidOrigin(_) | context::Error::InvalidRepo(_) => {
                     local(LocalCode::InvalidInput, false, None)
                 }
-                context::Error::InvalidClone | context::Error::Git(_) => {
-                    local(LocalCode::InvalidClone, false, None)
-                }
+                context::Error::InvalidClone
+                | context::Error::Git(_)
+                | context::Error::GitInspection => local(LocalCode::InvalidClone, false, None),
                 context::Error::IdentityMismatch { .. } | context::Error::RepositoryMismatch(_) => {
                     local(LocalCode::IdentityMismatch, false, None)
                 }
@@ -474,6 +474,12 @@ mod tests {
         assert_eq!(
             (none.code, none.next),
             (Code::Local(LocalCode::NoIdentity), Some(NextCommand::Join))
+        );
+
+        let unreadable = Error::Context(context::Error::GitInspection).failure();
+        assert_eq!(
+            (unreadable.code, unreadable.retryable, unreadable.next),
+            (Code::Local(LocalCode::InvalidClone), false, None)
         );
 
         let timeout = Error::Http(http::Error::Timeout(AgentRoute::Ready)).failure();
