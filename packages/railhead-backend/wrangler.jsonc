@@ -11,6 +11,12 @@
       "invocation_logs": false
     }
   },
+  "r2_buckets": [
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "railhead-check-backups"
+    }
+  ],
   "artifacts": [
     {
       "binding": "ARTIFACTS",
@@ -33,11 +39,22 @@
       }
     ]
   },
+  "workflows": [
+    {
+      "binding": "CHECKS",
+      "name": "railhead-checks",
+      "class_name": "CheckWorkflow",
+      "script_name": "railhead"
+    }
+  ],
   "vars": {
+    "ARTIFACTS_NAMESPACE": "railhead",
+    "BACKUP_BUCKET_NAME": "railhead-check-backups",
     "RELYING_PARTY_HOST": "railhead.mashin.workers.dev"
   },
   "secrets": {
     "required": [
+      "CLOUDFLARE_ACCOUNT_ID",
       "OWNER_BOOTSTRAP_TOKEN",
       "SESSION_SIGNING_SECRET"
     ]
@@ -66,6 +83,10 @@
     "Owner": {
       "type": "durable-object",
       "storage": "sqlite"
+    },
+    "CheckWorkflow": {
+      "type": "workflow",
+      "name": "railhead-checks"
     }
   },
   "containers": [

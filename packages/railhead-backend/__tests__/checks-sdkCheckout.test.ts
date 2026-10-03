@@ -608,7 +608,9 @@ function withRailheadSandbox(
       });
       return new Response(null, { status: 101, webSocket: client });
     });
-    const sandboxEnv = { ...env, BACKUP_BUCKET: bucket };
+    // The bucket stand-in implements only what a restore calls.
+    const sandboxEnv: Env = { ...env };
+    Reflect.set(sandboxEnv, "BACKUP_BUCKET", bucket);
     // The pool types the object's props as `unknown`; the SDK's constructor declares none.
     const sandbox = new RailheadSandbox(
       state as ConstructorParameters<typeof RailheadSandbox>[0],

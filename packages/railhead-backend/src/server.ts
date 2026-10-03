@@ -5,6 +5,7 @@ import { serveAgent } from "./gateway/agentHttp";
 import { GIT_PATH_PREFIX, serveGit } from "./gateway/gitHttp";
 import { RailheadApiImpl } from "./gateway/rpc";
 
+export { CheckWorkflow } from "./checks/workflow";
 export { Owner } from "./modules/owner/OwnerObject";
 export { Repo } from "./repo/RepoObject";
 export { ContainerProxy, RailheadSandbox } from "./sandbox/sandboxObject";
