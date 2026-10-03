@@ -28,6 +28,7 @@ import type {
   CheckReport,
   MergeIntentRecord,
   MergeIntentStatus,
+  MergeIntentWrite,
 } from "../contracts/train";
 import type { EventLog } from "../repo/eventLog";
 import { migrate, type RepoStorage } from "../repo/storage";
@@ -97,7 +98,48 @@ export function createAuthorization(
       const record = readIntent(context.storage, "intent_id", intentId);
       return record === null ? fail("not_found", "No such merge intent.") : ok(record);
     },
+    record: (intentId) =>
+      isId("intent", intentId) ? readIntent(context.storage, "intent_id", intentId) : null,
+    unsettled: () =>
+      context.storage.sql
+        .exec<IntentRow>(
+          `SELECT * FROM merge_intents WHERE status = 'authorized' AND attempts > 0
+           ORDER BY authorized_at, intent_id`,
+        )
+        .toArray()
+        .map(toRecord),
+    recordWrite: (intentId, expectedAttempts, change) =>
+      recordWrite(context, intentId, expectedAttempts, change),
   };
+}
+
+/**
+ * Applies the main writer's change if the intent is still `authorized` at `expectedAttempts`. A
+ * change that would lower the attempt count, or record main moved without an observed commit, is a
+ * bug in the caller and is refused rather than stored.
+ */
+function recordWrite(
+  context: AuthorizationContext,
+  intentId: IntentId,
+  expectedAttempts: number,
+  change: MergeIntentWrite,
+): MergeIntentRecord | null {
+  if (!isId("intent", intentId)) return null;
+  if (!Number.isSafeInteger(change.attempts) || change.attempts < expectedAttempts) return null;
+  if (change.main !== null && !isCommitSha(change.main)) return null;
+  if (change.status !== "authorized" && change.main === null) return null;
+  const cursor = context.storage.sql.exec(
+    `UPDATE merge_intents SET status = ?, attempts = ?, main = ?, updated_at = ?
+     WHERE intent_id = ? AND status = 'authorized' AND attempts = ?`,
+    change.status,
+    change.attempts,
+    change.main,
+    context.clock(),
+    intentId,
+    expectedAttempts,
+  );
+  if (cursor.rowsWritten === 0) return null;
+  return readIntent(context.storage, "intent_id", intentId);
 }
 
 function authorize(
@@ -202,16 +244,46 @@ function verify(readers: AuthorizationReaders, attemptId: CheckRunId): PortResul
 
   const pinsChecked = checkPins(attempt.pins);
   if (pinsChecked !== null) return pinsChecked;
-  for (const pin of attempt.pins) {
+  // Every decision the pins must satisfy now must be the version the check was scheduled under.
+  const fenced = checkFence(
+    readers,
+    attempt.pins,
+    attempt.decisions,
+    attempt.definition.acceptance?.decision ?? null,
+  );
+  if (!fenced.ok) return fenced;
+  const current = fenced.value;
+  if (current.length > MAX_LIST_LENGTH) {
+    return mismatch(`The pins must satisfy more than ${MAX_LIST_LENGTH} decisions.`);
+  }
+  return ok({ attempt, decisions: current });
+}
+
+/** What a merge fence reads: each claim's generation and the decisions its work must satisfy. */
+export type FenceReaders = Pick<AuthorizationReaders, "currentGeneration" | "currentVersions">;
+
+/**
+ * The fence a merge rests on, shared by authorization and the main writer so the rule has one
+ * copy. Every pin's claim must still be at its pinned generation; every decision the pins must
+ * satisfy now must be at the version in `required`, with no two pins reporting different versions
+ * of one decision; and `acceptance`, the decision a passing acceptance check proves, must be among
+ * them. Returns the decision versions current now. Reads only: call it inside the transaction whose
+ * write relies on its answer.
+ */
+export function checkFence(
+  readers: FenceReaders,
+  pins: readonly ClaimPin[],
+  required: readonly DecisionRef[],
+  acceptance: DecisionRef | null,
+): PortResult<DecisionRef[]> {
+  for (const pin of pins) {
     if (readers.currentGeneration(pin.claimId) !== pin.generation) {
       return fail("stale_generation", "A claim changed owner since its pin was checked.");
     }
   }
-
-  // Every decision the pins must satisfy now must be the version the check was scheduled under.
-  const scheduled = new Map(attempt.decisions.map((ref) => [ref.decisionId, ref.version]));
+  const expected = new Map(required.map((ref) => [ref.decisionId, ref.version]));
   const current = new Map<string, number>();
-  for (const pin of attempt.pins) {
+  for (const pin of pins) {
     const refs = readers.currentVersions(pin.claimId);
     if (refs === null) return superseded("The decisions this claim must satisfy are unknown.");
     for (const ref of refs) {
@@ -220,23 +292,15 @@ function verify(readers: AuthorizationReaders, attemptId: CheckRunId): PortResul
         return superseded("Two claims report different versions of one decision.");
       }
       current.set(ref.decisionId, ref.version);
-      if (scheduled.get(ref.decisionId) !== ref.version) {
+      if (expected.get(ref.decisionId) !== ref.version) {
         return superseded("A decision changed since the check was scheduled.");
       }
     }
   }
-  const acceptance = attempt.definition.acceptance;
-  if (
-    acceptance !== null &&
-    current.get(acceptance.decision.decisionId) !== acceptance.decision.version
-  ) {
+  if (acceptance !== null && current.get(acceptance.decisionId) !== acceptance.version) {
     return superseded("The decision this acceptance check proves is no longer current.");
   }
-  if (current.size > MAX_LIST_LENGTH) {
-    return mismatch(`The pins must satisfy more than ${MAX_LIST_LENGTH} decisions.`);
-  }
-  const decisions = [...current].map(([decisionId, version]) => ({ decisionId, version }));
-  return ok({ attempt, decisions });
+  return ok([...current].map(([decisionId, version]) => ({ decisionId, version })));
 }
 
 /** Refuses an attempt whose pins cannot be one merge: none, too many, or one claim twice. */
