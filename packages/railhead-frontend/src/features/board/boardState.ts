@@ -949,6 +949,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         intents: draft.put(state.intents, intentId, { ...intent, landing }),
       };
     }
+    // The board does not show held checks yet.
+    case "train.held":
+    case "check.approved":
+      return state;
     default:
       return unreachable(event);
   }

@@ -239,6 +239,18 @@ pub(crate) fn require_commit(value: &str, field: &'static str) -> Result<()> {
     require(is_commit_sha(value), field, "a commit id")
 }
 
+/// A SHA-256 digest: 64 lowercase hexadecimal characters.
+pub(crate) fn require_digest(value: &str, field: &'static str) -> Result<()> {
+    require(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        field,
+        "a SHA-256 digest",
+    )
+}
+
 pub(crate) fn require_positive(value: SafeInteger, field: &'static str) -> Result<()> {
     if value.get() >= 1 {
         Ok(())

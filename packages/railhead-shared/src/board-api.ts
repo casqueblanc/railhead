@@ -10,10 +10,10 @@
 // or below it, and pages over any gap. A subscription does not survive the backend hibernating or
 // the socket closing; the persisted cursor is what survives.
 //
-// Acting: every human-only action (invite or confirm an agent, file an issue, decide) is one passkey
-// assertion bound to that exact action. The board asks for a challenge naming the action, the
-// browser's authenticator signs it, and the backend performs the action only if the assertion is
-// for that challenge and is used once. There is no owner session that can perform an action without
+// Acting: every human-only action (invite or confirm an agent, file an issue, decide, approve a held
+// check) is one passkey assertion bound to that exact action. The board asks for a challenge naming
+// the action, the browser's authenticator signs it, and the backend performs the action only if the
+// assertion is for that challenge and is used once. There is no owner session that can perform an action without
 // a fresh assertion, and no method that takes an actor or appends an arbitrary event.
 //
 // Every interface here is implemented by a class carrying `@validateRpc()`. A missing backend module
@@ -261,7 +261,14 @@ export type OwnerAction =
       decisionId: DecisionId;
       option: string;
       expectedVersion: number | null;
-    };
+    }
+  /**
+   * Run the candidate's own check definition for the one attempt held on `candidate` because it
+   * edits protected check paths. `digest` is the `train.held` digest of that definition. The
+   * attempt must still be held on that candidate with that digest, or the action fails with
+   * `action_stale`; it never approves another attempt or definition.
+   */
+  | { kind: "check.approve"; checkRunId: CheckRunId; candidate: CommitSha; digest: string };
 
 /** What a performed action produced, tagged like its action. */
 export type OwnerActionResult =
@@ -274,7 +281,9 @@ export type OwnerActionResult =
   /** The filed issue. */
   | { kind: "issue.file"; issueId: IssueId }
   /** The recorded decision version. */
-  | { kind: "decision.record"; decisionId: DecisionId; version: number };
+  | { kind: "decision.record"; decisionId: DecisionId; version: number }
+  /** The approved attempt, which the train runs next. */
+  | { kind: "check.approve"; checkRunId: CheckRunId };
 
 /** A WebAuthn request the browser passes to `navigator.credentials.get`. */
 export interface ActionChallenge {

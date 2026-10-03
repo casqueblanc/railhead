@@ -671,6 +671,8 @@ const EVENT_TYPES: Readonly<Record<EventType, true>> = {
   "train.conflict": true,
   "train.intent": true,
   "train.main": true,
+  "train.held": true,
+  "check.approved": true,
 };
 
 const isEventType = (value: string): value is EventType => Object.hasOwn(EVENT_TYPES, value);
@@ -880,6 +882,27 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
           intentId: string(d, "intentId", p),
           outcome: oneOf(d, "outcome", p, ["updated", "rejected", "reconciled"]),
           main: string(d, "main", p),
+        },
+      };
+    case "train.held":
+      return {
+        type,
+        data: {
+          checkRunId: string(d, "checkRunId", p),
+          expectedMain: string(d, "expectedMain", p),
+          candidate: string(d, "candidate", p),
+          claims: list(d, "claims", p, stringItem),
+          paths: list(d, "paths", p, stringItem),
+          digest: nullableString(d, "digest", p),
+        },
+      };
+    case "check.approved":
+      return {
+        type,
+        data: {
+          checkRunId: string(d, "checkRunId", p),
+          candidate: string(d, "candidate", p),
+          digest: string(d, "digest", p),
         },
       };
     default:

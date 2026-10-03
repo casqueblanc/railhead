@@ -237,6 +237,12 @@ pub enum EventPayload {
     /// The result of an attempt to move main.
     #[serde(rename = "train.main")]
     TrainMain(TrainMain),
+    /// A candidate edits protected check paths; its attempt waits for a person.
+    #[serde(rename = "train.held")]
+    TrainHeld(TrainHeld),
+    /// A person approved running a held candidate's own definition.
+    #[serde(rename = "check.approved")]
+    CheckApproved(CheckApproved),
 }
 
 /// Who may record an event type: `HUMAN_ONLY_EVENTS`, `AGENT_ONLY_EVENTS`, `SYSTEM_ONLY_EVENTS`.
@@ -274,6 +280,8 @@ impl EventPayload {
             Self::TrainConflict(_) => "train.conflict",
             Self::TrainIntent(_) => "train.intent",
             Self::TrainMain(_) => "train.main",
+            Self::TrainHeld(_) => "train.held",
+            Self::CheckApproved(_) => "check.approved",
         }
     }
 
@@ -282,7 +290,8 @@ impl EventPayload {
             Self::AgentInvited(_)
             | Self::AgentConfirmed(_)
             | Self::AgentRevoked(_)
-            | Self::DecisionRecorded(_) => Recorder::Person,
+            | Self::DecisionRecorded(_)
+            | Self::CheckApproved(_) => Recorder::Person,
             Self::InboxAcked(_) => Recorder::Agent,
             Self::AgentJoined(_)
             | Self::ClaimRefused(_)
@@ -295,7 +304,8 @@ impl EventPayload {
             | Self::TrainCheck(_)
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
-            | Self::TrainMain(_) => Recorder::System,
+            | Self::TrainMain(_)
+            | Self::TrainHeld(_) => Recorder::System,
             Self::IssueFiled(_)
             | Self::ClaimOpened(_)
             | Self::ClaimPushed(_)
@@ -329,7 +339,9 @@ impl EventPayload {
             | Self::TrainCheck(_)
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
-            | Self::TrainMain(_) => None,
+            | Self::TrainMain(_)
+            | Self::TrainHeld(_)
+            | Self::CheckApproved(_) => None,
         }
     }
 
@@ -356,6 +368,8 @@ impl EventPayload {
             Self::TrainConflict(data) => data.validate(),
             Self::TrainIntent(data) => data.validate(),
             Self::TrainMain(data) => data.validate(),
+            Self::TrainHeld(data) => data.validate(),
+            Self::CheckApproved(data) => data.validate(),
         }
     }
 }

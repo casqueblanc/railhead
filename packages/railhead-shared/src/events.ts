@@ -319,6 +319,38 @@ export type EventPayload =
   | {
       type: "train.main";
       data: { intentId: IntentId; outcome: MainOutcome; main: CommitSha };
+    }
+  | {
+      /**
+       * A candidate edits the trusted check definition or a path it protects, so its check attempt
+       * is held for a person and nothing runs until one approves it.
+       */
+      type: "train.held";
+      data: {
+        /** The held attempt. */
+        checkRunId: CheckRunId;
+        /** The main commit the candidate was composed on, whose definition the attempt names. */
+        expectedMain: CommitSha;
+        /** The candidate commit. */
+        candidate: CommitSha;
+        /** The claims composed into the candidate. */
+        claims: ClaimId[];
+        /** The protected paths the candidate edits, the definition's own path first when edited. */
+        paths: string[];
+        /**
+         * SHA-256 of the candidate's own definition file: what an approval runs and names. `null`
+         * when the candidate has no valid definition, so there is nothing to approve.
+         */
+        digest: string | null;
+      };
+    }
+  | {
+      /**
+       * A person approved running the candidate's own definition, with exactly this digest, for
+       * this one held attempt.
+       */
+      type: "check.approved";
+      data: { checkRunId: CheckRunId; candidate: CommitSha; digest: string };
     };
 
 /** The name of one event type. */
@@ -344,6 +376,7 @@ export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
   "agent.confirmed",
   "agent.revoked",
   "decision.recorded",
+  "check.approved",
 ];
 
 /**
@@ -366,6 +399,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "train.conflict",
   "train.intent",
   "train.main",
+  "train.held",
 ];
 
 // =======================================================================================
@@ -377,6 +411,7 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
 const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
 const KEY_FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/;
+const DIGEST = /^[0-9a-f]{64}$/;
 
 /** True when `value` is an identifier of the given kind. */
 export function isId(kind: IdKind, value: string): boolean {
@@ -587,6 +622,25 @@ function validatePayload(event: EventPayload): void {
       requireId("intent", event.data.intentId, "intentId");
       requireCommit(event.data.main, "main");
       return;
+    case "train.held":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.expectedMain, "expectedMain");
+      requireCommit(event.data.candidate, "candidate");
+      requireList(event.data.claims, "claims");
+      if (event.data.claims.length === 0) throw new Error("claims must name at least one claim");
+      requireUnique(event.data.claims, "claims");
+      event.data.claims.forEach((id, index) => requireId("claim", id, `claims[${index}]`));
+      requireList(event.data.paths, "paths");
+      if (event.data.paths.length === 0) throw new Error("paths must name at least one path");
+      requireUnique(event.data.paths, "paths");
+      event.data.paths.forEach((path, index) => requirePath(path, `paths[${index}]`));
+      if (event.data.digest !== null) requireDigest(event.data.digest, "digest");
+      return;
+    case "check.approved":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.candidate, "candidate");
+      requireDigest(event.data.digest, "digest");
+      return;
     default:
       return unreachable(event);
   }
@@ -657,6 +711,10 @@ function requireId(kind: IdKind, value: string, field: string): void {
 
 function requireCommit(value: string, field: string): void {
   if (!isCommitSha(value)) throw new Error(`${field} is not a commit id`);
+}
+
+function requireDigest(value: string, field: string): void {
+  if (!DIGEST.test(value)) throw new Error(`${field} is not a SHA-256 digest`);
 }
 
 function requireAgentName(name: string): void {

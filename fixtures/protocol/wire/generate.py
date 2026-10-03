@@ -686,6 +686,9 @@ def agent_fixtures() -> dict:
     }
 
 
+CHECK_DIGEST = hashlib.sha256(b'{"name":"test","command":"pnpm test","timeoutMs":600000}').hexdigest()
+
+
 def event(seq: int, type_: str, actor: dict, data: dict) -> dict:
     return {"v": 1, "seq": seq, "at": NOW + seq, "repo": REPO_ID, "actor": actor, "type": type_, "data": data}
 
@@ -719,6 +722,8 @@ def events_fixture() -> dict:
         ("agent.revoked", HUMAN, {"agentId": AGENT}),
         ("claim.reopened", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "reason": "decision_superseded", "decisions": [{"decisionId": "dec_upload1", "version": 2}]}),
         ("claim.adapted", SYSTEM, {"claimId": "clm_42abcd", "intentId": "int_merge01", "decision": {"decisionId": "dec_upload1", "version": 1}}),
+        ("train.held", SYSTEM, {"checkRunId": "chk_run0002", "expectedMain": SHA_BASE, "candidate": SHA_OTHER, "claims": ["clm_42abcd"], "paths": [".railhead/check.json"], "digest": CHECK_DIGEST}),
+        ("check.approved", HUMAN, {"checkRunId": "chk_run0002", "candidate": SHA_OTHER, "digest": CHECK_DIGEST}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -739,6 +744,10 @@ def events_fixture() -> dict:
         ("acknowledgement recorded by the system", {**events[10], "actor": SYSTEM}, "by the agent itself"),
         ("agent acknowledging another agent's item", {**events[10], "actor": {"kind": "agent", "id": "agt_ember01"}}, "its own inbox items"),
         ("decision recorded by an agent", {**events[7], "actor": AGENT_ACTOR}, "by a person"),
+        ("held check asserted by a person", {**events[21], "actor": HUMAN}, "by the system"),
+        ("held path outside the repository", {**events[21], "data": {**events[21]["data"], "paths": ["../check.json"]}}, "paths"),
+        ("check approval recorded by the system", {**events[22], "actor": SYSTEM}, "by a person"),
+        ("check approval with an uppercase digest", {**events[22], "data": {**events[22]["data"], "digest": CHECK_DIGEST.upper()}}, "digest"),
     ]
     return {
         "valid": events,

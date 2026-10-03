@@ -11,9 +11,9 @@ use crate::integer::{SafeInteger, nullable};
 use crate::rules::{
     IdKind, MAX_CHECK_NAME_LENGTH, MAX_ISSUE_BODY_LENGTH, MAX_OPTION_LABEL_LENGTH, MAX_OPTIONS,
     MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, MAX_TITLE_LENGTH, MIN_OPTIONS, require,
-    require_agent_name, require_commit, require_id, require_key_fingerprint, require_length,
-    require_list, require_option_key, require_path, require_positive, require_ref, require_text,
-    require_unique,
+    require_agent_name, require_commit, require_digest, require_id, require_key_fingerprint,
+    require_length, require_list, require_option_key, require_path, require_positive, require_ref,
+    require_text, require_unique,
 };
 
 /// `agent.invited`: a person invited an agent.
@@ -552,6 +552,76 @@ impl TrainMain {
     pub(crate) fn validate(&self) -> Result<()> {
         require_id(IdKind::Intent, &self.intent_id, "intentId")?;
         require_commit(&self.main, "main")
+    }
+}
+
+/// `train.held`: a candidate edits protected check paths, so its attempt waits for a person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainHeld {
+    /// The held `chk_` attempt.
+    pub check_run_id: String,
+    /// The main commit the candidate was composed on.
+    pub expected_main: String,
+    /// The candidate commit.
+    pub candidate: String,
+    /// The `clm_` claims composed into it.
+    pub claims: Vec<String>,
+    /// The protected paths the candidate edits.
+    pub paths: Vec<String>,
+    /// SHA-256 of the candidate's own definition, or `None` when it has no valid one.
+    #[serde(deserialize_with = "nullable")]
+    pub digest: Option<String>,
+}
+
+impl TrainHeld {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
+        require_commit(&self.expected_main, "expectedMain")?;
+        require_commit(&self.candidate, "candidate")?;
+        require_list(&self.claims, "claims")?;
+        require(
+            !self.claims.is_empty(),
+            "claims",
+            "a list of at least one claim",
+        )?;
+        require_unique(self.claims.iter().map(String::as_str), "claims")?;
+        self.claims
+            .iter()
+            .try_for_each(|id| require_id(IdKind::Claim, id, "claims"))?;
+        require_list(&self.paths, "paths")?;
+        require(
+            !self.paths.is_empty(),
+            "paths",
+            "a list of at least one path",
+        )?;
+        require_unique(self.paths.iter().map(String::as_str), "paths")?;
+        self.paths
+            .iter()
+            .try_for_each(|path| require_path(path, "paths"))?;
+        self.digest
+            .as_deref()
+            .map_or(Ok(()), |digest| require_digest(digest, "digest"))
+    }
+}
+
+/// `check.approved`: a person approved running a held candidate's own definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckApproved {
+    /// The approved `chk_` attempt.
+    pub check_run_id: String,
+    /// The candidate commit.
+    pub candidate: String,
+    /// SHA-256 of the definition the approval covers.
+    pub digest: String,
+}
+
+impl CheckApproved {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
+        require_commit(&self.candidate, "candidate")?;
+        require_digest(&self.digest, "digest")
     }
 }
 
