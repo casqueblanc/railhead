@@ -30,6 +30,8 @@ export const unavailableIdentity: IdentityPort = {
   confirm: refuse("identity"),
   revoke: refuse("identity"),
   pendingJoins: refuse("identity"),
+  view: refuse("identity"),
+  credential: refuse("identity"),
 };
 
 /** Sessions while its module is missing: no caller authenticates. */
