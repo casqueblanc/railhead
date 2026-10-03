@@ -653,27 +653,30 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
- * and the revocation the pin owed, since its holder may push again, raises its episode and forgets
- * its last refusal. A sweep the pin started keeps its barrier, so the holder pushes only once that
- * sweep has ended.
- * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
+ * Returns a ready claim pinned at `generation` in `episode` to working with a lease until
+ * `leaseUntil`, clears its pin and the revocation the pin owed, since its holder may push again,
+ * raises its episode and forgets its last refusal. A sweep the pin started keeps its barrier, so
+ * the holder pushes only once that sweep has ended.
+ * Returns `false`, and writes nothing, when the claim is no longer ready at that generation and
+ * episode.
  */
 export function reopenReady(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
+  episode: number,
   leaseUntil: number,
 ): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
          episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL
-       WHERE claim_id = ? AND generation = ? AND state = 'ready'
+       WHERE claim_id = ? AND generation = ? AND episode = ? AND state = 'ready'
        RETURNING claim_id`,
       leaseUntil,
       claimId,
       generation,
+      episode,
     )
     .toArray();
   return updated.length === 1;

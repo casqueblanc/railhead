@@ -16,7 +16,7 @@ import type {
   IntentId,
 } from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
-import type { ClaimPin } from "./claims";
+import type { ClaimPin, EpisodePin } from "./claims";
 import type { PortResult } from "./result";
 
 /**
@@ -45,8 +45,8 @@ export interface CheckAttempt {
   expectedMain: CommitSha;
   /** The exact composed commit being checked. */
   candidate: CommitSha;
-  /** The pins composed into it, each at its generation. */
-  pins: ClaimPin[];
+  /** The pins composed into it, each at its generation and ready episode. */
+  pins: EpisodePin[];
   /** The trusted definition the run uses. */
   definition: CheckDefinition;
   /** The decision versions required when the attempt was scheduled. */
@@ -116,8 +116,8 @@ export interface MergeIntentRecord {
   expectedMain: CommitSha;
   /** The commit main moves to. */
   candidate: CommitSha;
-  /** The pins merged, each at the generation that was current when authorized. */
-  pins: ClaimPin[];
+  /** The pins merged, each at the generation and ready episode that were checked. */
+  pins: EpisodePin[];
   /** The decision versions that were current when authorized. */
   decisions: DecisionRef[];
   /** The passing check attempt on exactly `candidate`. */
@@ -259,6 +259,14 @@ export interface TrainPort {
    * for the next wake itself. It never throws for a port's failure.
    */
   resume(): Promise<void>;
+  /**
+   * Settles once the train has confirmed the alarm for the wake it found in storage when it was
+   * built: `true` when storage holds that alarm or the train owes none, `false` when every attempt
+   * failed. It never rejects, and every call returns the same answer. The Repo awaits it before
+   * serving anything, and a `false` resets the object, so the next request or alarm builds the
+   * train again and asks again. `true` when the module is missing, which owes nothing.
+   */
+  startup(): Promise<boolean>;
 }
 
 /** What the main writer records about its progress on an intent. */

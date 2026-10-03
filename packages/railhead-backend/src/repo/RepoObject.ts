@@ -101,11 +101,25 @@ export class Repo extends DurableObject<Env> {
       console.error(JSON.stringify({ event: "repo.wake_failed", repo, error: name }));
     });
     // Modules ask for wakes while they are built, so the alarm is read first.
-    void ctx.blockConcurrencyWhile(async () => {
-      await this.#alarm.load();
-      const summary = this.#readSummary();
-      this.#installed = summary === null ? null : this.#install(summary);
-    });
+    ctx
+      .blockConcurrencyWhile(async () => {
+        await this.#alarm.load();
+        const summary = this.#readSummary();
+        this.#installed = summary === null ? null : this.#install(summary);
+        // The train's wake may be all that would wake an idle Repo. When every attempt to store it
+        // failed (the train logs that), throwing resets the object, so the event that started it
+        // fails and the next request or alarm rebuilds the train, which asks again from its stored
+        // wake row. An idle Repo whose storage refuses every alarm write waits for that request.
+        if (this.#installed !== null && !(await this.#installed.ports.train.startup())) {
+          throw new Error("the train's wake could not be stored");
+        }
+      })
+      .catch((error: unknown) => {
+        // The runtime has already reset the object; the next event builds it again.
+        const name = error instanceof Error ? error.name : "unknown";
+        const repo = this.#installed?.summary.repoId ?? null;
+        console.error(JSON.stringify({ event: "repo.start_failed", repo, error: name }));
+      });
   }
 
   /** The repository, or `null` when it was never initialized. */

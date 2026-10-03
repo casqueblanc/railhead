@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { ClaimView } from "@railhead/shared/agent-api";
 import type { CommitSha, DecisionRef, RailheadEvent } from "@railhead/shared/events";
-import type { ClaimPin } from "../src/contracts/claims";
+import type { EpisodePin } from "../src/contracts/claims";
 import { fail, ok } from "../src/contracts/result";
 import type {
   AttemptOutcome,
@@ -76,8 +76,8 @@ function acceptanceCheck(
   };
 }
 
-function pinOf(claimId: string, commit = sha("a")): ClaimPin {
-  return { claimId, generation: 1, commit };
+function pinOf(claimId: string, commit = sha("a")): EpisodePin {
+  return { claimId, generation: 1, commit, episode: 1 };
 }
 
 function attemptOf(fields: Partial<CheckAttempt> = {}): CheckAttempt {

@@ -46,7 +46,7 @@ export const MAX_AGENTS = 64;
  * secret reaches a signature check, so the budget is per invite: requests naming an unknown invite
  * or a wrong secret are refused before any signature check and spend no invite's budget.
  */
-export const MAX_JOIN_REFUSALS_PER_WINDOW = 30;
+const MAX_JOIN_REFUSALS_PER_WINDOW = 30;
 
 /** The window of the join rate limit, in milliseconds. */
 export const JOIN_WINDOW_MS = 60_000;

@@ -21,12 +21,20 @@ const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
 const HUMAN: Actor = { kind: "human", id: "usr_lemarier" };
 const AGENT: Actor = { kind: "agent", id: "agt_atlas01" };
+const SYSTEM: Actor = { kind: "system", id: "sys_claims" };
 const STATE_TABLE = "CREATE TABLE IF NOT EXISTS claims (id TEXT PRIMARY KEY) STRICT";
 
 function issue(n: number, body = ""): EventPayload {
   return {
     type: "issue.filed",
     data: { issueId: `iss_issue${String(n).padStart(4, "0")}`, title: `Issue ${n}`, body },
+  };
+}
+
+function reopened(claimId: string): EventPayload {
+  return {
+    type: "claim.reopened",
+    data: { claimId, generation: 1, reason: "lost_conflict", decisions: [] },
   };
 }
 
@@ -415,6 +423,23 @@ describe("EventLog replay", () => {
         refusal("corrupt_log"),
       );
       expect(rowCount(storage, "events")).toBe(0);
+    });
+  });
+
+  it("serves a version 1 reopen stored before reasons as a superseded decision", async () => {
+    await withStorage((storage) => {
+      const log = openLog(storage);
+      log.transaction((tx) => {
+        tx.append(SYSTEM, reopened("clm_before01"));
+        tx.append(SYSTEM, reopened("clm_after001"));
+      });
+      // The shape `settle` appended before reopen reasons existed.
+      storage.sql.exec("UPDATE events SET body = json_remove(body, '$.data.reason') WHERE seq = 1");
+
+      expect(log.replay(0, 10).events.map((event) => event.data)).toEqual([
+        { claimId: "clm_before01", generation: 1, reason: "decision_superseded", decisions: [] },
+        { claimId: "clm_after001", generation: 1, reason: "lost_conflict", decisions: [] },
+      ]);
     });
   });
 

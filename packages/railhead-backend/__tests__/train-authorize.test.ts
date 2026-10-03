@@ -7,7 +7,7 @@ import {
   type ClaimId,
   type DecisionRef,
 } from "@railhead/shared/events";
-import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
+import type { EpisodePin, ReadyPin } from "../src/contracts/claims";
 import type { ReadyGate } from "../src/contracts/inbox";
 import type { PortErrorCode, PortResult } from "../src/contracts/result";
 import type {
@@ -38,8 +38,8 @@ function claimId(n: number): ClaimId {
   return `clm_claim${String(n).padStart(3, "0")}`;
 }
 
-function pin(n: number, generation = 1): ClaimPin {
-  return { claimId: claimId(n), generation, commit: String(n % 10).repeat(40) };
+function pin(n: number, generation = 1): EpisodePin {
+  return { claimId: claimId(n), generation, commit: String(n % 10).repeat(40), episode: 1 };
 }
 
 function attempt(overrides: Partial<CheckAttempt> = {}): CheckAttempt {
@@ -83,7 +83,7 @@ class World implements AuthorizationReaders {
       this.versions.set(stored_pin.claimId, stored.decisions);
       this.ready.set(stored_pin.claimId, {
         pin: stored_pin,
-        episode: 1,
+        episode: stored_pin.episode,
         decisions: stored.decisions,
       });
     }
@@ -354,6 +354,30 @@ describe("authorize fences ready pins", () => {
         decisions: [],
       });
       await expectRefused(h, "decision_superseded");
+    });
+  });
+
+  it("refuses a claim readied again with the same commit in a later episode", async () => {
+    const world = new World();
+    // Reopened and readied again with the checked commit: only the episode moved.
+    world.ready.set(claimId(1), { pin: pin(1), episode: 2, decisions: [DEC_FORMAT, DEC_LIMIT] });
+    await withHarness(world, (h) => expectRefused(h, "decision_superseded"));
+  });
+
+  it("reads an intent stored before pins carried episodes as episode 0, which no claim is in", async () => {
+    await withHarness(new World(), async (h) => {
+      expect((await h.authorize()).ok).toBe(true);
+      h.storage.sql.exec(
+        "UPDATE merge_intents SET pins = json_remove(pins, '$[0].episode', '$[1].episode')",
+      );
+      const read = await h.intent(INTENT);
+      expect(read.ok && read.value.pins).toEqual([
+        { ...pin(1), episode: 0 },
+        { ...pin(2, 3), episode: 0 },
+      ]);
+
+      h.storage.sql.exec("UPDATE merge_intents SET pins = json_set(pins, '$[0].episode', 'one')");
+      await expect(h.intent(INTENT)).rejects.toThrow("unreadable pins");
     });
   });
 
