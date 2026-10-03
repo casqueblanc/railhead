@@ -788,7 +788,12 @@ async fn a_name_that_joined_elsewhere_is_not_reused() -> anyhow::Result<()> {
     let dir = world.agent_dir("atlas");
     fs::create_dir_all(&dir)?;
     #[cfg(unix)]
-    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    for private in [world.home.path().join("agents"), dir.clone()] {
+        fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )?;
+    }
     let record = json!({"name": "atlas", "agentId": "agt_other01",
         "origin": "https://railhead.dev", "repo": "casqueblanc/demo"});
     let path = dir.join("identity.json");
