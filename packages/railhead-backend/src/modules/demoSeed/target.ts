@@ -8,7 +8,7 @@
 // finishes on the next run. An initialized Repo is never pushed to: if its main is missing or
 // empty, a reset failed partway, and the seed is refused until a reset finishes.
 //
-// Reset deletes, by exact name, every fork the Repo's Artifacts table recorded, then the main
+// Reset deletes, by exact name, every fork the Artifacts adapter recorded in the Repo, then the main
 // Artifacts repository, then the Repo's own storage. It never lists the namespace to choose what to
 // delete. A failed deletion stops the reset before the Repo's storage is wiped, so the fork names
 // stay readable and the next reset finishes the job; since main goes last, a reset that stopped
@@ -30,11 +30,13 @@ import {
   boundedCall,
   MINT_CLOCK_SKEW_MS,
   mainRepoName,
+  recordedForks,
   revokeActiveTokens,
   type TokenSweepLimits,
 } from "../../artifacts/adapter";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import { migrate, type RepoStorage } from "../../repo/storage";
+import { BUNDLE_REF } from "./bundle";
 import { pushMain, type PushOutcome } from "./receivePack";
 
 /** The repository methods the seed calls. `ArtifactsRepo` satisfies it. */
@@ -55,7 +57,7 @@ export interface SeedArtifacts {
 export interface SeedTargetContext {
   /** The repository's identifier, the same before and after `initialize`. */
   readonly repoId: RepoId;
-  /** The Repo's storage, read for the forks the Artifacts module recorded. */
+  /** The Repo's storage, where the Artifacts adapter records its forks. */
   readonly storage: RepoStorage;
   /** The Artifacts namespace, or `undefined` when the Worker has no `ARTIFACTS` binding. */
   readonly artifacts: SeedArtifacts | undefined;
@@ -250,19 +252,29 @@ export function createSeedTarget(
     );
   }
 
-  /** Main's head, `null` for a repository without one, or `missing` when there is no repository. */
+  /**
+   * The head of main's `refs/heads/main`, which the push creates, whatever `HEAD` names: `null`
+   * when the repository has no such branch or no commit on it, or `missing` when there is no
+   * repository.
+   */
   async function readMain(
     artifacts: SeedArtifacts,
     name: string,
   ): Promise<PortResult<CommitSha | null | "missing">> {
+    let repo: SeedArtifactsRepo;
     try {
-      using repo = await opened(artifacts, name);
-      const [latest] = await bounded(repo.log({ limit: 1 }));
+      repo = await opened(artifacts, name);
+    } catch (error) {
+      return artifactsCode(error) === "NOT_FOUND" ? ok("missing") : artifactsFailed();
+    }
+    using handle = repo;
+    try {
+      const [latest] = await bounded(handle.log({ ref: BUNDLE_REF, limit: 1 }));
       if (latest === undefined) return ok(null);
       return isCommitSha(latest.hash) ? ok(latest.hash) : artifactsFailed();
     } catch (error) {
-      if (artifactsCode(error) === "NOT_FOUND") return ok("missing");
-      return artifactsFailed();
+      // The repository exists, so a missing ref is a main branch not created yet.
+      return artifactsCode(error) === "NOT_FOUND" ? ok(null) : artifactsFailed();
     }
   }
 
@@ -304,7 +316,7 @@ export function createSeedTarget(
   /**
    * Revokes every live token on main with the Artifacts adapter's sweep, which lists until none is
    * left within its deadline and revocation budget; a sweep that runs out leaves the rest to the
-   * next seed. Clears the create and mint records once main is clean. Tokens are owed only between
+   * next seed, and one whose listing cannot cover every token fails. Clears the create and mint records once main is clean. Tokens are owed only between
    * a seed's create or mint and the sweep that must precede initialization, and an initialized Repo
    * is never created or minted on, so while any are owed no other module holds a token on main:
    * every one is the seed's.
@@ -320,18 +332,6 @@ export function createSeedTarget(
     }
     sql.exec("DELETE FROM demo_seed_effects WHERE kind IN ('create', 'mint')");
     return true;
-  }
-
-  /** The fork names the Artifacts module recorded in this Repo, if its table exists. */
-  function forkNames(): string[] {
-    const table = sql
-      .exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifacts_forks'")
-      .toArray();
-    if (table.length === 0) return [];
-    return sql
-      .exec<{ repo: string }>("SELECT repo FROM artifacts_forks ORDER BY repo")
-      .toArray()
-      .map((row) => row.repo);
   }
 
   return {
@@ -394,7 +394,13 @@ export function createSeedTarget(
         if (artifacts === undefined) return noArtifacts();
         if (unresolved()) return busy();
         // Main goes last, so a deletion that fails leaves it in place behind the forks.
-        const names = [...forkNames(), await mainRepoName(context.repoId)];
+        let forks: string[];
+        try {
+          forks = recordedForks(context.storage);
+        } catch {
+          return fail("internal", "The demo repository's fork records could not be read.");
+        }
+        const names = [...forks, await mainRepoName(context.repoId)];
         let deleted = context.initialized();
         for (const name of names) {
           try {

@@ -7,6 +7,8 @@ import {
   MINT_CLOCK_SKEW_MS,
   forkRepoName,
   mainRepoName,
+  PARTIAL_TOKEN_LISTING,
+  recordedForks,
   type ArtifactsAdapterLimits,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
@@ -163,6 +165,29 @@ describe("forkForClaim", () => {
       });
       expect(fake.forkCalls).toBe(1);
       expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("keeps a reconciled fork pending while its token listing is partial", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const repo = await forkRepoName(REPO, CLAIM);
+      fake.failNextFork("lose-response");
+      expect(await adapter().forkForClaim(CLAIM, HEAD)).toMatchObject({ ok: false });
+      const minted = [fake.mintFor(repo, "write", 600), fake.mintFor(repo, "write", 600)];
+
+      // The page shows only the initial token; once it is revoked the other two are out of sight.
+      fake.pageTokens(1, "creation");
+      expect(await adapter().forkForClaim(CLAIM, HEAD)).toEqual(PARTIAL_TOKEN_LISTING);
+      expect(fake.liveTokens(repo)).toEqual(minted);
+      expect(forkRows(storage)).toEqual([{ claim_id: CLAIM, state: "pending", head: null }]);
+
+      fake.pageTokens(null);
+      expect(await adapter().forkForClaim(CLAIM, HEAD)).toEqual({
+        ok: true,
+        value: { repo, head: HEAD },
+      });
+      expect(fake.liveTokens(repo)).toEqual([]);
+      expect(fake.forkCalls).toBe(1);
     });
   });
 
@@ -368,18 +393,48 @@ describe("revokeTokens", () => {
     });
   });
 
-  it("reports busy while the token listing is only a page, and succeeds once it is whole", async () => {
+  // Release and takeover both revoke through `revokeTokens`, so these are their paths.
+  it("fails, not busy, when a page shows no live token but covers less than the total", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
       const repo = await forkClaim(port);
       const tokens = [1, 2, 3, 4, 5].map(() => fake.mintFor(repo, "write", 600));
 
-      // The page holds the fork's revoked initial token and the first of these five.
-      fake.pageTokens(2);
-      expect(await port.revokeTokens(repo)).toMatchObject({ ok: false, code: "busy" });
+      // The page keeps the fork's revoked initial token first, so the sweep sees one live token.
+      fake.pageTokens(2, "creation");
+      expect(await port.revokeTokens(repo)).toEqual(PARTIAL_TOKEN_LISTING);
+      expect(fake.liveTokens(repo)).toEqual(tokens.slice(1));
+      // A repeat sees the same page: it fails the same way at once instead of staying busy.
+      expect(await port.revokeTokens(repo)).toEqual(PARTIAL_TOKEN_LISTING);
       expect(fake.liveTokens(repo)).toEqual(tokens.slice(1));
 
       fake.pageTokens(null);
+      expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("revokes past one page when live tokens come first, and still reports the listing partial", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      [1, 2, 3, 4, 5].forEach(() => fake.mintFor(repo, "write", 600));
+
+      // Every live token is reachable, but a page without one cannot show that none is left.
+      fake.pageTokens(2, "live-first");
+      expect(await port.revokeTokens(repo)).toEqual(PARTIAL_TOKEN_LISTING);
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
+  it("reports clean from a page that holds exactly the total", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
+
+      // The initial token and three more: four tokens, all on a page of four.
+      fake.pageTokens(4, "creation");
       expect(await port.revokeTokens(repo)).toEqual({ ok: true, value: undefined });
       expect(fake.liveTokens(repo)).toEqual([]);
     });
@@ -836,6 +891,35 @@ describe("repository isolation", () => {
       }
       expect(await theirs.revokeTokens(forked.value.repo)).toMatchObject({ code: "not_found" });
       expect(fake.tokensMinted).toBe(0);
+    });
+  });
+});
+
+describe("recordedForks", () => {
+  it("lists every recorded fork, pending or ready, by name", async () => {
+    await withArtifacts(async ({ fake, storage, adapter }) => {
+      const port = adapter();
+      const ready = await forkClaim(port);
+      const pending = await forkRepoName(REPO, SECOND_CLAIM);
+      fake.failNextFork("lose-response");
+      expect(await port.forkForClaim(SECOND_CLAIM, HEAD)).toMatchObject({ ok: false });
+
+      expect(recordedForks(storage)).toEqual([ready, pending].toSorted());
+    });
+  });
+
+  it("lists nothing in storage the adapter never used", async () => {
+    await withArtifacts(async ({ storage }) => {
+      expect(recordedForks(storage)).toEqual([]);
+    });
+  });
+
+  it("throws rather than read a fork table newer than this code knows", async () => {
+    await withArtifacts(async ({ storage, adapter }) => {
+      await forkClaim(adapter());
+      storage.sql.exec("UPDATE railhead_migrations SET version = 99 WHERE owner = 'artifacts'");
+
+      expect(() => recordedForks(storage)).toThrow(/newer than/);
     });
   });
 });

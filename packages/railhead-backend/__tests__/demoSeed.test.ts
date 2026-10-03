@@ -600,8 +600,8 @@ describe("seed target", () => {
       seed.onNextPush = () => {
         for (let i = 0; i < 10; i += 1) seed.fake.mintFor(main, "write", 300);
       };
-      // The page shows four of the twelve tokens: the sweep revokes those and cannot confirm the rest.
-      seed.fake.pageTokens(4);
+      // The page shows four of the twelve tokens: the sweep revokes those and cannot see the rest.
+      seed.fake.pageTokens(4, "creation");
       expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
       expect(seed.fake.liveTokens(main)).toHaveLength(12 - 4);
       expect(host.initialized).toBe(false);
@@ -610,6 +610,20 @@ describe("seed target", () => {
       expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
       expect(seed.fake.liveTokens(main)).toEqual([]);
       expect(host.initialized).toBe(true);
+    }));
+
+  it("reads main's branch, not HEAD, so a HEAD naming another branch still seeds", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      seed.fake.seed(main, []).headRef = "refs/heads/trunk";
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(host.initialized).toBe(true);
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+      // A retry reads the same branch and finds the work done, pushing nothing.
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(seed.pushes).toHaveLength(1);
     }));
 
   it("resets by deleting the recorded forks and then main by name, and nothing else", () =>
@@ -632,6 +646,30 @@ describe("seed target", () => {
 
       // A reset of an absent repository deletes nothing and still succeeds.
       expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: false }));
+    }));
+
+  it("refuses a reset when the fork records are newer than this code, deleting nothing", () =>
+    withTarget(async ({ seed, target, storage, host, main }) => {
+      await target.seed(HEAD, fakePack());
+      const adapter = createArtifactsAdapter({
+        repoId: REPO_ID,
+        storage,
+        clock: seed.fake.clock,
+        namespace: seed.fake,
+      });
+      const fork = await adapter.forkForClaim("clm_claim0001", HEAD);
+      if (!fork.ok) throw new Error(fork.code);
+      storage.sql.exec("UPDATE railhead_migrations SET version = 99 WHERE owner = 'artifacts'");
+
+      expect(await target.reset()).toEqual({
+        ok: false,
+        code: "internal",
+        message: "The demo repository's fork records could not be read.",
+      });
+      expect(seed.deleted).toEqual([]);
+      expect(seed.fake.repos.has(fork.value.repo)).toBe(true);
+      expect(seed.fake.repos.has(main)).toBe(true);
+      expect(host.wipes).toBe(0);
     }));
 
   it("stops a reset whose deletion failed before wiping the Repo", () =>

@@ -91,6 +91,9 @@ export const MINT_CLOCK_SKEW_MS = 300_000;
 /** How many list-and-revoke rounds one token sweep makes before reporting the repository busy. */
 const MAX_REVOKE_ROUNDS = 5;
 
+/** The migration owner name of the adapter's tables. */
+const ARTIFACTS_OWNER = "artifacts";
+
 const MIGRATIONS = [
   `CREATE TABLE artifacts_forks (
     claim_id TEXT PRIMARY KEY,
@@ -126,7 +129,7 @@ export function createArtifactsAdapter(
   context: ArtifactsAdapterContext,
   limits: ArtifactsAdapterLimits = ARTIFACTS_LIMITS,
 ): ArtifactsPort {
-  migrate(context.storage, "artifacts", MIGRATIONS);
+  migrate(context.storage, ARTIFACTS_OWNER, MIGRATIONS);
   return new ArtifactsAdapter(context, limits);
 }
 
@@ -491,7 +494,7 @@ class ArtifactsAdapter implements ArtifactsPort {
     }
     using handle = fork;
     const swept = await this.#revokeActive(handle);
-    if (!swept.ok) throw new UnrevokedTokens();
+    if (!swept.ok) throw new UnrevokedTokens(swept);
     return await this.#head(handle);
   }
 
@@ -629,14 +632,25 @@ export async function boundedCall<T>(
 }
 
 /**
+ * The failure of a sweep whose listing showed no live token but did not cover every token. The
+ * listing has no page argument, so the rest cannot be reached and a retry would see the same page.
+ */
+export const PARTIAL_TOKEN_LISTING: PortFailure = fail(
+  "internal",
+  "Artifacts listed only part of the repository's tokens, so the rest cannot be checked for live ones.",
+);
+
+/**
  * Revokes every live token on `handle`'s repository, within a total deadline and revocation
- * budget. Running out of either reports busy; a repeat continues where this one stopped. A binding
- * call that fails or times out throws.
+ * budget. Running out of either while live tokens are still listed reports busy; a repeat
+ * continues where this one stopped. A binding call that fails or times out throws.
  *
  * `listTokens` returns one page and takes no page argument, so the sweep revokes the live tokens
- * it can see and lists again. It reports the repository clean only from a listing whose `total`
- * the page covers; a partial listing with no live token left on it reports busy. Whether the
- * binding's page drops revoked tokens, and so whether repeats reach later ones, is not verified.
+ * it can see and lists again. It reports the repository clean only from a listing that shows no
+ * live token and whose page covers `total`. A listing that shows no live token but covers less
+ * than `total` fails with `PARTIAL_TOKEN_LISTING` instead of busy: `total` likely counts revoked
+ * and expired tokens too, so if the page keeps those, no repeat would ever see further. Whether the
+ * binding's page keeps or drops revoked tokens is not verified.
  */
 export async function revokeActiveTokens(
   handle: Pick<ArtifactsRepo, "listTokens" | "revokeToken">,
@@ -652,7 +666,7 @@ export async function revokeActiveTokens(
     const listed = await boundedCall(handle.listTokens(), remaining());
     const active = listed.tokens.filter((token) => token.state === "active");
     if (active.length === 0) {
-      return listed.total <= listed.tokens.length ? ok(undefined) : unfinished;
+      return listed.total <= listed.tokens.length ? ok(undefined) : { ...PARTIAL_TOKEN_LISTING };
     }
     for (const token of active) {
       if (budget === 0 || remaining() <= 0) return unfinished;
@@ -661,6 +675,19 @@ export async function revokeActiveTokens(
     }
   }
   return unfinished;
+}
+
+/**
+ * The names of every fork the adapter recorded in `storage`, pending or ready, in name order. It
+ * brings the adapter's table up to date first, so it throws rather than answer from a schema newer
+ * than this code knows.
+ */
+export function recordedForks(storage: RepoStorage): ArtifactsRepoName[] {
+  migrate(storage, ARTIFACTS_OWNER, MIGRATIONS);
+  return storage.sql
+    .exec<{ repo: string }>("SELECT repo FROM artifacts_forks ORDER BY repo")
+    .toArray()
+    .map((row) => row.repo);
 }
 
 /** A promise and the function that resolves it. */
@@ -689,9 +716,13 @@ async function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> 
 
 /** A fork's live tokens could not all be revoked, so it must not be used yet. */
 class UnrevokedTokens extends Error {
-  constructor() {
+  /** The sweep's failure, reported as the request's. */
+  readonly failure: PortFailure;
+
+  constructor(failure: PortFailure) {
     super("fork still has live tokens");
     this.name = "UnrevokedTokens";
+    this.failure = failure;
   }
 }
 
@@ -739,9 +770,7 @@ function failureOf(error: unknown): PortFailure {
   if (error instanceof CallTimedOut) {
     return fail("busy", "Artifacts did not answer in time; the request may be repeated.");
   }
-  if (error instanceof UnrevokedTokens) {
-    return fail("busy", "The claim's fork still has live tokens; try again.");
-  }
+  if (error instanceof UnrevokedTokens) return error.failure;
   if (error instanceof MissingHead) {
     return fail("internal", "The claim's fork has no commit.");
   }
