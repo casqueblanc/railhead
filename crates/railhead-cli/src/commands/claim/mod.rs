@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::commands::join;
 use crate::http::Endpoint;
 use crate::identity::SessionToken;
-use crate::output::{Output, Render, inert};
+use crate::output::{Output, Render, inert, quoted};
 use crate::{Agent, Error, Result};
 
 use workspace::{CloneState, Remotes};
@@ -159,7 +159,7 @@ pub struct CloneInfo {
 impl Render for Claimed {
     fn render(&self, out: &mut dyn Write) -> io::Result<()> {
         let verb = if self.resumed { "resumed" } else { "claimed" };
-        writeln!(out, "{verb} {}", inert(&self.claim.claim_id))?;
+        writeln!(out, "{verb} {}", quoted(&self.claim.claim_id))?;
         render_claim(out, &self.claim)?;
         let state = match self.clone.state {
             CloneState::Created => "cloned into",
@@ -184,15 +184,15 @@ pub fn render_claim(out: &mut dyn Write, claim: &ClaimView) -> io::Result<()> {
     writeln!(
         out,
         "issue {}, {state}, generation {}",
-        inert(&claim.issue_id),
+        quoted(&claim.issue_id),
         claim.generation
     )?;
     if let Some(commit) = &claim.ready_commit {
-        writeln!(out, "pinned commit {}", inert(commit))?;
+        writeln!(out, "pinned commit {}", quoted(commit))?;
     }
-    writeln!(out, "task: {}", inert(&claim.task.title))?;
+    writeln!(out, "task: {}", quoted(&claim.task.title))?;
     for line in claim.task.body.lines() {
-        writeln!(out, "  {}", inert(line))?;
+        writeln!(out, "  {}", quoted(line))?;
     }
     Ok(())
 }
@@ -209,23 +209,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_task_renders_as_inert_indented_text() -> anyhow::Result<()> {
-        let claim: ClaimView = serde_json::from_value(serde_json::json!({
+    fn claim(title: &str, body: &str) -> anyhow::Result<ClaimView> {
+        Ok(serde_json::from_value(serde_json::json!({
             "claimId": "clm_42abcd", "issueId": "iss_upload1", "generation": 3,
             "base": "a".repeat(40), "state": "ready", "readyCommit": "b".repeat(40),
             "originUrl": "x", "upstreamUrl": "y",
-            "task": {"title": "Fix \u{1b}[31muploads", "body": "line one\nline \u{202e}two"}
-        }))?;
+            "task": {"title": title, "body": body}
+        }))?)
+    }
+
+    fn rendered(claim: &ClaimView) -> anyhow::Result<String> {
         let mut text = Vec::new();
-        render_claim(&mut text, &claim)?;
+        render_claim(&mut text, claim)?;
+        Ok(String::from_utf8(text)?)
+    }
+
+    #[test]
+    fn a_task_renders_as_quoted_indented_lines() -> anyhow::Result<()> {
+        let text = rendered(&claim(
+            "Fix \u{1b}[31muploads",
+            "line one\nline \u{202e}two",
+        )?)?;
         assert_eq!(
-            String::from_utf8(text)?,
+            text,
             format!(
-                "issue iss_upload1, ready, generation 3\npinned commit {}\n\
-                 task: Fix \u{fffd}[31muploads\n  line one\n  line \u{fffd}two\n",
+                "issue \"iss_upload1\", ready, generation 3\npinned commit \"{}\"\n\
+                 task: \"Fix \\u001b[31muploads\"\n  \"line one\"\n  \"line \u{fffd}two\"\n",
                 "b".repeat(40)
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_task_body_prints_no_lines() -> anyhow::Result<()> {
+        let text = rendered(&claim("", "")?)?;
+        assert!(text.ends_with("task: \"\"\n"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_cannot_forge_a_line() -> anyhow::Result<()> {
+        let text = rendered(&claim(
+            "ok\nclaim clm_99forge\u{2028}claim clm_98forge",
+            "fine\rclaim clm_97forge\u{2029}claim clm_96forge\u{85}claim clm_95forge",
+        )?)?;
+        assert_eq!(
+            text.lines().nth(2),
+            Some("task: \"ok\\nclaim clm_99forge\\u2028claim clm_98forge\"")
+        );
+        assert_eq!(
+            text.lines().nth(3),
+            Some("  \"fine\\rclaim clm_97forge\\u2029claim clm_96forge\\u0085claim clm_95forge\"")
+        );
+        assert!(
+            !text
+                .split(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
+                .any(|line| line.starts_with("claim ")),
+            "{text}"
         );
         Ok(())
     }
