@@ -23,7 +23,7 @@ import {
 } from "@railhead/shared/agent-api";
 import type { ClaimId, QuestionId, RepoId } from "@railhead/shared/events";
 import type { AgentPrincipal } from "../contracts/principals";
-import { fail, type PortFailure, type PortResult } from "../contracts/result";
+import { fail, ok, type PortFailure, type PortResult } from "../contracts/result";
 import type { RepoPorts } from "../repo/composeRepo";
 
 /** One agent request, validated by the Worker, with its path and query parameters parsed. */
@@ -125,10 +125,13 @@ async function runSessionCommand(
   command: SessionCommand,
 ): Promise<PortResult<AgentResults[AgentRouteName]>> {
   switch (command.route) {
-    case "status":
-      // No port returns the agent's own `AgentView` yet, so status stays unavailable rather than
-      // answering with an invented one.
-      return fail("unavailable", "The status route is not available.");
+    case "status": {
+      const view = await ports.identity.view(agent);
+      if (!view.ok) return view;
+      const claim = await ports.claims.activeClaim(agent);
+      if (!claim.ok) return claim;
+      return ok({ agent: view.value, claim: claim.value });
+    }
     case "work":
       return ports.claims.work(agent);
     case "claim":

@@ -5,7 +5,9 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_AGENT_REQUEST_BYTES,
   type AgentRouteName,
+  type AgentView,
   type ClaimResult,
+  type ClaimView,
   type InboxDigest,
 } from "@railhead/shared/agent-api";
 import { API_PATH, type RailheadApi } from "@railhead/shared/api";
@@ -28,6 +30,12 @@ const AGENT: AgentPrincipal = {
   repoId: "rep_other01",
 };
 const TOKEN = "aaaa.bbbb.cccc";
+const VIEW: AgentView = {
+  agentId: AGENT.agentId,
+  name: "atlas",
+  ownerId: AGENT.ownerId,
+  state: "confirmed",
+};
 const CLAIM = "clm_claim001";
 
 function issue(n: number): EventPayload {
@@ -227,14 +235,21 @@ describe("unavailable modules", () => {
           operation: "fetch",
         }),
         ports.sessions.authenticate(TOKEN),
-        ports.decisions.requirements(CLAIM),
-        ports.owner.perform("chl_x", {
-          credentialId: "a",
-          clientDataJson: "a",
-          authenticatorData: "a",
-          signature: "a",
-          userHandle: null,
-        }),
+        // Decisions is installed, but asking needs the claims module to confirm the claim.
+        ports.decisions.ask(
+          { kind: "agent", agentId: "agt_atlas01", ownerId: "usr_lemarier", repoId },
+          CLAIM,
+          {
+            generation: 1,
+            requestId: "req_upload0000000001",
+            text: "Reject or chunk?",
+            options: [
+              { key: "reject", label: "Reject" },
+              { key: "chunk", label: "Chunk" },
+            ],
+            scope: ["src/upload.ts"],
+          },
+        ),
       ]);
     });
 
@@ -250,6 +265,8 @@ describe("unavailable modules", () => {
 async function withFakePorts<R>(
   overrides: {
     authenticate?: PortResult<AgentPrincipal>;
+    view?: PortResult<AgentView>;
+    activeClaim?: PortResult<ClaimView | null>;
     work?: PortResult<ClaimResult>;
     digest?: PortResult<InboxDigest>;
   },
@@ -274,8 +291,19 @@ async function withFakePorts<R>(
           return overrides.authenticate ?? ok(AGENT);
         },
       },
+      identity: {
+        ...real.identity,
+        view: async () => {
+          calls.push("view");
+          return overrides.view ?? ok(VIEW);
+        },
+      },
       claims: {
         ...real.claims,
+        activeClaim: async () => {
+          calls.push("activeClaim");
+          return overrides.activeClaim ?? ok(null);
+        },
         work: async () => {
           calls.push("work");
           return overrides.work ?? fail("no_work", "Nothing is ready.");
@@ -358,15 +386,40 @@ describe("agent dispatch", () => {
     });
   });
 
-  it("answers status with unavailable rather than an invented agent view", async () => {
-    await withFakePorts({}, async (ports, calls) => {
+  it("answers status with the identity's view and the active claim", async () => {
+    await withFakePorts({ activeClaim: ok(claim.claim) }, async (ports, calls) => {
       const reply = await dispatchAgent(
         { repoId: AGENT.repoId, ports },
         { command: { route: "status" }, token: TOKEN },
       );
 
-      expect(reply).toMatchObject({ ok: false, error: { code: "unavailable" } });
-      expect(calls).toEqual(["authenticate"]);
+      expect(reply).toEqual({
+        ok: true,
+        data: { agent: VIEW, claim: claim.claim },
+        inbox: { items: [], pending: 0 },
+        next: null,
+      });
+      expect(calls).toEqual(["authenticate", "view", "activeClaim", "digest"]);
+    });
+  });
+
+  it("refuses status when the identity or the claims module refuses", async () => {
+    await withFakePorts({ view: fail("identity_revoked", "Revoked.") }, async (ports, calls) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, ports },
+          { command: { route: "status" }, token: TOKEN },
+        ),
+      ).toMatchObject({ ok: false, error: { code: "identity_revoked" } });
+      expect(calls).toEqual(["authenticate", "view"]);
+    });
+    await withFakePorts({ activeClaim: fail("unavailable", "Claims are down.") }, async (ports) => {
+      expect(
+        await dispatchAgent(
+          { repoId: AGENT.repoId, ports },
+          { command: { route: "status" }, token: TOKEN },
+        ),
+      ).toMatchObject({ ok: false, error: { code: "unavailable" } });
     });
   });
 
@@ -400,13 +453,13 @@ describe("agent dispatch", () => {
 });
 
 describe("agent HTTP routes", () => {
-  it("dispatch a valid join to the missing identity module, which changes nothing", async () => {
+  it("dispatch a valid join to the identity module, which refuses an invite it never issued and changes nothing", async () => {
     const { name, stub, repoId } = await freshRepo();
 
     const response = await agentRequest(name, "/join", { body: VALID_JOIN, headers: JSON_HEADERS });
 
-    expect(response.status).toBe(503);
-    expect(await agentError(response, "join")).toBe("unavailable");
+    expect(response.status).toBe(403);
+    expect(await agentError(response, "join")).toBe("join_refused");
     expect(await logHead(stub, repoId)).toBe(0);
   });
 
@@ -524,7 +577,7 @@ describe("agent HTTP routes", () => {
     expect(new TextEncoder().encode(body).length).toBe(MAX_AGENT_REQUEST_BYTES);
 
     const join = await agentRequest(name, "/join", { body, headers: JSON_HEADERS });
-    expect(await agentError(join, "join")).toBe("unavailable");
+    expect(await agentError(join, "join")).toBe("join_refused");
 
     const work = await agentRequest(name, "/work", {
       headers: { Authorization: `Bearer ${TOKEN}` },
@@ -601,14 +654,16 @@ describe("board RPC lifecycle", () => {
     using api = newWebSocketRpcSession<RailheadApi>(await openSession());
     using board = value(await api.openBoard("acme", name));
 
-    expect(await board.pendingJoins()).toMatchObject({ ok: false, code: "unavailable" });
     using owner = await board.owner();
     expect(await owner.prepare({ kind: "agent.revoke", agentId: "agt_atlas01" })).toMatchObject({
       ok: false,
       code: "unavailable",
     });
     using enrollment = await api.ownerEnrollment();
-    expect(await enrollment.prepare("bootstrap")).toMatchObject({ ok: false, code: "unavailable" });
+    expect(await enrollment.prepare("bootstrap")).toMatchObject({
+      ok: false,
+      code: "bootstrap_closed",
+    });
   });
 
   /** A client that tries methods and argument types the public interface does not declare. */
