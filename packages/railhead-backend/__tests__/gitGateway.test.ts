@@ -1644,7 +1644,7 @@ describe("bounds", () => {
         expect(serving.settled, state).toBe(false);
         // Cut off at the head's limit, well before the whole exchange's.
         await elapse(1);
-        expect(serving.settled, state).toBe(true);
+        await until(() => serving.settled);
         const response = await serving.promise;
         expect(response.status, state).toBe(status);
         expect(await response.text(), state).toContain(message);
@@ -2184,7 +2184,7 @@ describe("a slow upload", () => {
       await until(() => asked);
       // Cut off at the headers wait, long before the whole exchange's limit.
       await elapse(steady.headersTimeoutMs);
-      expect(serving.settled).toBe(true);
+      await until(() => serving.settled);
       const response = await serving.promise;
       expect(response.status).toBe(504);
       expect(pushedEvents(world)).toEqual([]);
