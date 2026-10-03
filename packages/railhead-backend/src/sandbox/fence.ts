@@ -20,6 +20,9 @@
 // keeps every such call tracked until it settles. While one is pending no destroy confirms
 // retirement and `retire` rejects after `RETIRE_SETTLE_MS`, so the repository keeps the slot
 // uncertain; when it settles, success or failure, the fence destroys the container again at once.
+// The SDK joins a destroy that overlaps one already in flight rather than starting another, so the
+// fence runs its destroys one after another and confirms retirement only with a destroy that began
+// after the last command settled.
 // Route, wake-up and destroy calls are never abandoned: the operation that made them awaits them.
 //
 // The grant also ends at retirement: the gateway asks
@@ -121,6 +124,10 @@ export class SandboxFence {
   readonly #inflight = new Set<Promise<unknown>>();
   // Container commands not yet settled, including those whose caller stopped waiting at a timeout.
   readonly #effects = new Set<Promise<unknown>>();
+  // How many container commands have settled; a destroy that saw this change confirms nothing.
+  #settlements = 0;
+  // The last destroy queued; each waits for the one before, so none joins an earlier one.
+  #teardown: Promise<unknown> = Promise.resolve();
 
   constructor(
     storage: Pick<DurableObjectStorage, "kv">,
@@ -203,11 +210,11 @@ export class SandboxFence {
   async retire(): Promise<void> {
     const deadline = this.#read()?.deadline ?? 0;
     const outstanding = [...this.#inflight, ...this.#effects];
-    await this.#destroy(deadline);
-    if (outstanding.length === 0) return;
-    const settled = await this.#quiet(outstanding);
-    await this.#destroy(deadline);
-    if (!settled || this.#effects.size > 0) throw new SandboxFenceError("unsettled");
+    const confirmed = await this.#destroy(deadline);
+    if (outstanding.length === 0 && confirmed) return;
+    const settled = outstanding.length === 0 || (await this.#quiet(outstanding));
+    const confirmedAfter = await this.#destroy(deadline);
+    if (!settled || !confirmedAfter) throw new SandboxFenceError("unsettled");
   }
 
   /**
@@ -258,6 +265,7 @@ export class SandboxFence {
     this.#effects.add(effect);
     const settled = () => {
       this.#effects.delete(effect);
+      this.#settlements += 1;
       if (abandoned) this.#reconcile();
     };
     // Registered before the race below, so the effect is forgotten before its caller resumes.
@@ -278,12 +286,14 @@ export class SandboxFence {
   }
 
   // A command abandoned at its timeout settled. The start or command that ran it retired the
-  // incarnation, but the call may have started the container since: destroy it again now. A failed
-  // destroy stays recorded as retiring, with its retry scheduled, for the next wake-up or release.
+  // incarnation, but the call may have started the container since: destroy it again once any
+  // destroy under way has returned. A release waits for it like any other operation under way. A
+  // failed destroy stays recorded as retiring, with its retry scheduled, for the next wake-up or
+  // release.
   #reconcile(): void {
     const state = this.#read();
     if (state === null || state.phase === "live") return;
-    this.#destroy(state.deadline).catch((error: unknown) => {
+    this.#track(() => this.#destroy(state.deadline)).catch((error: unknown) => {
       console.error(
         "sandbox teardown after a late command failed",
         error instanceof Error ? error.name : "unknown",
@@ -338,12 +348,21 @@ export class SandboxFence {
     throw new SandboxFenceError("retired");
   }
 
-  // One destroy attempt. The incarnation is marked retiring and a retry is scheduled before the
-  // container is touched, so a failure or a restart mid-destroy still leaves a retry behind. A retry
-  // that cannot be scheduled does not stop this attempt; if the attempt fails as well, both
-  // failures are reported and the incarnation stays retiring for the next wake-up or release.
-  async #destroy(deadline: number): Promise<void> {
+  // One destroy attempt, true when it confirmed retirement. The incarnation is marked retiring at
+  // once, and the attempt runs after every earlier one has returned: the SDK would join a destroy
+  // still in flight, which may have stopped the container before a late command started it again.
+  // A retry is scheduled before the container is touched, so a failure or a restart mid-destroy
+  // still leaves a retry behind. A retry that cannot be scheduled does not stop this attempt; if
+  // the attempt fails as well, both failures are reported and the incarnation stays retiring for
+  // the next wake-up or release.
+  #destroy(deadline: number): Promise<boolean> {
     const attempts = this.#retiring(deadline);
+    const turn = this.#teardown.then(() => this.#destroyAfter(deadline, attempts));
+    this.#teardown = turn.catch(noop);
+    return turn;
+  }
+
+  async #destroyAfter(deadline: number, attempts: number): Promise<boolean> {
     let unscheduled: { error: unknown } | null = null;
     if (attempts < MAX_TEARDOWN_ATTEMPTS) {
       try {
@@ -352,6 +371,7 @@ export class SandboxFence {
         unscheduled = { error };
       }
     }
+    const settlements = this.#settlements;
     try {
       await this.#container.destroy();
     } catch (error) {
@@ -365,9 +385,12 @@ export class SandboxFence {
         { cause: error },
       );
     }
-    // A command still in flight may start the container after this destroy: the incarnation stays
-    // retiring until it settles and the destroy that follows confirms.
-    if (this.#effects.size === 0) this.#write({ phase: "retired", deadline });
+    // A command still in flight may start the container after this destroy, and one that settled
+    // during it may have started it after the stop: the incarnation stays retiring until the
+    // destroy that follows the last settlement confirms.
+    if (this.#effects.size > 0 || this.#settlements !== settlements) return false;
+    this.#write({ phase: "retired", deadline });
+    return true;
   }
 
   // Records one more unconfirmed destroy and returns how many there have been in a row.
@@ -414,3 +437,5 @@ export class SandboxFence {
     this.#storage.kv.put(KEY, state);
   }
 }
+
+function noop(): void {}

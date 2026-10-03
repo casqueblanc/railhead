@@ -793,3 +793,113 @@ describe("sandbox command settling after its timeout", () => {
     });
   });
 });
+
+/**
+ * A container whose destroy behaves as the SDK's: one that overlaps a destroy in flight joins it
+ * rather than stopping the container again, and the container stops before that destroy returns.
+ * Every destroy is held until the test returns it; a command started by `make` waits for `resume`.
+ */
+function coalescingContainer(late: "succeeds" | "fails") {
+  const state = {
+    running: false,
+    /** Destroys that reached the container, not counting those that joined one in flight. */
+    stops: 0,
+    /** Returns the destroy in flight. */
+    finishDestroy: noop,
+  };
+  const command = deferred();
+  const stopped = { ...deferred(), count: 0 };
+  let inflight: Promise<void> | null = null;
+  const container: FencedContainer = {
+    route: async () => undefined,
+    wake: async () => undefined,
+    destroy: () => {
+      if (inflight !== null) return inflight;
+      state.stops += 1;
+      state.running = false;
+      const gate = deferred();
+      state.finishDestroy = gate.resolve;
+      inflight = gate.promise.then(() => {
+        inflight = null;
+      });
+      stopped.resolve();
+      return inflight;
+    },
+    exec: async (name) => {
+      if (name !== START_PROBE) await command.promise;
+      state.running = true;
+      if (name !== START_PROBE && late === "fails") throw new Error("aborted output reader");
+      return { exitCode: 0, stdout: "", stderr: "", truncated: false };
+    },
+  };
+  return { state, container, resume: command.resolve, firstStop: stopped.promise };
+}
+
+describe("sandbox teardown racing a late command", () => {
+  for (const late of ["succeeds", "fails"] as const) {
+    it(`destroys again after a late command that ${late} restarted the container during a destroy`, async () => {
+      await withFence(async ({ over, phase }) => {
+        const sdk = coalescingContainer(late);
+        const fence = over(sdk.container);
+        await fence.start(POLICY, DEADLINE);
+        expect(sdk.state.running).toBe(true);
+
+        // The command times out and its fail-closed destroy stops the container, still in flight.
+        const exec = refusal(fence.exec({ command: "make", timeoutMs: 20 }));
+        await sdk.firstStop;
+        expect(sdk.state.stops).toBe(1);
+        expect(sdk.state.running).toBe(false);
+
+        // The abandoned command starts the container again and settles while that destroy runs.
+        sdk.resume();
+        await flush();
+        expect(sdk.state.running).toBe(true);
+
+        // The first destroy returns; it stopped the container before the restart, so it confirms
+        // nothing, and the next destroy reaches the container rather than joining it.
+        sdk.state.finishDestroy();
+        expect(await exec).toBe("timed_out");
+        await flush();
+        expect(phase()).toBe("retiring");
+        expect(sdk.state.stops).toBe(2);
+        expect(sdk.state.running).toBe(false);
+
+        sdk.state.finishDestroy();
+        await flush();
+        expect(phase()).toBe("retired");
+        expect(sdk.state.stops).toBe(2);
+      });
+    });
+  }
+
+  it("confirms a release only after a destroy that followed the late command's restart", async () => {
+    await withFence(async ({ over, phase }) => {
+      const sdk = coalescingContainer("succeeds");
+      const fence = over(sdk.container);
+      await fence.start(POLICY, DEADLINE);
+
+      const exec = refusal(fence.exec({ command: "make", timeoutMs: 20 }));
+      await sdk.firstStop;
+      // The release arrives while the command is pending and the fail-closed destroy is in flight.
+      let released = false;
+      const release = fence.retire().then(() => {
+        released = true;
+      });
+      sdk.resume();
+      await flush();
+      sdk.state.finishDestroy();
+      expect(await exec).toBe("timed_out");
+
+      // Every later destroy reaches the container; none returns until the one before it has.
+      for (let stops = 2; stops <= 4; stops += 1) {
+        await flush();
+        expect(sdk.state.stops).toBe(stops);
+        expect(released).toBe(false);
+        sdk.state.finishDestroy();
+      }
+      await release;
+      expect(sdk.state.running).toBe(false);
+      expect(phase()).toBe("retired");
+    });
+  });
+});
