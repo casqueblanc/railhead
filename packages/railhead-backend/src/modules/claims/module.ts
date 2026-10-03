@@ -11,14 +11,18 @@
 // `ready` pins an exact commit. The commit's existence in the fork is checked first, since that
 // awaits Artifacts; then one transaction checks that the agent still holds the claim at the
 // generation it sent, that the inbox gate is clear and that the decision versions are known, and
-// records the pin with those versions and that the fork's tokens are owed a revocation. Only then
-// are they revoked. Until a revocation reports `revoked`, `ready` answers `busy`, the Repo's alarm
-// retries it and `pin` refuses with `busy`, since a partial token listing may hide a live token. A
-// repeat of the same pin passes the same gate and returns it, revoking again while the revocation
-// is owed, so a lost response is answered by retrying. `pin`, the train's read, answers only while
-// those versions are still the current ones and the inbox gate is still clear. From the pin on,
-// `authorizeGit` refuses every push to the fork; a push already granted may still move the fork's
-// branch, but never the pin, which names a commit rather than a ref.
+// records the pin with those versions and that the fork's tokens are owed a revocation, and queues
+// it on the train as that transaction's last write, so the pin reaches the train exactly once. Only
+// then are the tokens revoked. Until a revocation reports `revoked`, `ready` answers `busy`, the
+// Repo's alarm retries it and `pin` refuses with `busy`, since a partial token listing may hide a
+// live token. A repeat of the same pin passes the same gate and returns it, revoking again while
+// the revocation is owed, so a lost response is answered by retrying; if the train holds no entry
+// for the pin, the repeat queues it in that transaction. `pin`, the train's read, answers only
+// while those versions are still the current ones and the inbox gate is still clear. From the pin
+// on, `authorizeGit` refuses every push to the fork; a push already granted may still move the
+// fork's branch, but never the pin, which names a commit rather than a ref. Each pin and each
+// reopening raises the claim's episode, and a push is fenced to the episode it was granted in, so a
+// push granted before ready is never recorded after a reopening.
 //
 // A decision version recorded after ready supersedes the pin: the train must not take it, and the
 // holder must adapt. The first claims call that reads such a claim, whether a `ready`, the holder's
@@ -92,7 +96,8 @@ import { ARTIFACTS_LIMITS, forkRepoName, mainRepoName, mintCutoff } from "../../
 import type { MintCutoff, TokenRevocation } from "../../contracts/artifacts";
 import type { ClaimPin, ClaimsPort, GitAccess, GitGrant } from "../../contracts/claims";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
-import { fail, ok, type PortFailure, type PortResult } from "../../contracts/result";
+import { fail, ok, unavailable, type PortFailure, type PortResult } from "../../contracts/result";
+import { UnavailableError } from "../../contracts/unavailable";
 import type { RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { EventLogError, type EventTransaction } from "../../repo/eventLog";
 import {
@@ -538,6 +543,20 @@ export function createClaims(
       : fail("busy", "The fork's tokens are not yet revoked; repeat the request.");
   };
 
+  /**
+   * Runs `body` in a transaction. A `RolledBack` it throws, or a missing module's
+   * `UnavailableError`, undoes its writes and is answered as a failure.
+   */
+  const rollingBack = <T>(body: (tx: EventTransaction) => PortResult<T>): PortResult<T> => {
+    try {
+      return log.transaction(body).value;
+    } catch (error) {
+      if (error instanceof RolledBack) return error.failure;
+      if (error instanceof UnavailableError) return unavailable(error.port);
+      throw error;
+    }
+  };
+
   const current = (row: ClaimRow): ClaimRow | null => {
     const now = activeClaimOf(context.storage.sql, row.agentId);
     return now?.claimId === row.claimId ? now : null;
@@ -685,6 +704,11 @@ export function createClaims(
       return row !== null && heldWorking(row, clock()) ? row.generation : null;
     },
 
+    workingEpisode(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      return row !== null && heldWorking(row, clock()) ? row.episode : null;
+    },
+
     async ready(agent, claimId, request) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
@@ -705,7 +729,7 @@ export function createClaims(
       // Ownership, the inbox gate and the decision versions are read in the transaction that
       // records the pin, so a decision recorded or a takeover made during the commit lookup is
       // seen here and nothing else can run between these reads and the write.
-      const decided = log.transaction((tx): PortResult<ReadyResult> => {
+      const decided = rollingBack((tx): PortResult<ReadyResult> => {
         const held = standing(claimById(tx.sql, claimId), agent, request);
         if (held.kind === "refused") return refuse(tx, held);
         const leased = hold(tx, held.row);
@@ -723,9 +747,19 @@ export function createClaims(
         }
         // `settle` left this claim ready, so its pin is under the current versions.
         if (row.state === "ready") {
-          return row.readyCommit === commit
-            ? ok({ claim: view(row), repeated: true })
-            : refuse(tx, { kind: "refused", reason: "after_ready", row });
+          if (row.readyCommit !== commit) {
+            return refuse(tx, { kind: "refused", reason: "after_ready", row });
+          }
+          // A pin the train no longer holds, because it never reached the train or its entry was
+          // dropped, is queued now, under the same gate and versions. A train that cannot say
+          // whether it holds the pin refuses the repeat, so the agent retries.
+          const entered = ports().train.holdsLiveEntry(claimId, generation);
+          if (entered === null) return unavailable("train");
+          if (!entered) {
+            const queued = ports().train.queue(tx, { claimId, generation, commit }, row.episode);
+            if (!queued.ok) throw new RolledBack(queued);
+          }
+          return ok({ claim: view(row), repeated: true });
         }
         if (!pinReady(tx.sql, claimId, generation, commit, decisions, clock())) {
           throw new Error("a working claim read in this transaction could not be pinned");
@@ -738,16 +772,25 @@ export function createClaims(
         wakeForDeadline(tx.sql);
         const pinned = claimById(tx.sql, claimId);
         if (pinned === null) throw new Error("a pinned claim cannot be read back");
+        // Last, since it asks for the train's wake. A refusal rolls the pin back.
+        const queued = ports().train.queue(tx, { claimId, generation, commit }, pinned.episode);
+        if (!queued.ok) throw new RolledBack(queued);
         return ok({ claim: view(pinned), repeated: false });
-      }).value;
+      });
       if (!decided.ok) return decided;
 
       // The fork is read only from the pin on, since `authorizeGit` refuses every later push;
       // revoking its tokens ends a write already granted. Nothing awaits since the transaction, so
       // this read sees the pin it recorded. A repeat while the revocation is owed revokes again.
       const pinned = claimById(context.storage.sql, claimId);
-      if (pinned === null || pinned.revokeDue === null) return decided;
-      const revoked = await revoke(claimId, owedBy(pinned));
+      const revoked =
+        pinned === null || pinned.revokeDue === null ? null : await revoke(claimId, owedBy(pinned));
+      // The pin is committed, so the wake is asked for whatever the revocation answered. Its alarm
+      // write in the transaction may have failed, and a ready answered with success must leave a
+      // drive scheduled, so a failed write refuses it. A repeat, finding the entry live, asks again.
+      const armed = await ports().train.armWake();
+      if (!armed) return unavailable("train");
+      if (revoked === null) return decided;
       if (revoked.kind === "swept" && !revoked.result.ok) return revoked.result;
       // A decision, a reopen or another `ready` may have run during the sweep, so the answer comes
       // from the stored claim, not from `decided`.
@@ -783,6 +826,18 @@ export function createClaims(
       }
       const pin: ClaimPin = { claimId, generation: row.generation, commit: row.readyCommit };
       return ok(pin);
+    },
+
+    readyPin(claimId) {
+      const row = claimById(context.storage.sql, claimId);
+      if (row?.state !== "ready" || row.readyCommit === null || row.readyDecisions === null) {
+        return null;
+      }
+      return {
+        pin: { claimId, generation: row.generation, commit: row.readyCommit },
+        episode: row.episode,
+        decisions: row.readyDecisions,
+      };
     },
 
     async authorizeGit(access) {
@@ -883,6 +938,17 @@ type Sweep =
   | { kind: "stale" }
   /** Artifacts was called; its answer is recorded. */
   | { kind: "swept"; result: PortResult<TokenRevocation> };
+
+/** Thrown inside a transaction to roll it back and answer with `failure`. */
+class RolledBack extends Error {
+  readonly failure: PortFailure;
+
+  constructor(failure: PortFailure) {
+    super("the transaction was refused");
+    this.name = "RolledBack";
+    this.failure = failure;
+  }
+}
 
 /** Who records a refusal: the claims module, never the agent it refuses. */
 const CLAIMS_ACTOR: Actor = { kind: "system", id: "sys_claims" };
@@ -1034,7 +1100,7 @@ function pushGrant(row: ClaimRow, principal: AgentPrincipal, repo: string): Port
       return ok({
         repo,
         scope: "write",
-        fence: { claimId: row.claimId, generation: row.generation },
+        fence: { claimId: row.claimId, generation: row.generation, episode: row.episode },
       });
     case "ready":
       return fail("after_ready", "The claim is ready, so its fork takes no more pushes.");
@@ -1048,7 +1114,7 @@ function pushGrant(row: ClaimRow, principal: AgentPrincipal, repo: string): Port
 }
 
 /** True when both lists name the same version of the same decisions, in any order. */
-function sameVersions(left: readonly DecisionRef[], right: readonly DecisionRef[]): boolean {
+export function sameVersions(left: readonly DecisionRef[], right: readonly DecisionRef[]): boolean {
   if (left.length !== right.length) return false;
   const versions = new Map(left.map((ref) => [ref.decisionId, ref.version]));
   return (

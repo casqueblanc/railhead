@@ -66,9 +66,10 @@ export interface RepoContext {
    * `resume` when it fires, so a module records what it owes in its own tables and asks again from
    * `resume` when its time has not come. The alarm write is issued at once, so a wake asked for
    * inside a transaction commits with that transaction's rows; ask for it as the transaction's last
-   * write.
+   * write. It resolves `true` once storage holds an alarm no later than `at`, or `false` if the
+   * write failed. It never rejects, so a caller that needs no confirmation may ignore it.
    */
-  readonly wake: (at: number) => void;
+  readonly wake: (at: number) => Promise<boolean>;
 }
 
 /** Every module's port, as other modules and the adapters see them. Main's ref is not here. */

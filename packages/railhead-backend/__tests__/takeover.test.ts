@@ -143,7 +143,7 @@ function withTakeover<T>(
       env,
       wake: (at: number) => {
         wakes.push(at);
-        void alarm.request(at);
+        return alarm.request(at);
       },
     };
     const base = composeRepo(context);
@@ -632,8 +632,9 @@ describe("leases", () => {
           log: setup.log,
           clock: setup.fake.clock,
           env,
-          wake: (at) => {
+          wake: async (at) => {
             restartWakes.push(at);
+            return true;
           },
         },
         () => {

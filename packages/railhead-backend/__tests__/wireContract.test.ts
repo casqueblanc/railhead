@@ -495,7 +495,6 @@ describe("unavailable ports", () => {
           createdAt: 1,
         }),
     ],
-    ["train.enqueue", () => unavailableTrain.enqueue(pin)],
     [
       "train.recordCheck",
       () =>

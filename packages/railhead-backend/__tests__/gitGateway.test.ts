@@ -124,7 +124,8 @@ interface World {
   fake: FakeArtifacts;
   /** The Artifacts port the gateway calls. */
   artifacts: ArtifactsPort;
-  claim: { agentId: string; generation: number; state: ClaimState };
+  /** `episode` is the claim's working episode, which a pin and a reopening each raise. */
+  claim: { agentId: string; generation: number; episode: number; state: ClaimState };
   authorizations: GitAccess[];
   /** Whether the claims module answers every decision as unavailable. */
   claimsDown: boolean;
@@ -166,7 +167,13 @@ interface World {
   /** Builds a new gateway over the same storage, as a restarted Repo would. */
   restart: () => void;
   /** The pushes waiting for their record, as stored. */
-  pending: () => { claim_id: string; generation: number; attempts: number; due_at: number }[];
+  pending: () => {
+    claim_id: string;
+    generation: number;
+    episode: number;
+    attempts: number;
+    due_at: number;
+  }[];
   /** Runs one statement on the gateway's storage. */
   exec: (query: string, ...bindings: SqlStorageValue[]) => void;
   /** The cutoff of a revocation beginning now, as the claims module captures it. */
@@ -200,7 +207,11 @@ function claimsFor(world: World): ClaimsPort {
           return ok({
             repo: world.forkName,
             scope: "write",
-            fence: { claimId: CLAIM, generation: world.claim.generation },
+            fence: {
+              claimId: CLAIM,
+              generation: world.claim.generation,
+              episode: world.claim.episode,
+            },
           });
         case "ready":
           return fail("after_ready", "The claim is ready, so its fork takes no more pushes.");
@@ -217,6 +228,9 @@ function claimsFor(world: World): ClaimsPort {
         throw fault.error;
       }
       return claimId === CLAIM && world.claim.state === "working" ? world.claim.generation : null;
+    },
+    workingEpisode(claimId) {
+      return claimId === CLAIM && world.claim.state === "working" ? world.claim.episode : null;
     },
   };
 }
@@ -263,7 +277,7 @@ function withGateway(
       artifacts,
       mainName,
       forkName,
-      claim: { agentId: AGENT.agentId, generation: 3, state: "working" },
+      claim: { agentId: AGENT.agentId, generation: 3, episode: 1, state: "working" },
       authorizations: [],
       claimsDown: false,
       authorize: null,
@@ -304,8 +318,14 @@ function withGateway(
       },
       pending: () =>
         state.storage.sql
-          .exec<{ claim_id: string; generation: number; attempts: number; due_at: number }>(
-            "SELECT claim_id, generation, attempts, due_at FROM git_pending_push ORDER BY id",
+          .exec<{
+            claim_id: string;
+            generation: number;
+            episode: number;
+            attempts: number;
+            due_at: number;
+          }>(
+            "SELECT claim_id, generation, episode, attempts, due_at FROM git_pending_push ORDER BY id",
           )
           .toArray(),
       exec: (query, ...bindings) => {
@@ -846,13 +866,13 @@ describe("authority", () => {
         "fenced read grant for a fetch",
         () => rpc("git-upload-pack", SHALLOW_FETCH_REQUEST),
         "/git-upload-pack",
-        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3 } },
+        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3, episode: 1 } },
       ],
       [
         "read grant for a push",
         () => advertise("git-receive-pack"),
         "/info/refs",
-        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3 } },
+        { repo: "", scope: "read", fence: { claimId: CLAIM, generation: 3, episode: 1 } },
       ],
       [
         "unfenced write grant for a push",
@@ -864,7 +884,7 @@ describe("authority", () => {
         "push fenced to another claim",
         () => rpc("git-receive-pack", PUSH_REQUEST),
         "/git-receive-pack",
-        { repo: "", scope: "write", fence: { claimId: otherClaim, generation: 3 } },
+        { repo: "", scope: "write", fence: { claimId: otherClaim, generation: 3, episode: 1 } },
       ],
     ];
     for (const [label, request, path, grant] of cases) {
@@ -1229,6 +1249,14 @@ async function until(condition: () => boolean): Promise<void> {
   throw new Error("the condition never held");
 }
 
+/** The claim goes ready, a decision supersedes its pin, and it reopens at the same generation. */
+function readyThenReopened(world: World): void {
+  world.claim.state = "ready";
+  world.claim.episode += 1;
+  world.claim.state = "working";
+  world.claim.episode += 1;
+}
+
 describe("a push decided again after it was admitted", () => {
   it("mints nothing and sends nothing when the claim closes while the head is held back", async () => {
     const changes: [string, (world: World) => void, string][] = [
@@ -1373,6 +1401,7 @@ describe("a push decided again after it was admitted", () => {
           world.claim.state = "ready";
         },
       ],
+      ["ready, then reopened at the same generation", readyThenReopened],
     ];
     for (const [label, change] of changes) {
       await withGateway(async (world) => {
@@ -1421,6 +1450,7 @@ describe("a push decided again after it was admitted", () => {
           world.claim.state = "ready";
         },
       ],
+      ["ready, then reopened at the same generation", readyThenReopened],
       [
         "reclaimed at a new generation",
         (world) => {
@@ -2487,6 +2517,21 @@ describe("a push left pending", () => {
     await withGateway(async (world) => {
       await pushWithFailedRecord(world);
       world.claim = { ...world.claim, generation: 4 };
+      world.respond = () => advertisement([[PUSHED, "refs/heads/feature"]]);
+      world.skew = FAST.maxDurationMs;
+      await world.gateway.resume();
+      expect(world.events()).toEqual([]);
+      expect(world.pending()).toEqual([]);
+      expect(forkReads(world)).toEqual([]);
+      expect(logged).toEqual([unrecorded("record_failed"), unrecorded("claim_changed")]);
+    });
+  });
+
+  it("is dropped by the alarm when its claim was reopened after ready at the same generation", async () => {
+    await withGateway(async (world) => {
+      await pushWithFailedRecord(world);
+      expect(world.pending()).toMatchObject([{ generation: 3, episode: 1 }]);
+      readyThenReopened(world);
       world.respond = () => advertisement([[PUSHED, "refs/heads/feature"]]);
       world.skew = FAST.maxDurationMs;
       await world.gateway.resume();

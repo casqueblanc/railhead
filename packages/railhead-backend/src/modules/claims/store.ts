@@ -12,6 +12,10 @@
 // read of the pin can compare them with the current versions. A claim also keeps the last refusal
 // it recorded, so a repeated refusal is not recorded again.
 //
+// `episode` counts the claim's moves between working and ready: pinning and reopening each raise
+// it, and nothing lowers it. A push is fenced to the episode it was granted in as well as the
+// generation, so a push begun before ready cannot be recorded after the claim was reopened.
+//
 // An allocating or working claim holds a lease until `lease_until`. A working claim whose lease
 // lapsed expires; the expiry owes a revocation of its fork's tokens, due at `revoke_due`, and the
 // claim is reassigned only once that revocation is settled and `revoke_due` is cleared. A pin owes
@@ -70,6 +74,7 @@ const MIGRATIONS: readonly string[] = [
     WHERE state IN ('allocating', 'working', 'ready')`,
   "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
   "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
+  "ALTER TABLE claims_claims ADD COLUMN episode INTEGER NOT NULL DEFAULT 1 CHECK (episode > 0)",
   "ALTER TABLE claims_claims ADD COLUMN lease_until INTEGER",
   "ALTER TABLE claims_claims ADD COLUMN revoke_due INTEGER",
   `CREATE INDEX claims_by_lease ON claims_claims (lease_until)
@@ -100,6 +105,8 @@ export interface ClaimRow {
   agentId: AgentId;
   ownerId: UserId;
   generation: number;
+  /** Raised each time the claim is pinned or reopened. */
+  episode: number;
   state: StoredState;
   /** The main commit requested for the fork, written once before the fork call. */
   forkBase: CommitSha | null;
@@ -132,6 +139,7 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   agent_id: string;
   owner_id: string;
   generation: number;
+  episode: number;
   state: string;
   fork_base: string | null;
   base: string | null;
@@ -143,9 +151,9 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   body: string;
 }
 
-const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.state,
-    c.fork_base, c.base, c.ready_commit, c.ready_decisions, c.lease_until, c.revoke_due, i.title,
-    i.body
+const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.episode,
+    c.state, c.fork_base, c.base, c.ready_commit, c.ready_decisions, c.lease_until, c.revoke_due,
+    i.title, i.body
   FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id`;
 
 /** Creates or migrates the claims tables. */
@@ -615,9 +623,9 @@ export function openClaim(
 
 /**
  * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
- * makes the claim ready, records that its fork's tokens are owed a revocation due at `now`, and
- * forgets its last refusal. Returns `false`, and writes nothing, when the claim is no longer working
- * at that generation.
+ * makes the claim ready, raises its episode, records that its fork's tokens are owed a revocation
+ * due at `now`, and forgets its last refusal. Returns `false`, and writes nothing, when the claim
+ * is no longer working at that generation.
  */
 export function pinReady(
   sql: SqlStorage,
@@ -630,7 +638,8 @@ export function pinReady(
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
-         last_refusal = NULL, revoke_due = ?, revoke_attempt = revoke_attempt + 1
+         episode = episode + 1, last_refusal = NULL, revoke_due = ?,
+         revoke_attempt = revoke_attempt + 1
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,
@@ -645,8 +654,9 @@ export function pinReady(
 
 /**
  * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
- * and the revocation the pin owed, since its holder may push again, and forgets its last refusal.
- * A sweep the pin started keeps its barrier, so the holder pushes only once that sweep has ended.
+ * and the revocation the pin owed, since its holder may push again, raises its episode and forgets
+ * its last refusal. A sweep the pin started keeps its barrier, so the holder pushes only once that
+ * sweep has ended.
  * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
  */
 export function reopenReady(
@@ -658,7 +668,7 @@ export function reopenReady(
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         last_refusal = NULL, lease_until = ?, revoke_due = NULL
+         episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
       leaseUntil,
@@ -726,6 +736,7 @@ function claimRow(raw: RawClaim): ClaimRow {
     agentId: raw.agent_id,
     ownerId: raw.owner_id,
     generation: raw.generation,
+    episode: raw.episode,
     state: storedState(raw.state),
     forkBase: raw.fork_base,
     base: raw.base,

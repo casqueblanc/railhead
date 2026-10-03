@@ -79,7 +79,7 @@ function inRepo<T>(
       log,
       clock: fake.clock,
       env,
-      wake: () => {},
+      wake: async () => true,
     };
     const artifacts = createArtifactsAdapter({ ...context, namespace: fake }, FAST);
     const base = composeRepo(context);
@@ -372,8 +372,8 @@ describe("currentGeneration", () => {
   });
 });
 
-describe("workingGeneration", () => {
-  it("reports a working claim's generation, and unknown for an allocating or missing one", async () => {
+describe("workingGeneration and workingEpisode", () => {
+  it("report a working claim's generation and episode, and unknown for an allocating or missing one", async () => {
     await withClaims(async ({ port, sql }, { fake }) => {
       await fileIssues(port, 2);
       const held = claimed(await port.work(agent(1)));
@@ -388,10 +388,14 @@ describe("workingGeneration", () => {
       expect(port.workingGeneration(intent ?? "")).toBeNull();
       expect(port.workingGeneration("clm_nosuchclaim")).toBeNull();
       expect(port.workingGeneration("")).toBeNull();
+      expect(port.workingEpisode(held.claim.claimId)).toBe(1);
+      expect(port.workingEpisode(intent ?? "")).toBeNull();
+      expect(port.workingEpisode("clm_nosuchclaim")).toBeNull();
+      expect(port.workingEpisode("")).toBeNull();
     });
   });
 
-  it("reads as unknown once a claim is ready, merged or expired, and follows a new generation", async () => {
+  it("read as unknown once a claim is ready, merged or expired, and follow a new generation", async () => {
     await withClaims(async ({ port, sql }) => {
       await fileIssues(port, 1);
       const held = claimed(await port.work(agent(1)));
@@ -402,12 +406,14 @@ describe("workingGeneration", () => {
           held.claim.claimId,
         );
         expect(port.workingGeneration(held.claim.claimId), state).toBeNull();
+        expect(port.workingEpisode(held.claim.claimId), state).toBeNull();
       }
       sql.exec(
         "UPDATE claims_claims SET state = 'working', generation = 2 WHERE claim_id = ?",
         held.claim.claimId,
       );
       expect(port.workingGeneration(held.claim.claimId)).toBe(2);
+      expect(port.workingEpisode(held.claim.claimId)).toBe(1);
     });
   });
 });
@@ -517,7 +523,7 @@ describe("allocation failures", () => {
         log,
         clock: () => 1,
         env,
-        wake: () => {},
+        wake: async () => true,
       };
       const base = composeRepo(context);
       const port = claimsEntry(context, () => base);
