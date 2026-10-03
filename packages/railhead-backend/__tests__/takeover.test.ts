@@ -661,6 +661,56 @@ describe("takeover", () => {
     });
   });
 
+  it("keeps an expired claim with a pending revocation ahead of a newer open issue", async () => {
+    await withTakeover(async (setup) => {
+      const { claim, fork } = await setup.open();
+      const newer = await setup.file("Add downloads");
+      setup.revocation = "pending_debt";
+      setup.fake.advance(CLAIM_LEASE_MS);
+
+      // While the release is pending, another agent is told to wait rather than handed the newer issue.
+      expectFailure(await setup.port.work(agent(2)), "busy");
+      expectFailure(await setup.port.work(agent(3)), "busy");
+      const claimed = setup.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM claims_claims WHERE issue_id = ?", newer)
+        .toArray()[0];
+      expect(claimed?.n).toBe(0);
+      expect(setup.revoked).toEqual([fork]);
+
+      // Once a sweep settles, the expired claim goes first and the newer issue to the next agent.
+      setup.revocation = "revoked";
+      await fireAlarm(setup);
+      expect(await setup.port.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2 } },
+      });
+      expect(await setup.port.work(agent(3))).toMatchObject({
+        ok: true,
+        value: { claim: { issueId: newer, generation: 1 } },
+      });
+    });
+  });
+
+  it("lets the former holder take a newer issue while its own expired claim is released", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+      const newer = await setup.file("Add downloads");
+      setup.revocation = "pending_debt";
+      setup.fake.advance(CLAIM_LEASE_MS);
+
+      // Its own expired claim is never offered back, so it does not wait on it.
+      expect(await setup.port.work(agent(1))).toMatchObject({
+        ok: true,
+        value: { claim: { issueId: newer, generation: 1 } },
+      });
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({
+        agent_id: "agt_agent0001",
+        state: "expired",
+      });
+      expectFailure(await setup.port.work(agent(2)), "busy");
+    });
+  });
+
   it("passes a lapsed allocation to the successor, which finishes the same fork intent", async () => {
     await withTakeover(async (setup) => {
       await setup.file("Add uploads");

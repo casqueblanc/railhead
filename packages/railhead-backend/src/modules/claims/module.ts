@@ -45,6 +45,8 @@
 // the former holder had in flight can still move the fork's branch, but the successor's pin names
 // its own commit. An allocation whose holder's lease lapsed before the fork opened passes to the
 // successor at the next generation with no event, and the successor finishes the same fork intent.
+// While an expired claim's revocation is pending, `work` answers `busy` to every agent but its
+// former holder rather than hand out a newer issue, so the claim stays first in line.
 //
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
@@ -361,11 +363,12 @@ export function createClaims(
         if (held !== null && held.state !== "expired") return ok({ row: held, resumed: true });
         const takeover = nextTakeover(sql, agent.agentId, clock());
         if (takeover !== null) return takeOver(tx, agent, takeover);
-        const issueId = nextOpenIssue(sql);
-        if (issueId !== null) return intend(sql, agent, issueId);
+        // An expired claim still being released stays ahead of every new issue.
         if (releasePending(sql, agent.agentId)) {
           return fail("busy", "An expired claim is still being released; repeat the request.");
         }
+        const issueId = nextOpenIssue(sql);
+        if (issueId !== null) return intend(sql, agent, issueId);
         return fail("no_work", "No issue is ready to claim.");
       }).value;
       return finish(chosen);
