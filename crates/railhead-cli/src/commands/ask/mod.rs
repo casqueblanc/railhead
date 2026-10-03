@@ -201,13 +201,14 @@ fn ask(
         Err(http::Error::Rejected {
             route,
             status,
-            error,
+            mut error,
         }) => {
             if error.retryable {
-                out.notice(&format!(
-                    "to retry this question without asking it twice, repeat the same rh ask with --request-id {request_id}"
-                ))
-                .map_err(Error::Output)?;
+                error.message = format!(
+                    "{} (to retry this question without asking it twice, repeat the same rh ask with --request-id {request_id})",
+                    error.message
+                );
+                error.next = Some(NextCommand::Ask);
             }
             return Err(http::Error::Rejected {
                 route,

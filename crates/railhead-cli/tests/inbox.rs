@@ -1076,10 +1076,23 @@ async fn an_ask_whose_answer_is_lost_names_the_key_to_reconcile_it() -> anyhow::
     // connection is reported as unreachable, as every other command reports it.
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let origin = format!("http://{}", listener.local_addr()?);
+    // Accept until a deadline, so a run that never connects fails its assertions, not the job.
+    listener.set_nonblocking(true)?;
     let closer = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0_u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut buffer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buffer = [0_u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut buffer);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
         }
     });
     let world = world_at(MockServer::start().await, &origin)?;
@@ -1150,13 +1163,12 @@ async fn an_ask_answered_badly_or_refused_for_now_still_names_its_key() -> anyho
         assert_eq!(run.code, Some(1), "{}", run.stdout);
         assert_eq!(run.at("/error/code")?, json!(code));
         assert_eq!(run.at("/error/retryable")?, json!(true));
+        assert_eq!(run.at("/error/next")?, json!("rh ask"));
         let named = format!("--request-id {key}");
         let message = run.at("/error/message")?;
         assert!(
-            message.as_str().is_some_and(|text| text.contains(&named))
-                || run.stderr.contains(&named),
-            "{key} not named: {message} / {}",
-            run.stderr
+            message.as_str().is_some_and(|text| text.contains(&named)),
+            "{key} not named in the error: {message}"
         );
     }
     assert!(!runs.iter().any(|run| run.stdout.contains("oops")));
