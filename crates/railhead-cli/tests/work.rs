@@ -156,9 +156,21 @@ impl Run {
 }
 
 fn rh(world: &World, dir: &Path, agent: Option<&str>, args: &[&str]) -> anyhow::Result<Run> {
+    rh_with(world, dir, agent, &[], args)
+}
+
+/// `rh` with extra environment variables.
+fn rh_with(
+    world: &World,
+    dir: &Path,
+    agent: Option<&str>,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> anyhow::Result<Run> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rh"));
     command
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(dir)
         .env("RAILHEAD_HOME", world.home.path())
         .env_remove("RAILHEAD_AGENT")
@@ -521,6 +533,132 @@ async fn a_failed_clone_leaves_nothing_and_the_next_run_recovers() -> anyhow::Re
         world.fork_head
     );
     assert_eq!(requests(&world).await, 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    // The fork's upload pack, which Git starts for the fetch, records its process and never
+    // answers. It ignores SIGTERM, so only killing its process group ends it.
+    let pid_file = world.work.path().join("upload-pack.pid");
+    let hang = world.work.path().join("hang.sh");
+    fs::write(
+        &hang,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    )?;
+    fs::set_permissions(&hang, fs::Permissions::from_mode(0o755))?;
+    point_fork_at(&world, &world.fork)?;
+    let pointed = fs::read_to_string(&world.git_config)?;
+    fs::write(
+        &world.git_config,
+        format!(
+            "{pointed}[remote \"origin\"]\n\tuploadpack = {}\n",
+            hang.display()
+        ),
+    )?;
+    // The empty target and a directory beside it are both kept as they were.
+    fs::create_dir(world.clone_dir())?;
+    let beside = world.outside().join("demo-clm_old001");
+    fs::create_dir(&beside)?;
+    fs::write(beside.join("notes.txt"), "draft\n")?;
+
+    let started = Instant::now();
+    let stopped = rh_with(
+        &world,
+        &world.outside(),
+        Some("atlas"),
+        &[("RAILHEAD_GIT_TIMEOUT", "2")],
+        &["--json", "work"],
+    )?;
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(stopped.code, Some(1), "{}", stopped.stdout);
+    let envelope = stopped.json()?;
+    assert_eq!(envelope.pointer("/error/code"), Some(&json!("git")));
+    assert_eq!(envelope.pointer("/error/retryable"), Some(&json!(true)));
+    let message = envelope
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.starts_with(
+            "fetching the claim's fork: git was still running after 2 seconds and was stopped"
+        ) && message.contains("running the command again resumes the claim"),
+        "{message}"
+    );
+    let pid: i32 = fs::read_to_string(&pid_file)?.trim().parse()?;
+    let gone = Instant::now() + Duration::from_secs(5);
+    while Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()?
+        .success()
+    {
+        assert!(Instant::now() < gone, "the upload pack {pid} still runs");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fs::read_dir(world.clone_dir())?.count(), 0);
+    assert_eq!(fs::read_to_string(beside.join("notes.txt"))?, "draft\n");
+    let partial: Vec<_> = fs::read_dir(world.work.path())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("rh-partial"))
+        .collect();
+    assert!(partial.is_empty(), "{partial:?}");
+
+    // The same claim, rerun with a Git that answers, resumes into the kept target.
+    point_fork_at(&world, &world.fork)?;
+    let recovered = rh(&world, &world.outside(), Some("atlas"), &["--json", "work"])?;
+    assert_eq!(recovered.code, Some(0), "{}", recovered.stdout);
+    assert_eq!(
+        recovered.json()?.pointer("/data/clone/state"),
+        Some(&json!("created"))
+    );
+    assert_eq!(
+        git_in(&world, &world.clone_dir(), &["rev-parse", "HEAD"])?,
+        world.fork_head
+    );
+    assert_eq!(requests(&world).await, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_git_timeout_is_refused() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    point_fork_at(&world, &world.fork)?;
+    for value in ["0", "3601", "ten", "-5"] {
+        let refused = rh_with(
+            &world,
+            &world.outside(),
+            Some("atlas"),
+            &[("RAILHEAD_GIT_TIMEOUT", value)],
+            &["--json", "work"],
+        )?;
+        assert_eq!(refused.error_code()?, json!("invalid_input"), "{value}");
+        assert!(!world.clone_dir().exists(), "{value}");
+    }
+    assert_eq!(requests(&world).await, 0);
     Ok(())
 }
 

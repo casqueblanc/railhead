@@ -74,8 +74,10 @@ impl Target {
     ///
     /// # Errors
     ///
-    /// [`LocalCode::WorkspaceConflict`] when the directory holds something else.
+    /// [`LocalCode::WorkspaceConflict`] when the directory holds something else,
+    /// [`LocalCode::InvalidInput`] when the Git deadline setting is invalid.
     pub fn new(agent: &Agent<'_>, dir: Option<&Path>) -> Result<Self> {
+        workspace::check_git_timeout()?;
         let cwd = std::env::current_dir().map_err(Error::WorkingDirectory)?;
         let dir = dir.map(|dir| cwd.join(dir));
         if let Some(dir) = &dir {

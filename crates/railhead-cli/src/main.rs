@@ -9,6 +9,7 @@ mod context;
 mod http;
 mod identity;
 mod output;
+mod subprocess;
 
 mod commands {
     pub mod ack;

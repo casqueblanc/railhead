@@ -5,6 +5,10 @@
 //! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. An existing clone of the same claim and agent is reused:
 //! its Railhead settings are refreshed and its working tree, index and refs are never touched.
 //!
+//! Every Git process has an overall deadline, [`DEFAULT_GIT_TIMEOUT`] unless
+//! [`GIT_TIMEOUT_ENV`] names another; one still running then is stopped with everything it started,
+//! and the command fails as retryable with the clone as it was before, or no new clone at all.
+//!
 //! Every remote is checked against the agent's own origin and repository before Git sees it, so
 //! a backend answer cannot point a clone, or the credential helper, at another host.
 
@@ -13,16 +17,27 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use railhead_protocol::{ClaimView, IdKind, NextCommand, SafeInteger, is_commit_sha, is_id};
 
 use crate::context::{CloneBinding, GIT_IDENTITY_CONFIG_KEY};
 use crate::identity::Identity;
 use crate::output::LocalCode;
+use crate::subprocess::{self, RunError};
 use crate::{Error, Result};
 
 /// The Git setting that records the ownership generation the clone's agent last saw.
 pub const GIT_GENERATION_CONFIG_KEY: &str = "railhead.generation";
+
+/// The environment variable that sets how many seconds one Git process may run.
+pub const GIT_TIMEOUT_ENV: &str = "RAILHEAD_GIT_TIMEOUT";
+
+/// How long one Git process may run when [`GIT_TIMEOUT_ENV`] is unset.
+pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The longest deadline [`GIT_TIMEOUT_ENV`] may set.
+const MAX_GIT_TIMEOUT_SECS: u64 = 3600;
 
 /// The branch a claim's fork carries; forks are made from the default branch only.
 const BRANCH: &str = "main";
@@ -177,13 +192,13 @@ pub fn open(
 ///
 /// # Errors
 ///
-/// [`LocalCode::InvalidClone`] when it is missing or not a positive integer.
+/// [`LocalCode::InvalidClone`] when it is missing or not a positive integer, [`LocalCode::Git`]
+/// when Git outlived its deadline.
 pub fn generation(dir: &Path) -> Result<SafeInteger> {
-    let value = git(
+    let value = unless_timed_out(git(
         dir,
         &["config", "--local", "--get", GIT_GENERATION_CONFIG_KEY],
-    )
-    .ok();
+    ))?;
     value
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&value| value > 0)
@@ -202,19 +217,21 @@ pub fn generation(dir: &Path) -> Result<SafeInteger> {
 ///
 /// # Errors
 ///
-/// [`LocalCode::Git`] when the clone has no commit.
+/// [`LocalCode::Git`] when the clone has no commit or Git outlived its deadline.
 pub fn head(dir: &Path) -> Result<String> {
-    git(dir, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-        .ok()
-        .filter(|sha| is_commit_sha(sha))
-        .ok_or_else(|| {
-            local(
-                LocalCode::Git,
-                "this clone has no commit at HEAD to pin".to_owned(),
-                false,
-                None,
-            )
-        })
+    unless_timed_out(git(
+        dir,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    ))?
+    .filter(|sha| is_commit_sha(sha))
+    .ok_or_else(|| {
+        local(
+            LocalCode::Git,
+            "this clone has no commit at HEAD to pin".to_owned(),
+            false,
+            None,
+        )
+    })
 }
 
 enum Occupant {
@@ -304,30 +321,52 @@ fn stage(parent: &Path, name: &OsStr) -> Result<PathBuf> {
     ))
 }
 
+/// Builds the clone in `staging`. A failed fetch and a Git step stopped at its deadline are
+/// retryable: `create` removes the staging directory, and the next run starts again.
 fn build(staging: &Path, identity: &Identity, claim: &ClaimView, remotes: &Remotes) -> Result<()> {
-    let created = git_command(Path::new("."))
-        .args(["init", "--quiet", "--initial-branch", BRANCH])
-        .arg(staging)
-        .status();
-    check_status("creating the clone", created)?;
-    configure(staging, identity, claim.generation, remotes)?;
-    let fetched = git_command(staging)
-        .args(["fetch", "--quiet", "origin"])
-        .status();
-    check_status("fetching the claim's fork", fetched).map_err(|error| match error {
-        Error::Local { message, .. } => local(
-            LocalCode::Git,
+    build_steps(staging, identity, claim, remotes).map_err(|error| match error {
+        Error::Local {
+            code,
+            message,
+            retryable: true,
+            next,
+        } => local(
+            code,
             format!("{message}; nothing was kept, and running the command again resumes the claim"),
             true,
-            None,
+            next,
         ),
+        other => other,
+    })
+}
+
+fn build_steps(
+    staging: &Path,
+    identity: &Identity,
+    claim: &ClaimView,
+    remotes: &Remotes,
+) -> Result<()> {
+    let mut init = git_command(Path::new("."));
+    init.args(["init", "--quiet", "--initial-branch", BRANCH])
+        .arg(staging);
+    run_git("creating the clone", &mut init, false)?;
+    configure(staging, identity, claim.generation, remotes)?;
+    let mut fetch = git_command(staging);
+    fetch.args(["fetch", "--quiet", "origin"]);
+    // A fetch fails when the fork is briefly unreachable; a later run may reach it.
+    run_git("fetching the claim's fork", &mut fetch, false).map_err(|error| match error {
+        Error::Local {
+            code,
+            message,
+            next,
+            ..
+        } => local(code, message, true, next),
         other => other,
     })?;
     let tracking = format!("origin/{BRANCH}");
-    let checkout = git_command(staging)
-        .args(["checkout", "--quiet", "-B", BRANCH, "--track", &tracking])
-        .status();
-    check_status("checking out the fork", checkout)
+    let mut checkout = git_command(staging);
+    checkout.args(["checkout", "--quiet", "-B", BRANCH, "--track", &tracking]);
+    run_git("checking out the fork", &mut checkout, false).map(drop)
 }
 
 /// Writes the clone's Railhead settings: its agent, the generation it saw, both remotes and the
@@ -421,7 +460,6 @@ fn git_command(dir: &Path) -> Command {
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
         .env("GIT_HTTP_LOW_SPEED_TIME", "60")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         // Git's messages include text from the remote, which is untrusted.
         .stderr(Stdio::null());
     for key in GIT_LOCATION_ENV {
@@ -432,22 +470,86 @@ fn git_command(dir: &Path) -> Command {
 
 /// Runs Git in `dir` and returns its first line of output.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = git_command(dir).args(args).stdout(Stdio::piped()).output();
     let action = args.first().copied().unwrap_or("git");
-    let output = output.map_err(|error| git_unavailable(action, &error))?;
-    if !output.status.success() {
-        return Err(git_failed(action, output.status));
-    }
-    let text = String::from_utf8(output.stdout).map_err(|_| git_failed(action, output.status))?;
+    let mut command = git_command(dir);
+    command.args(args);
+    let stdout = run_git(action, &mut command, true)?;
+    let text = String::from_utf8(stdout).map_err(|_| {
+        local(
+            LocalCode::Git,
+            format!("{action}: git wrote output that is not UTF-8"),
+            false,
+            None,
+        )
+    })?;
     Ok(text.lines().next().unwrap_or_default().to_owned())
 }
 
-fn check_status(action: &str, status: io::Result<std::process::ExitStatus>) -> Result<()> {
-    let status = status.map_err(|error| git_unavailable(action, &error))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(git_failed(action, status))
+/// Runs `command` within the Git deadline and returns its stdout when `capture` is set.
+fn run_git(action: &str, command: &mut Command, capture: bool) -> Result<Vec<u8>> {
+    let limit = git_timeout(std::env::var_os(GIT_TIMEOUT_ENV).as_deref())?;
+    match subprocess::run(command, limit, capture) {
+        Ok(done) if done.status.success() => Ok(done.stdout),
+        Ok(done) => Err(git_failed(action, done.status)),
+        Err(RunError::Io(error)) => Err(git_unavailable(action, &error)),
+        Err(error @ RunError::TimedOut(_)) => Err(local(
+            LocalCode::Git,
+            format!("{action}: git {error}; {GIT_TIMEOUT_ENV} sets a longer limit in seconds"),
+            true,
+            None,
+        )),
+    }
+}
+
+/// Refuses an invalid [`GIT_TIMEOUT_ENV`], before any request.
+///
+/// # Errors
+///
+/// [`LocalCode::InvalidInput`] unless it is unset or whole seconds from 1 to 3600.
+pub fn check_git_timeout() -> Result<()> {
+    git_timeout(std::env::var_os(GIT_TIMEOUT_ENV).as_deref()).map(drop)
+}
+
+/// The deadline `value` of [`GIT_TIMEOUT_ENV`] sets: whole seconds from 1 to 3600.
+fn git_timeout(value: Option<&OsStr>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_GIT_TIMEOUT);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_GIT_TIMEOUT_SECS).contains(seconds))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            local(
+                LocalCode::InvalidInput,
+                format!("{GIT_TIMEOUT_ENV} must be whole seconds from 1 to {MAX_GIT_TIMEOUT_SECS}"),
+                false,
+                None,
+            )
+        })
+}
+
+/// `None` for a Git failure that says something about the clone; a retryable failure, such as a
+/// deadline or an invalid deadline setting, says nothing about it and is returned.
+fn unless_timed_out(result: Result<String>) -> Result<Option<String>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if matches!(
+                error,
+                Error::Local {
+                    code: LocalCode::InvalidInput,
+                    ..
+                } | Error::Local {
+                    retryable: true,
+                    ..
+                }
+            ) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(None),
     }
 }
 
@@ -667,6 +769,31 @@ mod tests {
             "{error:?}"
         );
         assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn the_git_timeout_is_whole_seconds_within_an_hour() -> anyhow::Result<()> {
+        assert_eq!(git_timeout(None)?, DEFAULT_GIT_TIMEOUT);
+        assert_eq!(git_timeout(Some(OsStr::new("1")))?, Duration::from_secs(1));
+        assert_eq!(
+            git_timeout(Some(OsStr::new("3600")))?,
+            Duration::from_secs(3600)
+        );
+        for value in ["0", "3601", "", " 5", "1.5", "-1", "18446744073709551616"] {
+            let error = git_timeout(Some(OsStr::new(value))).err();
+            assert!(
+                matches!(
+                    error,
+                    Some(Error::Local {
+                        code: LocalCode::InvalidInput,
+                        retryable: false,
+                        ..
+                    })
+                ),
+                "{value:?}: {error:?}"
+            );
+        }
         Ok(())
     }
 
