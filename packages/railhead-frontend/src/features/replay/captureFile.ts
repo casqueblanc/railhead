@@ -277,20 +277,28 @@ export const captureLog = async (
 };
 
 /**
- * The secret shapes `captureLog` redacts, each with its replacement. In a credential context
- * (`Bearer`, `Basic`, an `Authorization` value or a URL password) every nonempty value is redacted
- * whatever its length, so prose such as "basic setup" loses its next word too. A replacement can be
+ * The secret shapes `captureLog` redacts, in order, each with its replacement. In a credential
+ * context (`Bearer`, `Basic`, an `Authorization` value or a URL password) every nonempty value is
+ * redacted whatever its length, so prose such as "basic setup" loses its next word too. A replacement can be
  * longer than what it replaces, so `captureLog` checks the redacted capture against the event and
  * file bounds and refuses one that no longer fits rather than writing the credential.
  */
 const SECRET_SHAPES: readonly (readonly [RegExp, (match: string[]) => string])[] = [
+  // The whole `Authorization` value, scheme and credential, up to its closing quote or the end of
+  // the line, in header, `key=value` and JSON forms. First, so a value whose credential another
+  // shape also matches is redacted and counted once. The header name and quotes stay readable.
+  [
+    /\b(Authorization["']?\s*[:=]\s*)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|["']?[^\s"'][^\r\n"']*)/gi,
+    ([, name, double, single]) => {
+      const quote = double !== undefined ? '"' : single !== undefined ? "'" : "";
+      return `${name ?? ""}${quote}${REDACTED}${quote}`;
+    },
+  ],
   // Railhead session tokens are JWTs: `<header>.<claims>.<mac>`, the header always `{"alg":...`.
   [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, () => REDACTED],
   // Artifacts repository tokens, which a write remote carries.
   [/art_v1_[A-Za-z0-9]{16,}(?:\?expires=\d+)?/g, () => REDACTED],
   [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, () => REDACTED],
-  // The header name stays readable.
-  [/\b(Authorization\s*[:=]\s*"?)[A-Za-z0-9._~+/=-]+/gi, ([, name]) => `${name ?? ""}${REDACTED}`],
   // `https://<user>:<password>@host`, as a Git remote with a session token or write token is.
   [/\b(https?:\/\/)[^\s/@:]+:[^\s/@[\]]+@/gi, ([, scheme]) => `${scheme ?? ""}${REDACTED}@`],
 ];

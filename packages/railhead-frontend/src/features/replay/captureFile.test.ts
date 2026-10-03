@@ -489,6 +489,42 @@ describe("captureLog redaction", () => {
       "Authorization=[redacted]",
     ],
     ["a one-character URL password", "https://u:Q@host", ":Q@", "https://[redacted]@host"],
+    [
+      "a two-part Authorization value",
+      "Authorization: Token secret123",
+      "secret123",
+      "Authorization: [redacted]",
+    ],
+    [
+      "a quoted Authorization value with spaces",
+      'Authorization = "Token secret 123" then',
+      "secret 123",
+      'Authorization = "[redacted]" then',
+    ],
+    [
+      "an Authorization header inside a quoted curl argument",
+      `curl -H 'Authorization: Token secret 123' https://railhead.example`,
+      "secret 123",
+      `curl -H 'Authorization: [redacted]' https://railhead.example`,
+    ],
+    [
+      "a lowercase JSON authorization header",
+      '{"authorization": "Token secret123", "accept": "*/*"}',
+      "secret123",
+      '{"authorization": "[redacted]", "accept": "*/*"}',
+    ],
+    [
+      "an Authorization value with no closing quote",
+      'Authorization: "Token secret123',
+      "secret123",
+      "Authorization: [redacted]",
+    ],
+    [
+      "an Authorization value carrying a session token",
+      `Authorization: Bearer ${SESSION_TOKEN}`,
+      SESSION_TOKEN,
+      "Authorization: [redacted]",
+    ],
   ])("keeps %s out of the written file", async (_label, body, credential, expected) => {
     const result = await capturedEvents([withBody(body)]);
     expect(result.capture.events).toEqual([withBody(expected)]);
@@ -496,6 +532,16 @@ describe("captureLog redaction", () => {
     const written = serializeCapture(result.capture);
     if (!written.ok) throw new Error(`serialize failed: ${written.error.kind}`);
     expect(written.text).not.toContain(credential);
+  });
+
+  it("redacts an unquoted Authorization value to the end of its line only", async () => {
+    const result = await capturedEvents([
+      withBody("Authorization: Token secret123 was refused\nretry with rh login"),
+    ]);
+    expect(result.capture.events).toEqual([
+      withBody("Authorization: [redacted]\nretry with rh login"),
+    ]);
+    expect(result.redacted).toBe(1);
   });
 
   it("redacts the word after Bearer or Basic in prose too", async () => {
