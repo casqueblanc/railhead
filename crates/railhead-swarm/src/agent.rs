@@ -49,7 +49,8 @@ use crate::scenario::Bounds;
 /// The plan an agent writes when it acknowledges a conflict, the only item it can act on.
 const CONFLICT_PLAN: &str = "Simulated agent: redo the edit on the new main and push it again.";
 
-/// Longest pause between two retries of one step.
+/// Longest pause the driver chooses between two retries of one step. A longer delay the backend
+/// asks for is kept.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// What every agent shares.
@@ -63,6 +64,8 @@ pub struct Shared {
     pub bounds: Bounds,
     /// The URL prefix of every fork of the scenario's repository.
     pub fork_prefix: String,
+    /// When the run times out: no retry waits past it.
+    pub deadline: Instant,
     /// Landings seen so far, to find same-path pairs Git merged.
     pub landings: Mutex<Landings>,
 }
@@ -164,17 +167,45 @@ fn judge(state: Option<ClaimState>) -> Polled {
     }
 }
 
-/// A landed edit of a shared path, for pairing same-path edits.
+/// Most swarm lines a landing keeps from its base. The scaffold has room for 65; a base with
+/// more was changed by something other than the swarm, and its landing never pairs.
+const MAX_BASE_LINES: usize = 256;
+
+/// A landed edit of a shared path, for pairing same-path edits. It keeps hashes of the swarm
+/// lines pairing compares, never the file's text, so a run's landings stay bounded whatever the
+/// size of the shared file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Landing {
     /// The claim that landed it.
-    pub claim_id: String,
+    claim_id: String,
     /// The path it changed.
-    pub path: String,
-    /// The line it wrote, which only this edit writes.
-    pub line: String,
-    /// The path's contents the edit was written on, from the claim's clone.
-    pub base: String,
+    path: String,
+    /// The hash of the line it wrote, which only this edit writes.
+    line: u64,
+    /// The hashes of the swarm lines the path held when the edit was written on it, sorted;
+    /// `None` when it held more than [`MAX_BASE_LINES`].
+    base: Option<Box<[u64]>>,
+}
+
+impl Landing {
+    /// The landing of `claim_id`, which wrote `line` into `path` when it held `base`.
+    fn new(claim_id: &str, path: &str, line: &str, base: &str) -> Self {
+        let mut lines: Vec<u64> = swarm_lines(base).take(MAX_BASE_LINES + 1).collect();
+        lines.sort_unstable();
+        Self {
+            claim_id: claim_id.to_owned(),
+            path: path.to_owned(),
+            line: line_hash(line),
+            base: (lines.len() <= MAX_BASE_LINES).then(|| lines.into_boxed_slice()),
+        }
+    }
+
+    /// Whether the base is known to lack `line`.
+    fn lacks(&self, line: u64) -> bool {
+        self.base
+            .as_ref()
+            .is_some_and(|base| base.binary_search(&line).is_err())
+    }
 }
 
 /// Landings seen in this run.
@@ -187,14 +218,16 @@ impl Landings {
     /// read back after both landed, holds both lines. Without that evidence it returns `None`, an
     /// edit that built on the other included.
     fn record(&mut self, landing: Landing, main: &str) -> Option<String> {
-        let merged = holds(main, &landing.line)
+        let on_main: std::collections::HashSet<u64> = swarm_lines(main).collect();
+        let merged = on_main
+            .contains(&landing.line)
             .then(|| {
                 self.0.iter().rev().find(|earlier| {
                     earlier.path == landing.path
                         && earlier.claim_id != landing.claim_id
-                        && holds(main, &earlier.line)
-                        && !holds(&landing.base, &earlier.line)
-                        && !holds(&earlier.base, &landing.line)
+                        && on_main.contains(&earlier.line)
+                        && landing.lacks(earlier.line)
+                        && earlier.lacks(landing.line)
                 })
             })
             .flatten()
@@ -202,16 +235,51 @@ impl Landings {
         self.0.push(landing);
         merged
     }
+
+    /// How many line hashes the landings keep, to show they stay bounded.
+    #[cfg(test)]
+    fn retained(&self) -> usize {
+        self.0
+            .iter()
+            .map(|landing| 1 + landing.base.as_ref().map_or(0, |base| base.len()))
+            .sum()
+    }
 }
 
-/// Whether `text` has a line that is `line`, or ends with it after a space, as a slot or the
-/// contested line does.
-fn holds(text: &str, line: &str) -> bool {
-    text.lines().any(|existing| {
-        existing
-            .strip_suffix(line)
-            .is_some_and(|rest| rest.is_empty() || rest.ends_with(' '))
+/// The hashes of the swarm lines `text` holds: each of its lines that is one an edit writes
+/// (`<agent> round <round> <16 hex digits>`, see [`Edit::line`]), or ends with one after a
+/// space, as a slot or the contested line does.
+fn swarm_lines(text: &str) -> impl Iterator<Item = u64> + '_ {
+    text.lines().filter_map(|existing| {
+        let mut words = existing.rsplitn(5, ' ');
+        let (token, round, label, agent) =
+            (words.next()?, words.next()?, words.next()?, words.next()?);
+        let swarm = agent.strip_prefix("swarm-").is_some_and(is_digits)
+            && label == "round"
+            && is_digits(round)
+            && token.len() == 16
+            && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+        // The four words, joined by the single spaces they were split on.
+        let length = agent.len() + label.len() + round.len() + token.len() + 3;
+        swarm
+            .then(|| existing.len().checked_sub(length))
+            .flatten()
+            .and_then(|start| existing.get(start..))
+            .map(line_hash)
     })
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// A swarm line's hash. A collision can only make a base seem to hold a line, which counts a
+/// pair as not merged.
+fn line_hash(line: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    line.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Agent {
@@ -660,7 +728,7 @@ impl Run<'_> {
                 return Err(self.fail(Step::Ready, error.code()).await);
             };
             tries += 1;
-            tokio::time::sleep(backoff(tries, after, bounds.poll)).await;
+            self.pause(Step::Ready, tries, after).await?;
             if self.reconcile(held, commit).await? == Reconciled::Settled {
                 return Ok(());
             }
@@ -840,12 +908,12 @@ impl Run<'_> {
         let main = self
             .retrying(Step::Verify, || runner.git_text(env, dir, "show", &show))
             .await?;
-        let landing = Landing {
-            claim_id: held.claim_id.clone(),
-            path: path.to_owned(),
-            line: edit.line(&self.agent.env.name),
-            base,
-        };
+        let landing = Landing::new(
+            &held.claim_id,
+            path,
+            &edit.line(&self.agent.env.name),
+            &base,
+        );
         let merged = self
             .shared
             .landings
@@ -890,6 +958,17 @@ impl Run<'_> {
         Ok(again)
     }
 
+    /// Waits before retry `tries` of `step`, which the backend asked to delay by `asked`. A wait
+    /// that would end after the run's deadline stops the agent instead: the retry could not run.
+    async fn pause(&self, step: Step, tries: u32, asked: Duration) -> Outcome<()> {
+        let delay = backoff(tries, asked, self.shared.bounds.poll);
+        if !ends_by(Instant::now(), delay, self.shared.deadline) {
+            return Err(self.fail(step, "retry_after_deadline".to_owned()).await);
+        }
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+
     /// Runs `step` until it succeeds, repeating a retryable failure within the retry bound.
     async fn retrying<T, F, Fut>(&self, step: Step, attempt: F) -> Outcome<T>
     where
@@ -903,7 +982,7 @@ impl Run<'_> {
                 Err(error) => match error.retry() {
                     Some(after) if tries < self.shared.bounds.retries => {
                         tries += 1;
-                        tokio::time::sleep(backoff(tries, after, self.shared.bounds.poll)).await;
+                        self.pause(step, tries, after).await?;
                     }
                     Some(_) | None => return Err(self.fail(step, error.code()).await),
                 },
@@ -912,11 +991,16 @@ impl Run<'_> {
     }
 }
 
-/// The pause before retry `tries`: the backend's delay, or the poll interval doubled per try,
-/// whichever is longer, at most [`MAX_BACKOFF`].
+/// The pause before retry `tries`: the poll interval doubled per try, at most [`MAX_BACKOFF`],
+/// or the backend's delay when that is longer.
 fn backoff(tries: u32, asked: Duration, poll: Duration) -> Duration {
     let doubled = poll.saturating_mul(2_u32.saturating_pow(tries.saturating_sub(1)));
-    asked.max(doubled).min(MAX_BACKOFF)
+    asked.max(doubled.min(MAX_BACKOFF))
+}
+
+/// Whether a pause of `delay` from `now` ends by `deadline`.
+fn ends_by(now: Instant, delay: Duration, deadline: Instant) -> bool {
+    now.checked_add(delay).is_some_and(|end| end <= deadline)
 }
 
 /// What reading a claim back after an uncertain `rh ready` showed.
@@ -991,6 +1075,8 @@ fn is_repo_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     const A: &str = "swarm-00 round 0 000000000000000a";
@@ -998,12 +1084,11 @@ mod tests {
     const BASE: &str = "slot 00: open\nslot 01: open\n";
 
     fn landing(claim_id: &str, path: &str, line: &str, base: &str) -> Landing {
-        Landing {
-            claim_id: claim_id.to_owned(),
-            path: path.to_owned(),
-            line: line.to_owned(),
-            base: base.to_owned(),
-        }
+        Landing::new(claim_id, path, line, base)
+    }
+
+    fn holds(text: &str, line: &str) -> bool {
+        swarm_lines(text).any(|held| held == line_hash(line))
     }
 
     #[test]
@@ -1093,7 +1178,81 @@ mod tests {
             "round 0 000000000000000a"
         ));
         assert!(!holds("xswarm-00 round 0 000000000000000a\n", A));
+        assert!(!holds("swarm-00  round 0 000000000000000a\n", A));
+        assert!(!holds("swarm-00 round 0 000000000000000a \n", A));
         assert!(!holds("", A));
+        // Only lines an edit writes are kept: a short token or another word is not one.
+        assert_eq!(
+            swarm_lines("swarm-00 round 0 abc\nslot 00: open\n--\n").count(),
+            0
+        );
+    }
+
+    /// A shared file near the read limit: every slot holds a swarm line, padded with long lines.
+    fn large_base() -> String {
+        let mut base = String::with_capacity(1024 * 1024);
+        for slot in 0..64 {
+            // Writing to a `String` cannot fail.
+            let _ = writeln!(base, "slot {slot:02}: swarm-{slot:02} round 9 {slot:016x}");
+        }
+        let filler = format!("{}\n", "-".repeat(1023));
+        while base.len() < 1000 * 1024 {
+            base.push_str(&filler);
+        }
+        base
+    }
+
+    #[test]
+    fn landings_keep_line_hashes_not_the_shared_file() {
+        let base = large_base();
+        let mut landings = Landings::default();
+        for index in 0..100_u64 {
+            let line = format!("swarm-00 round {index} {index:016x}");
+            let main = format!("{base}contested: {line}\n");
+            let claim = format!("clm_{index:06}");
+            assert_eq!(
+                landings.record(landing(&claim, "f", &line, &base), &main),
+                None
+            );
+        }
+        // Each landing keeps its line and the base's 64 slot lines: about 50 KiB in all, where
+        // the bases were 100 MiB.
+        assert_eq!(landings.retained(), 100 * 65);
+
+        // Pairing still works on a large base: neither line on it, both on main.
+        let mut landings = Landings::default();
+        let both = format!("{base}contested: {A}\nslot 64: {B}\n");
+        landings.record(landing("clm_aaaaaa", "f", A, &base), &both);
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, &base), &both),
+            Some("clm_aaaaaa".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_base_with_more_swarm_lines_than_the_scaffold_never_pairs() {
+        let mut crowded = String::new();
+        for index in 0..=MAX_BASE_LINES {
+            let _ = writeln!(crowded, "swarm-63 round {index} {index:016x}");
+        }
+        let both = format!("slot 00: {A}\nslot 01: {B}\n");
+        let mut landings = Landings::default();
+        landings.record(landing("clm_aaaaaa", "f", A, BASE), &both);
+        // B's base is unknown, so it may have held A's line: not counted as merged.
+        assert_eq!(
+            landings.record(landing("clm_bbbbbb", "f", B, &crowded), &both),
+            None
+        );
+        // It keeps only its own line.
+        assert_eq!(landings.retained(), 2);
+        // One line fewer is kept whole.
+        crowded.truncate(crowded.trim_end().rfind('\n').map_or(0, |end| end + 1));
+        assert_eq!(swarm_lines(&crowded).count(), MAX_BASE_LINES);
+        let kept = landing("clm_cccccc", "f", A, &crowded);
+        assert_eq!(
+            kept.base.as_ref().map(|base| base.len()),
+            Some(MAX_BASE_LINES)
+        );
     }
 
     #[test]
@@ -1174,7 +1333,26 @@ mod tests {
             Duration::from_secs(2)
         );
         assert_eq!(backoff(40, Duration::ZERO, poll), MAX_BACKOFF);
-        assert_eq!(backoff(1, Duration::from_secs(600), poll), MAX_BACKOFF);
+        // The backend's delay is kept above the driver's cap.
+        assert_eq!(
+            backoff(1, Duration::from_secs(600), poll),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            backoff(40, Duration::from_secs(45), poll),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn a_retry_waits_only_when_it_can_run_before_the_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(120);
+        assert!(ends_by(now, Duration::from_secs(30), deadline));
+        assert!(ends_by(now, Duration::from_secs(120), deadline));
+        assert!(!ends_by(now, Duration::from_secs(121), deadline));
+        assert!(!ends_by(now, Duration::from_secs(600), deadline));
+        assert!(!ends_by(now, Duration::MAX, deadline));
     }
 
     #[test]

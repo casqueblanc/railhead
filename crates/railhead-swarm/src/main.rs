@@ -223,6 +223,9 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
         events,
         bounds: scenario.bounds,
         fork_prefix: scenario.repository.fork_prefix(&scenario.origin),
+        deadline: started
+            .checked_add(scenario.bounds.run_timeout)
+            .context("the run timeout is out of range")?,
         landings: Mutex::new(Landings::default()),
     });
     let mut writer = Writer::new(io::stdout(), started);

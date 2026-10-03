@@ -195,6 +195,10 @@ struct State {
     lose_ready: Option<Lost>,
     /// An owner's item the next `ready` routes to its claim and refuses on.
     decide_on_ready: Option<Kind>,
+    /// The delay `work` asks for while it answers `rate_limited`.
+    limit_work_ms: Option<u64>,
+    /// `work` requests received.
+    works: u64,
 }
 
 /// The fake backend.
@@ -560,7 +564,13 @@ impl Fake {
                     &Self::digest(&state, agent),
                 ))
             }
-            ("POST", ["work"]) => self.work(&mut state, agent),
+            ("POST", ["work"]) => {
+                state.works += 1;
+                match state.limit_work_ms {
+                    Some(after) => Ok(failure(AgentErrorCode::RateLimited, Some(after))),
+                    None => self.work(&mut state, agent),
+                }
+            }
             ("POST", ["claims", claim_id, "ready"]) => {
                 if state.stall_ready {
                     return Ok(failure(AgentErrorCode::Busy, None).set_delay(LATE));
@@ -1805,5 +1815,62 @@ async fn a_progress_record_outside_the_plan_stops_the_rerun_before_any_request()
     fs::write(&path, record.to_string())?;
     let rerun = run(&mut world.driver(&scenario)?)?;
     assert_eq!(rerun.code, Some(0), "{:?}", rerun.of_type("failed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_retry_delay_past_the_run_deadline_stops_the_agent_without_retrying() -> anyhow::Result<()>
+{
+    // The backend asks for ten minutes; the run has two.
+    let far = world(1, 1, false).await?;
+    far.state().limit_work_ms = Some(600_000);
+    let scenario = far.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let started = std::time::Instant::now();
+    let stopped = run(&mut far.driver(&scenario)?)?;
+    assert_eq!(stopped.code, Some(1));
+    assert_eq!(stopped.steps_of("swarm-00"), ["failed"]);
+    assert_eq!(
+        stopped
+            .of_type("failed")
+            .first()
+            .map(|e| (e.get("step"), e.get("code"))),
+        Some((Some(&json!("claim")), Some(&json!("retry_after_deadline"))))
+    );
+    // Not retried early, and not waited on until the run timed out.
+    assert_eq!(far.state().works, 1);
+    assert_eq!(
+        stopped.summary()?.get("stoppedBy"),
+        Some(&json!("completed"))
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+
+    // A delay that fits the run is waited out, then the claim goes ahead.
+    let near = world(1, 1, false).await?;
+    near.state().limit_work_ms = Some(1_500);
+    let scenario = near.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let limited = std::sync::Arc::clone(&near.fake);
+    let lift = std::thread::spawn(move || {
+        // Lifted after the first refusal, before the asked delay ends.
+        while limited
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .works
+            == 0
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        limited
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limit_work_ms = None;
+    });
+    let started = std::time::Instant::now();
+    let waited = run(&mut near.driver(&scenario)?)?;
+    let _ = lift.join();
+    assert_eq!(waited.code, Some(0), "{:?}", waited.of_type("failed"));
+    assert_eq!(near.state().works, 2);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1_500));
     Ok(())
 }
