@@ -573,4 +573,34 @@ describe("the train's settle wake", () => {
       expect(ref.main).toBe(first.candidate);
     });
   });
+
+  it("settles a batch whose intent settled without the train hearing it", async () => {
+    const ref = new FakeMain(MAIN, ["drop"]);
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      ref.down = true;
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      await exhaust(h);
+      const before = h.authorization.record(intentId);
+      if (before === null) throw new Error("no intent was recorded");
+
+      // The writer's last answer was lost: main moved and the intent settled, but the batch did not.
+      ref.down = false;
+      ref.main = first.candidate;
+      expect(
+        h.authorization.recordWrite(intentId, before.attempts, {
+          status: "updated",
+          attempts: before.attempts,
+          main: first.candidate,
+        }),
+      ).toMatchObject({ status: "updated" });
+      expect(batchStates(h.train)).toEqual([["passed", null]]);
+
+      await h.alarm();
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(readWake(h.sql)).toBeNull();
+    });
+  });
 });
