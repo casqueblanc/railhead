@@ -1,9 +1,11 @@
 // How a check's sandbox gets its commit, and how a failed runner becomes a check outcome, with
 // `@cloudflare/ci` patched by `patches/@cloudflare__ci@0.2.0.patch`.
 //
-// No token enters the sandbox. The checkout names the Git gateway (`src/sandbox/gateway.ts`) with
-// a grant: a read-only policy for the one repository that lapses after the longest sandbox
-// lifetime. The patched runner selects that handler before its first command; the gateway adds a
+// No token enters the sandbox. The checkout carries a grant: a read-only policy for the one
+// repository that lapses after the longest sandbox lifetime. Before its first command the patched
+// runner starts the sandbox's fenced incarnation (`src/sandbox/fence.ts`) under that grant, which
+// routes the sandbox's Git requests to the gateway (`src/sandbox/gateway.ts`) and retires it when
+// the grant lapses. The gateway serves the grant only while that incarnation is live, and adds a
 // short-lived token outside the container. The patched runner also stops a run whose checkout exits
 // nonzero before the check's command starts.
 //
@@ -15,9 +17,6 @@ import { cloudflareArtifacts, isCiRunnerFailure, type CloudflareArtifacts } from
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
 import { MAX_SANDBOX_LIFETIME_MS } from "../sandbox/admission";
 import { parseSandboxPolicy, type SandboxGrant } from "../sandbox/policy";
-
-/** The `RailheadSandbox` outbound handler that serves Git for a grant. */
-export const CHECKOUT_OUTBOUND_HANDLER = "gitGateway";
 
 /**
  * How long a checkout's grant lasts from the moment the runner asks for it: no sandbox outlives
@@ -36,12 +35,12 @@ const COMMAND_FAILED = /^ failed with exit code ([1-9][0-9]{0,9})\n=== stdout ==
 type Provider = ReturnType<SourceControlAdapter<CloudflareArtifacts>["create"]>;
 type Source = Parameters<Provider["getSourceCheckout"]>[0];
 
-/** The checkout a runner receives: no token, and the gateway handler with its grant. */
+/** The checkout a runner receives: no token, and the grant its sandbox's fence starts under. */
 export interface GatewayCheckout {
   kind: "git";
   remote: string;
   sha: string;
-  outbound: { handler: typeof CHECKOUT_OUTBOUND_HANDLER; params: SandboxGrant };
+  fence: SandboxGrant;
 }
 
 /** One Artifacts repository a check reads: `owner` is its namespace. */
@@ -107,10 +106,7 @@ export function gatewayCheckout(source: Source, accountId: string, now: number):
     kind: "git",
     remote: `https://${host}/git/${source.owner}/${source.repo}.git`,
     sha: source.sha,
-    outbound: {
-      handler: CHECKOUT_OUTBOUND_HANDLER,
-      params: { policy, expiresAt: now + CHECKOUT_GRANT_MS },
-    },
+    fence: { policy, expiresAt: now + CHECKOUT_GRANT_MS },
   };
 }
 

@@ -6,17 +6,18 @@ import {
 } from "@cloudflare/ci";
 import type { CiBindings } from "@cloudflare/ci/worker";
 import type { SourceControlAdapter } from "@cloudflare/ci/worker/source-control";
-import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { env, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  CHECKOUT_OUTBOUND_HANDLER,
   classifyRunnerFailure,
   gatewayCheckout,
   railheadCheckout,
   type RunnerFailure,
 } from "../src/checks/sdkCheckout";
 import { MAX_SANDBOX_LIFETIME_MS } from "../src/sandbox/admission";
-import { parseSandboxGrant } from "../src/sandbox/policy";
+import { SandboxFence } from "../src/sandbox/fence";
+import { parseSandboxGrant, type SandboxGrant } from "../src/sandbox/policy";
 import { RailheadSandbox } from "../src/sandbox/sandboxObject";
 
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
@@ -42,20 +43,11 @@ describe("gatewayCheckout", () => {
       kind: "git",
       remote: `https://${HOST}/git/railhead/demo.git`,
       sha: SHA,
-      outbound: {
-        handler: "gitGateway",
-        params: {
-          policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
-          expiresAt: NOW + MAX_SANDBOX_LIFETIME_MS,
-        },
+      fence: {
+        policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
+        expiresAt: NOW + MAX_SANDBOX_LIFETIME_MS,
       },
     });
-  });
-
-  it("selects a handler RailheadSandbox actually registers", () => {
-    expect(Object.keys(RailheadSandbox.outboundHandlers ?? {})).toContain(
-      CHECKOUT_OUTBOUND_HANDLER,
-    );
   });
 
   it.each([
@@ -84,12 +76,45 @@ describe("gatewayCheckout", () => {
   );
 });
 
+/** The grants a fence routed, over a container whose every command succeeds. */
+class FenceRecorder {
+  readonly routed: SandboxGrant[] = [];
+  destroys = 0;
+}
+
+/**
+ * Runs `body` with a real fence over the storage of a Durable Object no other test touches, on the
+ * clock the gateway reads, so fake timers move both.
+ */
+function withFence(body: (fence: SandboxFence, recorder: FenceRecorder) => Promise<void>) {
+  const stub = env.REPO.getByName(crypto.randomUUID());
+  return runInDurableObject(stub, async (_instance, state) => {
+    const recorder = new FenceRecorder();
+    const fence = new SandboxFence(
+      state.storage,
+      {
+        route: async (grant) => {
+          recorder.routed.push(grant);
+        },
+        exec: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+        destroy: async () => {
+          recorder.destroys += 1;
+        },
+        wake: async () => {},
+      },
+      () => Date.now(),
+    );
+    await body(fence, recorder);
+  });
+}
+
 /**
  * The gitGateway handler RailheadSandbox registers, over a recording Artifacts binding and upstream
- * fetch. Nothing is stubbed between the outbound params and the gateway: the handler parses them.
+ * fetch. Nothing is stubbed between the grant and the gateway: the handler parses it. The sending
+ * sandbox's object answers whether the grant is current from `fence`, or refuses with none.
  */
-function registeredGateway() {
-  const handler = RailheadSandbox.outboundHandlers?.[CHECKOUT_OUTBOUND_HANDLER];
+function registeredGateway(fence: SandboxFence | null) {
+  const handler = RailheadSandbox.outboundHandlers?.["gitGateway"];
   if (handler === undefined) throw new Error("no git gateway handler");
   const minted: string[] = [];
   const forwarded: { url: string; auth: string | null }[] = [];
@@ -101,6 +126,12 @@ function registeredGateway() {
           return { plaintext: `minted-${scope}` };
         },
         [Symbol.dispose]: () => {},
+      }),
+    },
+    SANDBOX: {
+      idFromString: (id: string) => id,
+      get: () => ({
+        railheadGrantCurrent: async (expiresAt: number) => fence?.grantCurrent(expiresAt) ?? false,
       }),
     },
   };
@@ -143,40 +174,91 @@ describe("the checkout's grant at the registered Git gateway", () => {
     vi.restoreAllMocks();
   });
 
-  it("forwards the checkout's fetch with a read token minted outside the sandbox", async () => {
-    const { remote, outbound } = checkoutAt(NOW);
-    const gateway = registeredGateway();
+  it("forwards a started sandbox's fetch with a read token minted outside it", async () => {
+    const { remote, fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence, recorder) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const gateway = registeredGateway(fence);
 
-    const response = await gateway.serve(fetchRefs(remote), outbound.params);
+      const response = await gateway.serve(fetchRefs(remote), grant);
 
-    expect(response.status).toBe(200);
-    expect(await response.text()).toBe("upstream");
-    expect(gateway.minted).toEqual(["read:demo:60"]);
-    expect(gateway.forwarded).toEqual([
-      { url: `${remote}/info/refs?service=git-upload-pack`, auth: "Bearer minted-read" },
-    ]);
+      expect(recorder.routed).toEqual([grant]);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("upstream");
+      expect(gateway.minted).toEqual(["read:demo:60"]);
+      expect(gateway.forwarded).toEqual([
+        { url: `${remote}/info/refs?service=git-upload-pack`, auth: "Bearer minted-read" },
+      ]);
+    });
   });
 
   it("forwards one millisecond before the grant lapses and refuses at the moment it does", async () => {
-    const { remote, outbound } = checkoutAt(NOW + MAX_SANDBOX_LIFETIME_MS - 1);
-    const gateway = registeredGateway();
+    const { remote, fence: grant } = checkoutAt(NOW + MAX_SANDBOX_LIFETIME_MS - 1);
+    await withFence(async (fence) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const gateway = registeredGateway(fence);
 
-    const before = await gateway.serve(fetchRefs(remote), outbound.params);
-    vi.setSystemTime(NOW + MAX_SANDBOX_LIFETIME_MS);
-    const at = await gateway.serve(fetchRefs(remote), outbound.params);
+      const before = await gateway.serve(fetchRefs(remote), grant);
+      vi.setSystemTime(NOW + MAX_SANDBOX_LIFETIME_MS);
+      const at = await gateway.serve(fetchRefs(remote), grant);
 
-    expect(before.status).toBe(200);
-    expect(at.status).toBe(403);
-    expect(await at.text()).toContain("policy");
-    expect(gateway.minted).toEqual(["read:demo:60"]);
-    expect(gateway.forwarded).toHaveLength(1);
+      expect(before.status).toBe(200);
+      expect(at.status).toBe(403);
+      expect(await at.text()).toContain("policy");
+      expect(gateway.minted).toEqual(["read:demo:60"]);
+      expect(gateway.forwarded).toHaveLength(1);
+    });
+  });
+
+  it("refuses the grant to a sandbox whose fence never started, before minting", async () => {
+    const { remote, fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence) => {
+      const gateway = registeredGateway(fence);
+
+      const response = await gateway.serve(fetchRefs(remote), grant);
+
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("retired");
+      expect(gateway.minted).toEqual([]);
+      expect(gateway.forwarded).toEqual([]);
+    });
+  });
+
+  it("refuses the grant once the sandbox is retired before its deadline", async () => {
+    const { remote, fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence, recorder) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const gateway = registeredGateway(fence);
+
+      const live = await gateway.serve(fetchRefs(remote), grant);
+      await fence.retire();
+      const retired = await gateway.serve(fetchRefs(remote), grant);
+
+      expect(live.status).toBe(200);
+      expect(recorder.destroys).toBe(1);
+      expect(retired.status).toBe(403);
+      expect(await retired.text()).toContain("retired");
+      expect(gateway.minted).toEqual(["read:demo:60"]);
+      expect(gateway.forwarded).toHaveLength(1);
+    });
+  });
+
+  it("refuses a grant whose sandbox object cannot be asked", async () => {
+    const { remote, fence: grant } = checkoutAt(NOW);
+    const gateway = registeredGateway(null);
+
+    const response = await gateway.serve(fetchRefs(remote), grant);
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("retired");
+    expect(gateway.minted).toEqual([]);
   });
 
   it("refuses a checkout policy passed without its deadline, and no params at all", async () => {
-    const { remote, outbound } = checkoutAt(NOW);
-    const gateway = registeredGateway();
+    const { remote, fence: grant } = checkoutAt(NOW);
+    const gateway = registeredGateway(null);
 
-    const bare = await gateway.serve(fetchRefs(remote), outbound.params.policy);
+    const bare = await gateway.serve(fetchRefs(remote), grant.policy);
     const missing = await gateway.serve(fetchRefs(remote), undefined);
 
     for (const response of [bare, missing]) {
@@ -188,27 +270,27 @@ describe("the checkout's grant at the registered Git gateway", () => {
   });
 
   it("refuses a push and another repository under the checkout's grant", async () => {
-    const { outbound } = checkoutAt(NOW);
-    const gateway = registeredGateway();
+    const { fence: grant } = checkoutAt(NOW);
+    await withFence(async (fence) => {
+      await fence.start(grant.policy, grant.expiresAt);
+      const gateway = registeredGateway(fence);
 
-    const push = await gateway.serve(
-      new Request(`https://${HOST}/git/railhead/demo.git/git-receive-pack`, {
-        method: "POST",
-        body: "0000",
-      }),
-      outbound.params,
-    );
-    const other = await gateway.serve(
-      fetchRefs(`https://${HOST}/git/railhead/other.git`),
-      outbound.params,
-    );
+      const push = await gateway.serve(
+        new Request(`https://${HOST}/git/railhead/demo.git/git-receive-pack`, {
+          method: "POST",
+          body: "0000",
+        }),
+        grant,
+      );
+      const other = await gateway.serve(fetchRefs(`https://${HOST}/git/railhead/other.git`), grant);
 
-    expect(push.status).toBe(403);
-    expect(await push.text()).toContain("read-only");
-    expect(other.status).toBe(403);
-    expect(await other.text()).toContain("repository");
-    expect(gateway.minted).toEqual([]);
-    expect(gateway.forwarded).toEqual([]);
+      expect(push.status).toBe(403);
+      expect(await push.text()).toContain("read-only");
+      expect(other.status).toBe(403);
+      expect(await other.text()).toContain("repository");
+      expect(gateway.minted).toEqual([]);
+      expect(gateway.forwarded).toEqual([]);
+    });
   });
 });
 
@@ -232,7 +314,7 @@ class ScriptedSandbox {
   readonly backups: { localBucket: unknown }[] = [];
   readonly restored: unknown[] = [];
   readonly scripts: string[] = [];
-  outboundParams: unknown = null;
+  started: unknown = null;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -241,11 +323,16 @@ class ScriptedSandbox {
     private readonly command: ScriptedCommand,
     private readonly trees: Readonly<Record<string, readonly string[]>>,
     private readonly saved: Map<string, ReadonlySet<string>>,
+    private readonly fence: SandboxFence | null,
   ) {}
 
-  async setOutboundHandler(handler: string, params: unknown) {
-    this.calls.push(`outbound:${handler}`);
-    this.outboundParams = params;
+  /** `RailheadSandbox.railheadStart`, through `fence` when the test gives one. */
+  async railheadStart(policy: unknown, expiresAt: unknown) {
+    this.calls.push("start");
+    this.started = { policy, expiresAt };
+    const grant = parseSandboxGrant(this.started);
+    if (grant === null) throw new Error("the runner started the sandbox without a valid grant");
+    await this.fence?.start(grant.policy, grant.expiresAt);
   }
 
   async execWithSessionToken(command: string, _session: string, options?: { env?: object }) {
@@ -399,6 +486,8 @@ async function run(options: {
   cachedBy?: string;
   /** Each commit's tracked files, and those of the cached backup, for workspace assertions. */
   trees?: Record<string, readonly string[]>;
+  /** The fence the sandbox starts through; the run must then start only one sandbox. */
+  fence?: SandboxFence;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -409,6 +498,7 @@ async function run(options: {
     typeof command === "function" ? command : () => command,
     trees,
     new Map([[BACKUP_ID, new Set(trees[cachedBy])]]),
+    options.fence ?? null,
   );
   const artifacts = new RecordingArtifacts();
   const bindings = {
@@ -468,19 +558,19 @@ describe("a check run through the patched SDK", () => {
 
     expect(outcome).toEqual({ kind: "pass" });
     expect(sandbox.calls).toEqual([
-      "outbound:gitGateway",
+      "start",
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
       "destroy",
-      "outbound:gitGateway",
+      "start",
       "restore",
       "checkout:overlay",
       "command:(npm test) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
       "destroy",
     ]);
-    expect(sandbox.outboundParams).toEqual({
+    expect(sandbox.started).toEqual({
       policy: { host: HOST, namespace: NAMESPACE, read: [REPO], write: null },
       expiresAt: expect.any(Number),
     });
@@ -493,23 +583,45 @@ describe("a check run through the patched SDK", () => {
     expect(sandbox.backups).toEqual([{ localBucket: true }, { localBucket: true }]);
   });
 
-  it("passes the registered gateway a grant that serves the checkout's fetch until it lapses", async () => {
-    const started = Date.now();
-    const { sandbox } = await run({});
-    const finished = Date.now();
-    const grant = parseSandboxGrant(sandbox.outboundParams);
-    const gateway = registeredGateway();
+  it("starts the sandbox's fence under a grant the registered gateway serves until retirement", async () => {
+    await withFence(async (fence, recorder) => {
+      const started = Date.now();
+      // The cache hit skips the install, so only the test's sandbox starts.
+      const { outcome, sandbox } = await run({ cached: true, fence });
+      const finished = Date.now();
+      const grant = parseSandboxGrant(sandbox.started);
+      const gateway = registeredGateway(fence);
+      const remote = `https://${HOST}/git/railhead/demo.git`;
 
-    const response = await gateway.serve(
-      fetchRefs(`https://${HOST}/git/railhead/demo.git`),
-      sandbox.outboundParams,
-    );
+      const live = await gateway.serve(fetchRefs(remote), sandbox.started);
+      await fence.retire();
+      const retired = await gateway.serve(fetchRefs(remote), sandbox.started);
 
-    expect(grant?.expiresAt).toBeGreaterThanOrEqual(started + MAX_SANDBOX_LIFETIME_MS);
-    expect(grant?.expiresAt).toBeLessThanOrEqual(finished + MAX_SANDBOX_LIFETIME_MS);
-    expect(response.status).toBe(200);
-    expect(gateway.minted).toEqual(["read:demo:60"]);
-    expect(gateway.forwarded.map(({ auth }) => auth)).toEqual(["Bearer minted-read"]);
+      expect(outcome).toEqual({ kind: "pass" });
+      expect(sandbox.calls.filter((call) => call === "start")).toHaveLength(1);
+      expect(recorder.routed).toEqual([grant]);
+      expect(grant?.expiresAt).toBeGreaterThanOrEqual(started + MAX_SANDBOX_LIFETIME_MS);
+      expect(grant?.expiresAt).toBeLessThanOrEqual(finished + MAX_SANDBOX_LIFETIME_MS);
+      expect(live.status).toBe(200);
+      expect(retired.status).toBe(403);
+      expect(await retired.text()).toContain("retired");
+      expect(gateway.minted).toEqual(["read:demo:60"]);
+      expect(gateway.forwarded.map(({ auth }) => auth)).toEqual(["Bearer minted-read"]);
+    });
+  });
+
+  it("runs no command when the sandbox's fence refuses to start", async () => {
+    await withFence(async (fence) => {
+      // A retired object never starts again, as when the deadline passed before the runner began.
+      await fence.retire();
+      const { outcome, sandbox } = await run({ cached: true, fence });
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+      });
+      expect(sandbox.calls).toEqual(["start", "destroy"]);
+    });
   });
 
   it("records a checkout that cannot find the commit as an error and never runs the check", async () => {
@@ -519,7 +631,7 @@ describe("a check run through the patched SDK", () => {
       kind: "rejected",
       failure: { conclusion: "error", runner: "install", reason: "checkout" },
     });
-    expect(sandbox.calls).toEqual(["outbound:gitGateway", "checkout", "destroy"]);
+    expect(sandbox.calls).toEqual(["start", "checkout", "destroy"]);
   });
 
   it("records a failed overlay checkout on a chained runner as an error before its command", async () => {
