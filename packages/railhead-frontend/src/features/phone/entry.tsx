@@ -1,7 +1,9 @@
-import type { FeatureEntry, BoardSlotProps } from "../board/boardPorts";
+import type { BoardSlotProps, FeatureEntry } from "../board/boardPorts";
+import { PhoneLinksPanel } from "./PhoneLinksPanel";
 
-/**
- * The board's slot for links that open questions and confirmations on a phone.
- * Unavailable until this feature supplies its component.
- */
-export const phoneEntry: FeatureEntry<BoardSlotProps> = { kind: "unavailable" };
+const PhoneSlot = ({ feed }: BoardSlotProps) => (
+  <PhoneLinksPanel feed={feed} origin={window.location.origin} />
+);
+
+/** The board's slot for links that open questions and confirmations on a phone. */
+export const phoneEntry: FeatureEntry<BoardSlotProps> = { kind: "available", Component: PhoneSlot };
