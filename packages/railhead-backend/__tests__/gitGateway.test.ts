@@ -158,7 +158,12 @@ interface World {
   tokens: () => string[];
   /** The tokens still live, across main and the fork. */
   live: () => FakeToken[];
-  /** How far the gateway's clock is ahead of the real one, in milliseconds. */
+  /**
+   * When the world was set up. The gateway's clock stays there, so a loaded host cannot make a
+   * pending push due early; only `skew` moves it.
+   */
+  start: number;
+  /** How far the gateway's clock has moved past `start`, in milliseconds. */
   skew: number;
   /** Every alarm time the gateway asked the Repo for, whether its write succeeded or not. */
   wakes: number[];
@@ -327,6 +332,7 @@ function inGateway(
       minted: () => allTokens().length - setupTokens,
       tokens: allTokens,
       live: () => [...fake.liveTokens(mainName), ...fake.liveTokens(forkName)],
+      start: Date.now(),
       skew: 0,
       wakes: [],
       wakeAnswer: () => true,
@@ -356,7 +362,7 @@ function inGateway(
         {
           log,
           storage: state.storage,
-          clock: () => Date.now() + world.skew,
+          clock: () => world.start + world.skew,
           wake: (at) => {
             world.wakes.push(at);
             // Resolved later, as the Repo's alarm write is, on a real timer.
@@ -2539,13 +2545,12 @@ async function pushWithFailedRecord(world: World): Promise<void> {
 describe("a push left pending", () => {
   it("is saved before release, and recorded by the alarm of a restarted gateway after its record failed", async () => {
     await withGateway(async (world) => {
-      const before = Date.now();
       await pushWithFailedRecord(world);
       const [row, ...others] = world.pending();
       expect(others).toEqual([]);
       expect(row).toMatchObject({ claim_id: CLAIM, generation: 3, attempts: 0 });
       // The alarm is asked for once the push's exchange must have ended.
-      expect(row?.due_at).toBeGreaterThanOrEqual(before + FAST.maxDurationMs);
+      expect(row?.due_at).toBe(world.start + FAST.maxDurationMs);
       expect(world.wakes).toEqual([row?.due_at]);
 
       world.restart();
@@ -2677,12 +2682,12 @@ describe("a push left pending", () => {
       world.respond = () => new Response("down", { status: 500 });
       for (let attempt = 1; attempt < 5; attempt += 1) {
         world.skew += 24 * 60 * 60_000;
-        const now = Date.now() + world.skew;
+        const now = world.start + world.skew;
         await world.gateway.resume();
         const [row] = world.pending();
         expect(row?.attempts).toBe(attempt);
         // Each failed read waits twice as long as the one before.
-        expect(row?.due_at).toBeGreaterThanOrEqual(now + 60_000 * 2 ** (attempt - 1));
+        expect(row?.due_at).toBe(now + 60_000 * 2 ** (attempt - 1));
         expect(world.wakes.at(-1)).toBe(row?.due_at);
       }
       // A truncated advertisement is no better than none.
