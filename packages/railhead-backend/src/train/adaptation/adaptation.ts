@@ -394,16 +394,18 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
       .map((row) => row.intent_id);
   }
 
+  // Asks the alarm to run now when an adaptation is unannounced, and says whether it asked.
+  function wakeIfUnannounced(): boolean {
+    const unannounced =
+      sql.exec("SELECT 1 FROM adaptations WHERE announced = 0 LIMIT 1").toArray().length > 0;
+    if (unannounced) wake(clock());
+    return unannounced;
+  }
+
   // Asks the alarm to run now while an adaptation is unannounced, else for the earliest pending
   // landing, if any. Call it as a transaction's last write.
   function requestWake(): void {
-    const unannounced = sql
-      .exec("SELECT 1 FROM adaptations WHERE announced = 0 LIMIT 1")
-      .toArray().length;
-    if (unannounced > 0) {
-      wake(clock());
-      return;
-    }
+    if (wakeIfUnannounced()) return;
     const row = sql
       .exec<{ next: number | null }>(
         "SELECT MIN(next_at) AS next FROM adaptation_landings WHERE outcome IS NULL",
@@ -454,6 +456,10 @@ export function createAdaptation(deps: AdaptationDeps): AdaptationPort {
       intentId,
     );
   }
+
+  // Adaptations left unannounced by a restart or by the migration that added `announced` would wait
+  // for unrelated activity to wake the Repo, so a start with any asks for the alarm once.
+  wakeIfUnannounced();
 
   return {
     owe(intentId, pins) {

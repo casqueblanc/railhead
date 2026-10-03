@@ -437,6 +437,36 @@ describe("claim.adapted", () => {
     });
   });
 
+  it("asks for the alarm on start while an adaptation is unannounced, and announces it once", async () => {
+    const stub = env.REPO.getByName(crypto.randomUUID());
+    const world = new World();
+    await withAdaptation(({ adaptation }) => adaptation.recordLanding(INTENT), stub, world);
+    await evictDurableObject(stub);
+    // The restarted Repo is idle: no landing is owed and nothing else would wake it.
+    await withAdaptation(
+      async ({ adaptation, wakes, events, now }) => {
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0]).toBeLessThanOrEqual(now());
+        expect(events()).toEqual([]);
+        await adaptation.resume();
+        await adaptation.resume();
+        expect(announced(events())).toEqual([{ claimId: ATLAS, intentId: INTENT, version: 1 }]);
+      },
+      stub,
+      world,
+    );
+    await evictDurableObject(stub);
+    // Once everything is announced, a start asks for nothing.
+    await withAdaptation(
+      ({ wakes, events }) => {
+        expect(wakes).toEqual([]);
+        expect(events()).toHaveLength(1);
+      },
+      stub,
+      world,
+    );
+  });
+
   it("announces an adaptation recorded before the Repo restarted", async () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     const world = new World();
