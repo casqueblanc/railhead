@@ -765,7 +765,7 @@ describe("totals and recent activity", () => {
 
     expect(once.totals).toEqual({
       humanActions: 7,
-      firstAt: SYNTH_START_MS,
+      earliestAt: SYNTH_START_MS,
       lastAt: SYNTH_START_MS + (last(checkBeforeLand) - 1) * 1000,
     });
     expect(replayed.totals).toEqual(once.totals);
@@ -794,7 +794,7 @@ describe("totals and recent activity", () => {
   it("starts with no counts and no recent activity", () => {
     const empty = emptyBoardState(SYNTH_REPO);
 
-    expect(empty.totals).toEqual({ humanActions: 0, firstAt: null, lastAt: null });
+    expect(empty.totals).toEqual({ humanActions: 0, earliestAt: null, lastAt: null });
     expect(empty.recent).toEqual([]);
   });
 });

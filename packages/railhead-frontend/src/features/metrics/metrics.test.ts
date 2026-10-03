@@ -114,6 +114,22 @@ describe("boardMetrics", () => {
     expect(at(4).checks.pass).toBe(4);
   });
 
+  it("spans from the earliest event in the window, not the first in sequence", () => {
+    const prelude = uploadPrelude();
+    const steps = [...prelude, checkResult("chk_synthearly", synthCommit(2), "test", "pass")];
+    // The prelude is recorded at minute 5; the check after it carries minute 4.
+    const events = timed(steps, (index) =>
+      index < prelude.length ? SYNTH_START_MS + 5 * MINUTE + index : SYNTH_START_MS + 4 * MINUTE,
+    );
+
+    expect(boardMetrics(fold(events)).recent).toEqual({
+      minutes: 2,
+      claimsOpened: 2,
+      checksRun: 1,
+      changesLanded: 0,
+    });
+  });
+
   it("does not count a late event older than the window as recent", () => {
     const prelude = uploadPrelude();
     const steps = [

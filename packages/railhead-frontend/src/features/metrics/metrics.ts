@@ -55,9 +55,9 @@ export const boardMetrics = (state: BoardState): BoardMetrics => {
 const MINUTE_MS = 60_000;
 
 const recentActivity = (state: BoardState): RecentActivity | null => {
-  const { firstAt, lastAt } = state.totals;
-  if (firstAt === null || lastAt === null) return null;
-  const spanned = Math.floor(lastAt / MINUTE_MS) - Math.floor(firstAt / MINUTE_MS) + 1;
+  const { earliestAt, lastAt } = state.totals;
+  if (earliestAt === null || lastAt === null) return null;
+  const spanned = Math.floor(lastAt / MINUTE_MS) - Math.floor(earliestAt / MINUTE_MS) + 1;
   const activity: RecentActivity = {
     minutes: Math.min(ACTIVITY_WINDOW_MINUTES, spanned),
     claimsOpened: 0,

@@ -2,7 +2,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
-import { SYNTH_REPO } from "../../../../../fixtures/board/syntheticLog";
+import {
+  SYNTH_REPO,
+  SYNTH_START_MS,
+  synthCommit,
+  syntheticLog,
+} from "../../../../../fixtures/board/syntheticLog";
+import { checkResult, uploadPrelude } from "../../../../../fixtures/board/uploadSteps";
 import { emptyBoardState, foldEvents } from "../board/boardState";
 import type { BoardFeed } from "../claims/boardFeed";
 import { TotalsPanel } from "./TotalsPanel";
@@ -55,6 +61,27 @@ describe("TotalsPanel", () => {
     expect(text()).toContain("In the last minute of the log");
     expect(text()).toContain(`Counted from events 1–${complete.cursor}.`);
     expect(text()).not.toMatch(/%|per minute|rate/i);
+  });
+
+  it("labels the span from the earliest event when a later one carries an earlier time", async () => {
+    const steps = [
+      ...uploadPrelude(),
+      checkResult("chk_synthearly", synthCommit(2), "test", "pass"),
+    ];
+    // The prelude is recorded at minute 5; the check after it carries minute 4.
+    const events = syntheticLog("A late check", steps).events.map((event, index) => ({
+      ...event,
+      at: SYNTH_START_MS + (index < steps.length - 1 ? 5 * 60_000 + index : 4 * 60_000),
+    }));
+    const board = foldEvents(emptyBoardState(SYNTH_REPO), events);
+    await render({ kind: "board", board, connection: "live", recovered: false });
+
+    expect(text()).toContain("In the last 2 minutes of the log");
+    expect(counts().slice(-3)).toEqual([
+      ["Claims opened", "2"],
+      ["Checks run", "1"],
+      ["Changes landed", "0"],
+    ]);
   });
 
   it("says the counts stop where the board does when it is not live", async () => {

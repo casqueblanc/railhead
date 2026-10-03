@@ -220,8 +220,11 @@ export interface MinuteActivity {
 export interface LogTotals {
   /** Events a person recorded: invites, confirmations, revocations, filed issues and decisions. */
   humanActions: number;
-  /** `at` of the first applied event, or `null` before it. */
-  firstAt: number | null;
+  /**
+   * The earliest `at` of any applied event, or `null` before the first. A late event can carry an
+   * earlier `at` than the event before it in sequence.
+   */
+  earliestAt: number | null;
   /** The latest `at` of any applied event, or `null` before the first. */
   lastAt: number | null;
 }
@@ -293,7 +296,7 @@ export const emptyBoardState = (repo: RepoId): BoardState => ({
   checkRuns: {},
   intents: {},
   conflicts: [],
-  totals: { humanActions: 0, firstAt: null, lastAt: null },
+  totals: { humanActions: 0, earliestAt: null, lastAt: null },
   recent: [],
 });
 
@@ -476,7 +479,7 @@ const foldInto = (state: BoardState, event: RailheadEvent, draft: FoldDraft): Bo
 
 const countTotals = (totals: LogTotals, event: RailheadEvent): LogTotals => ({
   humanActions: totals.humanActions + (event.actor.kind === "human" ? 1 : 0),
-  firstAt: totals.firstAt ?? event.at,
+  earliestAt: totals.earliestAt === null ? event.at : Math.min(totals.earliestAt, event.at),
   lastAt: totals.lastAt === null ? event.at : Math.max(totals.lastAt, event.at),
 });
 
