@@ -14,7 +14,19 @@
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
 
-import { ContainerProxy, Sandbox, getSandbox } from "@cloudflare/sandbox";
+import {
+  ContainerProxy,
+  Sandbox,
+  getSandbox,
+  type BackupOptions,
+  type DirectoryBackup,
+  type ExecOptions,
+  type ExecResult,
+  type ListFilesOptions,
+  type Process,
+  type ProcessOptions,
+  type RestoreBackupResult,
+} from "@cloudflare/sandbox";
 import { MAX_OUTPUT_BYTES, type SandboxCommand, type SandboxDriver } from "./entry";
 import { SandboxFence } from "./fence";
 import { serveGitGateway } from "./gateway";
@@ -88,6 +100,55 @@ export class RailheadSandbox extends Sandbox<Env> {
   /** Runs when the fence asked to be woken: at the deadline, or to retry a teardown. */
   async railheadExpire(): Promise<void> {
     await this.#fence.expire();
+  }
+
+  // The SDK operations a CI run issues on this object run inside the fence's live incarnation, so
+  // its retirement waits for them and none starts, or reports, after it.
+
+  override restoreBackup(backup: DirectoryBackup): Promise<RestoreBackupResult> {
+    return this.#fence.operate(() => super.restoreBackup(backup));
+  }
+
+  override createBackup(options: BackupOptions): Promise<DirectoryBackup> {
+    return this.#fence.operate(() => super.createBackup(options));
+  }
+
+  override execWithSessionToken(
+    command: string,
+    sessionId: string,
+    options?: ExecOptions,
+  ): Promise<ExecResult> {
+    return this.#fence.operate(() => super.execWithSessionToken(command, sessionId, options));
+  }
+
+  override listFiles(path: string, options?: ListFilesOptions): ReturnType<Sandbox["listFiles"]> {
+    return this.#fence.operate(() => super.listFiles(path, options));
+  }
+
+  override async startProcess(
+    command: string,
+    options?: ProcessOptions,
+    sessionId?: string,
+  ): Promise<Process> {
+    const started = await this.#fence.operate(() =>
+      super.startProcess(command, options, sessionId),
+    );
+    return {
+      ...started,
+      waitForExit: (timeout) => this.#fence.operate(() => started.waitForExit(timeout)),
+    };
+  }
+
+  // Every SDK call that reaches or starts the container passes here: one that resumes after
+  // retirement, such as a restore whose archive read outlived the deadline, is refused before it
+  // can restart the container the fence destroyed.
+  override async containerFetch(
+    requestOrUrl: Request | string | URL,
+    portOrInit?: number | RequestInit,
+    portParam?: number,
+  ): Promise<Response> {
+    this.#fence.admit();
+    return super.containerFetch(requestOrUrl, portOrInit, portParam);
   }
 }
 

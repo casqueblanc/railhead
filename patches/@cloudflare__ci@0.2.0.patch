@@ -81,7 +81,7 @@ index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..81af991e8ed7611a175d72cc2b6332bf
      : { status: 'miss' as const };
    if (cache.status === 'hit') {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00d3b5cc53 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..0311a879ff8e9fa2340a29400efb8926f3fd8987 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
 @@ -1,5 +1,6 @@
@@ -100,7 +100,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00
     */
    async run(
      input: RunStepInput & { restore?: DirectoryBackup }
-@@ -45,13 +46,28 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -45,13 +46,30 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
        containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
      });
  
@@ -121,7 +121,9 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00
 -        (await sandbox.exec('test -c /dev/fuse')).exitCode !== 0;
 +      // Railhead patch: start the sandbox's fenced incarnation before the first
 +      // command. The fence routes the checkout's Git requests to the gateway
-+      // under the grant and retires the sandbox when the grant lapses.
++      // under the grant and retires the sandbox when the grant lapses. Every
++      // call below (restore, exec, process, backup, file listing) runs inside
++      // that incarnation, so none touches the container after it retires.
 +      if (fenced) {
 +        await sandbox.railheadStart(
 +          input.source.fence.policy,
@@ -135,7 +137,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00
        if (input.restore) {
          await sandbox.restoreBackup(input.restore);
          // Overlay (no rm) so cached node_modules survive while tracked source
-@@ -59,20 +75,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -59,20 +77,27 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          // different commit's source (e.g. a reused install cache), so this is
          // what keeps it correct. Files deleted since then linger; the next
          // install/build regenerates derived output.
@@ -175,7 +177,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00
        }
  
        const proc = await sandbox.startProcess(
-@@ -102,46 +125,39 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -102,46 +127,39 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          ttl: input.ttlSeconds,
          localBucket,
        });
@@ -248,28 +250,32 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..dad6cb27fccbcb6037d00f1cd2350b00
  async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
    const listing = await sandbox.listFiles('/tmp');
    const sizes = new Map(
-@@ -157,9 +173,18 @@ async function readLog(
+@@ -157,11 +175,20 @@ async function readLog(
    sandbox: ReturnType<typeof getSandbox>,
    file: string,
    size: number
 -): Promise<string | ReadableStream<Uint8Array>> {
-+): Promise<string> {
-   if (size > INLINE_LOG_BYTES) {
+-  if (size > INLINE_LOG_BYTES) {
 -    return sandbox.readFileStream(file);
-+    // Railhead patch: the tail, bounded like an inline log, instead of a
-+    // stream that would keep the sandbox alive after the run returns.
-+    const { exitCode, stdout } = await sandbox.exec(
-+      `tail -c ${INLINE_LOG_BYTES} ${file}`,
-+      { cwd: '/', timeout: 30_000 }
-+    );
-+    if (exitCode !== 0) {
-+      throw new Error(`reading a log's tail exited with status ${exitCode}`);
-+    }
-+    return `[log truncated to its last ${INLINE_LOG_BYTES} bytes]\n${stdout}`;
++): Promise<string> {
++  // Railhead patch: every log is read through `exec`, which the sandbox's
++  // fence tracks, and a log above the inline limit keeps its tail instead of
++  // a stream that would keep the sandbox alive after the run returns.
++  const { exitCode, stdout } = await sandbox.exec(
++    `tail -c ${INLINE_LOG_BYTES} ${file}`,
++    { cwd: '/', timeout: 30_000 }
++  );
++  if (exitCode !== 0) {
++    throw new Error(`reading a log exited with status ${exitCode}`);
    }
-   return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
+-  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
++  return size > INLINE_LOG_BYTES
++    ? `[log truncated to its last ${INLINE_LOG_BYTES} bytes]\n${stdout}`
++    : stdout;
  }
-@@ -198,43 +223,6 @@ function resolveCwd(cwd: string | undefined) {
+ 
+ async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
+@@ -198,43 +225,6 @@ function resolveCwd(cwd: string | undefined) {
    return posix.join(WORKSPACE_DIR, normalized);
  }
  

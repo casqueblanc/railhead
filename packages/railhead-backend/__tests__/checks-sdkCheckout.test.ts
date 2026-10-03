@@ -90,6 +90,9 @@ class FenceRecorder {
   failingDestroys = 0;
 }
 
+// How long a test fence's `retire` waits for operations under way, in real milliseconds.
+const SETTLE_MS = 50;
+
 /**
  * Runs `body` with a real fence over the storage of a Durable Object no other test touches, on the
  * clock the gateway reads, so fake timers move both.
@@ -114,6 +117,7 @@ function withFence(body: (fence: SandboxFence, recorder: FenceRecorder) => Promi
         },
       },
       () => Date.now(),
+      SETTLE_MS,
     );
     await body(fence, recorder);
   });
@@ -305,6 +309,17 @@ describe("the checkout's grant at the registered Git gateway", () => {
   });
 });
 
+function noop(): void {}
+
+/** A promise the test settles by hand. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = noop;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 /** What one scripted sandbox command returns. */
 interface Scripted {
   exitCode: number;
@@ -318,6 +333,8 @@ type ScriptedCommand = (command: string, workspace: ReadonlySet<string>) => Scri
  * A Sandbox Durable Object stub that records every call and answers from a script. It models the
  * workspace as a set of paths: a fresh checkout replaces it with the fetched commit's tree, an
  * overlay adds that tree without deleting anything, and a backup restores the paths it captured.
+ * Given a fence, it runs each SDK operation through `operate` and reaches the container through
+ * `admit`, as `RailheadSandbox`'s overrides and its `containerFetch` do.
  */
 class ScriptedSandbox {
   readonly calls: string[] = [];
@@ -332,6 +349,12 @@ class ScriptedSandbox {
   tailFails = false;
   /** Whether `railheadRetire` rejects without retiring. */
   retireFails = false;
+  /** Called when the runner asks for a restore, before the fence sees it. */
+  onRestore: () => void = noop;
+  /** When set, a restore waits on it, as the SDK's restore waits on R2, before it extracts. */
+  restoreWaits: Promise<void> | null = null;
+  /** Called once a restore is waiting on `restoreWaits`. */
+  onRestoreWaiting: () => void = noop;
   private workspace = new Set<string>();
   private lastCommand: Scripted = { exitCode: 0 };
 
@@ -352,10 +375,26 @@ class ScriptedSandbox {
     await this.fence?.start(grant.policy, grant.expiresAt);
   }
 
-  async execWithSessionToken(command: string, _session: string, options?: { env?: object }) {
+  /** Runs `operation` as `RailheadSandbox` does: inside the fence's incarnation when there is one. */
+  private fenced<T>(operation: () => Promise<T>): Promise<T> {
+    return this.fence === null ? operation() : this.fence.operate(operation);
+  }
+
+  /** Reaches the container, as the SDK does through `RailheadSandbox.containerFetch`. */
+  private reach(): void {
+    this.fence?.admit();
+  }
+
+  execWithSessionToken(command: string, session: string, options?: { env?: object }) {
+    return this.fenced(async () => this.execScripted(command, session, options));
+  }
+
+  private execScripted(command: string, _session: string, options?: { env?: object }) {
+    this.reach();
     this.envs.push({ ...options?.env });
     if (command.startsWith(`tail -c ${INLINE_LOG_BYTES} `)) {
-      this.calls.push("log:tail");
+      // Labelled by the log's size: a read above the inline limit keeps only the tail.
+      this.calls.push(this.logBytes > INLINE_LOG_BYTES ? "log:tail" : "log:read");
       return { exitCode: this.tailFails ? 1 : 0, stdout: "last lines", stderr: "" };
     }
     if (command.startsWith("tail -c")) {
@@ -381,14 +420,28 @@ class ScriptedSandbox {
   }
 
   async startProcess(command: string, options?: { env?: Record<string, string> }) {
-    this.calls.push(`command:${command}`);
-    this.envs.push({ ...options?.env });
-    this.lastCommand = this.command(command, this.workspace);
-    const { exitCode } = this.lastCommand;
-    return { waitForExit: async () => ({ exitCode }) };
+    const exitCode = await this.fenced(async () => {
+      this.reach();
+      this.calls.push(`command:${command}`);
+      this.envs.push({ ...options?.env });
+      this.lastCommand = this.command(command, this.workspace);
+      return this.lastCommand.exitCode;
+    });
+    return {
+      waitForExit: () =>
+        this.fenced(async () => {
+          this.reach();
+          return { exitCode };
+        }),
+    };
   }
 
-  async createBackup(options: { localBucket?: unknown }) {
+  createBackup(options: { localBucket?: unknown }) {
+    return this.fenced(async () => this.backupScripted(options));
+  }
+
+  private backupScripted(options: { localBucket?: unknown }) {
+    this.reach();
     this.calls.push("backup");
     this.backups.push({ localBucket: options.localBucket });
     const id = crypto.randomUUID();
@@ -396,14 +449,27 @@ class ScriptedSandbox {
     return { id, dir: "/workspace", localBucket: options.localBucket };
   }
 
-  async restoreBackup(backup: { id: string }) {
-    this.calls.push("restore");
-    this.restored.push(backup);
-    this.workspace = new Set(this.saved.get(backup.id));
-    return { success: true };
+  restoreBackup(backup: { id: string }) {
+    this.onRestore();
+    return this.fenced(async () => {
+      if (this.restoreWaits !== null) {
+        this.onRestoreWaiting();
+        await this.restoreWaits;
+      }
+      this.reach();
+      this.calls.push("restore");
+      this.restored.push(backup);
+      this.workspace = new Set(this.saved.get(backup.id));
+      return { success: true };
+    });
   }
 
-  async listFiles() {
+  listFiles() {
+    return this.fenced(async () => this.listScripted());
+  }
+
+  private listScripted() {
+    this.reach();
     if (this.logBytes === 0) return { files: [] };
     return {
       files: ["/tmp/ci-step.out", "/tmp/ci-step.err"].map((absolutePath) => ({
@@ -411,11 +477,6 @@ class ScriptedSandbox {
         size: this.logBytes,
       })),
     };
-  }
-
-  async readFile() {
-    if (this.logBytes > 0) this.calls.push("log:read");
-    return { content: "" };
   }
 
   /** `RailheadSandbox.railheadRetire`, through `fence` when the test gives one. */
@@ -541,6 +602,11 @@ async function run(options: {
   logBytes?: number;
   tailFails?: boolean;
   retireFails?: boolean;
+  /** Called when the runner asks for a restore, before the fence sees it. */
+  onRestore?: () => void;
+  /** A restore waits on this, as on R2, and calls `onRestoreWaiting` once it is waiting. */
+  restoreWaits?: Promise<void>;
+  onRestoreWaiting?: () => void;
 }) {
   const sha = options.sha ?? SHA;
   const command = options.command ?? { exitCode: 0 };
@@ -556,6 +622,9 @@ async function run(options: {
   sandbox.logBytes = options.logBytes ?? 0;
   sandbox.tailFails = options.tailFails ?? false;
   sandbox.retireFails = options.retireFails ?? false;
+  sandbox.onRestore = options.onRestore ?? noop;
+  sandbox.restoreWaits = options.restoreWaits ?? null;
+  sandbox.onRestoreWaiting = options.onRestoreWaiting ?? noop;
   const artifacts = new RecordingArtifacts();
   const bindings = {
     CF_TOKEN: "cf-secret-token",
@@ -625,12 +694,16 @@ describe("a check run through the patched SDK", () => {
       "checkout",
       "command:(npm ci) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
+      "log:read",
+      "log:read",
       "retire",
       "start",
       "restore",
       "checkout:overlay",
       "command:(npm test) > /tmp/ci-step.out 2> /tmp/ci-step.err",
       "backup",
+      "log:read",
+      "log:read",
       "retire",
     ]);
     expect(sandbox.started).toEqual({
@@ -673,7 +746,7 @@ describe("a check run through the patched SDK", () => {
       expect(recorder.routed).toEqual([parseSandboxGrant(sandbox.started)]);
       expect(current).toEqual([true]);
       // The runner's own cleanup retired the fence: nothing in the test did.
-      expect(sandbox.calls.slice(-2)).toEqual(["backup", "retire"]);
+      expect(sandbox.calls.slice(-4)).toEqual(["backup", "log:read", "log:read", "retire"]);
       expect(sandbox.calls).not.toContain("destroy");
       expect(recorder.destroys).toBe(1);
       expect(fence.grantCurrent(expiresAt)).toBe(false);
@@ -681,6 +754,72 @@ describe("a check run through the patched SDK", () => {
       expect(await after.text()).toContain("retired");
       expect(gateway.minted).toEqual([]);
       expect(gateway.forwarded).toEqual([]);
+    });
+  });
+
+  it("never touches the container when a restore that began before expiry resumes after it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
+    await withFence(async (fence, recorder) => {
+      const r2 = deferred();
+      const waiting = deferred();
+      // The cache hit skips the install, so the test's sandbox restores the cached workspace.
+      const pending = run({
+        cached: true,
+        fence,
+        restoreWaits: r2.promise,
+        onRestoreWaiting: waiting.resolve,
+      });
+      await waiting.promise;
+
+      // The deadline's wake-up retires the sandbox while the restore waits on R2. It cannot confirm
+      // the teardown while the restore is unresolved.
+      vi.setSystemTime(expiresAt);
+      await expect(fence.expire()).rejects.toMatchObject({ code: "unsettled" });
+      expect(fence.grantCurrent(expiresAt)).toBe(false);
+      const destroysAtExpiry = recorder.destroys;
+      expect(destroysAtExpiry).toBeGreaterThan(0);
+
+      r2.resolve();
+      const { outcome, sandbox } = await pending;
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+      });
+      // Nothing reached the container after the restore resumed: no extraction, checkout,
+      // command, backup or log read, and no cache pointer.
+      expect(sandbox.calls).toEqual(["start", "retire"]);
+      expect(sandbox.restored).toEqual([]);
+      // The restore's settling and the runner's release each destroyed the container again, and
+      // the teardown is now confirmed.
+      expect(recorder.destroys).toBe(destroysAtExpiry + 2);
+      await fence.retire();
+      expect(fence.grantCurrent(expiresAt)).toBe(false);
+    });
+  });
+
+  it("refuses a restore asked for after the sandbox's deadline without running it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const expiresAt = NOW + MAX_SANDBOX_LIFETIME_MS;
+    await withFence(async (fence, recorder) => {
+      const { outcome, sandbox } = await run({
+        cached: true,
+        fence,
+        onRestore: () => vi.setSystemTime(expiresAt),
+      });
+
+      expect(outcome).toEqual({
+        kind: "rejected",
+        failure: { conclusion: "error", runner: "test", reason: "infrastructure" },
+      });
+      expect(sandbox.calls).toEqual(["start", "retire"]);
+      expect(sandbox.restored).toEqual([]);
+      expect(recorder.destroys).toBeGreaterThan(0);
+      await fence.retire();
+      expect(fence.grantCurrent(expiresAt)).toBe(false);
     });
   });
 

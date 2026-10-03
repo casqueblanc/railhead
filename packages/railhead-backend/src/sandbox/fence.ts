@@ -25,6 +25,11 @@
 // after the last command settled.
 // Route, wake-up and destroy calls are never abandoned: the operation that made them awaits them.
 //
+// Container calls the fence does not issue itself, such as a backup restore or a process wait, run
+// through `operate` under the same tracking, deadline and destroy-on-settle, and `admit` refuses
+// every path that would reach or start the container outside the live incarnation, so a call that
+// resumes after retirement cannot touch it.
+//
 // The grant also ends at retirement: the gateway asks
 // `grantCurrent` before it uses it, and that is false from the moment retirement is recorded. A
 // wake-up that arrives early schedules itself again, so a scheduler that runs callbacks before their
@@ -187,6 +192,45 @@ export class SandboxFence {
   }
 
   /**
+   * Runs one container operation the fence does not issue itself, such as a backup restore or a
+   * process wait, inside the live incarnation. It is refused, never started, once the incarnation is
+   * retired or past its deadline, and abandoned at the deadline. Until it settles it holds
+   * retirement unconfirmed like a command; if retirement happened while it ran, the container is
+   * destroyed again before the operation reports, whether it succeeded or failed.
+   */
+  operate<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#track(async () => {
+      const state = this.#read();
+      if (state === null) throw new SandboxFenceError("not_started");
+      if (state.phase !== "live") throw new SandboxFenceError("retired");
+      if (this.#clock() >= state.deadline) return this.#expireFrom(state.deadline);
+      let result: T;
+      try {
+        result = await this.#effect(operation, Math.max(1, state.deadline - this.#clock()));
+      } catch (error) {
+        await this.#settleEffect();
+        if (this.#clock() >= state.deadline) return this.#expireFrom(state.deadline);
+        return this.#failClosed(state.deadline, error);
+      }
+      await this.#settleEffect();
+      if (this.#clock() >= state.deadline) return this.#expireFrom(state.deadline);
+      return result;
+    });
+  }
+
+  /**
+   * Refuses unless the incarnation is live and before its deadline. Every path that reaches or
+   * starts the container passes here, so an operation that resumes after retirement, or after the
+   * deadline, cannot touch it.
+   */
+  admit(): void {
+    const state = this.#read();
+    if (state === null) throw new SandboxFenceError("not_started");
+    if (state.phase !== "live") throw new SandboxFenceError("retired");
+    if (this.#clock() >= state.deadline) throw new SandboxFenceError("expired");
+  }
+
+  /**
    * Whether the outbound grant that lapses at `expiresAt` is still this live incarnation's. False
    * once retirement is recorded, which happens before the container is touched.
    */
@@ -253,14 +297,27 @@ export class SandboxFence {
   }
 
   // Runs one command, aborting it at its timeout: the SDK does not stop a streaming command itself.
-  // A container that ignores the abort is not waited for, but its call stays tracked until it
-  // settles, and if it settles after its caller gave up the container is destroyed again.
   async #run(
     command: string,
     options: { timeoutMs: number; env?: Record<string, string>; cwd?: string },
   ): Promise<BoundedOutput> {
     const abort = new AbortController();
-    const effect = this.#container.exec(command, { ...options, signal: abort.signal });
+    return this.#effect(
+      () => this.#container.exec(command, { ...options, signal: abort.signal }),
+      options.timeoutMs,
+      abort,
+    );
+  }
+
+  // Runs one container call, giving up on it at `timeoutMs`. A call that ignores `abort` is not
+  // waited for, but it stays tracked until it settles, and if it settles after its caller gave up
+  // the container is destroyed again.
+  async #effect<T>(
+    start: () => Promise<T>,
+    timeoutMs: number,
+    abort?: AbortController,
+  ): Promise<T> {
+    const effect = start();
     let abandoned = false;
     this.#effects.add(effect);
     const settled = () => {
@@ -274,9 +331,9 @@ export class SandboxFence {
     const timedOut = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         abandoned = true;
-        abort.abort();
+        abort?.abort();
         reject(new SandboxFenceError("timed_out"));
-      }, options.timeoutMs);
+      }, timeoutMs);
     });
     try {
       return await Promise.race([effect, timedOut]);
