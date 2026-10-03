@@ -6,16 +6,27 @@
 // edited, so nothing runs) or `started` (a sandbox slot was admitted and the run was asked for) to
 // `reported` (the run's result, with its output cut to `MAX_CHECK_LOG_BYTES` and the SHA-256 of what
 // was kept). The output is untrusted text: it is stored for a reader, never logged. The table keeps
-// at most `MAX_STORED_ATTEMPTS` rows; the oldest settled ones go first.
+// at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones going first. A started attempt counts
+// as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its run cannot still be
+// running, and the train no longer accepts its report. A report for an attempt removed this way
+// finds no row and is refused, so an abandoned run can neither grow the table nor pass late.
 
 import type { CheckResult, CheckRunId, CommitSha } from "@railhead/shared/events";
+import { CHECK_DEADLINE_MS } from "../modules/train/scheduler";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
 
 /** The most bytes of a run's output kept, from its end. */
 export const MAX_CHECK_LOG_BYTES = 64 * 1024;
 
-/** The most attempts kept. Writing one more removes the oldest held or reported one. */
+/** The most attempts kept. Writing one more removes the oldest settled one. */
 export const MAX_STORED_ATTEMPTS = 512;
+
+/**
+ * How long after its sandbox's deadline a started attempt is kept as if its report could still
+ * arrive. The train waits `CHECK_DEADLINE_MS` from when it asked for the run, which was before the
+ * sandbox was admitted, so by then it refuses the report anyway.
+ */
+export const REPORT_GRACE_MS = CHECK_DEADLINE_MS;
 
 const OWNER = "checks";
 
@@ -158,7 +169,7 @@ export class AttemptTable {
     return atomically(this.#storage, () => {
       const existing = this.get(identity.attemptId);
       if (existing !== null) return existing;
-      this.#prune();
+      this.#prune(now);
       this.#storage.sql.exec(
         `INSERT INTO check_attempts
            (attempt_id, candidate, expected_main, digest, state, held_paths, sandbox, deadline,
@@ -182,8 +193,8 @@ export class AttemptTable {
   }
 
   // Makes room for one more row: removes the oldest settled attempts beyond the bound. A started
-  // attempt is never removed, so its report always finds it.
-  #prune(): void {
+  // attempt whose report could still arrive is never removed, so that report finds it.
+  #prune(now: number): void {
     const row = this.#storage.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM check_attempts")
       .one();
@@ -191,8 +202,10 @@ export class AttemptTable {
     if (excess <= 0) return;
     this.#storage.sql.exec(
       `DELETE FROM check_attempts WHERE attempt_id IN (
-         SELECT attempt_id FROM check_attempts WHERE state != 'started'
+         SELECT attempt_id FROM check_attempts
+         WHERE state != 'started' OR deadline <= ?
          ORDER BY updated_at, attempt_id LIMIT ?)`,
+      now - REPORT_GRACE_MS,
       excess,
     );
   }

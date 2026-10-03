@@ -3,7 +3,12 @@ import type { RunnerOptions } from "@cloudflare/ci/worker";
 import { introspectWorkflowInstance, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { AttemptTable, MAX_CHECK_LOG_BYTES, MAX_STORED_ATTEMPTS } from "../src/checks/attempts";
+import {
+  AttemptTable,
+  MAX_CHECK_LOG_BYTES,
+  MAX_STORED_ATTEMPTS,
+  REPORT_GRACE_MS,
+} from "../src/checks/attempts";
 import {
   CHECK_DEFINITION_PATH,
   MAX_CHECK_TIMEOUT_MS,
@@ -27,7 +32,14 @@ import { fail, ok, type PortResult } from "../src/contracts/result";
 import type { CheckAttempt, CheckPort, CheckReport } from "../src/contracts/train";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
-import { repoObjectName } from "../src/repo/RepoObject";
+import {
+  insertBatch,
+  markCheckStarted,
+  recordCandidate,
+  requestCheck,
+} from "../src/modules/train/store";
+import { CHECK_DEADLINE_MS } from "../src/modules/train/scheduler";
+import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { MAX_SANDBOX_LIFETIME_MS, type Admission } from "../src/sandbox/admission";
 import type { SandboxPolicy } from "../src/sandbox/policy";
 
@@ -763,15 +775,76 @@ function identity(i: number) {
   };
 }
 
+/** How many rows the attempt table holds. */
+function rowCount(attempts: AttemptTable, ids: readonly string[]): number {
+  return ids.filter((id) => attempts.get(id) !== null).length;
+}
+
 describe("the attempt table", () => {
-  it("keeps at most its bound, dropping the oldest settled attempts and never a started one", async () => {
+  it("keeps at most its bound, dropping the oldest settled attempts and never a live started one", async () => {
     await withChecks(async ({ attempts }) => {
+      // A run whose sandbox deadline is still ahead may yet report.
       attempts.start(identity(0), SANDBOX, NOW, 0);
       for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1) attempts.hold(identity(i), ["a"], i);
 
       expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
       expect(attempts.get(identity(1).attemptId)).toBeNull();
       expect(attempts.get(identity(MAX_STORED_ATTEMPTS).attemptId)?.state.kind).toBe("held");
+    });
+  });
+
+  it("bounds abandoned runs: a started attempt past its report window is dropped like a settled one", async () => {
+    await withChecks(async ({ attempts }) => {
+      const ids: string[] = [];
+      // More abandoned runs than the bound, each recorded long after the one before it ended.
+      for (let i = 0; i < MAX_STORED_ATTEMPTS + 8; i += 1) {
+        const now = NOW + i * 2 * REPORT_GRACE_MS;
+        attempts.start(identity(i), SANDBOX, now, now);
+        ids.push(identity(i).attemptId);
+      }
+
+      expect(rowCount(attempts, ids)).toBe(MAX_STORED_ATTEMPTS);
+      expect(attempts.get(identity(0).attemptId)).toBeNull();
+    });
+  });
+
+  it("keeps a started attempt until its report window has passed", async () => {
+    await withChecks(async ({ attempts }) => {
+      attempts.start(identity(0), SANDBOX, NOW, NOW);
+      for (let i = 1; i < MAX_STORED_ATTEMPTS; i += 1) attempts.hold(identity(i), ["a"], NOW + i);
+
+      // At one millisecond before the window closes, a held attempt goes instead.
+      attempts.hold(identity(MAX_STORED_ATTEMPTS), ["a"], NOW + REPORT_GRACE_MS - 1);
+      expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
+      expect(attempts.get(identity(1).attemptId)).toBeNull();
+
+      // Once it has closed, the abandoned run is the oldest settled attempt.
+      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), ["a"], NOW + REPORT_GRACE_MS);
+      expect(attempts.get(identity(0).attemptId)).toBeNull();
+    });
+  });
+
+  it("refuses a late report for an abandoned run it dropped, without reaching the train", async () => {
+    await withChecks(async (harness) => {
+      const digest = await started(harness);
+      const late = NOW + 2 * REPORT_GRACE_MS;
+      for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1)
+        harness.attempts.hold(identity(i), ["a"], late);
+
+      const result = await harness.checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest,
+        result: "pass",
+        log: "",
+        finishedAt: late,
+      });
+
+      expect(harness.attempts.get(ATTEMPT)).toBeNull();
+      expect(result).toEqual(
+        fail("check_mismatch", "No run of that attempt was started on that candidate."),
+      );
+      expect(harness.world.reports).toEqual([]);
     });
   });
 });
@@ -841,11 +914,11 @@ describe("runCheck", () => {
 });
 
 /**
- * A repository with one started attempt, as `checks.start` leaves it, and the run parameters the
- * Workflow receives for it.
+ * A repository with one started attempt, as `checks.start` leaves it, the train's batch waiting for
+ * that attempt's report, and the run parameters the Workflow receives for it.
  */
 async function startedRepository(): Promise<{
-  stub: DurableObjectStub;
+  stub: DurableObjectStub<Repo>;
   params: CheckRunParams;
 }> {
   const name = `r${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
@@ -855,12 +928,28 @@ async function startedRepository(): Promise<{
   const attemptId = `chk_${crypto.randomUUID().replaceAll("-", "")}`;
   const digest = "d".repeat(64);
   await runInDurableObject(stub, async (_instance, state) => {
+    const now = Date.now();
     new AttemptTable(state.storage).start(
       { attemptId, candidate: CANDIDATE, expectedMain: MAIN, digest },
       SANDBOX,
-      Date.now() + 60_000,
-      Date.now(),
+      now + 60_000,
+      now,
     );
+    // The train asked for this attempt's run and waits for its report, as `startCheck` leaves it.
+    const { sql } = state.storage;
+    const batchId = insertBatch(
+      sql,
+      {
+        expectedMain: MAIN,
+        pins: [{ claimId: "clm_pinned01", generation: 1, commit: OTHER }],
+        decisions: [],
+        definition: { name: "test", source: MAIN, digest, acceptance: null },
+      },
+      now,
+    );
+    recordCandidate(sql, batchId, CANDIDATE, attemptId, now);
+    requestCheck(sql, batchId, now + CHECK_DEADLINE_MS, now);
+    markCheckStarted(sql, batchId, now);
   });
   return {
     stub,
@@ -878,8 +967,21 @@ async function startedRepository(): Promise<{
   };
 }
 
+/** The results the train recorded for `attemptId` on the candidate, from `stub`'s event log. */
+async function trainResults(stub: DurableObjectStub<Repo>, attemptId: string): Promise<string[]> {
+  const page = await stub.readEvents(0, 100);
+  if (!page.ok) throw new Error(page.code);
+  return page.value.events.flatMap((event) =>
+    event.type === "train.check" &&
+    event.data.checkRunId === attemptId &&
+    event.data.candidate === CANDIDATE
+      ? [event.data.result]
+      : [],
+  );
+}
+
 /** The attempt's stored state in `stub`'s repository. */
-async function storedState(stub: DurableObjectStub, attemptId: string) {
+async function storedState(stub: DurableObjectStub<Repo>, attemptId: string) {
   return runInDurableObject(
     stub,
     async (_instance, state) => new AttemptTable(state.storage).get(attemptId)?.state,
@@ -887,7 +989,7 @@ async function storedState(stub: DurableObjectStub, attemptId: string) {
 }
 
 describe("a check run at the real Workflows step boundary", () => {
-  it("records a pass in the repository from the report step", async () => {
+  it("delivers a pass from the report step to the train, which records it", async () => {
     const { stub, params } = await startedRepository();
     await using instance = await introspectWorkflowInstance(env.CHECKS, params.attemptId);
     await instance.modify(async (m) => {
@@ -900,9 +1002,8 @@ describe("a check run at the real Workflows step boundary", () => {
     await env.CHECKS.create({ id: params.attemptId, params });
     await instance.waitForStatus("complete");
 
-    expect(await instance.waitForStepResult({ name: REPORT_STEP })).toEqual({
-      refused: "check_mismatch",
-    });
+    expect(await instance.waitForStepResult({ name: REPORT_STEP })).toEqual({ refused: null });
+    expect(await trainResults(stub, params.attemptId)).toEqual(["pass"]);
     expect(await storedState(stub, params.attemptId)).toEqual(
       expect.objectContaining({
         kind: "reported",
@@ -936,6 +1037,7 @@ describe("a check run at the real Workflows step boundary", () => {
     expect(await storedState(stub, params.attemptId)).toEqual(
       expect.objectContaining({ kind: "reported", result: "fail" }),
     );
+    expect(await trainResults(stub, params.attemptId)).toEqual(["fail"]);
   });
 
   it("records a checkout failure as error, not as the change's failure", async () => {
@@ -958,6 +1060,7 @@ describe("a check run at the real Workflows step boundary", () => {
         log: "The candidate could not be checked out; the check did not run.",
       }),
     );
+    expect(await trainResults(stub, params.attemptId)).toEqual(["error"]);
   });
 
   it("fails without running anything for parameters the checks module never writes", async () => {
@@ -971,6 +1074,7 @@ describe("a check run at the real Workflows step boundary", () => {
     expect(await storedState(stub, params.attemptId)).toEqual(
       expect.objectContaining({ kind: "started" }),
     );
+    expect(await trainResults(stub, params.attemptId)).toEqual([]);
     consoleError.mockRestore();
   });
 });
