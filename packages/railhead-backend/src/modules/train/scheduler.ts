@@ -1121,9 +1121,12 @@ export function createTrain(
           queued = existing.pin.commit !== pin.commit;
           break;
         case "landed":
-          // Main already holds this commit, merged under the decision versions of an earlier
-          // episode. A new episode must bring a new commit, which is merged and checked under its
-          // own versions.
+          // Main already holds this commit. A repeat of the episode it landed for is answered as
+          // done, with no new work or wake. A new episode must bring a new commit, which is merged
+          // and checked under its own versions.
+          if (existing.pin.commit === pin.commit && existing.episode === episode) {
+            return ok({ queued: false });
+          }
           if (existing.pin.commit === pin.commit) {
             return fail(
               "decision_superseded",

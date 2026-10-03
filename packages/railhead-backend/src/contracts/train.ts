@@ -211,8 +211,8 @@ export interface TrainPort {
    * Each call is a new ready episode of the claim, numbered by the claim's `episode`, which the
    * entry records: a pin already waiting is a no-op apart from that number, a waiting entry of the
    * same claim and generation takes the new commit, a dropped or parked one is queued again, a
-   * landed one is queued again with another commit and refused with `decision_superseded` with the
-   * same one, and a batched one takes the new commit and episode once its batch settles. A drive
+   * landed one is queued again with another commit, answered as done for a repeat of the episode it
+   * landed for, and refused with `decision_superseded` for a later episode of the same commit, and a batched one takes the new commit and episode once its batch settles. A drive
    * settles or drops a waiting entry only at the episode it read, so a newer episode is never lost
    * to an older read. Every accepted pin asks for a drive, restarting a wake whose retries ran out.
    * A pin of an older generation than one queued is `stale_generation`. A refusal writes nothing; a
