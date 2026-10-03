@@ -11,6 +11,7 @@
 // depend on several facts, such as "adapted", are computed by selectors over the folded facts and
 // are never stored.
 
+import { INVITE_TTL_MS } from "@railhead/shared/board-api";
 import {
   EVENT_SCHEMA_VERSION,
   validateEvent,
@@ -55,6 +56,13 @@ export interface InviteState {
   inviteId: InviteId;
   /** The agent name the invite fixed in advance. Untrusted text. */
   name: string;
+  /**
+   * When the invite stops being usable, in milliseconds since the Unix epoch: the event's `at` plus
+   * `INVITE_TTL_MS`. The backend reads its clock for its own expiry just before it appends the event,
+   * so this is never earlier than that expiry. No event records an expiry; this is how the board
+   * learns of it.
+   */
+  expiresAt: number;
   agentId: AgentId | null;
 }
 
@@ -492,7 +500,15 @@ const applyEvent = (state: BoardState, event: RailheadEvent): BoardState => {
     case "agent.invited": {
       const { inviteId, name } = event.data;
       fresh(state.invites, inviteId, "invite");
-      return { ...state, invites: put(state.invites, inviteId, { inviteId, name, agentId: null }) };
+      return {
+        ...state,
+        invites: put(state.invites, inviteId, {
+          inviteId,
+          name,
+          expiresAt: event.at + INVITE_TTL_MS,
+          agentId: null,
+        }),
+      };
     }
     case "agent.joined": {
       const { agentId, inviteId, name } = event.data;

@@ -12,6 +12,10 @@ export default defineConfig({
       // same `@validateRpc()` transform in memory. The `Repo` binding is the generated config's.
       main: "./src/server.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
+      // A fixed test value, never a real secret, so agent logins over HTTP work in the pool.
+      miniflare: {
+        bindings: { SESSION_SIGNING_SECRET: "test-only-session-signing-secret-0123456789" },
+      },
     }),
   ],
   test: {

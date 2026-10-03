@@ -6,6 +6,7 @@
 
 import type { DecisionId } from "@railhead/shared/events";
 import type { StreamStatus } from "../board/boardState";
+import type { AttemptControl } from "../enrollment/ownerActions";
 
 /** Answer a decision for the first time, or replace its current answer. */
 export interface RecordDecisionRequest {
@@ -28,12 +29,18 @@ export type DecisionsUnavailableReason =
   /** This browser has no owner passkey for the repository. */
   | "no_passkey";
 
+/**
+ * Records a decision. Nothing is sent once `control.signal` aborts, and `control.onSent` is called
+ * just before the signed answer is sent.
+ */
+export type RecordDecision = (
+  request: RecordDecisionRequest,
+  control: AttemptControl,
+) => Promise<RecordDecisionOutcome>;
+
 /** The page's decision action: available with its callback, or unavailable with a reason. */
 export type DecisionActions =
-  | {
-      kind: "available";
-      onRecordDecision: (request: RecordDecisionRequest) => Promise<RecordDecisionOutcome>;
-    }
+  | { kind: "available"; onRecordDecision: RecordDecision }
   | { kind: "unavailable"; reason: DecisionsUnavailableReason };
 
 /** Why an answer cannot be recorded from this board, including a board that is not up to date. */
@@ -46,10 +53,7 @@ export type DecisionBlock =
 
 /** The action as one card sees it. */
 export type DecisionCardAction =
-  | {
-      kind: "available";
-      onRecordDecision: (request: RecordDecisionRequest) => Promise<RecordDecisionOutcome>;
-    }
+  | { kind: "available"; onRecordDecision: RecordDecision }
   | { kind: "blocked"; block: DecisionBlock };
 
 /**
