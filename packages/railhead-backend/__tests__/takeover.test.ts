@@ -10,12 +10,14 @@ import {
   mainRepoName,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
-import type { ArtifactsRepoName } from "../src/contracts/artifacts";
+import type { ArtifactsPort, ArtifactsRepoName } from "../src/contracts/artifacts";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
-import { ok, type PortResult } from "../src/contracts/result";
+import { fail, ok, type PortResult } from "../src/contracts/result";
+import { unavailableSessions } from "../src/contracts/unavailable";
+import { createGitGateway } from "../src/git/gateway";
 import { CLAIM_LEASE_MS, REVOKE_RETRY_MS, createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
@@ -28,6 +30,7 @@ const HEAD = "2".repeat(40);
 const WORK = "4".repeat(40);
 const STALE = "5".repeat(40);
 const SUCCESSOR = "6".repeat(40);
+const ZERO = "0".repeat(40);
 
 function agent(n: number, repoId = REPO): AgentPrincipal {
   return { kind: "agent", agentId: `agt_agent000${n}`, ownerId: "usr_owner0001", repoId };
@@ -63,6 +66,10 @@ interface Setup {
   revoked: ArtifactsRepoName[];
   /** Every repository a token was minted for through the port, in order. */
   minted: ArtifactsRepoName[];
+  /** The Artifacts port the claims module calls. */
+  artifacts: ArtifactsPort;
+  /** When set, each `revokeTokens` awaits it before reaching Artifacts. */
+  holdRevocation: (() => Promise<void>) | null;
 }
 
 /** Runs `body` in a fresh Repo with real claims, inbox and decisions, and fake Artifacts. */
@@ -95,8 +102,9 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
         setup.minted.push(repo);
         return adapter.token(repo, scope, ttlMs);
       },
-      revokeTokens(repo) {
+      async revokeTokens(repo) {
         setup.revoked.push(repo);
+        await setup.holdRevocation?.();
         return adapter.revokeTokens(repo);
       },
     };
@@ -138,6 +146,8 @@ function withTakeover<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       },
       revoked: [],
       minted: [],
+      artifacts,
+      holdRevocation: null,
     };
     const result = await body(setup);
     expect(fake.openHandles).toBe(0);
@@ -163,6 +173,17 @@ async function fireAlarm(setup: Setup): Promise<void> {
     if (at > now) return;
   }
   throw new Error("the alarm kept asking to fire at once");
+}
+
+function noop(): void {}
+
+/** A promise the test settles by hand. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = noop;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 /** How many claims, of any state, the issue has. */
@@ -309,6 +330,66 @@ describe("leases", () => {
       expect(setup.wakes.at(-1)).toBeLessThanOrEqual(setup.fake.clock());
       expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "expired", generation: 1 });
     });
+  });
+
+  it("fences a working claim in both readers at its exact deadline, before any expiry is recorded", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+
+      setup.fake.advance(CLAIM_LEASE_MS - 1);
+      expect(setup.port.currentGeneration(claim.claimId)).toBe(1);
+      expect(setup.port.workingGeneration(claim.claimId)).toBe(1);
+      setup.fake.advance(1);
+      expect(setup.port.currentGeneration(claim.claimId)).toBeNull();
+      expect(setup.port.workingGeneration(claim.claimId)).toBeNull();
+      // Neither read records anything: the claim is still stored as working, with no expiry.
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "working", generation: 1 });
+      expect(types(setup.events())).not.toContain("claim.expired");
+    });
+  });
+
+  it("keeps a holder's claim while its work or claim call awaits slow revocations past its deadline", async () => {
+    for (const call of ["work", "claim"] as const) {
+      await withTakeover(async (setup) => {
+        // Agent 1's claim lapses while agent 2's, opened a second later, is a second from lapsing.
+        const old = await setup.open();
+        setup.fake.advance(1_000);
+        const issueId = await setup.file("Add downloads");
+        const held = await setup.port.work(agent(2));
+        if (!held.ok) throw new Error(`claim refused: ${held.code}`);
+        const { claimId } = held.value.claim;
+        setup.fake.advance(CLAIM_LEASE_MS - 1);
+
+        // Agent 2 calls a millisecond inside its lease; the revocation of agent 1's fork, which that
+        // call triggers, is held until the clock is past agent 2's original deadline.
+        const entered = deferred();
+        const released = deferred();
+        setup.holdRevocation = () => {
+          entered.resolve();
+          return released.promise;
+        };
+        const answer =
+          call === "work" ? setup.port.work(agent(2)) : setup.port.claim(agent(2), issueId);
+        await entered.promise;
+        setup.fake.advance(2);
+        released.resolve();
+
+        expect(await answer, call).toMatchObject({
+          ok: true,
+          value: { claim: { claimId, issueId, generation: 1, state: "working" }, resumed: true },
+        });
+        expect(setup.revoked, call).toEqual([old.fork]);
+        expect(stored(setup.sql, claimId), call).toMatchObject({
+          state: "working",
+          agent_id: agent(2).agentId,
+        });
+        expect(setup.port.workingGeneration(claimId), call).toBe(1);
+        expect(
+          setup.events().filter((event) => event.type === "claim.expired"),
+          call,
+        ).toMatchObject([{ data: { claimId: old.claim.claimId, generation: 1 } }]);
+      });
+    }
   });
 
   it("expires a lapsed claim on the alarm and revokes its fork's tokens", async () => {
@@ -1014,6 +1095,93 @@ describe("revocation at ready", () => {
       expect(await setup.port.pin(claim.claimId)).toEqual(
         ok({ claimId: claim.claimId, generation: 1, commit: WORK }),
       );
+    });
+  });
+});
+
+describe("the Git gateway at the lease deadline", () => {
+  const SESSION = "session-token-of-agent-one";
+  const encoder = new TextEncoder();
+  /** A pkt-line, written by hand so the test does not reuse the subject's encoder. */
+  const pkt = (payload: string): string =>
+    (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
+
+  /**
+   * Pushes a new branch to agent 1's fork through a gateway over the real claims module, with the
+   * clock moved `elapsed` milliseconds while the upstream holds the push, then answers that it
+   * applied. Returns the `claim.pushed` events recorded.
+   */
+  async function pushHeldFor(
+    setup: Setup,
+    claimId: string,
+    elapsed: number,
+  ): Promise<RailheadEvent[]> {
+    const gateway = createGitGateway({
+      log: setup.log,
+      storage: setup.storage,
+      clock: setup.fake.clock,
+      wake: async () => true,
+      ports: () => ({
+        sessions: {
+          ...unavailableSessions,
+          authenticate: async (token) =>
+            token === SESSION ? ok(agent(1)) : fail("unauthenticated", "The session is not valid."),
+        },
+        claims: setup.port,
+        artifacts: setup.artifacts,
+      }),
+      remote: async (repo) => ok(`https://fake.artifacts.invalid/${repo}.git`),
+      async upstream(request) {
+        // The fork read before release fails; the push's own report still settles it.
+        if (request.method === "GET") return new Response(null, { status: 500 });
+        await request.arrayBuffer();
+        setup.fake.advance(elapsed);
+        const report = `${pkt("unpack ok\n")}${pkt("ok refs/heads/feature\n")}0000`;
+        return new Response(`${pkt(`\u0001${report}`)}0000`, {
+          headers: { "content-type": "application/x-git-receive-pack-result" },
+        });
+      },
+    });
+    const body = encoder.encode(
+      `${pkt(`${ZERO} ${WORK} refs/heads/feature\0report-status side-band-64k\n`)}0000PACK`,
+    );
+    const response = await gateway.serve(
+      new Request("https://railhead.test/git/acme/demo.git/git-receive-pack", {
+        method: "POST",
+        headers: {
+          authorization: `Basic ${btoa(`${agent(1).agentId}:${SESSION}`)}`,
+          "content-type": "application/x-git-receive-pack-request",
+        },
+        body,
+      }),
+      { kind: "fork", claimId },
+      "/git-receive-pack",
+    );
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
+    return setup.events().filter((event) => event.type === "claim.pushed");
+  }
+
+  it("records an in-flight push whose report arrives a millisecond before the deadline", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+      // The push's authorization renews the lease, so the deadline is one lease from now.
+      expect(await pushHeldFor(setup, claim.claimId, CLAIM_LEASE_MS - 1)).toMatchObject([
+        {
+          type: "claim.pushed",
+          data: { claimId: claim.claimId, generation: 1, ref: "refs/heads/feature", to: WORK },
+        },
+      ]);
+    });
+  });
+
+  it("records nothing for an in-flight push whose fence is checked at the deadline, before the expiry is recorded", async () => {
+    await withTakeover(async (setup) => {
+      const { claim } = await setup.open();
+      expect(await pushHeldFor(setup, claim.claimId, CLAIM_LEASE_MS)).toEqual([]);
+      // Nothing recorded the expiry: only the lapsed lease fenced the push.
+      expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "working", generation: 1 });
+      expect(types(setup.events())).not.toContain("claim.expired");
     });
   });
 });

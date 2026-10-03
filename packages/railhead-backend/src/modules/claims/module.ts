@@ -31,16 +31,18 @@
 //
 // An allocating or working claim is a lease of `CLAIM_LEASE_MS`, renewed by every call of its
 // holder that reaches this module: status, `work`, `claim`, `ready`, an `ask` (which reads the
-// active claim) and Git authorization. A ready claim does not lapse, since the train holds its pin;
-// a reopened claim starts a new lease. The lapse is checked at the time of use: a holder call after
-// it, the Repo's alarm or another agent's `work` or `claim` expires the claim and appends
-// `claim.expired`. From then on the former holder is refused, `currentGeneration` reads it as
-// unknown, and the fork's tokens are owed a revocation. A lease is renewed only before it lapses:
-// a lapsed allocation is no longer its holder's, which sees no active claim and is answered `busy`
-// by `work` and `claim` until another agent takes the allocation over. The claim stays expired
-// until that revocation is settled; a failed revocation, or one Artifacts reports as
-// `pending_debt`, is retried by the Repo's alarm, and meanwhile nobody gets a write grant on the
-// fork.
+// active claim) and Git authorization. `work` and `claim` renew it before they await other forks'
+// revocations, so a slow revocation never lapses a lease its holder called inside. A ready claim
+// does not lapse, since the train holds its pin; a reopened claim starts a new lease. The lapse is
+// checked at the time of use: a holder call after it, the Repo's alarm or another agent's `work` or
+// `claim` expires the claim and appends `claim.expired`. Both fence readers, `currentGeneration`
+// and `workingGeneration`, read a lapsed working claim as unknown even before that, so no push is
+// recorded past the deadline. From the expiry on, the former holder is refused and the fork's tokens
+// are owed a revocation. A lease is renewed only before it lapses: a lapsed allocation is no longer
+// its holder's, which sees no active claim and is answered `busy` by `work` and `claim` until
+// another agent takes the allocation over. The claim stays expired until that revocation is
+// settled; a failed revocation, or one Artifacts reports as `pending_debt`, is retried by the
+// Repo's alarm, and meanwhile nobody gets a write grant on the fork.
 //
 // Takeover gives a settled expired claim, before any new issue, to the next agent other than its
 // former holder that asks for work or names its issue. It keeps the claim, its issue's text and
@@ -381,6 +383,7 @@ export function createClaims(
     async work(agent) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
+      holdActive(agent.agentId);
       await release();
       const chosen = log.transaction((tx): Chosen => {
         const { sql } = tx;
@@ -407,6 +410,7 @@ export function createClaims(
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
       if (!isId("issue", issueId)) return fail("invalid_request", "The issue id is malformed.");
+      holdActive(agent.agentId);
       await release();
       const chosen = log.transaction((tx): Chosen => {
         const { sql } = tx;
@@ -481,8 +485,7 @@ export function createClaims(
       if (row === null) return null;
       switch (row.state) {
         case "working":
-          // A lapsed lease is no longer held, even before anything records the expiry.
-          return row.leaseUntil !== null && row.leaseUntil <= clock() ? null : row.generation;
+          return heldWorking(row, clock()) ? row.generation : null;
         case "ready":
           return row.generation;
         case "allocating":
@@ -496,7 +499,7 @@ export function createClaims(
 
     workingGeneration(claimId) {
       const row = claimById(context.storage.sql, claimId);
-      return row?.state === "working" ? row.generation : null;
+      return row !== null && heldWorking(row, clock()) ? row.generation : null;
     },
 
     async ready(agent, claimId, request) {
@@ -625,6 +628,14 @@ function expire(tx: EventTransaction, row: ClaimRow, now: number): void {
     type: "claim.expired",
     data: { claimId: row.claimId, generation: row.generation },
   });
+}
+
+/**
+ * Whether `row` is a working claim whose lease has not lapsed by `now`. A lapsed lease is no longer
+ * held, even before anything records the expiry, so neither fence reader answers it.
+ */
+function heldWorking(row: ClaimRow, now: number): boolean {
+  return row.state === "working" && (row.leaseUntil === null || row.leaseUntil > now);
 }
 
 /** Whether `row` is an allocation whose lease lapsed at or before `now`, held by nobody. */

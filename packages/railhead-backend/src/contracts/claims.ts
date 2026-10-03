@@ -75,8 +75,9 @@ export interface ClaimsPort {
   currentGeneration(claimId: ClaimId): number | null;
   /**
    * The claim's ownership generation while it is working, or `null` once it is anything else, such
-   * as ready, expired or unknown. A fence reader like `currentGeneration`: call it inside the
-   * caller's transaction. A push is recorded only while this equals the push's fence generation.
+   * as ready, expired or unknown, or once its lease lapsed. A fence reader like `currentGeneration`:
+   * call it inside the caller's transaction. A push is recorded only while this equals the push's
+   * fence generation.
    */
   workingGeneration(claimId: ClaimId): number | null;
   /** Decides one Git request. A push needs the current owner of a working claim. */
