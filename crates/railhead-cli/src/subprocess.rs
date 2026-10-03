@@ -5,7 +5,9 @@
 //!
 //! On Unix, `SIGTERM` or `SIGINT` sent to `rh` while a child runs stops that child's process group
 //! the same way, so a Git clone cannot outlive `rh` and keep writing into a directory the caller is
-//! removing. The caller then reads [`interrupted`] and ends `rh` with [`exit_on`].
+//! removing. The caller then reads [`interrupted`] and ends `rh` with [`exit_on`]. Should the
+//! caller not get there in time, the signal watcher kills and reaps the group itself, and renames
+//! each directory registered with a [`SetAside`] to its discard name, before it ends `rh`.
 
 use std::io::{self, Read as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -80,10 +82,11 @@ fn run_until(
     signals::watch()?;
     let _running = signals::Running::enter().map_err(RunError::Interrupted)?;
     let mut child = command.spawn()?;
+    let group = signals::own(&child);
     let deadline = match deadline() {
         Ok(deadline) => deadline,
         Err(error) => {
-            stop(&mut child)?;
+            stop(&mut child, &group)?;
             return Err(error.into());
         }
     };
@@ -98,7 +101,7 @@ fn run_until(
                 let _ = sender.send(read);
             });
             if let Err(error) = reader {
-                stop(&mut child)?;
+                stop(&mut child, &group)?;
                 return Err(error.into());
             }
             Some(receiver)
@@ -112,40 +115,40 @@ fn run_until(
         None => Vec::new(),
         Some(receiver) => loop {
             if let Some(signal) = interrupted() {
-                stop(&mut child)?;
+                stop(&mut child, &group)?;
                 return Err(RunError::Interrupted(signal));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match receiver.recv_timeout(remaining.min(MAX_POLL)) {
                 Ok(Ok(bytes)) => break bytes,
                 Ok(Err(error)) => {
-                    stop(&mut child)?;
+                    stop(&mut child, &group)?;
                     return Err(error.into());
                 }
                 Err(RecvTimeoutError::Timeout) if remaining > MAX_POLL => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    stop(&mut child)?;
+                    stop(&mut child, &group)?;
                     return Err(RunError::TimedOut(limit));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    stop(&mut child)?;
+                    stop(&mut child, &group)?;
                     return Err(io::Error::other("the stdout reader stopped").into());
                 }
             }
         },
     };
-    let status = match wait_until(&mut child, deadline) {
+    let status = match wait_until(&mut child, &group, deadline) {
         Ok(Waited::Exited(status)) => status,
         Ok(Waited::TimedOut) => {
-            stop(&mut child)?;
+            stop(&mut child, &group)?;
             return Err(RunError::TimedOut(limit));
         }
         Ok(Waited::Interrupted(signal)) => {
-            stop(&mut child)?;
+            stop(&mut child, &group)?;
             return Err(RunError::Interrupted(signal));
         }
         Err(error) => {
-            stop(&mut child)?;
+            stop(&mut child, &group)?;
             return Err(error.into());
         }
     };
@@ -163,10 +166,10 @@ enum Waited {
 }
 
 /// Waits for `child` until `deadline`, or until `rh` receives `SIGTERM` or `SIGINT`.
-fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Waited> {
+fn wait_until(child: &mut Child, group: &signals::Group, deadline: Instant) -> io::Result<Waited> {
     let mut pause = Duration::from_millis(5);
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = signals::reap(group, || child.try_wait())? {
             return Ok(Waited::Exited(status));
         }
         if let Some(signal) = interrupted() {
@@ -186,31 +189,46 @@ fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Waited> {
 /// The child is not reaped until its group has been killed, so the group's id cannot have been
 /// reused by an unrelated process when the signal is sent.
 #[cfg(unix)]
-fn stop(child: &mut Child) -> io::Result<()> {
-    use rustix::process::{Pid, Signal, kill_process_group};
+fn stop(child: &mut Child, group: &signals::Group) -> io::Result<()> {
+    use rustix::process::Signal;
 
-    let group = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
-    let Some(group) = group else {
-        child.kill()?;
-        child.wait()?;
-        return Ok(());
-    };
-    // The group may already be empty; that is the outcome wanted.
-    let _ = kill_process_group(group, Signal::TERM);
+    #[cfg(debug_assertions)]
+    stall_for_test("stop");
+    signals::signal_group(group, child, Signal::TERM)?;
     thread::sleep(TERMINATE_GRACE);
-    let _ = kill_process_group(group, Signal::KILL);
-    child.wait()?;
+    signals::signal_group(group, child, Signal::KILL)?;
+    signals::reap(group, || child.wait().map(Some))?;
     Ok(())
 }
 
 /// Stops `child`, then reaps it.
 #[cfg(not(unix))]
-fn stop(child: &mut Child) -> io::Result<()> {
+fn stop(child: &mut Child, _group: &signals::Group) -> io::Result<()> {
     // The child may have exited since it was last checked; reaping it is what matters.
     let _ = child.kill();
     child.wait()?;
     Ok(())
 }
+
+/// Test-only: names the step, `stop` or `cleanup`, at which the thread that ran an interrupted child
+/// stalls for [`STALL`], so a test can see what the signal watcher leaves when `rh` must end before
+/// that thread has cleaned up. Read in debug builds alone; release builds compile none of it.
+#[cfg(debug_assertions)]
+const STALL_ENV: &str = "RH_TEST_SHUTDOWN_STALL";
+
+/// How long [`stall_for_test`] stalls: far longer than the signal watcher waits.
+#[cfg(debug_assertions)]
+const STALL: Duration = Duration::from_secs(120);
+
+/// Stalls for [`STALL`] when [`STALL_ENV`] names `step`.
+#[cfg(debug_assertions)]
+pub fn stall_for_test(step: &str) {
+    if std::env::var_os(STALL_ENV).is_some_and(|stall| stall == step) {
+        thread::sleep(STALL);
+    }
+}
+
+pub use signals::SetAside;
 
 /// The signal `rh` received, `SIGTERM` or `SIGINT`, once a child has been run; `None` before then
 /// and on platforms other than Unix.
@@ -233,32 +251,59 @@ pub fn exit_on(signal: i32) -> ! {
 
 /// `SIGTERM` and `SIGINT`, watched from the first child on.
 ///
-/// A watcher thread records the signal. When no child is running it ends `rh` at once, as the
-/// default action would. Otherwise the thread running the child sees the signal within
-/// [`MAX_POLL`], stops the child's process group and returns [`RunError::Interrupted`], so its
-/// caller can clean up before calling [`exit_on`]; the watcher ends `rh` anyway after
-/// [`INTERRUPT_GRACE`](signals::INTERRUPT_GRACE).
+/// A watcher thread records the signal. When no child is running and no [`SetAside`] is held it
+/// ends `rh` at once, as the default action would. Otherwise the thread running the child sees the
+/// signal within [`MAX_POLL`], stops the child's process group and returns
+/// [`RunError::Interrupted`], so its caller can clean up before calling [`exit_on`]. Should `rh`
+/// still be running after [`INTERRUPT_GRACE`](signals::INTERRUPT_GRACE), the watcher kills and
+/// reaps the child's group, sets aside every registered directory, and then ends `rh`.
 #[cfg(unix)]
 mod signals {
+    use std::fs;
     use std::io;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::path::PathBuf;
+    use std::process::Child;
+    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    /// How long `rh` may keep running after a signal that arrived while a child ran: long enough
-    /// to stop the child's group and remove what the interrupted step had written.
+    /// How long `rh` may keep running after a signal that arrived while a child ran or a
+    /// [`SetAside`] was held: long enough to stop the child's group and remove what the
+    /// interrupted step had written.
     pub const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
+    /// How long the watcher, once [`INTERRUPT_GRACE`] has passed, spends killing and reaping the
+    /// child's group and setting directories aside before it ends `rh` regardless.
+    const SETTLE_LIMIT: Duration = Duration::from_secs(2);
+
+    /// The pause between two attempts to take a lock or reap a child, while bounded.
+    const SETTLE_POLL: Duration = Duration::from_millis(10);
 
     /// The signal received, or 0 before any.
     static RECEIVED: AtomicI32 = AtomicI32::new(0);
     /// How many children are running.
     static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    /// The process group of each running child, which it leads, from its start until it is
+    /// reaped. A group is removed under this lock as its child is reaped, so the watcher never
+    /// signals a group id that has been reused.
+    static GROUPS: Mutex<Vec<Pid>> = Mutex::new(Vec::new());
+    /// Every [`SetAside`] held, with its directory and discard name once known.
+    static SET_ASIDE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    /// The next [`SetAside`] id.
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     /// Whether the watcher started, or why it could not.
     static WATCHER: OnceLock<Result<(), (io::ErrorKind, String)>> = OnceLock::new();
+
+    struct Entry {
+        id: u64,
+        paths: Option<(PathBuf, PathBuf)>,
+    }
 
     /// Starts the watcher, once.
     pub fn watch() -> io::Result<()> {
@@ -273,18 +318,168 @@ mod signals {
         thread::Builder::new()
             .name("rh-signals".to_owned())
             .spawn(move || {
-                // The first signal ends `rh`, so the iterator is never resumed.
+                // The first signal ends `rh`, so the iterator is never resumed. A later signal is
+                // absorbed by the handler still installed: it neither ends `rh` sooner nor skips
+                // the settling below.
                 if let Some(signal) = signals.forever().next() {
-                    // Stored before `RUNNING` is read, as `Running::enter` does the reverse, so
-                    // either a child about to start sees the signal or this sees the child.
+                    // Stored before anything is counted as busy, as `Running::enter` and
+                    // `SetAside::reserve` do the reverse, so either they see the signal or this
+                    // sees them.
                     RECEIVED.store(signal, Ordering::SeqCst);
-                    if RUNNING.load(Ordering::SeqCst) > 0 {
+                    if busy() {
                         thread::sleep(INTERRUPT_GRACE);
+                        settle_and_exit(signal);
                     }
                     exit_on(signal);
                 }
             })?;
         Ok(())
+    }
+
+    /// Whether a child is running or a [`SetAside`] is held; a lock still held after
+    /// [`SETTLE_LIMIT`] counts as held.
+    fn busy() -> bool {
+        RUNNING.load(Ordering::SeqCst) > 0
+            || lock_within(&SET_ASIDE, SETTLE_LIMIT).is_none_or(|entries| !entries.is_empty())
+    }
+
+    /// Kills and reaps the running child's group, then renames each registered directory to its
+    /// discard name, all within [`SETTLE_LIMIT`], and ends `rh`. What it cannot do in time is
+    /// reported and left.
+    ///
+    /// Both locks stay held until `rh` ends, so the thread that ran the child cannot signal a
+    /// group this reaped, whose id may since have been reused, nor rename what this set aside.
+    fn settle_and_exit(signal: i32) -> ! {
+        let started = Instant::now();
+        let left = || SETTLE_LIMIT.saturating_sub(started.elapsed());
+        let mut groups = lock_within(&GROUPS, left());
+        match groups.as_deref_mut() {
+            None => eprintln!("rh: the Git process group could not be stopped in time"),
+            Some(groups) => {
+                for pid in groups.drain(..) {
+                    kill_and_reap(pid, left());
+                }
+            }
+        }
+        let entries = lock_within(&SET_ASIDE, left());
+        match &entries {
+            None => eprintln!("rh: the partial clone could not be set aside in time"),
+            Some(entries) => {
+                for (dir, discard) in entries.iter().filter_map(|entry| entry.paths.as_ref()) {
+                    match fs::rename(dir, discard) {
+                        Ok(()) => {}
+                        // Already removed or set aside.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            eprintln!("rh: could not set aside {}: {error}", dir.display());
+                        }
+                    }
+                }
+            }
+        }
+        exit_on(signal)
+    }
+
+    /// Kills the group `pid` leads and reaps `pid`, waiting at most `limit` for it to exit.
+    fn kill_and_reap(pid: Pid, limit: Duration) {
+        match kill_process_group(pid, Signal::KILL) {
+            // An empty group has nothing left to kill; its leader may still need reaping.
+            Ok(()) | Err(Errno::SRCH) => {}
+            Err(error) => eprintln!("rh: could not stop the Git process group: {error}"),
+        }
+        let until = Instant::now().checked_add(limit);
+        loop {
+            match waitpid(Some(pid), WaitOptions::NOHANG) {
+                Ok(None) if until.is_some_and(|until| Instant::now() < until) => {
+                    thread::sleep(SETTLE_POLL);
+                }
+                Ok(None) => {
+                    eprintln!("rh: Git did not exit in time after it was killed");
+                    return;
+                }
+                Ok(Some(_)) => return,
+                Err(error) => {
+                    eprintln!("rh: could not reap Git: {error}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Takes `mutex`, giving up after `limit`. A poisoned lock is taken: its holder panicked, and
+    /// its state is only ever replaced whole.
+    fn lock_within<T>(mutex: &Mutex<T>, limit: Duration) -> Option<MutexGuard<'_, T>> {
+        let until = Instant::now().checked_add(limit)?;
+        loop {
+            match mutex.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) if Instant::now() < until => {
+                    thread::sleep(SETTLE_POLL);
+                }
+                Err(TryLockError::WouldBlock) => return None,
+            }
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A running child's process group, recorded for the watcher until the child is reaped or
+    /// this is dropped. `None` when the child's id is no process id, which never happens on Unix.
+    pub struct Group(Option<Pid>);
+
+    impl Drop for Group {
+        fn drop(&mut self) {
+            // A child left unreaped by a failed stop is no longer the watcher's to signal.
+            if let Some(pid) = self.0 {
+                lock(&GROUPS).retain(|&group| group != pid);
+            }
+        }
+    }
+
+    /// Records `child`'s process group, which it leads, for the watcher.
+    pub fn own(child: &Child) -> Group {
+        let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        if let Some(pid) = pid {
+            lock(&GROUPS).push(pid);
+        }
+        Group(pid)
+    }
+
+    /// Sends `signal` to `group`. With no group recorded, `SIGKILL` goes to `child` alone. Once
+    /// the watcher has taken the group, nothing is sent: the child is reaped and its id may be
+    /// reused.
+    ///
+    /// # Errors
+    ///
+    /// When `SIGKILL` cannot be sent to a child with no recorded group. A group that is already
+    /// empty is the outcome wanted, not an error.
+    pub fn signal_group(group: &Group, child: &mut Child, signal: Signal) -> io::Result<()> {
+        let groups = lock(&GROUPS);
+        match group.0 {
+            Some(pid) if groups.contains(&pid) => {
+                let _ = kill_process_group(pid, signal);
+                Ok(())
+            }
+            None if signal == Signal::KILL => child.kill(),
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// Runs `reap`, which reaps the child once it returns a value, with the child's group
+    /// removed in the same step.
+    pub fn reap<T>(
+        group: &Group,
+        reap: impl FnOnce() -> io::Result<Option<T>>,
+    ) -> io::Result<Option<T>> {
+        let mut groups = lock(&GROUPS);
+        let reaped = reap()?;
+        if let (Some(_), Some(pid)) = (&reaped, group.0) {
+            groups.retain(|&group| group != pid);
+        }
+        Ok(reaped)
     }
 
     pub fn received() -> Option<i32> {
@@ -321,15 +516,87 @@ mod signals {
             RUNNING.fetch_sub(1, Ordering::SeqCst);
         }
     }
+
+    /// A directory that must not be left under its own name when a signal ends `rh`.
+    ///
+    /// From [`SetAside::reserve`] until it is dropped, the signal watcher waits up to
+    /// [`INTERRUPT_GRACE`] before ending `rh`, and should `rh` still be running then, it renames the
+    /// directory given to [`SetAside::watch`] to its discard name, which a later run recognizes as
+    /// safe to remove.
+    pub struct SetAside {
+        id: u64,
+    }
+
+    impl SetAside {
+        /// Counts work that must not be cut short, or returns the signal already received instead.
+        pub fn reserve() -> Result<Self, i32> {
+            let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            lock(&SET_ASIDE).push(Entry { id, paths: None });
+            let reserved = Self { id };
+            match received() {
+                None => Ok(reserved),
+                Some(signal) => Err(signal),
+            }
+        }
+
+        /// Names the directory to set aside and the name to rename it to.
+        pub fn watch(&mut self, dir: PathBuf, discard: PathBuf) {
+            if let Some(entry) = lock(&SET_ASIDE)
+                .iter_mut()
+                .find(|entry| entry.id == self.id)
+            {
+                entry.paths = Some((dir, discard));
+            }
+        }
+
+        /// Renames the directory to its discard name now. Once it has been, the watcher leaves it.
+        ///
+        /// # Errors
+        ///
+        /// When the rename fails; the watcher still tries it before ending `rh` on a signal.
+        pub fn now(&mut self) -> io::Result<()> {
+            let mut entries = lock(&SET_ASIDE);
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == self.id) else {
+                return Ok(());
+            };
+            if let Some((dir, discard)) = &entry.paths {
+                fs::rename(dir, discard)?;
+            }
+            entry.paths = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for SetAside {
+        fn drop(&mut self) {
+            lock(&SET_ASIDE).retain(|entry| entry.id != self.id);
+        }
+    }
 }
 
 /// No signal is watched on platforms other than Unix.
 #[cfg(not(unix))]
 mod signals {
+    use std::fs;
     use std::io;
+    use std::path::PathBuf;
+    use std::process::Child;
 
     pub fn watch() -> io::Result<()> {
         Ok(())
+    }
+
+    pub struct Group;
+
+    pub fn own(_child: &Child) -> Group {
+        Group
+    }
+
+    pub fn reap<T>(
+        _group: &Group,
+        reap: impl FnOnce() -> io::Result<Option<T>>,
+    ) -> io::Result<Option<T>> {
+        reap()
     }
 
     pub fn received() -> Option<i32> {
@@ -341,6 +608,36 @@ mod signals {
     impl Running {
         pub fn enter() -> Result<Self, i32> {
             Ok(Self(()))
+        }
+    }
+
+    /// A directory renamed to its discard name before it is removed.
+    pub struct SetAside {
+        paths: Option<(PathBuf, PathBuf)>,
+    }
+
+    impl SetAside {
+        /// Never refused: no signal is received here.
+        pub fn reserve() -> Result<Self, i32> {
+            Ok(Self { paths: None })
+        }
+
+        /// Names the directory to set aside and the name to rename it to.
+        pub fn watch(&mut self, dir: PathBuf, discard: PathBuf) {
+            self.paths = Some((dir, discard));
+        }
+
+        /// Renames the directory to its discard name now.
+        ///
+        /// # Errors
+        ///
+        /// When the rename fails.
+        pub fn now(&mut self) -> io::Result<()> {
+            if let Some((dir, discard)) = &self.paths {
+                fs::rename(dir, discard)?;
+            }
+            self.paths = None;
+            Ok(())
         }
     }
 }

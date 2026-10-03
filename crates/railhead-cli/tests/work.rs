@@ -664,13 +664,47 @@ async fn a_git_that_never_exits_is_stopped_and_the_next_run_recovers() -> anyhow
     Ok(())
 }
 
-/// `rh work` whose fetch never ends, ended with `signal`: its Git process group is gone and its
-/// partial clone removed by the time `rh` exits, and `rh` ends as the signal would have ended it.
+/// Where the thread that ran an interrupted Git step stalls, through the debug-build hook, so the
+/// signal watcher must end `rh` before that thread has cleaned up.
 #[cfg(unix)]
-async fn signal_during_fetch(signal: rustix::process::Signal) -> anyhow::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    /// No stall: the step stops Git and removes its partial clone itself.
+    None,
+    /// Before the step stops Git: the watcher must kill and reap Git's group and set the partial
+    /// clone aside.
+    Stop,
+    /// After the step set its partial clone aside, before removing it.
+    Cleanup,
+}
+
+/// Names of the entries in `dir` that contain `part`.
+#[cfg(unix)]
+fn entries_named(dir: &Path, part: &str) -> anyhow::Result<Vec<String>> {
+    Ok(fs::read_dir(dir)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(part))
+        .collect())
+}
+
+/// `rh work` whose fetch never ends, ended with `signal`, and with `second` once the first has
+/// been seen: its Git process group is gone by the time `rh` exits, `rh` ends as the first signal
+/// would have ended it, and no partial clone is left under its staging name. When `stall` keeps
+/// the step from cleaning up, `rh` ends at the signal watcher's limit with the partial clone set
+/// aside, and the next `rh work` removes it.
+#[cfg(unix)]
+async fn signal_during_fetch(
+    signal: rustix::process::Signal,
+    second: Option<rustix::process::Signal>,
+    stall: Stall,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::time::{Duration, Instant};
+
+    /// The signal watcher's limit in `rh`.
+    const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 
     let world = world().await?;
     answer(
@@ -714,13 +748,18 @@ async fn signal_during_fetch(signal: rustix::process::Signal) -> anyhow::Result<
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    match stall {
+        Stall::None => command.env_remove("RH_TEST_SHUTDOWN_STALL"),
+        Stall::Stop => command.env("RH_TEST_SHUTDOWN_STALL", "stop"),
+        Stall::Cleanup => command.env("RH_TEST_SHUTDOWN_STALL", "cleanup"),
+    };
     git_env(&mut command, &world.git_config);
-    let mut rh = command.spawn()?;
+    let mut running = command.spawn()?;
     let ready = Instant::now() + Duration::from_secs(60);
     while !pid_file.exists() {
-        if Instant::now() > ready || rh.try_wait()?.is_some() {
-            rh.kill()?;
-            rh.wait()?;
+        if Instant::now() > ready || running.try_wait()?.is_some() {
+            running.kill()?;
+            running.wait()?;
             anyhow::bail!("the fetch never started");
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -732,16 +771,68 @@ async fn signal_during_fetch(signal: rustix::process::Signal) -> anyhow::Result<
         .collect::<Result<_, _>>()?;
     assert_eq!(pids.len(), 2, "{recorded}");
 
-    let pid = rustix::process::Pid::from_child(&rh);
+    let pid = rustix::process::Pid::from_child(&running);
     let started = Instant::now();
     rustix::process::kill_process(pid, signal)?;
-    let output = rh.wait_with_output()?;
-    // Stopped by the signal, not by the hour-long deadline.
-    assert!(started.elapsed() < Duration::from_secs(30));
+    if let Some(second) = second {
+        send_second(&world, pid, second, stall)?;
+    }
+    let output = running.wait_with_output()?;
+    let ended = started.elapsed();
+    // Stopped by the signal, not by the hour-long deadline or the two-minute stall.
+    assert!(ended < Duration::from_secs(30), "{ended:?}");
+    if stall != Stall::None {
+        // Ended by the watcher's limit, which a second signal does not shorten.
+        assert!(ended >= INTERRUPT_GRACE, "{ended:?}");
+    }
     assert_eq!(output.status.signal(), Some(signal.as_raw()), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
 
-    // Checked once, right after `rh` exited: a process killed then may only wait to be reaped.
+    assert_gone(&pids)?;
+    assert!(!world.clone_dir().exists());
+    let partial = entries_named(world.work.path(), "rh-partial")?;
+    assert!(partial.is_empty(), "{partial:?}");
+    let discarded = entries_named(world.work.path(), "rh-discard")?;
+    if stall == Stall::None {
+        assert!(discarded.is_empty(), "{discarded:?}");
+        return Ok(());
+    }
+    // What the stalled step did not remove is left under its discard name alone.
+    let [discard] = discarded.as_slice() else {
+        anyhow::bail!("expected one discarded clone: {discarded:?}");
+    };
+    let discard = world.work.path().join(discard);
+    assert!(discard.join(".git").is_dir(), "{discarded:?}");
+    the_next_run_removes(&world, &discard)
+}
+
+/// Sends `signal` to `pid` while `rh` is still cleaning up after the first: once the step has set
+/// its clone aside when it stalls there, otherwise a moment after the first.
+#[cfg(unix)]
+fn send_second(
+    world: &World,
+    pid: rustix::process::Pid,
+    signal: rustix::process::Signal,
+    stall: Stall,
+) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let seen = Instant::now() + Duration::from_secs(30);
+    while stall == Stall::Cleanup
+        && entries_named(world.work.path(), "rh-discard")?.is_empty()
+        && Instant::now() < seen
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    rustix::process::kill_process(pid, signal)?;
+    Ok(())
+}
+
+/// Asserts that no process in `pids` still runs. Checked once, right after `rh` exited: a process
+/// killed then may only wait to be reaped.
+#[cfg(unix)]
+fn assert_gone(pids: &[i32]) -> anyhow::Result<()> {
     for pid in pids {
         let state = Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -752,26 +843,58 @@ async fn signal_during_fetch(signal: rustix::process::Signal) -> anyhow::Result<
             "process {pid} outlived rh: {state}"
         );
     }
-    assert!(!world.clone_dir().exists());
-    let partial: Vec<_> = fs::read_dir(world.work.path())?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains("rh-partial"))
-        .collect();
-    assert!(partial.is_empty(), "{partial:?}");
+    Ok(())
+}
+
+/// Runs `rh work` with a fork that answers and asserts that it removes `discard` and builds the
+/// clone.
+#[cfg(unix)]
+fn the_next_run_removes(world: &World, discard: &Path) -> anyhow::Result<()> {
+    point_fork_at(world, &world.fork)?;
+    let recovered = rh(world, &world.outside(), Some("atlas"), &["--json", "work"])?;
+    assert_eq!(recovered.code, Some(0), "{}", recovered.stdout);
+    assert_eq!(
+        recovered.json()?.pointer("/data/clone/state"),
+        Some(&json!("created"))
+    );
+    assert!(!discard.exists());
+    let left = entries_named(world.work.path(), ".rh-")?;
+    assert!(left.is_empty(), "{left:?}");
     Ok(())
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn sigterm_during_a_fetch_stops_git_before_rh_exits() -> anyhow::Result<()> {
-    signal_during_fetch(rustix::process::Signal::TERM).await
+    signal_during_fetch(rustix::process::Signal::TERM, None, Stall::None).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn sigint_during_a_fetch_stops_git_before_rh_exits() -> anyhow::Result<()> {
-    signal_during_fetch(rustix::process::Signal::INT).await
+    signal_during_fetch(rustix::process::Signal::INT, None, Stall::None).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stalled_stop_leaves_git_killed_and_the_clone_set_aside() -> anyhow::Result<()> {
+    signal_during_fetch(
+        rustix::process::Signal::TERM,
+        Some(rustix::process::Signal::INT),
+        Stall::Stop,
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stalled_cleanup_leaves_the_clone_for_the_next_run_to_remove() -> anyhow::Result<()> {
+    signal_during_fetch(
+        rustix::process::Signal::INT,
+        Some(rustix::process::Signal::TERM),
+        Stall::Cleanup,
+    )
+    .await
 }
 
 /// Makes the fork's upload pack run `interloper` once, before the first fetch is answered, so it

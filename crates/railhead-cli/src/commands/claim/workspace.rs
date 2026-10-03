@@ -2,7 +2,9 @@
 //!
 //! A new clone is built in a staging directory that this run creates beside its target and alone
 //! owns, and is renamed into place only once its fork is fetched and checked out, so a failed
-//! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. The rename never
+//! fetch leaves nothing behind and the next `rh work` or `rh claim` starts clean. A staging
+//! directory is renamed to a discard name before it is removed, by this run or, when a signal ends
+//! `rh` first, by the signal watcher; the next run removes what is left under that name. The rename never
 //! replaces another run's clone: when a run of the same claim published first, this run's clone is
 //! discarded and that one reused. An existing clone of the same claim and agent is reused:
 //! its Railhead settings are refreshed and its working tree, index and refs are never touched.
@@ -286,7 +288,12 @@ fn create(
         .ok_or_else(|| conflict(dir, "is not a directory a clone can be created in"))?;
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|error| io_error("creating", parent, &error))?;
-    let staging = stage(parent, name)?;
+    remove_discarded(parent, name)?;
+    // Reserved before the staging directory exists, so a signal from here on lets this run set it
+    // aside rather than end `rh` with it in place.
+    let mut aside = subprocess::SetAside::reserve().map_err(interrupted)?;
+    let Staging { staging, discard } = stage(parent, name)?;
+    aside.watch(staging.clone(), discard.clone());
 
     let placed =
         build(&staging, identity, claim, remotes).and_then(|()| match publish(&staging, dir) {
@@ -303,11 +310,67 @@ fn create(
             },
         });
     // Only this run's own staging directory is removed; it never held anything an agent wrote.
-    // A published clone has left it.
+    // A published clone has left it. It is renamed to its discard name first, so should `rh` end
+    // before the removal finishes, the next run removes the rest.
     if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|cleanup| io_error("removing", &staging, &cleanup))?;
+        aside
+            .now()
+            .map_err(|cleanup| io_error("setting aside", &staging, &cleanup))?;
+        #[cfg(debug_assertions)]
+        subprocess::stall_for_test("cleanup");
+        fs::remove_dir_all(&discard).map_err(|cleanup| io_error("removing", &discard, &cleanup))?;
     }
     placed
+}
+
+/// The error for a step `rh` did not start because it received `signal`. Never printed: `rh` ends
+/// on the signal.
+fn interrupted(signal: i32) -> Error {
+    local(
+        LocalCode::Git,
+        format!("cloning was not started because rh received signal {signal}"),
+        true,
+        None,
+    )
+}
+
+/// Removes the discarded staging directories of `name` in `parent`: those an earlier run set aside
+/// but did not finish removing. Nothing else is touched.
+fn remove_discarded(parent: &Path, name: &OsStr) -> Result<()> {
+    let mut prefix = OsStr::new(".").to_os_string();
+    prefix.push(name);
+    prefix.push(DISCARD_INFIX);
+    let prefix = prefix.to_string_lossy().into_owned();
+    let entries = fs::read_dir(parent).map_err(|error| io_error("reading", parent, &error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error("reading", parent, &error))?;
+        let file_name = entry.file_name();
+        let is_discard = file_name
+            .to_str()
+            .and_then(|file_name| file_name.strip_prefix(&prefix))
+            .is_some_and(is_staging_suffix);
+        // A symbolic link with a discard name is never followed or removed.
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !(is_discard && is_dir) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            // Another run removed it first.
+            Err(_) if !path.exists() => {}
+            Err(error) => return Err(io_error("removing", &path, &error)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `suffix` is the `<pid>-<attempt>` that ends a staging or discard name.
+fn is_staging_suffix(suffix: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    suffix
+        .split_once('-')
+        .is_some_and(|(pid, attempt)| digits(pid) && digits(attempt))
 }
 
 /// Moves the finished clone in `staging` to `dir` in one step. A rename replaces a missing or
@@ -328,21 +391,42 @@ fn publish(staging: &Path, dir: &Path) -> io::Result<()> {
 /// How many staging names `stage` tries before giving up.
 const STAGING_ATTEMPTS: u32 = 64;
 
+/// What follows the target's name in a staging directory's name.
+const STAGING_INFIX: &str = ".rh-partial-";
+
+/// What follows the target's name in a discarded staging directory's name.
+const DISCARD_INFIX: &str = ".rh-discard-";
+
+/// A staging directory this run created, and the name it is renamed to before it is removed.
+struct Staging {
+    staging: PathBuf,
+    discard: PathBuf,
+}
+
 /// Creates a staging directory beside the target that belongs to this run alone.
 ///
 /// The directory is created with `create_dir`, which fails when the name is taken, so this run
 /// owns exactly what it created and never adopts or deletes anything already there. A directory
 /// left by a killed run is kept for a person to inspect: its name says what it is, but nothing
-/// proves no other run is still using it.
-fn stage(parent: &Path, name: &OsStr) -> Result<PathBuf> {
+/// proves no other run is still using it. Its discard name is where it goes once this run gives it
+/// up; only then may another run remove it.
+fn stage(parent: &Path, name: &OsStr) -> Result<Staging> {
     let pid = std::process::id();
+    let named = |infix: &str, attempt: u32| {
+        let mut file_name = OsStr::new(".").to_os_string();
+        file_name.push(name);
+        file_name.push(format!("{infix}{pid}-{attempt}"));
+        parent.join(file_name)
+    };
     for attempt in 0..STAGING_ATTEMPTS {
-        let mut staging_name = OsStr::new(".").to_os_string();
-        staging_name.push(name);
-        staging_name.push(format!(".rh-partial-{pid}-{attempt}"));
-        let staging = parent.join(staging_name);
+        let staging = named(STAGING_INFIX, attempt);
         match fs::create_dir(&staging) {
-            Ok(()) => return Ok(staging),
+            Ok(()) => {
+                return Ok(Staging {
+                    staging,
+                    discard: named(DISCARD_INFIX, attempt),
+                });
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io_error("creating", &staging, &error)),
         }
@@ -745,14 +829,86 @@ mod tests {
         parent.join(format!(".demo.rh-partial-{}-{attempt}", std::process::id()))
     }
 
+    fn discard_path(parent: &Path, attempt: u32) -> PathBuf {
+        parent.join(format!(".demo.rh-discard-{}-{attempt}", std::process::id()))
+    }
+
     #[test]
     fn staging_creates_a_new_empty_directory_of_its_own() -> anyhow::Result<()> {
         let parent = tempfile::tempdir()?;
         let first = stage(parent.path(), OsStr::new("demo"))?;
-        assert_eq!(first, staging_path(parent.path(), 0));
-        assert_eq!(fs::read_dir(&first)?.count(), 0);
+        assert_eq!(first.staging, staging_path(parent.path(), 0));
+        assert_eq!(first.discard, discard_path(parent.path(), 0));
+        assert_eq!(fs::read_dir(&first.staging)?.count(), 0);
+        assert!(!first.discard.exists());
         let second = stage(parent.path(), OsStr::new("demo"))?;
-        assert_eq!(second, staging_path(parent.path(), 1));
+        assert_eq!(second.staging, staging_path(parent.path(), 1));
+        assert_eq!(second.discard, discard_path(parent.path(), 1));
+        Ok(())
+    }
+
+    #[test]
+    fn discarded_staging_of_the_target_alone_is_removed() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let discarded = parent.path().join(".demo.rh-discard-41-0");
+        fs::create_dir_all(discarded.join("objects"))?;
+        fs::write(discarded.join("objects/pack"), "partial\n")?;
+        // Another target's discard, a staging directory still in use, a name that only looks
+        // like a discard, and a file under a discard name are all kept.
+        let kept = [
+            ".other.rh-discard-41-0",
+            ".demo.rh-partial-41-0",
+            ".demo.rh-discard-41-x",
+            ".demo.rh-discard-41",
+            "demo",
+        ];
+        for name in kept {
+            fs::create_dir(parent.path().join(name))?;
+        }
+        fs::write(parent.path().join(".demo.rh-discard-42-0"), "a file\n")?;
+        remove_discarded(parent.path(), OsStr::new("demo"))?;
+        assert!(!discarded.exists());
+        for name in kept {
+            assert!(parent.path().join(name).is_dir(), "{name} was removed");
+        }
+        assert!(parent.path().join(".demo.rh-discard-42-0").is_file());
+        // Nothing to remove is not an error.
+        remove_discarded(parent.path(), OsStr::new("demo"))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_discard_name_on_a_symbolic_link_is_not_followed() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        fs::write(elsewhere.path().join("work.txt"), "kept\n")?;
+        let link = parent.path().join(".demo.rh-discard-41-0");
+        std::os::unix::fs::symlink(elsewhere.path(), &link)?;
+        remove_discarded(parent.path(), OsStr::new("demo"))?;
+        assert!(link.symlink_metadata()?.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join("work.txt"))?,
+            "kept\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_parent_that_cannot_be_read_is_reported() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let missing = parent.path().join("missing");
+        let error = remove_discarded(&missing, OsStr::new("demo")).err();
+        assert!(
+            matches!(
+                error,
+                Some(Error::Local {
+                    code: LocalCode::WorkspaceConflict,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 
@@ -763,7 +919,7 @@ mod tests {
         fs::create_dir(&taken)?;
         fs::write(taken.join("work.txt"), "unpublished\n")?;
         let staging = stage(parent.path(), OsStr::new("demo"))?;
-        assert_eq!(staging, staging_path(parent.path(), 1));
+        assert_eq!(staging.staging, staging_path(parent.path(), 1));
         assert_eq!(fs::read_to_string(taken.join("work.txt"))?, "unpublished\n");
         Ok(())
     }
