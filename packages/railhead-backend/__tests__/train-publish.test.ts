@@ -143,6 +143,11 @@ interface Harness {
   wakes: number[];
   /** Builds another train over the same storage, as a restarted `Repo` does, and uses it. */
   restart(): QueueingTrain;
+  /**
+   * Queues `pin` as `ready` does, as the claim's first ready episode, without driving: it waits for
+   * the next drive.
+   */
+  queue(pin: ClaimPin): PortResult<{ queued: boolean }>;
 }
 
 /**
@@ -212,7 +217,10 @@ function withRepo<R>(
       authorization,
       mainWriter,
     };
-    let train = queueing(createTrain(context, () => ports), log);
+    let train = queueing(
+      createTrain(context, () => ports),
+      log,
+    );
     return body({
       get train() {
         return train;
@@ -235,9 +243,13 @@ function withRepo<R>(
       },
       wakes,
       restart: () => {
-        train = queueing(createTrain(context, () => ports), log);
+        train = queueing(
+          createTrain(context, () => ports),
+          log,
+        );
         return train;
       },
+      queue: (queued) => log.transaction((tx) => train.queue(tx, queued, 1)).value,
     });
   });
 }
@@ -557,6 +569,87 @@ describe("the train's settle wake", () => {
       await h.alarm();
       expect(restarted.batches(1)).toMatchObject([{ state: "landed" }]);
       expect(ref.main).toBe(first.candidate);
+    });
+  });
+
+  it("reconciles a write that landed unrecorded after the wake ran out, writing nothing again", async () => {
+    const ref = new FakeMain(
+      MAIN,
+      Array.from({ length: MAX_WRITE_ATTEMPTS }, (): Step => "drop"),
+    );
+    await withRepo(ref, [pin(1)], async (h) => {
+      await h.train.enqueue(pin(1));
+      const first = await pass(h);
+      const intentId = latestIntent(h.train);
+      expect(ref.updates).toHaveLength(MAX_WRITE_ATTEMPTS);
+      ref.down = true;
+      await exhaust(h);
+      const writes = ref.updates.length;
+      expect(writes).toBe(MAX_WRITE_ATTEMPTS);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "authorized" });
+
+      // One of the writes did land, though it answered as uncertain: main holds the candidate
+      // while the intent is still authorized and the batch still passed.
+      ref.main = first.candidate;
+      ref.down = false;
+      await h.alarm();
+
+      expect(ref.updates).toHaveLength(writes);
+      expect(h.authorization.record(intentId)).toMatchObject({
+        status: "reconciled",
+        main: first.candidate,
+      });
+      expect(mainOutcomes(h.events())).toEqual([
+        { intentId, outcome: "reconciled", main: first.candidate },
+      ]);
+      expect(batchStates(h.train)).toEqual([["landed", null]]);
+      expect(states(h.train)).toEqual({ clm_claim001: "landed" });
+      expect(readWake(h.sql)).toBeNull();
+    });
+  });
+
+  it("rejects a write that never landed once its fence moved after the wake ran out, and requeues the batch", async () => {
+    const ref = new FakeMain(
+      MAIN,
+      Array.from({ length: MAX_WRITE_ATTEMPTS }, (): Step => "drop"),
+    );
+    await withRepo(ref, [pin(1), pin(2)], async (h) => {
+      // Both pins wait for one drive, so they form one batch.
+      expect(h.queue(pin(1))).toEqual(ok({ queued: true }));
+      await h.train.enqueue(pin(2));
+      const first = await pass(h);
+      ref.down = true;
+      expect(first.pins).toEqual([pin(1), pin(2)]);
+      const intentId = latestIntent(h.train);
+      const attemptAt = h.authorization.record(intentId)?.updatedAt ?? 0;
+      await exhaust(h);
+      const writes = ref.updates.length;
+
+      // Claim 1 changes owner while the wake is exhausted; the write never reached main, and its
+      // window has long ended.
+      h.claims.set(pin(1).claimId, { ...pin(1), generation: 2 });
+      ref.down = false;
+      expect(h.now() - attemptAt).toBeGreaterThanOrEqual(MAIN_UPDATE_EXPIRY_MS);
+      await h.alarm();
+
+      expect(ref.updates).toHaveLength(writes);
+      expect(ref.main).toBe(MAIN);
+      expect(h.authorization.record(intentId)).toMatchObject({ status: "reconciled", main: MAIN });
+      expect(mainOutcomes(h.events())).toEqual([{ intentId, outcome: "reconciled", main: MAIN }]);
+      expect(batchStates(h.train)[0]).toEqual(["failed", "main_rejected"]);
+      // Claim 2's pin was requeued and batched again on main; claim 1's moved pin was dropped.
+      expect(states(h.train)).toEqual({ clm_claim001: "dropped", clm_claim002: "batched" });
+      const second = h.started.at(-1);
+      expect(second?.expectedMain).toBe(MAIN);
+      expect(second?.pins).toEqual([pin(2)]);
+      // The wake left exhaustion: it is armed for the new attempt, and clears once it lands.
+      const wake = readWake(h.sql);
+      expect(wake?.failures).not.toBe(EXHAUSTED_FAILURES);
+      expect(h.wakes.at(-1)).toBe(wake?.dueAt);
+      await pass(h);
+      expect(ref.main).toBe(h.started.at(-1)?.candidate);
+      expect(states(h.train)).toEqual({ clm_claim001: "dropped", clm_claim002: "landed" });
+      expect(readWake(h.sql)).toBeNull();
     });
   });
 
