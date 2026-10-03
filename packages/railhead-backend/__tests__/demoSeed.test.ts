@@ -729,7 +729,7 @@ describe("seed target", () => {
       expect(host.wipes).toBe(1);
     }));
 
-  it("keeps main through a reset whose fork deletion failed, so a seed pushes nothing", () =>
+  it("refuses every seed after a reset whose first deletion failed, until a reset finishes", () =>
     withTarget(async ({ seed, target, storage, host, main }) => {
       await target.seed(HEAD, fakePack());
       const adapter = createArtifactsAdapter({
@@ -749,18 +749,74 @@ describe("seed target", () => {
       expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
       expect(host.wipes).toBe(0);
 
-      // Main is still in place, so the seed has nothing to create, mint or push.
-      expect(await target.seed(HEAD, fakePack())).toEqual(
-        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
-      );
+      // The failed call may still have deleted the fork, so even main's own head is refused.
+      for (const head of [HEAD, OTHER_HEAD]) {
+        expect(await target.seed(head, fakePack())).toMatchObject({
+          ok: false,
+          code: "action_stale",
+        });
+      }
       expect(seed.pushes.length).toBe(pushes);
       expect(seed.fake.createTokenCalls).toBe(mints);
-      expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initializeCalls).toBe(1);
 
       seed.failDeleteOf = null;
       expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
       expect(seed.deleted).toEqual([fork.value.repo, main]);
       expect(host.wipes).toBe(1);
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+    }));
+
+  it("refuses a same-head seed after a reset deleted one fork and failed on the next", () =>
+    withTarget(async ({ seed, target, storage, host, main, restart }) => {
+      await target.seed(HEAD, fakePack());
+      const adapter = createArtifactsAdapter({
+        repoId: REPO_ID,
+        storage,
+        clock: seed.fake.clock,
+        namespace: seed.fake,
+      });
+      const forks: string[] = [];
+      for (const claim of ["clm_claim0001", "clm_claim0002"] as const) {
+        const fork = await adapter.forkForClaim(claim, HEAD);
+        if (!fork.ok) throw new Error(fork.code);
+        forks.push(fork.value.repo);
+      }
+      // The reset deletes forks in name order.
+      const [first, second] = forks.toSorted();
+      if (first === undefined || second === undefined) throw new Error("two forks expected");
+
+      seed.failDeleteOf = second;
+      expect(await target.reset()).toMatchObject({ ok: false, code: "internal" });
+      expect(seed.deleted).toEqual([first]);
+      expect(seed.fake.repos.has(first)).toBe(false);
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(host.wipes).toBe(0);
+
+      // Main still holds the head, but the Repo still records the deleted fork: the seed must not
+      // report the demo as seeded, and neither may a restarted object.
+      const refused = {
+        ok: false,
+        code: "action_stale",
+        message: "A reset of the demo repository did not finish. Reset it first.",
+      };
+      expect(await target.seed(HEAD, fakePack())).toEqual(refused);
+      expect(await restart().seed(HEAD, fakePack())).toEqual(refused);
+      expect(host.initializeCalls).toBe(1);
+
+      // A reset that finishes asks again for the fork already gone, deletes the rest and clears
+      // the way.
+      seed.failDeleteOf = null;
+      expect(await target.reset()).toEqual(ok({ kind: "demo.reset", deleted: true }));
+      expect(seed.deleted).toEqual([first, first, second, main]);
+      expect(host.wipes).toBe(1);
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.fake.repos.get(main)?.commits).toEqual([HEAD]);
+      expect(seed.fake.liveTokens(main)).toEqual([]);
     }));
 
   it("refuses to seed an initialized Repo whose main is missing or empty until a reset", () =>

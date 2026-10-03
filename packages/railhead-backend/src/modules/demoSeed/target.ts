@@ -12,7 +12,9 @@
 // Artifacts repository, then the Repo's own storage. It never lists the namespace to choose what to
 // delete. A failed deletion stops the reset before the Repo's storage is wiped, so the fork names
 // stay readable and the next reset finishes the job; since main goes last, a reset that stopped
-// early leaves main in place.
+// early leaves main in place. Before its first deletion the reset records that it is pending, and
+// every seed is refused while that record stands, so a seed cannot report success over a Repo whose
+// forks are partly deleted. Only a reset that finishes clears it.
 //
 // One seed or reset runs at a time per object; a second is refused as busy. A binding call that
 // changes Artifacts (create, token mint, delete) is recorded in storage before it starts, and a
@@ -46,7 +48,10 @@ export type SeedArtifactsRepo = Disposable &
 
 /** The namespace methods the seed calls. The `ARTIFACTS` binding satisfies it. */
 export interface SeedArtifacts {
-  /** Creates a repository; throws `ALREADY_EXISTS` when it exists. Its initial token is revoked. */
+  /**
+   * Creates a repository; throws `ALREADY_EXISTS` when it exists. The token it is created with is
+   * not used; the seed's sweep of main's tokens revokes it.
+   */
   create(name: string): Promise<unknown>;
   /** Opens a repository; throws `NOT_FOUND` when it does not exist. */
   get(name: string): Promise<SeedArtifactsRepo>;
@@ -123,6 +128,11 @@ const MIGRATIONS: readonly string[] = [
     incarnation TEXT NOT NULL,
     started_at INTEGER NOT NULL,
     answered INTEGER NOT NULL DEFAULT 0 CHECK (answered IN (0, 1))
+  ) STRICT`,
+  // One row while a reset that began deleting has not finished.
+  `CREATE TABLE demo_seed_reset (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    started_at INTEGER NOT NULL
   ) STRICT`,
 ];
 
@@ -267,6 +277,11 @@ export function createSeedTarget(
     );
   }
 
+  /** Whether a reset began deleting and has not finished. */
+  function resetPending(): boolean {
+    return sql.exec("SELECT 1 FROM demo_seed_reset LIMIT 1").toArray().length > 0;
+  }
+
   /**
    * The head of main's `refs/heads/main`, which the push creates, whatever `HEAD` names: `null`
    * when the repository has no such branch or no commit on it, or `missing` when there is no
@@ -366,6 +381,7 @@ export function createSeedTarget(
         const { artifacts } = context;
         if (artifacts === undefined) return noArtifacts();
         if (unresolved()) return busy();
+        if (resetPending()) return halfReset();
         const name = await mainRepoName(context.repoId);
         const before = await readMain(artifacts, name);
         if (!before.ok) return before;
@@ -419,6 +435,11 @@ export function createSeedTarget(
         }
         const names = [...forks, await mainRepoName(context.repoId)];
         let deleted = context.initialized();
+        // A deletion that fails, or answers without reaching us, may still have deleted something.
+        sql.exec(
+          "INSERT OR IGNORE INTO demo_seed_reset (id, started_at) VALUES (1, ?)",
+          context.clock(),
+        );
         for (const name of names) {
           try {
             if (await effect("delete", () => artifacts.delete(name))) deleted = true;
@@ -427,7 +448,9 @@ export function createSeedTarget(
           }
         }
         // Every call answered, and main and its forks are gone with their tokens: the wipe drops no
-        // record that still matters.
+        // record that still matters. The marker goes first, since the wipe leaves no table to clear;
+        // a wipe that fails after it leaves an initialized Repo without main, which seeds refuse too.
+        sql.exec("DELETE FROM demo_seed_reset");
         await context.wipe();
         return ok({ kind: "demo.reset", deleted });
       });
@@ -461,10 +484,7 @@ function otherHead(): PortResult<never> {
 }
 
 function halfReset(): PortResult<never> {
-  return fail(
-    "action_stale",
-    "The demo repository lost its main to a reset that did not finish. Reset it first.",
-  );
+  return fail("action_stale", "A reset of the demo repository did not finish. Reset it first.");
 }
 
 function artifactsFailed(): PortResult<never> {
