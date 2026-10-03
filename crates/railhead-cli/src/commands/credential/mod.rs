@@ -8,16 +8,19 @@
 //! it tell apart. Any other protocol, host, path or user is refused with nothing on stdout. The
 //! answer is `username=<agentId>` and `password=<session token>`: the Railhead session, and
 //! nothing else, since the CLI never holds an Artifacts token. When the agent has no current
-//! session, or it is about to expire, the helper logs in with its key first.
+//! session, or it is about to expire, the helper logs in with its key first, and shows the pending
+//! inbox and next command that login reported on stderr.
 
 use std::convert::Infallible;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::str::FromStr;
+
+use serde::Serialize;
 
 use crate::commands::join::{self, key::SigningKey};
 use crate::context::CloneBinding;
 use crate::identity::{Identity, SessionToken};
-use crate::output::{LocalCode, Output};
+use crate::output::{LocalCode, Output, Render};
 use crate::{Agent, Error, Result};
 
 /// Largest request the helper reads from Git, in bytes. Git's requests are a few hundred.
@@ -80,7 +83,7 @@ fn answer(
         Operation::Get => {
             let binding = clone_of(agent)?;
             request.check(&agent.identity, binding)?;
-            let token = session(agent)?;
+            let token = session(agent, out)?;
             out.credential(&[
                 ("username", agent.identity.agent_id.as_str()),
                 ("password", token.expose()),
@@ -118,8 +121,8 @@ fn clone_of<'a>(agent: &'a Agent<'_>) -> Result<&'a CloneBinding> {
 }
 
 /// The agent's stored session while it is current, or a new one from a login with its key, stored
-/// for the next request.
-fn session(agent: &Agent<'_>) -> Result<SessionToken> {
+/// for the next request. A login's pending inbox and next command go to stderr, never stdout.
+fn session(agent: &Agent<'_>, out: &mut Output<'_>) -> Result<SessionToken> {
     if let Some(token) = agent.stored_session()? {
         return Ok(token);
     }
@@ -131,12 +134,38 @@ fn session(agent: &Agent<'_>) -> Result<SessionToken> {
         next: Some(railhead_protocol::NextCommand::Join),
     })?;
     let client = agent.client()?;
-    let session = agent
+    let login = agent
         .invocation
         .runtime
         .block_on(join::login(&client, &agent.identity, &key))?;
-    store.save_session(&agent.identity.name, &session)?;
-    Ok(session.token)
+    store.save_session(&agent.identity.name, &login.session)?;
+    let pending = login
+        .inbox
+        .as_ref()
+        .is_some_and(|inbox| inbox.pending.get() > 0);
+    if pending || login.next.is_some() {
+        let logged_in = LoggedIn {
+            agent_id: agent.identity.agent_id.to_string(),
+        };
+        out.success(&logged_in, login.inbox.as_ref(), login.next)
+            .map_err(Error::Output)?;
+    }
+    Ok(login.session.token)
+}
+
+/// What the helper reports after a login that carried notices. Credential mode prints it on
+/// stderr.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoggedIn {
+    /// The agent that logged in.
+    agent_id: String,
+}
+
+impl Render for LoggedIn {
+    fn render(&self, out: &mut dyn Write) -> io::Result<()> {
+        writeln!(out, "logged in again as {}", self.agent_id)
+    }
 }
 
 /// The fields of a Git credential request this helper reads.

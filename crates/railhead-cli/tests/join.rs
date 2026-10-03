@@ -91,6 +91,8 @@ struct Backend {
     joins: AtomicUsize,
     /// Logins redeemed so far.
     logins: AtomicUsize,
+    /// The `inbox` and `next` every login answer carries; both `null` when unset.
+    notices: Mutex<Option<(Value, Value)>>,
 }
 
 impl Backend {
@@ -101,6 +103,23 @@ impl Backend {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         keys.first()
             .and_then(|line| PublicKey::from_openssh(line).ok())
+    }
+
+    fn notices(&self) -> (Value, Value) {
+        self.notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or((Value::Null, Value::Null))
+    }
+
+    /// Makes every later login report an unacknowledged rework decision and ask for `rh sync`.
+    fn report_inbox(&self) {
+        *self
+            .notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((pending_inbox(), json!("sync")));
     }
 
     fn keys(&self) -> Vec<String> {
@@ -171,11 +190,16 @@ impl Respond for Join {
             .code
             .clone()
             .unwrap_or_else(|| code(&public_key, field("inviteId")));
+        let next = if state == "pending" {
+            json!("join")
+        } else {
+            Value::Null
+        };
         let answer = json_response(
             200,
             &json!({"ok": true, "data": {"agent": {"agentId": AGENT, "name": "atlas",
                 "ownerId": "usr_lemarier", "state": state}, "code": code,
-                "pollAfterMs": self.poll_after_ms}, "inbox": null, "next": "join"}),
+                "pollAfterMs": self.poll_after_ms}, "inbox": null, "next": next}),
         );
         match self.slow {
             Some(delay) if answered > 0 => answer.set_delay(delay),
@@ -205,18 +229,33 @@ impl Respond for Session {
                 } else {
                     FRESH
                 };
+                let (inbox, next) = self.backend.notices();
                 json_response(
                     200,
                     &json!({"ok": true, "data": {"token": token,
                         "expiresAt": now_ms() + SESSION_TTL_MS,
                         "agent": {"agentId": AGENT, "name": "atlas", "ownerId": "usr_lemarier",
                         "state": "confirmed"}, "repoId": "rep_demo0001"},
-                        "inbox": null, "next": null}),
+                        "inbox": inbox, "next": next}),
                 )
             }
             _ => failure(401, "challenge_invalid", "The challenge is invalid."),
         }
     }
+}
+
+/// An inbox digest with an unacknowledged rework decision, two items pending in all.
+fn pending_inbox() -> Value {
+    json!({"items": [{"item": 17, "claimId": "clm_42abcd", "queuedAt": 1_789_999_996_000_u64,
+        "entry": {"kind": "rework", "decision": {"decisionId": "dec_upload1", "version": 2}},
+        "decision": {"decisionId": "dec_upload1", "version": 2, "supersedes": 1,
+            "questionId": "qst_upload1",
+            "question": "Should uploads above 10 MB be rejected or chunked?",
+            "option": {"key": "chunk", "label": "Upload them in chunks"},
+            "previous": {"key": "reject", "label": "Reject them"},
+            "scope": ["src/upload.ts"], "decidedBy": "usr_lemarier",
+            "decidedAt": 1_789_999_995_000_u64}}],
+        "pending": 2})
 }
 
 fn login_message(origin: &str) -> String {
@@ -483,6 +522,38 @@ async fn joining_twice_resumes_with_the_same_key() -> anyhow::Result<()> {
     let run = finish(&world, &from_env)?;
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(fs::read(&key_path)?, key);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resumed_join_shows_the_inbox_its_login_reported() -> anyhow::Result<()> {
+    let world = world().await?;
+    world.mount(0, None, None).await;
+    let first = join(&world, &["--name", "atlas"])?;
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    world.backend.report_inbox();
+
+    let resumed = join(&world, &["--name", "atlas"])?;
+    assert_eq!(resumed.code, Some(0), "{}", resumed.stderr);
+    let envelope = resumed.json()?;
+    assert_eq!(envelope.get("inbox"), Some(&pending_inbox()));
+    assert_eq!(envelope.get("next"), Some(&json!("rh sync")));
+    assert_eq!(envelope.pointer("/data/agentId"), Some(&json!(AGENT)));
+
+    let invite = world.invite();
+    let text = rh(&world, &["join", invite.as_str(), "--name", "atlas"])?;
+    assert_eq!(text.code, Some(0), "{}", text.stderr);
+    let tail: Vec<&str> = text.stdout.lines().skip(2).collect();
+    assert_eq!(
+        tail,
+        [
+            "inbox: 2 unacknowledged; read them with rh sync",
+            "next: rh sync"
+        ],
+        "{}",
+        text.stdout
+    );
+    assert_eq!(world.requests("/session").await, 3);
     Ok(())
 }
 
@@ -985,8 +1056,47 @@ async fn the_helper_logs_in_when_the_session_is_gone_and_erase_drops_only_its_to
             format!("username={AGENT}\npassword={FRESH}\n").as_str()
         )
     );
+    // A login that reports no inbox and no next command prints nothing for a person.
+    assert_eq!(run.stderr, "");
     assert_eq!(world.requests("/session").await, logins + 1);
     assert_eq!(token(&world)?, Some(json!(FRESH)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_credential_login_shows_its_inbox_on_stderr_only() -> anyhow::Result<()> {
+    let world = joined().await?;
+    let clone = clone(&world)?;
+    world.backend.report_inbox();
+    let fork = request(&world, "git/casqueblanc/demo/claims/clm_42abcd.git");
+
+    // The stored session is current, so no login runs and there is nothing to report.
+    let current = credential(&world, clone.path(), "get", &fork)?;
+    assert_eq!(
+        (
+            current.code,
+            current.stdout.as_str(),
+            current.stderr.as_str()
+        ),
+        (
+            Some(0),
+            format!("username={AGENT}\npassword={TOKEN}\n").as_str(),
+            ""
+        )
+    );
+
+    fs::remove_file(world.agent_dir("inv-abc123").join("session"))?;
+    let run = credential(&world, clone.path(), "get", &fork)?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout, format!("username={AGENT}\npassword={FRESH}\n"));
+    assert_eq!(
+        run.stderr,
+        format!(
+            "logged in again as {AGENT}\ninbox: 2 unacknowledged; read them with rh sync\nnext: rh sync\n"
+        )
+    );
+    // The decision's text stays in the inbox for rh sync; the helper only points to it.
+    assert!(!run.stderr.contains("Should uploads"), "{}", run.stderr);
     Ok(())
 }
 

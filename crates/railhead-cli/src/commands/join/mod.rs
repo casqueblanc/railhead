@@ -18,8 +18,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use railhead_protocol::{
-    AgentErrorCode, ChallengeRequest, ChallengeResult, EnrollmentState, JoinRequest, JoinResult,
-    NextCommand, SessionRequest, SessionResult,
+    AgentErrorCode, ChallengeRequest, ChallengeResult, EnrollmentState, InboxDigest, JoinRequest,
+    JoinResult, NextCommand, SessionRequest, SessionResult,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -127,11 +127,11 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
 
     invocation.runtime.block_on(async {
         let deadline = Instant::now() + wait;
-        let mut result = match client
+        let mut answer = match client
             .send::<_, JoinResult>(&Endpoint::Join, None, &request)
             .await
         {
-            Ok(success) => success.data,
+            Ok(success) => success,
             Err(error) => {
                 // A refused join registered nothing, so a key made for it is not anyone's yet.
                 if made == KeyOrigin::Created && is_refusal(&error) {
@@ -140,45 +140,59 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
                 return Err(error.into());
             }
         };
-        let identity = enrollment.record(existing, &result)?;
-        if result.agent.state == EnrollmentState::Pending {
+        let identity = enrollment.record(existing, &answer.data)?;
+        if answer.data.agent.state == EnrollmentState::Pending {
             out.notice(&enrollment.waiting(&identity, args.wait))
                 .map_err(Error::Output)?;
         }
         // The first ask is always sent, even with `--wait 0`; every later one starts and ends
         // within the wait, and an answer it would bring after the deadline is not waited for.
-        while result.agent.state == EnrollmentState::Pending {
+        while answer.data.agent.state == EnrollmentState::Pending {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(enrollment.still_pending(&identity));
             }
-            let asked = Duration::from_millis(result.poll_after_ms.get());
+            let asked = Duration::from_millis(answer.data.poll_after_ms.get());
             tokio::time::sleep(asked.clamp(MIN_POLL, MAX_POLL).min(left)).await;
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(enrollment.still_pending(&identity));
             }
             let ask = client.send::<_, JoinResult>(&Endpoint::Join, None, &request);
-            result = match tokio::time::timeout(left, ask).await {
-                Ok(answer) => answer?.data,
+            answer = match tokio::time::timeout(left, ask).await {
+                Ok(answer) => answer?,
                 Err(_elapsed) => return Err(enrollment.still_pending(&identity)),
             };
-            enrollment.check(&identity, &result)?;
+            enrollment.check(&identity, &answer.data)?;
         }
-        let session = login(&client, &identity, &key).await?;
-        store.save_session(&name, &session)?;
+        let login = login(&client, &identity, &key).await?;
+        store.save_session(&name, &login.session)?;
         let joined = Joined {
             name: name.to_string(),
             agent_id: identity.agent_id.to_string(),
-            display_name: result.agent.name,
+            display_name: answer.data.agent.name,
             origin: invite.origin.as_str(),
             repo: invite.repo.to_string(),
-            state: result.agent.state,
+            state: answer.data.agent.state,
             code: enrollment.code.clone(),
         };
-        out.success(&joined, None, Some(NextCommand::Work))
+        // The login is the latest answer, so its inbox and hint win over the join's.
+        let inbox = login.inbox.or(answer.inbox);
+        let next = login.next.or(answer.next).unwrap_or(NextCommand::Work);
+        out.success(&joined, inbox.as_ref(), Some(next))
             .map_err(Error::Output)
     })
+}
+
+/// A login's session, with the pending inbox and next command its response carried.
+#[derive(Debug)]
+pub struct Login {
+    /// The session, bound to the identity that logged in.
+    pub session: Session,
+    /// Unacknowledged inbox items the backend reported with the session.
+    pub inbox: Option<InboxDigest>,
+    /// The command the backend asks the agent to run next.
+    pub next: Option<NextCommand>,
 }
 
 /// Logs in as `identity`: asks for a challenge, signs it when it is exactly the message `rh`
@@ -188,11 +202,7 @@ pub fn run(invocation: &Invocation<'_>, args: &Args, out: &mut Output<'_>) -> Re
 ///
 /// When a request fails, or the backend proposes another message, names another agent or returns
 /// a malformed token. Nothing is signed for a message `rh` did not build.
-pub async fn login(
-    client: &http::Client,
-    identity: &Identity,
-    key: &SigningKey,
-) -> Result<Session> {
+pub async fn login(client: &http::Client, identity: &Identity, key: &SigningKey) -> Result<Login> {
     let agent_id = identity.agent_id.to_string();
     let challenge = client
         .send::<_, ChallengeResult>(
@@ -221,7 +231,7 @@ pub async fn login(
             "the login challenge is not the message rh signs; nothing was signed",
         ));
     }
-    let session = client
+    let response = client
         .send::<_, SessionResult>(
             &Endpoint::Session,
             None,
@@ -231,8 +241,8 @@ pub async fn login(
                 signature: key.sign(&message)?,
             },
         )
-        .await?
-        .data;
+        .await?;
+    let session = response.data;
     if session.agent.agent_id != identity.agent_id.as_str() {
         return Err(malformed(
             "the session names another agent; it was not stored",
@@ -240,7 +250,11 @@ pub async fn login(
     }
     let token = SessionToken::new(session.token)
         .ok_or_else(|| malformed("the session token is malformed; it was not stored"))?;
-    Ok(Session::new(identity, token, session.expires_at.get()))
+    Ok(Login {
+        session: Session::new(identity, token, session.expires_at.get()),
+        inbox: response.inbox,
+        next: response.next,
+    })
 }
 
 /// `chl_` and 16 to 64 letters or digits.
