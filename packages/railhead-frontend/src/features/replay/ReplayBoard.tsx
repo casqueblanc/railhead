@@ -167,7 +167,11 @@ interface SourceLabelProps {
   onClose: () => void;
 }
 
-/** Says, before anything else on the page, that this is a replay and where its log came from. */
+/**
+ * Says, before anything else on the page, that this is a replay and where its file says the log
+ * came from. A capture carries no signature, so anyone can edit a file to read `captured`: the
+ * label repeats the file's claim and never calls it verified.
+ */
 const SourceLabel = ({ source, head, onClose }: SourceLabelProps) => {
   const close = (
     <Button size="sm" onClick={onClose}>
@@ -179,8 +183,8 @@ const SourceLabel = ({ source, head, onClose }: SourceLabelProps) => {
       return (
         <Banner
           icon={<FilmStripIcon weight="fill" aria-hidden="true" />}
-          title="Replay of a captured log. This board is not live."
-          description={`Captured from ${source.origin}, repository ${source.org}/${source.name}, at ${formatTime(source.capturedAt)}. ${head} events. Answering and owner actions are off, and nothing is sent to the backend.`}
+          title="Replay of a file that claims to be a captured log. This board is not live."
+          description={`The file says it was captured from ${source.origin}, repository ${source.org}/${source.name}, at ${formatTime(source.capturedAt)}, with head at event ${head}. The board cannot verify where a file came from, so confirm how you got it before treating it as a real run. Answering and owner actions are off, and nothing is sent to the backend.`}
           action={close}
         />
       );

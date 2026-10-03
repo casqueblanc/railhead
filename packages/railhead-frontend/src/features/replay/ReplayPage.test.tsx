@@ -89,14 +89,20 @@ describe("ReplayPage", () => {
     vi.useRealTimers();
   });
 
+  const claimTitle = "Replay of a file that claims to be a captured log. This board is not live.";
+
   it("replays a captured file offline to its final board, labelled as a replay", async () => {
     await act(async () => root.render(<ReplayPage loadSynthetic={null} />));
     await choose(fileOf(captured));
 
-    expect(text()).toContain("Replay of a captured log. This board is not live.");
+    expect(text()).toContain(claimTitle);
     expect(text()).toContain(
-      "Captured from https://railhead.example, repository demo/upload-app, at 2026-10-05 12:30:00 UTC.",
+      `The file says it was captured from https://railhead.example, repository demo/upload-app, at 2026-10-05 12:30:00 UTC, with head at event ${captured.head}.`,
     );
+    expect(text()).toContain(
+      "The board cannot verify where a file came from, so confirm how you got it before treating it as a real run.",
+    );
+    expect(text()).not.toMatch(/\bverified\b/i);
     expect(position()).toBe(String(captured.head));
     // The final board's sections, from the fold of every event.
     expect(text()).toContain("Decided");
@@ -138,7 +144,37 @@ describe("ReplayPage", () => {
     await click(decisionReversal.description);
 
     expect(text()).toContain("Synthetic replay. Not a captured run.");
-    expect(text()).not.toContain("Replay of a captured log");
+    expect(text()).toContain(
+      `${decisionReversal.description}. Built from hand-written development fixtures: no agent did this work.`,
+    );
+    expect(text()).not.toContain("captured log");
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it("shows a synthetic file edited to say captured as a claim, never as a verified run", async () => {
+    await act(async () => root.render(<ReplayPage loadSynthetic={null} />));
+    const serialized = serializeCapture(synthetic);
+    if (!serialized.ok) throw new Error("serialize failed");
+    // What a person can do with a text editor: swap the source and keep the fixture's events.
+    const edited: unknown = JSON.parse(serialized.text);
+    if (typeof edited !== "object" || edited === null) throw new Error("capture is not an object");
+    const forged = JSON.stringify({
+      ...edited,
+      source: {
+        kind: "captured",
+        origin: "https://railhead.example",
+        org: "demo",
+        name: "upload-app",
+        capturedAt: Date.UTC(2026, 9, 5, 12, 30),
+      },
+    });
+    await choose(new File([forged], "run.json", { type: "application/json" }));
+
+    expect(text()).toContain(claimTitle);
+    expect(text()).toContain("The board cannot verify where a file came from");
+    expect(text()).not.toMatch(/\bverified\b/i);
+    expect(text()).not.toContain("Synthetic replay");
+    expect(position()).toBe(String(synthetic.head));
     expect(network).not.toHaveBeenCalled();
   });
 

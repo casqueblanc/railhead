@@ -16,7 +16,8 @@
 //
 // `source` says how the log was made. `captured` means the capture script read it from a running
 // Railhead; `synthetic` means it was built from hand-written development fixtures and must never be
-// presented as a run.
+// presented as a run. Nothing signs the file, so an opened `captured` source is only the file's
+// claim: parsing checks that the events are consistent, not where they came from.
 //
 // This module imports nothing at run time but `@railhead/shared/events`, so the capture script can
 // load it under `node` directly.
@@ -138,6 +139,7 @@ const BOARD_ERROR_CODES: Record<BoardErrorCode, true> = {
   action_stale: true,
   bootstrap_closed: true,
   quota_exceeded: true,
+  busy: true,
   unavailable: true,
   internal: true,
 };

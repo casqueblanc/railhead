@@ -255,6 +255,11 @@ for (const [label, refusal, expected] of [
     { refuseReadWith: "internal" },
     "capture-replay: The backend refused to read the log (internal).\n",
   ],
+  [
+    "reading with a code added later",
+    { refuseReadWith: "busy" },
+    "capture-replay: The backend refused to read the log (busy).\n",
+  ],
 ] as const) {
   test(`prints only a known code when the backend refuses ${label}`, async () => {
     const board = await startBoard("rep_synthrepo", [], refusal);
