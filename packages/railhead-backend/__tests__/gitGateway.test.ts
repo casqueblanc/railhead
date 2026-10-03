@@ -1656,14 +1656,16 @@ describe("invalid requests", () => {
 });
 
 describe("bounds", () => {
-  it("cuts off a client that stalls inside the push head, whether or not the claim admits it", async () => {
-    // A head limit no other timer shares, so arming it is unambiguous.
-    const limits: GitGatewayLimits = { ...FAST, headTimeoutMs: 150 };
-    const cases: [ClaimState, number, string][] = [
-      ["working", 408, "did not arrive in time"],
-      ["ready", 403, "The claim is ready"],
-    ];
-    for (const [state, status, message] of cases) {
+  // A head limit no other timer shares, so arming it is unambiguous.
+  const HEAD_LIMITS: GitGatewayLimits = { ...FAST, headTimeoutMs: 150 };
+
+  // One case per claim state, so each world gets the whole per-test timeout on a loaded host.
+  it.for<[ClaimState, number, string]>([
+    ["working", 408, "did not arrive in time"],
+    ["ready", 403, "The claim is ready"],
+  ])(
+    "cuts off a client that stalls inside the push head while the claim is %s",
+    async ([state, status, message]) => {
       await withGateway(async (world) => {
         // The fake clock moves only once the head timer exists: the gateway authorizes the push
         // before arming it, and under load that can lag the stream's first pull. Wrapped by hand,
@@ -1671,7 +1673,7 @@ describe("bounds", () => {
         const setTimer = globalThis.setTimeout;
         let armed = false;
         globalThis.setTimeout = ((handler: () => void, ms?: number) => {
-          if (ms === limits.headTimeoutMs) armed = true;
+          if (ms === HEAD_LIMITS.headTimeoutMs) armed = true;
           return setTimer(handler, ms);
         }) as typeof setTimeout;
         try {
@@ -1694,7 +1696,7 @@ describe("bounds", () => {
             world.gateway.serve(rpc("git-receive-pack", body), FORK, "/git-receive-pack"),
           );
           await until(() => armed);
-          await elapse(limits.headTimeoutMs - 1);
+          await elapse(HEAD_LIMITS.headTimeoutMs - 1);
           expect(serving.settled, state).toBe(false);
           // Cut off at the head's limit, well before the whole exchange's.
           await elapse(1);
@@ -1709,9 +1711,9 @@ describe("bounds", () => {
         } finally {
           globalThis.setTimeout = setTimer;
         }
-      }, limits);
-    }
-  });
+      }, HEAD_LIMITS);
+    },
+  );
 
   it("answers a client whose body fails inside the push head, and leaves no time limit armed", async () => {
     const slow: GitGatewayLimits = { ...FAST, maxDurationMs: 60_000 };
