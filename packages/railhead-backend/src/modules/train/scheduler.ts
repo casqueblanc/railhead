@@ -58,6 +58,7 @@ import {
   type CommitSha,
   type CheckRunId,
   type DecisionRef,
+  type IntentId,
 } from "@railhead/shared/events";
 import type { ClaimPin } from "../../contracts/claims";
 import {
@@ -719,10 +720,10 @@ export function createTrain(
   ): Step {
     switch (record.status) {
       case "updated":
-        landBatch(generation, batch);
+        landBatch(generation, batch, record.intentId);
         return CONTINUE;
       case "reconciled":
-        if (record.main === batch.candidate) landBatch(generation, batch);
+        if (record.main === batch.candidate) landBatch(generation, batch, record.intentId);
         else failBatch(generation, batch, "main_rejected");
         return CONTINUE;
       case "rejected":
@@ -735,11 +736,23 @@ export function createTrain(
     }
   }
 
-  function landBatch(generation: number, batch: BatchRecord): void {
+  function landBatch(generation: number, batch: BatchRecord, intentId: IntentId): void {
     const now = clock();
     fenced(generation, () => {
       for (const pin of batch.pins) settleEntry(sql, pin, "landed", null, now);
       settleBatch(sql, batch.batchId, { state: "landed" }, now);
+      // The adaptation is owed in the landing's own transaction, so neither commits without the
+      // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
+      // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
+      ports().adaptation.owe(intentId, batch.pins);
+      try {
+        ports().adaptation.recordLanding(intentId);
+      } catch (error) {
+        const name = error instanceof Error ? error.name : "unknown";
+        console.error(
+          JSON.stringify({ event: "train.adaptation_failed", repo: context.repoId, error: name }),
+        );
+      }
     });
   }
 
