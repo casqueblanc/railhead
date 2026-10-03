@@ -223,6 +223,15 @@ def claim_view(state: str = "working", ready: str | None = None, generation: int
     }
 
 
+
+def pin_view(state: dict, next_commit: str | None = None) -> dict:
+    return {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_HEAD, "nextCommit": next_commit, "state": state}
+
+
+def batched(batch: str, check_run: str | None) -> dict:
+    return {"kind": "batched", "batchId": 7, "batch": batch, "checkRunId": check_run}
+
+
 SPECS = {
     "invalid_request": (400, False, None),
     "not_found": (404, False, "status"),
@@ -496,6 +505,63 @@ def agent_fixtures() -> dict:
                 rejected("generation as a string", {**READY_BODY, "generation": "1"}, "shape"),
                 rejected("commit missing", {"generation": 1}, "shape"),
             ],
+        },
+        "pin": {
+            "method": "GET",
+            "path": f"{BASE}/pin",
+            "exchanges": [
+                exchange(
+                    "a pin waiting second in the queue",
+                    request(None, True),
+                    success({"pin": pin_view({"kind": "queued", "position": 2})}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a pin in a batch being formed, before any check run",
+                    request(None, True),
+                    success({"pin": pin_view(batched("forming", None))}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a pin in a batch being checked",
+                    request(None, True),
+                    success({"pin": pin_view(batched("checking", "chk_run0001"))}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a pin in a batch held for a person, with a newer commit waiting",
+                    request(None, True),
+                    success({"pin": pin_view(batched("held", "chk_run0001"), next_commit=SHA_OTHER)}, DIGEST, "sync"),
+                ),
+                exchange(
+                    "a pin in a passed batch moving main",
+                    request(None, True),
+                    success({"pin": pin_view(batched("landing", "chk_run0001"))}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a landed pin",
+                    request(None, True),
+                    success({"pin": pin_view({"kind": "landed"})}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a pin parked with the claim it conflicts with",
+                    request(None, True),
+                    success({"pin": pin_view({"kind": "parked", "reason": "conflict"})}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "a pin dropped after its check failed",
+                    request(None, True),
+                    success({"pin": pin_view({"kind": "dropped", "reason": "check_failed"})}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "an agent without a ready claim",
+                    request(None, True),
+                    success({"pin": None}, EMPTY_DIGEST, None),
+                ),
+                exchange(
+                    "the train module is not installed",
+                    request(None, True),
+                    failure("unavailable", "The train module is not installed."),
+                ),
+            ],
+            "rejectedRequests": [rejected("a body on a route without one", {"claimId": "clm_42abcd"}, "shape")],
         },
         "inbox": {
             "method": "GET",

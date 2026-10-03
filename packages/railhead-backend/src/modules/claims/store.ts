@@ -15,6 +15,23 @@
 // `episode` counts the claim's moves between working and ready: pinning and reopening each raise
 // it, and nothing lowers it. A push is fenced to the episode it was granted in as well as the
 // generation, so a push begun before ready cannot be recorded after the claim was reopened.
+//
+// An allocating or working claim holds a lease until `lease_until`. A working claim whose lease
+// lapsed expires; the expiry owes a revocation of its fork's tokens, due at `revoke_due`, and the
+// claim is reassigned only once that revocation is settled and `revoke_due` is cleared. A pin owes
+// the same revocation, and a ready claim keeps `revoke_due` until it is settled.
+//
+// `revoke_attempt` counts the revocation sweeps started for a claim and each new obligation to
+// revoke. Only a `revoked` answer from the latest sweep clears `revoke_due`, so an earlier sweep
+// that answers late cannot settle a debt a later sweep or obligation still owes.
+//
+// Every sweep that has started holds a revocation barrier on its claim's fork, recorded with its
+// attempt in the transaction that starts it. Until that attempt records its outcome, no write to the
+// fork is granted: the sweep could still revoke a token minted meanwhile, and a Repo restarted
+// mid-sweep knows of the sweep only through this row. Overlapping sweeps each hold their own. A
+// barrier whose sweep outlived `expires_at` is presumed lost; it keeps refusing grants until a new
+// sweep replaces it and records its outcome. Each barrier keeps its attempt's mint cutoff and start,
+// which bound what that sweep may revoke: never a token minted after the attempt began.
 
 import type { ClaimState } from "@railhead/shared/agent-api";
 import {
@@ -26,6 +43,7 @@ import {
   type IssueId,
   type UserId,
 } from "@railhead/shared/events";
+import type { MintCutoff } from "../../contracts/artifacts";
 import { migrate, type RepoStorage } from "../../repo/storage";
 
 /** Released schema steps. Append a step to change the schema; never edit one. */
@@ -57,6 +75,21 @@ const MIGRATIONS: readonly string[] = [
   "ALTER TABLE claims_claims ADD COLUMN ready_decisions TEXT",
   "ALTER TABLE claims_claims ADD COLUMN last_refusal TEXT",
   "ALTER TABLE claims_claims ADD COLUMN episode INTEGER NOT NULL DEFAULT 1 CHECK (episode > 0)",
+  "ALTER TABLE claims_claims ADD COLUMN lease_until INTEGER",
+  "ALTER TABLE claims_claims ADD COLUMN revoke_due INTEGER",
+  `CREATE INDEX claims_by_lease ON claims_claims (lease_until)
+    WHERE state IN ('allocating', 'working')`,
+  "CREATE INDEX claims_by_revocation ON claims_claims (revoke_due) WHERE revoke_due IS NOT NULL",
+  "ALTER TABLE claims_claims ADD COLUMN revoke_attempt INTEGER NOT NULL DEFAULT 0",
+  `CREATE TABLE claims_revocation_barriers (
+    claim_id TEXT NOT NULL REFERENCES claims_claims (claim_id),
+    attempt INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (claim_id, attempt)
+  ) STRICT`,
+  "CREATE INDEX claims_barriers_by_expiry ON claims_revocation_barriers (expires_at)",
+  "ALTER TABLE claims_revocation_barriers ADD COLUMN mint_cutoff INTEGER",
+  "ALTER TABLE claims_revocation_barriers ADD COLUMN started_at INTEGER",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -85,6 +118,17 @@ export interface ClaimRow {
    * that cannot be read, which no pin is trusted with.
    */
   readyDecisions: DecisionRef[] | null;
+  /**
+   * When the lease of an allocating or working claim lapses, in milliseconds since the Unix epoch;
+   * `null` for a claim in another state. A claim recorded before leases is given one when the
+   * module starts.
+   */
+  leaseUntil: number | null;
+  /**
+   * When the fork tokens of an expired or ready claim are next revoked; `null` when nothing is
+   * owed.
+   */
+  revokeDue: number | null;
   title: string;
   body: string;
 }
@@ -101,12 +145,15 @@ interface RawClaim extends Record<string, SqlStorageValue> {
   base: string | null;
   ready_commit: string | null;
   ready_decisions: string | null;
+  lease_until: number | null;
+  revoke_due: number | null;
   title: string;
   body: string;
 }
 
 const SELECT_CLAIM = `SELECT c.claim_id, c.issue_id, c.agent_id, c.owner_id, c.generation, c.episode,
-    c.state, c.fork_base, c.base, c.ready_commit, c.ready_decisions, i.title, i.body
+    c.state, c.fork_base, c.base, c.ready_commit, c.ready_decisions, c.lease_until, c.revoke_due,
+    i.title, i.body
   FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id`;
 
 /** Creates or migrates the claims tables. */
@@ -126,12 +173,17 @@ export function claimById(sql: SqlStorage, claimId: ClaimId): ClaimRow | null {
   return first(sql.exec<RawClaim>(`${SELECT_CLAIM} WHERE c.claim_id = ?`, claimId));
 }
 
-/** How many active claims the owner's agents hold. */
-export function activeClaimsOfOwner(sql: SqlStorage, ownerId: UserId): number {
+/**
+ * How many active claims the owner's agents hold at `now`. An allocation whose lease lapsed at or
+ * before `now` is held by nobody and is not counted, so a successor of the same owner can take it.
+ */
+export function activeClaimsOfOwner(sql: SqlStorage, ownerId: UserId, now: number): number {
   const [row] = sql
     .exec<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM claims_claims WHERE owner_id = ? AND state IN ${ACTIVE}`,
+      `SELECT COUNT(*) AS n FROM claims_claims WHERE owner_id = ? AND state IN ${ACTIVE}
+         AND NOT (state = 'allocating' AND lease_until IS NOT NULL AND lease_until <= ?)`,
       ownerId,
+      now,
     )
     .toArray();
   return row?.n ?? 0;
@@ -162,19 +214,374 @@ export function issueStatus(sql: SqlStorage, issueId: IssueId): "open" | "claime
   return row.claimed === 0 ? "open" : "claimed";
 }
 
-/** Records the fork intent: a claim at generation 1 with no fork yet. */
+/** Records the fork intent: a claim at generation 1 with no fork yet, leased until `leaseUntil`. */
 export function insertIntent(
   sql: SqlStorage,
   claim: { claimId: ClaimId; issueId: IssueId; agentId: AgentId; ownerId: UserId },
+  leaseUntil: number,
 ): void {
   sql.exec(
-    `INSERT INTO claims_claims (claim_id, issue_id, agent_id, owner_id, generation, state)
-     VALUES (?, ?, ?, ?, 1, 'allocating')`,
+    `INSERT INTO claims_claims
+       (claim_id, issue_id, agent_id, owner_id, generation, state, lease_until)
+     VALUES (?, ?, ?, ?, 1, 'allocating', ?)`,
     claim.claimId,
     claim.issueId,
     claim.agentId,
     claim.ownerId,
+    leaseUntil,
   );
+}
+
+/**
+ * Gives every allocating or working claim recorded before leases a lease until `leaseUntil`, so a
+ * holder that never calls again still lapses.
+ */
+export function backfillLeases(sql: SqlStorage, leaseUntil: number): void {
+  sql.exec(
+    `UPDATE claims_claims SET lease_until = ?
+     WHERE state IN ('allocating', 'working') AND lease_until IS NULL`,
+    leaseUntil,
+  );
+}
+
+/** Extends the lease of an allocating or working claim at `generation` to `leaseUntil`. */
+export function renewLease(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  leaseUntil: number,
+): void {
+  sql.exec(
+    `UPDATE claims_claims SET lease_until = ?
+     WHERE claim_id = ? AND generation = ? AND state IN ('allocating', 'working')`,
+    leaseUntil,
+    claimId,
+    generation,
+  );
+}
+
+/** Working claims whose lease lapsed at or before `now`, oldest lease first, at most `limit`. */
+export function lapsedClaims(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
+  return rows(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.state = 'working' AND c.lease_until <= ?
+       ORDER BY c.lease_until, c.claim_id LIMIT ?`,
+      now,
+      limit,
+    ),
+  );
+}
+
+/**
+ * Expires a working claim at `generation` and records that its fork's tokens are owed a revocation
+ * due at `now`. Returns `false`, and writes nothing, when the claim is no longer working at that
+ * generation.
+ */
+export function expireClaim(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  now: number,
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET state = 'expired', lease_until = NULL, revoke_due = ?,
+         revoke_attempt = revoke_attempt + 1
+       WHERE claim_id = ? AND generation = ? AND state = 'working'
+       RETURNING claim_id`,
+      now,
+      claimId,
+      generation,
+    )
+    .toArray();
+  return updated.length === 1;
+}
+
+/**
+ * Claims whose revocation is due at or before `now`, oldest issue first, at most `limit`. The
+ * oldest is first in line for takeover, so revoking it first is what lets a takeover proceed.
+ */
+export function dueRevocations(sql: SqlStorage, now: number, limit: number): ClaimRow[] {
+  return rows(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.revoke_due <= ? ORDER BY i.filed_seq, c.claim_id LIMIT ?`,
+      now,
+      limit,
+    ),
+  );
+}
+
+/**
+ * Starts a revocation sweep of the claim's fork tokens and returns its attempt, which
+ * `recordRevocation` needs to settle it, only while the stored generation, state and due
+ * revocation still equal `expected`. In the same step it raises the fork's revocation barrier for
+ * that attempt until `barrierUntil`, recording the attempt's `cutoff`. Returns `"stale"`, and writes nothing, when the claim changed
+ * since the caller read it: a reopened claim owes nothing, and its holder's new tokens must live.
+ */
+export function beginRevocation(
+  sql: SqlStorage,
+  expected: Pick<ClaimRow, "claimId" | "generation" | "state" | "revokeDue">,
+  barrierUntil: number,
+  cutoff: MintCutoff,
+): number | "stale" {
+  if (expected.revokeDue === null) return "stale";
+  const [row] = sql
+    .exec<{ revoke_attempt: number }>(
+      `UPDATE claims_claims SET revoke_attempt = revoke_attempt + 1
+       WHERE claim_id = ? AND generation = ? AND state = ? AND revoke_due = ?
+         AND state IN ('expired', 'ready')
+       RETURNING revoke_attempt`,
+      expected.claimId,
+      expected.generation,
+      expected.state,
+      expected.revokeDue,
+    )
+    .toArray();
+  if (row === undefined) return "stale";
+  raiseBarrier(sql, expected.claimId, row.revoke_attempt, barrierUntil, cutoff);
+  return row.revoke_attempt;
+}
+
+/**
+ * Starts a new sweep in place of the one whose barrier at attempt `lost` expired at or before
+ * `now`, and returns the new attempt, whose barrier replaces it until `barrierUntil` under the new
+ * attempt's `cutoff`. Returns
+ * `"stale"`, and writes nothing, when that barrier was lowered or replaced or has not expired.
+ */
+export function replaceLostBarrier(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  lost: number,
+  now: number,
+  barrierUntil: number,
+  cutoff: MintCutoff,
+): number | "stale" {
+  const [row] = sql
+    .exec<{ revoke_attempt: number }>(
+      `UPDATE claims_claims SET revoke_attempt = revoke_attempt + 1
+       WHERE claim_id = ? AND EXISTS (SELECT 1 FROM claims_revocation_barriers b
+         WHERE b.claim_id = claims_claims.claim_id AND b.attempt = ? AND b.expires_at <= ?)
+       RETURNING revoke_attempt`,
+      claimId,
+      lost,
+      now,
+    )
+    .toArray();
+  if (row === undefined) return "stale";
+  sql.exec(
+    "DELETE FROM claims_revocation_barriers WHERE claim_id = ? AND attempt = ?",
+    claimId,
+    lost,
+  );
+  raiseBarrier(sql, claimId, row.revoke_attempt, barrierUntil, cutoff);
+  return row.revoke_attempt;
+}
+
+function raiseBarrier(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  attempt: number,
+  until: number,
+  cutoff: MintCutoff,
+): void {
+  sql.exec(
+    `INSERT INTO claims_revocation_barriers (claim_id, attempt, expires_at, mint_cutoff, started_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    claimId,
+    attempt,
+    until,
+    cutoff.seq,
+    cutoff.startedAt,
+  );
+}
+
+/** Whether any revocation barrier stands on the claim's fork, expired or not. */
+export function barrierStands(sql: SqlStorage, claimId: ClaimId): boolean {
+  const [row] = sql
+    .exec<{ standing: number }>(
+      "SELECT EXISTS (SELECT 1 FROM claims_revocation_barriers WHERE claim_id = ?) AS standing",
+      claimId,
+    )
+    .toArray();
+  return row?.standing === 1;
+}
+
+/** One barrier whose sweep outlived it. */
+export interface LostBarrier {
+  claimId: ClaimId;
+  /** The attempt the barrier was raised for. */
+  attempt: number;
+}
+
+/** Barriers that expired at or before `now`, earliest first, at most `limit`. */
+export function lostBarriers(sql: SqlStorage, now: number, limit: number): LostBarrier[] {
+  return sql
+    .exec<{ claim_id: string; attempt: number }>(
+      `SELECT claim_id, attempt FROM claims_revocation_barriers WHERE expires_at <= ?
+       ORDER BY expires_at, claim_id LIMIT ?`,
+      now,
+      limit,
+    )
+    .toArray()
+    .map((row) => ({ claimId: row.claim_id, attempt: row.attempt }));
+}
+
+/** How a revocation sweep of a claim's fork tokens ended. */
+export type RevocationOutcome =
+  /** Artifacts reported every token revoked. */
+  | { kind: "settled" }
+  /** The sweep failed, threw or reported a debt; the revocation is due again at `retryAt`. */
+  | { kind: "owed"; retryAt: number };
+
+/**
+ * Records the outcome of the sweep `attempt` of a claim at `generation`, and lowers the barrier
+ * that attempt raised: the sweep has ended, so it can no longer revoke a token minted after this.
+ * A settled sweep clears `revoke_due` of an expired or ready claim only when it is the latest
+ * attempt and nothing newer is owed. An owed one always keeps the revocation of an expired or ready
+ * claim due, even after another sweep cleared it, so a late partial listing is never lost.
+ */
+export function recordRevocation(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  attempt: number,
+  outcome: RevocationOutcome,
+): void {
+  sql.exec(
+    "DELETE FROM claims_revocation_barriers WHERE claim_id = ? AND attempt = ?",
+    claimId,
+    attempt,
+  );
+  switch (outcome.kind) {
+    case "settled":
+      sql.exec(
+        `UPDATE claims_claims SET revoke_due = NULL
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')
+           AND revoke_attempt = ?`,
+        claimId,
+        generation,
+        attempt,
+      );
+      return;
+    case "owed":
+      sql.exec(
+        `UPDATE claims_claims SET revoke_due = ?
+         WHERE claim_id = ? AND generation = ? AND state IN ('expired', 'ready')`,
+        outcome.retryAt,
+        claimId,
+        generation,
+      );
+      return;
+    default:
+      outcome satisfies never;
+  }
+}
+
+/**
+ * The earliest time a lease lapses, a revocation is due or a barrier expires, or `null` when
+ * nothing waits.
+ */
+export function nextClaimsDeadline(sql: SqlStorage): number | null {
+  const [row] = sql
+    .exec<{ at: number | null }>(
+      `SELECT MIN(at) AS at FROM (
+         SELECT MIN(lease_until) AS at FROM claims_claims WHERE state = 'working'
+         UNION ALL
+         SELECT MIN(revoke_due) AS at FROM claims_claims WHERE revoke_due IS NOT NULL
+         UNION ALL
+         SELECT MIN(expires_at) AS at FROM claims_revocation_barriers
+       )`,
+    )
+    .toArray();
+  return row?.at ?? null;
+}
+
+/**
+ * The claim first in line for the agent: the claim of the oldest issue that is expired, whether or
+ * not its revocation is settled, or working with a lease that lapsed at or before `now` and no
+ * expiry recorded yet; then the oldest-leased allocation whose lease lapsed at or before `now`. The
+ * caller expires a lapsed working claim before anything else, and takes a claim over only once its
+ * revocation, and every older one, is settled. A claim the agent itself held last is never offered
+ * back to it.
+ */
+export function nextTakeover(sql: SqlStorage, agentId: AgentId, now: number): ClaimRow | null {
+  const lapsed = first(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.agent_id != ?
+         AND (c.state = 'expired' OR (c.state = 'working' AND c.lease_until <= ?))
+       ORDER BY i.filed_seq LIMIT 1`,
+      agentId,
+      now,
+    ),
+  );
+  if (lapsed !== null) return lapsed;
+  return first(
+    sql.exec<RawClaim>(
+      `${SELECT_CLAIM} WHERE c.state = 'allocating' AND c.lease_until <= ? AND c.agent_id != ?
+       ORDER BY c.lease_until, c.claim_id LIMIT 1`,
+      now,
+      agentId,
+    ),
+  );
+}
+
+/**
+ * Whether a claim on an issue filed before `issueId` still owes the revocation of its fork's
+ * tokens: an expired claim whose revocation is not settled, or a working claim whose lease lapsed
+ * at or before `now` and whose expiry is not recorded yet.
+ */
+export function releasePendingBefore(sql: SqlStorage, issueId: IssueId, now: number): boolean {
+  const [row] = sql
+    .exec<{ pending: number }>(
+      `SELECT EXISTS (SELECT 1 FROM claims_claims c JOIN claims_issues i ON i.issue_id = c.issue_id
+         WHERE ((c.state = 'expired' AND c.revoke_due IS NOT NULL)
+             OR (c.state = 'working' AND c.lease_until <= ?))
+           AND i.filed_seq < (SELECT filed_seq FROM claims_issues WHERE issue_id = ?)) AS pending`,
+      now,
+      issueId,
+    )
+    .toArray();
+  return row?.pending === 1;
+}
+
+/** The claim on the issue, or `null`. */
+export function claimOfIssue(sql: SqlStorage, issueId: IssueId): ClaimRow | null {
+  return first(sql.exec<RawClaim>(`${SELECT_CLAIM} WHERE c.issue_id = ?`, issueId));
+}
+
+/**
+ * Gives an expired claim whose revocation is settled, or an allocation whose lease lapsed at or
+ * before `now`, to `agent` at the next generation, leased until `leaseUntil`, and forgets its last
+ * refusal. An expired claim becomes working. Returns `false`, and writes nothing, when the claim
+ * is no longer that claim at `generation`.
+ */
+export function reassignClaim(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  agent: { agentId: AgentId; ownerId: UserId },
+  now: number,
+  leaseUntil: number,
+): boolean {
+  const updated = sql
+    .exec(
+      `UPDATE claims_claims SET agent_id = ?, owner_id = ?, generation = generation + 1,
+         state = CASE state WHEN 'expired' THEN 'working' ELSE state END,
+         lease_until = ?, last_refusal = NULL
+       WHERE claim_id = ? AND generation = ? AND agent_id != ? AND (
+         (state = 'expired' AND revoke_due IS NULL)
+         OR (state = 'allocating' AND lease_until <= ?))
+       RETURNING claim_id`,
+      agent.agentId,
+      agent.ownerId,
+      leaseUntil,
+      claimId,
+      generation,
+      agent.agentId,
+      now,
+    )
+    .toArray();
+  return updated.length === 1;
 }
 
 /** Records the main commit the fork is requested at, unless one is already recorded. */
@@ -188,23 +595,27 @@ export function recordForkBase(sql: SqlStorage, claimId: ClaimId, base: CommitSh
 
 /**
  * Opens an allocating claim at `generation` on a fork whose head is `base`. Returns `false`, and
- * writes nothing, when the claim is no longer that allocation.
+ * writes nothing, when the claim is no longer that allocation or its lease lapsed at or before
+ * `now`.
  */
 export function openClaim(
   sql: SqlStorage,
   claimId: ClaimId,
   generation: number,
   base: CommitSha,
+  now: number,
 ): boolean {
   // `rowsWritten` also counts index entries, so the updated rows are counted by `RETURNING`.
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', base = ?
        WHERE claim_id = ? AND generation = ? AND state = 'allocating'
+         AND (lease_until IS NULL OR lease_until > ?)
        RETURNING claim_id`,
       base,
       claimId,
       generation,
+      now,
     )
     .toArray();
   return updated.length === 1;
@@ -212,8 +623,9 @@ export function openClaim(
 
 /**
  * Pins `commit` on a working claim at `generation` under the decision versions `decisions`, which
- * makes the claim ready, raises its episode and forgets its last refusal. Returns `false`, and
- * writes nothing, when the claim is no longer working at that generation.
+ * makes the claim ready, raises its episode, records that its fork's tokens are owed a revocation
+ * due at `now`, and forgets its last refusal. Returns `false`, and writes nothing, when the claim
+ * is no longer working at that generation.
  */
 export function pinReady(
   sql: SqlStorage,
@@ -221,15 +633,18 @@ export function pinReady(
   generation: number,
   commit: CommitSha,
   decisions: readonly DecisionRef[],
+  now: number,
 ): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'ready', ready_commit = ?, ready_decisions = ?,
-         episode = episode + 1, last_refusal = NULL
+         episode = episode + 1, last_refusal = NULL, revoke_due = ?,
+         revoke_attempt = revoke_attempt + 1
        WHERE claim_id = ? AND generation = ? AND state = 'working'
        RETURNING claim_id`,
       commit,
       JSON.stringify(decisions.map(({ decisionId, version }) => ({ decisionId, version }))),
+      now,
       claimId,
       generation,
     )
@@ -238,17 +653,25 @@ export function pinReady(
 }
 
 /**
- * Returns a ready claim at `generation` to working, clears its pin, raises its episode and forgets
- * its last refusal.
+ * Returns a ready claim at `generation` to working with a lease until `leaseUntil`, clears its pin
+ * and the revocation the pin owed, since its holder may push again, raises its episode and forgets
+ * its last refusal. A sweep the pin started keeps its barrier, so the holder pushes only once that
+ * sweep has ended.
  * Returns `false`, and writes nothing, when the claim is no longer ready at that generation.
  */
-export function reopenReady(sql: SqlStorage, claimId: ClaimId, generation: number): boolean {
+export function reopenReady(
+  sql: SqlStorage,
+  claimId: ClaimId,
+  generation: number,
+  leaseUntil: number,
+): boolean {
   const updated = sql
     .exec(
       `UPDATE claims_claims SET state = 'working', ready_commit = NULL, ready_decisions = NULL,
-         episode = episode + 1, last_refusal = NULL
+         episode = episode + 1, last_refusal = NULL, lease_until = ?, revoke_due = NULL
        WHERE claim_id = ? AND generation = ? AND state = 'ready'
        RETURNING claim_id`,
+      leaseUntil,
       claimId,
       generation,
     )
@@ -299,8 +722,14 @@ export function insertIssue(
 }
 
 function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
-  const [raw] = cursor.toArray();
-  if (raw === undefined) return null;
+  return rows(cursor)[0] ?? null;
+}
+
+function rows(cursor: SqlStorageCursor<RawClaim>): ClaimRow[] {
+  return cursor.toArray().map(claimRow);
+}
+
+function claimRow(raw: RawClaim): ClaimRow {
   return {
     claimId: raw.claim_id,
     issueId: raw.issue_id,
@@ -313,6 +742,8 @@ function first(cursor: SqlStorageCursor<RawClaim>): ClaimRow | null {
     base: raw.base,
     readyCommit: raw.ready_commit,
     readyDecisions: raw.ready_decisions === null ? null : decisionList(raw.ready_decisions),
+    leaseUntil: raw.lease_until,
+    revokeDue: raw.revoke_due,
     title: raw.title,
     body: raw.body,
   };

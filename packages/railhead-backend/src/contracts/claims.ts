@@ -90,8 +90,9 @@ export interface ClaimsPort {
   currentGeneration(claimId: ClaimId): number | null;
   /**
    * The claim's ownership generation while it is working, or `null` once it is anything else, such
-   * as ready, expired or unknown. A fence reader like `currentGeneration`: call it inside the
-   * caller's transaction. A push is recorded only while this equals the push's fence generation.
+   * as ready, expired or unknown, or once its lease lapsed. A fence reader like `currentGeneration`:
+   * call it inside the caller's transaction. A push is recorded only while this equals the push's
+   * fence generation.
    */
   workingGeneration(claimId: ClaimId): number | null;
   /**
@@ -112,4 +113,9 @@ export interface ClaimsPort {
   authorizeGit(access: GitAccess): Promise<PortResult<GitGrant>>;
   /** Files an issue. */
   fileIssue(grant: GrantFor<"issue.file">): Promise<PortResult<{ issueId: IssueId }>>;
+  /**
+   * Called by the Repo's alarm. Expires claims whose lease lapsed, retries the fork-token
+   * revocations expired claims still owe, and asks for the alarm again at the next deadline.
+   */
+  resume(): Promise<void>;
 }

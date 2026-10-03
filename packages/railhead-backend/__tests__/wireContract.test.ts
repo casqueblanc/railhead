@@ -46,6 +46,7 @@ import challenge from "../../../fixtures/protocol/wire/agent/challenge.json";
 import claim from "../../../fixtures/protocol/wire/agent/claim.json";
 import inbox from "../../../fixtures/protocol/wire/agent/inbox.json";
 import join from "../../../fixtures/protocol/wire/agent/join.json";
+import pinRoute from "../../../fixtures/protocol/wire/agent/pin.json";
 import question from "../../../fixtures/protocol/wire/agent/question.json";
 import ready from "../../../fixtures/protocol/wire/agent/ready.json";
 import session from "../../../fixtures/protocol/wire/agent/session.json";
@@ -76,6 +77,7 @@ const FIXTURES: AgentFixture[] = [
   work,
   claim,
   ready,
+  pinRoute,
   inbox,
   ack,
   ask,
@@ -476,7 +478,10 @@ describe("unavailable ports", () => {
     ["artifacts.forkForClaim", () => unavailableArtifacts.forkForClaim("clm_42abcd", sha)],
     ["artifacts.commitExists", () => unavailableArtifacts.commitExists("repo", sha)],
     ["artifacts.token", () => unavailableArtifacts.token("repo", "write", 60_000)],
-    ["artifacts.revokeTokens", () => unavailableArtifacts.revokeTokens("repo")],
+    [
+      "artifacts.revokeTokens",
+      () => unavailableArtifacts.revokeTokens("repo", { seq: 0, startedAt: 0 }),
+    ],
     ["merge.compose", () => unavailableMerge.compose(sha, [pin], "mrg_attempt1")],
     ["merge.discard", () => unavailableMerge.discard("mrg_attempt1")],
     [

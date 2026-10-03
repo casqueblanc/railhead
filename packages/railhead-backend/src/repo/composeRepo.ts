@@ -143,6 +143,7 @@ export interface Resumable {
 /** The modules the Repo's alarm resumes, in composition order. */
 export function resumables(ports: RepoPorts): readonly Resumable[] {
   return [
+    { module: "claims", resume: () => ports.claims.resume() },
     { module: "git", resume: () => ports.git.resume() },
     { module: "train", resume: () => ports.train.resume() },
     { module: "adaptation", resume: () => ports.adaptation.resume() },
