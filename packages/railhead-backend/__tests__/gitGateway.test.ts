@@ -7,9 +7,10 @@ import {
   createArtifactsAdapter,
   forkRepoName,
   mainRepoName,
+  mintCutoff,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts, type FakeToken } from "../src/artifacts/fake";
-import type { ArtifactsPort } from "../src/contracts/artifacts";
+import type { ArtifactsPort, MintCutoff } from "../src/contracts/artifacts";
 import type { ClaimsPort, GitAccess, GitGrant } from "../src/contracts/claims";
 import type { SessionsPort } from "../src/contracts/identity";
 import type { AgentPrincipal } from "../src/contracts/principals";
@@ -175,6 +176,8 @@ interface World {
   }[];
   /** Runs one statement on the gateway's storage. */
   exec: (query: string, ...bindings: SqlStorageValue[]) => void;
+  /** The cutoff of a revocation beginning now, as the claims module captures it. */
+  cutoff: () => MintCutoff;
 }
 
 /** A `ClaimsPort` whose `authorizeGit` follows the A21 contract over one mutable claim. */
@@ -328,6 +331,7 @@ function withGateway(
       exec: (query, ...bindings) => {
         state.storage.sql.exec(query, ...bindings);
       },
+      cutoff: () => mintCutoff(state.storage, fake.clock()),
     };
     const claims = claimsFor(world);
     const build = (): GitPort => {
@@ -1291,7 +1295,7 @@ describe("a push decided again after it was admitted", () => {
         );
         await until(() => world.authorizations.length === 1);
         change(world);
-        const revoked = await world.artifacts.revokeTokens(world.forkName);
+        const revoked = await world.artifacts.revokeTokens(world.forkName, world.cutoff());
         expect(revoked.ok, label).toBe(true);
         resume();
         const response = await pending;
@@ -1310,7 +1314,7 @@ describe("a push decided again after it was admitted", () => {
     const pausingMint = (base: ArtifactsPort): ArtifactsPort => ({
       forkForClaim: (claimId, commit) => base.forkForClaim(claimId, commit),
       commitExists: (repo, commit) => base.commitExists(repo, commit),
-      revokeTokens: (repo) => base.revokeTokens(repo),
+      revokeTokens: (repo, cutoff) => base.revokeTokens(repo, cutoff),
       async token(repo, scope, ttlMs) {
         const minted = await base.token(repo, scope, ttlMs);
         // The read token is the fork read's before release; the push's own is the write token.
@@ -1324,7 +1328,7 @@ describe("a push decided again after it was admitted", () => {
           world.respond = () => gitResponse("git-receive-pack", "result", PUSH_RESULT);
           const close = async (): Promise<void> => {
             world.claim.state = "expired";
-            const revoked = await world.artifacts.revokeTokens(world.forkName);
+            const revoked = await world.artifacts.revokeTokens(world.forkName, world.cutoff());
             expect(revoked.ok, step).toBe(true);
           };
           duringMint = step === "token" ? close : null;

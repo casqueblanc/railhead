@@ -280,7 +280,7 @@ describe("unavailable modules", () => {
         ports.authorization.authorize("chk_attempt1"),
         ports.mainWriter.publish("int_intent01"),
         // Claims decide Git access themselves now; the Artifacts module behind them is missing.
-        ports.artifacts.revokeTokens("rh-f-missing"),
+        ports.artifacts.revokeTokens("rh-f-missing", { seq: 0, startedAt: 0 }),
       ]);
     });
 
@@ -401,7 +401,7 @@ describe("Repo alarm", () => {
     }
   });
 
-  it("resumes nothing for an empty list and lists the Git gateway, the train and adaptation for a composed Repo", async () => {
+  it("resumes nothing for an empty list and lists claims, the Git gateway, the train and adaptation for a composed Repo", async () => {
     const wakes: number[] = [];
     const context = {
       repoId: "rep_alarm0001",
@@ -427,7 +427,7 @@ describe("Repo alarm", () => {
         }),
       ).map((entry) => entry.module),
     );
-    expect(modules).toEqual(["git", "train", "adaptation"]);
+    expect(modules).toEqual(["claims", "git", "train", "adaptation"]);
   });
 });
 
