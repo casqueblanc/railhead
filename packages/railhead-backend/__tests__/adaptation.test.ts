@@ -708,7 +708,10 @@ async function land(
               currentDecision: (id) => world.decisions.get(id) ?? null,
             }
           : createDecisions(context, ports),
-      merge: { compose: async () => ok({ kind: "clean", candidate: LANDED }) },
+      merge: {
+        compose: async () => ok({ kind: "clean", candidate: LANDED }),
+        discard: async () => ok({ removed: 0 }),
+      },
       checks: {
         definitions: async (source) =>
           ok([acceptanceCheck(1, "chunk", source, decisionId ?? DECISION)]),
