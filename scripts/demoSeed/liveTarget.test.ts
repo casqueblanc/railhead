@@ -291,10 +291,10 @@ test("a signed reset deletes the demo repository, and another repository is refu
 
 test("issues are read from every page of the log, keeping only the titles asked for", async () => {
   const empty = new FakeBackend();
-  assert.deepEqual(
-    await withTarget(empty, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
-    [],
-  );
+  assert.deepEqual(await withTarget(empty, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED)), {
+    issues: [],
+    history: null,
+  });
 
   // More than two pages, with the wanted issues on the first and the last, and another between.
   const count = MAX_EVENT_PAGE * 2 + 3;
@@ -303,19 +303,81 @@ test("issues are read from every page of the log, keeping only the titles asked 
   backend.events[MAX_EVENT_PAGE] = issueEvent(MAX_EVENT_PAGE + 1, "Not seeded", "dropped");
   backend.events[count - 1] = issueEvent(count, "Last", "line\n\nline");
   assert.deepEqual(
-    await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
-    [
-      { title: "First", body: "one" },
-      { title: "Last", body: "line\n\nline" },
-    ],
+    await withTarget(backend, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED)),
+    {
+      issues: [
+        { title: "First", body: "one" },
+        { title: "Last", body: "line\n\nline" },
+      ],
+      history: "h1",
+    },
   );
 
-  // A log that stops advancing before its head is an error, not an empty board.
+  // A log that stops advancing before its head is a backend failure, not an empty board.
   backend.stall = true;
   await assert.rejects(
-    withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
-    /stopped at 0 before its head/,
+    withTarget(backend, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED)),
+    (error: unknown) =>
+      error instanceof BackendFailure &&
+      error.message === `readEvents stopped at cursor 0 before the log's head ${count}.`,
   );
+});
+
+test("a board history replaced during the scan fails the plan instead of mixing two logs", async () => {
+  const backend = withLog(MAX_EVENT_PAGE * 2);
+  backend.events[0] = issueEvent(1, "First", "one");
+  // Another operator resets and seeds again as the first page is answered.
+  backend.onReadEvents = () => {
+    backend.onReadEvents = null;
+    backend.startHistory();
+  };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED)),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message ===
+        "demo/upload-app changed during planning: its board history was replaced while it was read; run again.",
+  );
+});
+
+test("the board's history is read from one event, and is null for a missing repository", async () => {
+  assert.equal(
+    await withTarget(new FakeBackend(), { kind: "prepare" }, (t) => t.history(DEMO_REF)),
+    null,
+  );
+  const backend = withLog(MAX_EVENT_PAGE * 2);
+  backend.startHistory();
+  assert.equal(await withTarget(backend, { kind: "prepare" }, (t) => t.history(DEMO_REF)), "h2");
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => t.history({ org: "acme", repo: "upload-app" })),
+    /refusing/,
+  );
+});
+
+test("a repository reset and reseeded at the same head after the board read fails the plan", async () => {
+  const backend = withLog(0);
+  const [task] = manifest.issues;
+  assert.ok(task !== undefined);
+  // Without the history check the plan would mark this task filed on a board that has none.
+  backend.events = [issueEvent(1, task.title, task.body)];
+  // The scan reads the old board; another operator's reset and seed of the same head land before
+  // the plan reads the board's history again.
+  let opened = 0;
+  backend.onOpenBoard = () => {
+    opened += 1;
+    if (opened !== 2) return;
+    backend.events = [];
+    backend.startHistory();
+  };
+  await assert.rejects(
+    withTarget(backend, { kind: "prepare" }, (t) => seed(manifest, bundleAt(HEAD), t, t)),
+    (error: unknown) =>
+      error instanceof SeedRefusal &&
+      error.message === "The repository demo/upload-app changed during planning; run again.",
+  );
+  assert.equal(opened, 2);
+  assert.equal(backend.main, HEAD);
+  assert.equal(backend.prepared.length, 0);
 });
 
 test("a repository reset between the read and the board read fails the plan", async () => {
@@ -370,15 +432,16 @@ test("a board log longer than the page cap stops the plan as incomplete", async 
   // Exactly the cap is read whole.
   const full = withLog(cap);
   full.events[cap - 1] = issueEvent(cap, "Last", "end");
-  assert.deepEqual(await withTarget(full, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)), [
-    { title: "Last", body: "end" },
-  ]);
+  assert.deepEqual(
+    (await withTarget(full, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED))).issues,
+    [{ title: "Last", body: "end" }],
+  );
 
   // One event past it is refused, even though the wanted issue is within the first page.
   const over = withLog(cap + 1);
   over.events[0] = issueEvent(1, "First", "one");
   await assert.rejects(
-    withTarget(over, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    withTarget(over, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED)),
     (error: unknown) =>
       error instanceof SeedRefusal &&
       error.message ===
@@ -398,7 +461,7 @@ test("a board log that takes longer than the scan budget stops the plan as incom
   let clock = 0;
   const limits: LiveLimits = { ...LIVE_LIMITS, scanMs: 2500, now: () => (clock += 1000) };
   await assert.rejects(
-    withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED), limits),
+    withTarget(backend, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED), limits),
     (error: unknown) =>
       error instanceof SeedRefusal &&
       error.message ===
@@ -406,7 +469,7 @@ test("a board log that takes longer than the scan budget stops the plan as incom
   );
   // Within the budget the same log is read whole.
   assert.deepEqual(
-    await withTarget(backend, { kind: "prepare" }, (t) => t.issues(DEMO_REF, WANTED)),
+    (await withTarget(backend, { kind: "prepare" }, (t) => t.scan(DEMO_REF, WANTED))).issues,
     [],
   );
 });

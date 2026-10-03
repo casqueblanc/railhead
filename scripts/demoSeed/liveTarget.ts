@@ -15,7 +15,7 @@
 // reconciled before anything is written a second time; a reset reads nothing first, so the owner
 // inspects the instance before approving another.
 //
-// The board has no issue query, so `issues` replays the log from its start. It keeps only the
+// The board has no issue query, so `scan` replays the log from its start. It keeps only the
 // issues whose titles the caller asks for and stops with an incomplete plan past
 // `MAX_EVENT_PAGES` pages or `LiveLimits.scanMs`, so a long log cannot hold an operator's run for
 // hours or fill its memory.
@@ -44,6 +44,7 @@ import {
   demoRef,
   type BoardIssue,
   type BoardIssues,
+  type BoardScan,
   type RepoRef,
   type RepoState,
   type SeedTarget,
@@ -268,20 +269,20 @@ export class LiveTarget implements SeedTarget, BoardIssues {
 
   /**
    * The repository's filed issues titled one of `titles`, in log order, paging the log from its
-   * start. Other issues are dropped as each page arrives. A repository the board does not find has
-   * none, unless this target's `read` found it: then it changed during planning, such as a
-   * concurrent reset, and an empty list would report a seed done that is not.
+   * start, and the history they were read from. Other issues are dropped as each page arrives. Every
+   * page after the first names the first page's history, so a reset during the scan is refused, not
+   * mixed into the result. A repository the board does not find has none, unless this target's
+   * `read` found it: then it changed during planning, such as a concurrent reset, and an empty list
+   * would report a seed done that is not.
    */
-  async issues(ref: RepoRef, titles: ReadonlySet<string>): Promise<readonly BoardIssue[]> {
+  async scan(ref: RepoRef, titles: ReadonlySet<string>): Promise<BoardScan> {
     const { org, repo } = demoRef(ref);
     const { readMs, scanMs, now } = this.#limits;
     const deadline = now() + scanMs;
     const opened = await within(this.#session.openBoard(org, repo), readMs, "openBoard");
     if (!opened.ok && opened.code === "not_found") {
-      if (!this.#readFound) return [];
-      throw new SeedRefusal(
-        `${org}/${repo} changed during planning: it was read, then the board did not find it; run again.`,
-      );
+      if (!this.#readFound) return { issues: [], history: null };
+      throw changedDuring(`${org}/${repo}`, "it was read, then the board did not find it");
     }
     using board = valueOf(opened, "openBoard");
     const filed: BoardIssue[] = [];
@@ -295,20 +296,37 @@ export class LiveTarget implements SeedTarget, BoardIssues {
         MAX_EVENT_PAGE,
         ...(history === undefined ? [] : [history]),
       );
-      const page = valueOf(await within(read, Math.min(readMs, left), "readEvents"), "readEvents");
+      const answer = await within(read, Math.min(readMs, left), "readEvents");
+      if (!answer.ok && answer.code === "cursor_ahead" && history !== undefined) {
+        throw changedDuring(`${org}/${repo}`, "its board history was replaced while it was read");
+      }
+      const page = valueOf(answer, "readEvents");
       history = page.history;
       for (const event of page.events) {
         if (event.type === "issue.filed" && titles.has(event.data.title)) {
           filed.push({ title: event.data.title, body: event.data.body });
         }
       }
-      if (page.cursor >= page.head) return filed;
+      if (page.cursor >= page.head) return { issues: filed, history };
       if (page.cursor <= cursor) {
-        throw new Error(`The log stopped at ${page.cursor} before its head ${page.head}.`);
+        throw new BackendFailure(
+          `readEvents stopped at cursor ${page.cursor} before the log's head ${page.head}.`,
+        );
       }
       cursor = page.cursor;
     }
     throw tooLong(`past ${MAX_EVENT_PAGES * MAX_EVENT_PAGE} events`);
+  }
+
+  /** The board's current history for the repository, from one event; `null` when not found. */
+  async history(ref: RepoRef): Promise<string | null> {
+    const { org, repo } = demoRef(ref);
+    const { readMs } = this.#limits;
+    const opened = await within(this.#session.openBoard(org, repo), readMs, "openBoard");
+    if (!opened.ok && opened.code === "not_found") return null;
+    using board = valueOf(opened, "openBoard");
+    return valueOf(await within(board.readEvents(0, 1), readMs, "readEvents"), "readEvents")
+      .history;
   }
 
   /** Performs `action` with the held approval, which is spent whether or not the call succeeds. */
@@ -414,6 +432,11 @@ async function within<T>(promise: PromiseLike<T>, ms: number, call: string): Pro
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** The refusal for a repository that changed while a plan read it. */
+function changedDuring(name: string, how: string): SeedRefusal {
+  return new SeedRefusal(`${name} changed during planning: ${how}; run again.`);
 }
 
 /** The refusal for a board log too long to read within the scan's budget. */

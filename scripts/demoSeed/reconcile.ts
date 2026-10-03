@@ -79,13 +79,26 @@ export interface BoardIssue {
   readonly body: string;
 }
 
+/** What one read of the board found. */
+export interface BoardScan {
+  /** The repository's issues titled one of the titles asked for, in filing order. */
+  readonly issues: readonly BoardIssue[];
+  /**
+   * The board history the issues were read from, or `null` when the repository does not exist. A
+   * reset starts a new history, so a repository reset and seeded again at the same main has another.
+   */
+  readonly history: string | null;
+}
+
 /** The board's issues for one repository: the read `DemoSeedApi` does not offer. */
 export interface BoardIssues {
   /**
-   * The repository's open issues titled one of `titles`, in filing order, empty when it does not
-   * exist.
+   * The repository's open issues titled one of `titles`, all read from one history; no issues and
+   * no history when it does not exist.
    */
-  issues(ref: RepoRef, titles: ReadonlySet<string>): Promise<readonly BoardIssue[]>;
+  scan(ref: RepoRef, titles: ReadonlySet<string>): Promise<BoardScan>;
+  /** The board's current history for the repository, or `null` when it does not exist. */
+  history(ref: RepoRef): Promise<string | null>;
 }
 
 /** The target refused a write because it holds something else, as the backend's `action_stale`. */
@@ -124,7 +137,8 @@ export function demoRef(ref: RepoRef): RepoRef {
 
 /**
  * Plans a seed of `manifest` with `history` as main against what `target` and `board` hold now. It
- * reads `target` before and after `board`, and refuses when the two reads differ.
+ * reads `target` before and after scanning `board`, then the board's history, and refuses when the
+ * two target reads differ or the board's history is no longer the one its issues came from.
  */
 export async function planSeed(
   manifest: SeedManifest,
@@ -145,12 +159,19 @@ export async function planSeed(
     );
   }
   const titles = new Set(manifest.issues.map((issue) => issue.title));
-  const filed = Map.groupBy(await board.issues(ref, titles), (issue) => issue.title);
-  // The board read may have seen a repository another operator reset and seeded since the first
-  // read; the plan would then mark a main done that is not this one. This narrows the window but
-  // does not close it: the plan is several calls, not one snapshot.
+  const scanned = await board.scan(ref, titles);
+  const filed = Map.groupBy(scanned.issues, (issue) => issue.title);
+  // Another operator may reset and seed the repository while this plans: at another head the plan
+  // would mark a main done that is not this one, and at the same head the issues read may belong
+  // to the deleted board. Each shows as a changed main or a new history. This narrows the window
+  // but does not close it: the plan is several calls, not one snapshot.
   const again = await target.read(ref);
-  if ((again === null) !== (state === null) || again?.main !== state?.main) {
+  const boardHistory = await board.history(ref);
+  if (
+    (again === null) !== (state === null) ||
+    again?.main !== state?.main ||
+    boardHistory !== scanned.history
+  ) {
     throw new SeedRefusal(`The repository ${name} changed during planning; run again.`);
   }
 

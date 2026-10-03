@@ -66,6 +66,8 @@ export class FakeBackend {
   main: string | null = null;
   exists = false;
   events: RailheadEvent[] = [];
+  /** The board history; a reset starts another, as the backend's does. */
+  history = "h1";
   /** The demo repository's recorded forks, which a reset deletes one by one before main. */
   forks: string[] = [];
   /** The bundles `perform` received, as bytes. */
@@ -84,9 +86,12 @@ export class FakeBackend {
   withholdNextAnswer = false;
   /** Runs as `openBoard` is called, before it looks up the repository. */
   onOpenBoard: (() => void) | null = null;
+  /** Runs after `readEvents` builds a page, before it answers. */
+  onReadEvents: (() => void) | null = null;
   /** Whether `readEvents` stops advancing its cursor. */
   stall = false;
   readonly #challenges = new Map<string, DemoSeedAction>();
+  #histories = 1;
 
   prepare(action: DemoSeedAction): BoardResult<ActionChallenge> {
     this.prepared.push(action);
@@ -138,6 +143,7 @@ export class FakeBackend {
         this.exists = false;
         this.main = null;
         this.events = [];
+        this.startHistory();
         this.performed.push(action.kind);
         return { ok: true, value: { kind: "demo.reset", deleted } };
       }
@@ -146,18 +152,24 @@ export class FakeBackend {
     }
   }
 
-  readEvents(cursor: number, limit: number): BoardResult<EventPage> {
+  /** Starts a new board history, as a reset does. */
+  startHistory(): void {
+    this.#histories += 1;
+    this.history = `h${this.#histories}`;
+  }
+
+  readEvents(cursor: number, limit: number, history?: string): BoardResult<EventPage> {
+    if (history !== undefined && history !== this.history) return fail("cursor_ahead");
     const events = this.stall ? [] : this.events.filter((e) => e.seq > cursor).slice(0, limit);
-    return {
-      ok: true,
-      value: {
-        repo: REPO_ID,
-        events,
-        cursor: events.at(-1)?.seq ?? cursor,
-        head: this.events.at(-1)?.seq ?? 0,
-        history: "h1",
-      },
+    const page: EventPage = {
+      repo: REPO_ID,
+      events,
+      cursor: events.at(-1)?.seq ?? cursor,
+      head: this.events.at(-1)?.seq ?? 0,
+      history: this.history,
     };
+    this.onReadEvents?.();
+    return { ok: true, value: page };
   }
 }
 
@@ -193,8 +205,8 @@ class FakeBoard extends RpcTarget {
     super();
     this.#backend = backend;
   }
-  readEvents(cursor: number, limit: number): BoardResult<EventPage> {
-    return this.#backend.readEvents(cursor, limit);
+  readEvents(cursor: number, limit: number, history?: string): BoardResult<EventPage> {
+    return this.#backend.readEvents(cursor, limit, history);
   }
 }
 

@@ -3,7 +3,8 @@
 //   seed --dry-run      plan the seed of demo/upload-app, name every target and print each issue's
 //                       exact title and body for the owner to file; it builds the bundle in
 //                       scratch, so it refuses whatever bundle refuses, and writes nothing
-//   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else
+//   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else; with
+//                       --target it reads the instance first and fails if it does not answer
 //   seed|reset --target ORIGIN [--assertion FILE]
 //                       run against the deployed Railhead at ORIGIN; with --dry-run, plan against it
 //   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
@@ -69,6 +70,8 @@ import {
   planSeed,
   reset,
   seed,
+  type RepoRef,
+  type RepoState,
 } from "./reconcile.ts";
 import { STANDALONE_OVERLAY, STANDALONE_SUBJECT } from "./standalone.ts";
 
@@ -125,9 +128,18 @@ export async function run(
       requireDryRun(values["dry-run"], "reset");
       return [...plan, "note planned without a target: pass --target ORIGIN to run it"];
     }
-    if (values["dry-run"]) return [...plan, `note planned for ${live.origin}`];
     using session = openSession(live.origin);
-    const deleted = await reset(ref, new LiveTarget(session, live.approval, limits));
+    const target = new LiveTarget(session, live.approval, limits);
+    if (values["dry-run"]) {
+      // The plan deletes whatever the read reports, since a main left by a failed seed is hidden
+      // from it; the read shows the target answers before the preview names it.
+      const state = await target.read(ref);
+      return [
+        ...plan,
+        `note planned for ${live.origin}, which reports ${describeState(ref, state)}`,
+      ];
+    }
+    const deleted = await reset(ref, target);
     return [
       ...plan,
       deleted ? `deleted ${ref.org}/${ref.repo}` : `${ref.org}/${ref.repo} held nothing to delete`,
@@ -297,6 +309,13 @@ export function describeApproval(needed: ApprovalNeeded): string[] {
     `challenge ${JSON.stringify(challenge)}`,
     `note sign it with the owner passkey before ${new Date(challenge.expiresAt).toISOString()}, write { "challengeId", "assertion" } to a file, and rerun this command with --assertion FILE`,
   ];
+}
+
+/** What a reset dry run says the target's `read` found. */
+function describeState(ref: RepoRef, state: RepoState | null): string {
+  const name = `${ref.org}/${ref.repo}`;
+  if (state === null) return `${name} not initialized`;
+  return state.main === null ? `${name} without a main` : `${name} at main ${state.main}`;
 }
 
 function header(history: ImportedHistory): string[] {
