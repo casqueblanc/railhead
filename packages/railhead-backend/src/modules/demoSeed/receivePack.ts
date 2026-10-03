@@ -62,13 +62,20 @@ export async function pushMain(
         Accept: "application/x-git-receive-pack-result",
       },
       body,
+      // Workers forward every header to a redirect's target; a redirect must not carry the token.
+      redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     // A network failure or timeout: the request may have reached Artifacts and applied.
     return "uncertain";
   }
-  if (response.status === 401 || response.status === 403 || response.status === 404) {
+  if (
+    (response.status >= 300 && response.status < 400) ||
+    response.status === 401 ||
+    response.status === 403 ||
+    response.status === 404
+  ) {
     await response.body?.cancel();
     return "refused";
   }

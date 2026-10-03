@@ -223,6 +223,20 @@ describe("pushMain", () => {
     expect(await pushMain(request, answering("0".repeat(10_000)))).toBe("uncertain");
   });
 
+  it("does not follow a redirect, so the token reaches no other host", async () => {
+    const modes: (string | undefined)[] = [];
+    const redirecting: typeof fetch = async (_input, init) => {
+      modes.push(init?.redirect);
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "https://elsewhere.invalid/" },
+      });
+    };
+    const request = { remote: remote("rh-m-r"), token: "t", head: HEAD, pack: fakePack() };
+    expect(await pushMain(request, redirecting)).toBe("refused");
+    expect(modes).toEqual(["manual"]);
+  });
+
   it("never sends to a remote that is not plain HTTPS", async () => {
     const seed = new SeedFake();
     for (const bad of ["http://fake.invalid/r.git", "https://x:y@fake.invalid/r.git", "nope"]) {
