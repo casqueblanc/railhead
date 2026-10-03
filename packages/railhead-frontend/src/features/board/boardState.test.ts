@@ -656,3 +656,104 @@ describe("acceptance results for old and current options", () => {
     expect(atlasAdapted(regressed)).toBe(false);
   });
 });
+
+/** Folds `events` from an empty board and measures how long it took. */
+const timed = (events: readonly RailheadEvent[]): { state: BoardState; ms: number } => {
+  const started = performance.now();
+  const state = fold(events);
+  return { state, ms: performance.now() - started };
+};
+
+/** A synthetic issue id numbered `n`. */
+const issueId = (n: number) => `iss_long${n.toString().padStart(6, "0")}`;
+
+describe("folding a long log", () => {
+  /**
+   * The bound for 20,000 events. A fold that copied every record per event took 46 s for 20,000
+   * filed issues (#179); a linear fold takes tens of milliseconds, so the bound leaves room for a slow
+   * runner while still failing a quadratic fold by orders of magnitude.
+   */
+  const LONG_LOG_EVENTS = 20_000;
+  const LONG_LOG_BUDGET_MS = 1_000;
+
+  it(`folds ${LONG_LOG_EVENTS} filed issues within ${LONG_LOG_BUDGET_MS} ms`, () => {
+    const log = syntheticLog(
+      "a long run of filed issues",
+      Array.from({ length: LONG_LOG_EVENTS }, (_, n): SyntheticStep => ({
+        type: "issue.filed",
+        actor: SYNTH_OWNER,
+        data: { issueId: issueId(n), title: `Issue ${n}`, body: "" },
+      })),
+    );
+    const { state, ms } = timed(log.events);
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(state.cursor).toBe(LONG_LOG_EVENTS);
+    expect(Object.keys(state.issues)).toHaveLength(LONG_LOG_EVENTS);
+    expect(state.issues[issueId(LONG_LOG_EVENTS - 1)]?.title).toBe(`Issue ${LONG_LOG_EVENTS - 1}`);
+    expect(ms).toBeLessThan(LONG_LOG_BUDGET_MS);
+  });
+
+  it(`folds ${LONG_LOG_EVENTS} results of one check run in order within ${LONG_LOG_BUDGET_MS} ms`, () => {
+    const log = syntheticLog(
+      "a check run with many results",
+      Array.from({ length: LONG_LOG_EVENTS }, (_, n) =>
+        checkResult("chk_longrun", synthCommit(1), `check ${n}`, "pass"),
+      ),
+    );
+    const { state, ms } = timed(log.events);
+    const results = state.checkRuns["chk_longrun"]?.results ?? [];
+    expect(results).toHaveLength(LONG_LOG_EVENTS);
+    expect(results.map((entry) => entry.seq)).toEqual(log.events.map((event) => event.seq));
+    expect(ms).toBeLessThan(LONG_LOG_BUDGET_MS);
+  });
+
+  it("produces the same board in one batch as one event at a time", () => {
+    for (const log of [decisionReversal, checkBeforeLand, optionResults]) {
+      const stepwise = log.events.reduce(foldEvent, emptyBoardState(SYNTH_REPO));
+      expect(fold(log.events)).toEqual(stepwise);
+    }
+  });
+
+  it("leaves the board it started from unchanged", () => {
+    for (let cut = 1; cut < last(decisionReversal); cut += 1) {
+      const before = through(decisionReversal, cut);
+      const snapshot = structuredClone(before);
+      const folded = foldEvents(before, decisionReversal.events.slice(cut));
+      expect(folded.cursor).toBe(last(decisionReversal));
+      expect(before).toEqual(snapshot);
+    }
+  });
+
+  it("returns the board itself for an empty batch", () => {
+    const state = through(decisionReversal, 10);
+    expect(foldEvents(state, [])).toBe(state);
+  });
+
+  it("keeps a halted batch's earlier writes and none of the halting event's", () => {
+    const run = "chk_haltrun";
+    const log = syntheticLog("a check run that changes its candidate", [
+      {
+        type: "issue.filed",
+        actor: SYNTH_OWNER,
+        data: { issueId: issueId(1), title: "One", body: "" },
+      },
+      checkResult(run, synthCommit(1), "first", "pass"),
+      checkResult(run, synthCommit(1), "second", "fail"),
+      checkResult(run, synthCommit(2), "moved", "pass"),
+      {
+        type: "issue.filed",
+        actor: SYNTH_OWNER,
+        data: { issueId: issueId(2), title: "Two", body: "" },
+      },
+    ]);
+    const halted = fold(log.events);
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: { kind: "inconsistent", seq: 4, message: `check run ${run} changed its candidate` },
+    });
+    expect(halted.cursor).toBe(3);
+    expect(halted.checkRuns[run]?.results.map((entry) => entry.check)).toEqual(["first", "second"]);
+    expect(Object.keys(halted.issues)).toEqual([issueId(1)]);
+    expect({ ...halted, stream: null }).toEqual({ ...fold(log.events.slice(0, 3)), stream: null });
+  });
+});

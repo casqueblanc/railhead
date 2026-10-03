@@ -214,6 +214,38 @@ describe("useLiveBoardPorts", () => {
       expect(cursor()).toBe(HEAD);
     });
 
+    it("resumes a reconnect in the history its cursor was read under", async () => {
+      const next = new FakeBoard(SYNTH_REPO, LOG);
+      opens = [next];
+      await act(async () => session(0).break());
+      await act(async () => ports.onReconnect());
+      await act(async () => session(1).answer());
+
+      expect(next.readHistories).toEqual(["history-1"]);
+      expect(next.subscriptions.map((s) => s.history)).toEqual(["history-1"]);
+      expect(feed()).toMatchObject({ kind: "board", connection: "live", recovered: true });
+    });
+
+    it("folds nothing from a history the owner reset while the board was disconnected", async () => {
+      const before = feed();
+      if (before.kind !== "board") throw new Error(`the feed is ${before.kind}`);
+      // The reset log is longer than the board's cursor, so only the history tells them apart.
+      const next = new FakeBoard(SYNTH_REPO, LOG.slice(0, 2));
+      next.reset(LOG);
+      opens = [next];
+      await act(async () => session(0).break());
+      await act(async () => ports.onReconnect());
+      await act(async () => session(1).answer());
+
+      expect(next.reads).toEqual([HEAD - 2]);
+      expect(next.readHistories).toEqual(["history-1"]);
+      expect(next.subscriptions).toEqual([]);
+      const after = feed();
+      expect(after).toMatchObject({ kind: "board", connection: "lost", recovered: false });
+      expect(after.kind === "board" && after.board).toBe(before.board);
+      expect(gateOnConnection(ports).decisions).toEqual({ kind: "unavailable", reason: "offline" });
+    });
+
     it("lets nothing from the replaced session change the board or the ports", async () => {
       const old = board.latest();
       const oldOwner = ports.owner;
