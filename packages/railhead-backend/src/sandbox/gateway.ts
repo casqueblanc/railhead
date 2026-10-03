@@ -5,19 +5,26 @@
 // A push is checked before any of it is forwarded: its ref commands are read with the same
 // receive-pack parser the agent gateway uses, and each must create or update a ref under the
 // policy's candidate prefix. The pack after the commands is forwarded unread.
+//
+// The grant lapses at the sandbox's deadline, and the gateway holds it to that through every await:
+// it checks the grant on arrival, after reading a push's commands and after minting a token, so
+// nothing is forwarded once the grant has lapsed, and at the deadline it stops reading the
+// sandbox's body and aborts the upstream request.
 
 import { ReceivePackHeadParser, type RefUpdate } from "../git/pktLine";
-import type { SandboxPolicy } from "./policy";
+import type { SandboxGrant } from "./policy";
 
 /** Mints a short-lived token for one repository. The token never reaches the sandbox. */
 export type TokenMinter = (repo: string, scope: "read" | "write") => Promise<string>;
 
-/** What the gateway needs from outside: tokens and the upstream fetch. */
+/** What the gateway needs from outside: tokens, the upstream fetch and the time. */
 export interface GatewayDeps {
   /** Mints the repository token added to each forwarded request. */
   mint: TokenMinter;
   /** Sends the forwarded request. */
   fetch: (request: Request) => Promise<Response>;
+  /** The current time, in milliseconds since the Unix epoch, compared with the grant's deadline. */
+  now: () => number;
 }
 
 /** Why the gateway refused a request. Sent back to the sandbox as the body of a 403. */
@@ -36,13 +43,16 @@ export type GatewayRefusal =
 
 const GIT_PATH = /^\/git\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-/** Answers one request from a sandbox under `policy`; a `null` policy refuses everything. */
+/** Answers one request from a sandbox under `grant`; a `null` or lapsed grant refuses everything. */
 export async function serveGitGateway(
   request: Request,
-  policy: SandboxPolicy | null,
+  grant: SandboxGrant | null,
   deps: GatewayDeps,
 ): Promise<Response> {
-  if (policy === null) return refuse("policy");
+  const lapsed = () => grant === null || deps.now() >= grant.expiresAt;
+  if (grant === null || lapsed()) return refuse("policy");
+  const { policy } = grant;
+  const deadline = AbortSignal.timeout(grant.expiresAt - deps.now());
   const url = new URL(request.url);
   if (url.protocol !== "https:") return refuse("scheme");
   if (url.hostname !== policy.host || url.port !== "") return refuse("host");
@@ -64,7 +74,8 @@ export async function serveGitGateway(
   if (op === "git-receive-pack") {
     const prefix = policy.write?.refPrefix;
     if (prefix === undefined || request.body === null) return refuse("push");
-    const checked = await checkPush(request.body, prefix);
+    const checked = await checkPush(request.body, prefix, deadline);
+    if (lapsed()) return refuse("policy");
     if (checked.kind === "refused") return refuse(checked.reason);
     body = checked.body;
   } else if (op === "git-upload-pack") {
@@ -73,8 +84,10 @@ export async function serveGitGateway(
 
   // The sandbox's own Authorization header, if any, is dropped: only the minted token goes out.
   const headers = new Headers(request.headers);
-  headers.set("Authorization", `Bearer ${await deps.mint(repo, write ? "write" : "read")}`);
-  return deps.fetch(new Request(url, { method: request.method, headers, body }));
+  const token = await deps.mint(repo, write ? "write" : "read");
+  if (lapsed()) return refuse("policy");
+  headers.set("Authorization", `Bearer ${token}`);
+  return deps.fetch(new Request(url, { method: request.method, headers, body, signal: deadline }));
 }
 
 type PushCheck =
@@ -84,10 +97,20 @@ type PushCheck =
 /**
  * Reads a receive-pack body until its ref commands are complete and checks each against `prefix`.
  * Holds at most the head and the chunk that completed it; on success returns a stream that replays
- * those bytes and then the rest of the body.
+ * those bytes and then the rest of the body. When `deadline` aborts, the body is cancelled, so a
+ * read waiting on it ends and nothing more of it is forwarded.
  */
-async function checkPush(source: ReadableStream<Uint8Array>, prefix: string): Promise<PushCheck> {
+async function checkPush(
+  source: ReadableStream<Uint8Array>,
+  prefix: string,
+  deadline: AbortSignal,
+): Promise<PushCheck> {
   const reader = source.getReader();
+  // A cancel that fails leaves the stream errored, and the pending or next read rejects with that
+  // error, so its own rejection carries nothing more.
+  const stop = () => void reader.cancel().catch(() => undefined);
+  if (deadline.aborted) stop();
+  else deadline.addEventListener("abort", stop, { once: true });
   const parser = new ReceivePackHeadParser();
   const held: Uint8Array[] = [];
   let updates: readonly RefUpdate[] | null = null;

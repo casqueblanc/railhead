@@ -9,7 +9,13 @@
 //
 // The deadline is enforced here as well as in the repository: `start` schedules `expire` for the
 // deadline in the object's own durable alarm, commands are cut to the remaining lifetime, and the
-// outbound grant lapses at the same moment.
+// outbound grant lapses at the same moment. A wake-up that arrives early schedules itself again, so
+// a scheduler that runs callbacks before their time cannot consume the deadline.
+//
+// Retirement is recorded before the container is destroyed and confirmed after, and every attempt
+// first schedules a retry wake-up, so a failed destroy, or one cut off by a restart, is retried with
+// no other traffic. Retries back off and stop after `MAX_TEARDOWN_ATTEMPTS`; the repository keeps
+// the sandbox's slot until it releases the sandbox itself, whatever the fence confirmed.
 
 import { MAX_COMMAND_TIMEOUT_MS, type SandboxCommand } from "./entry";
 import type { SandboxGrant, SandboxPolicy } from "./policy";
@@ -28,8 +34,19 @@ export interface FencedContainer {
   ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
   /** Destroys the container. Destroying one that is not running succeeds. */
   destroy(): Promise<void>;
-  /** Durably arranges for `expire` to run at `deadline`, even if nothing else contacts the object. */
-  scheduleExpiry(deadline: number): Promise<void>;
+  /**
+   * Durably arranges for `expire` to run once no earlier than `at`, even if nothing else contacts
+   * the object. `expire` tolerates running early and schedules itself again.
+   */
+  wake(at: number): Promise<void>;
+}
+
+/** How many destroys the fence attempts on its own before leaving teardown to the repository. */
+export const MAX_TEARDOWN_ATTEMPTS = 8;
+
+/** The wait before retrying the teardown after `attempts` attempts: 5 s, doubling, at most 5 min. */
+export function teardownRetryDelay(attempts: number): number {
+  return Math.min(5_000 * 2 ** Math.max(0, attempts - 1), 300_000);
 }
 
 /** Why the fence refused an operation. */
@@ -46,13 +63,15 @@ export class SandboxFenceError extends Error {
   }
 }
 
-/** The fence's durable record. */
-interface FenceState {
-  /** When the incarnation must be gone; `0` when it was retired before it started. */
-  deadline: number;
-  /** Whether it was retired. Never cleared. */
-  retired: boolean;
-}
+/**
+ * The fence's durable record. `deadline` is when the incarnation must be gone, `0` when it was
+ * retired before it started. Once it leaves `live` it never returns: `retiring` means a destroy is
+ * not yet confirmed, `retired` that the last one succeeded.
+ */
+type FenceState =
+  | { phase: "live"; deadline: number }
+  | { phase: "retiring"; deadline: number; attempts: number }
+  | { phase: "retired"; deadline: number };
 
 const KEY = "railhead:fence";
 
@@ -77,11 +96,11 @@ export class SandboxFence {
   start(policy: SandboxPolicy, deadline: number): Promise<void> {
     return this.#track(async () => {
       const state = this.#read();
-      if (state?.retired === true) throw new SandboxFenceError("retired");
+      if (state !== null && state.phase !== "live") throw new SandboxFenceError("retired");
       if (state !== null && state.deadline !== deadline) throw new SandboxFenceError("retired");
       if (this.#clock() >= deadline) return this.#expireFrom(deadline);
-      this.#write({ deadline, retired: false });
-      await this.#container.scheduleExpiry(deadline);
+      this.#write({ phase: "live", deadline });
+      await this.#container.wake(deadline);
       await this.#container.route({ policy, expiresAt: deadline });
       await this.#settleEffect();
       const probe = await this.#container.exec(START_PROBE, {
@@ -97,7 +116,7 @@ export class SandboxFence {
     return this.#track(async () => {
       const state = this.#read();
       if (state === null) throw new SandboxFenceError("not_started");
-      if (state.retired) throw new SandboxFenceError("retired");
+      if (state.phase !== "live") throw new SandboxFenceError("retired");
       if (this.#clock() >= state.deadline) return this.#expireFrom(state.deadline);
       const result = await this.#container.exec(command.command, {
         timeoutMs: Math.min(command.timeoutMs, this.#remaining(state.deadline)),
@@ -114,40 +133,78 @@ export class SandboxFence {
   /**
    * Retires the incarnation for good and destroys its container. Returns once the container is
    * destroyed and every start or command that was running here has settled; each of those destroys
-   * the container again when it resumes, so none can leave it running.
+   * the container again when it resumes, so none can leave it running. A failed destroy rejects and
+   * leaves a retry scheduled.
    */
   async retire(): Promise<void> {
-    const state = this.#read();
-    if (state?.retired !== true) this.#write({ deadline: state?.deadline ?? 0, retired: true });
+    const deadline = this.#read()?.deadline ?? 0;
     const outstanding = [...this.#inflight];
-    await this.#container.destroy();
+    await this.#destroy(deadline);
     if (outstanding.length === 0) return;
     await Promise.allSettled(outstanding);
-    await this.#container.destroy();
+    await this.#destroy(deadline);
   }
 
-  /** The scheduled deadline: retires the incarnation unless that already happened. */
+  /**
+   * The scheduled wake-up. Before the deadline it schedules itself again; at the deadline it retires
+   * the incarnation; while a destroy is unconfirmed it retries it.
+   */
   async expire(): Promise<void> {
     const state = this.#read();
-    if (state === null || state.retired) return;
-    if (this.#clock() < state.deadline) return;
-    await this.retire();
+    if (state === null) return;
+    switch (state.phase) {
+      case "live":
+        if (this.#clock() < state.deadline) return this.#container.wake(state.deadline);
+        return this.retire();
+      case "retiring":
+        return this.retire();
+      case "retired":
+        return;
+      default:
+        throw new Error(`unknown fence phase: ${state satisfies never}`);
+    }
   }
 
-  // Retires from inside a start or command, which `retire` would wait on: marks the incarnation
-  // retired, destroys its container and refuses.
+  // Retires from inside a start or command, which `retire` would wait on: destroys the container
+  // and refuses.
   async #expireFrom(deadline: number): Promise<never> {
-    this.#write({ deadline, retired: true });
-    await this.#container.destroy();
+    await this.#destroy(deadline);
     throw new SandboxFenceError("expired");
   }
 
   // After an effect that may have started the container: if retirement happened meanwhile, destroy
   // it again before refusing, since that effect may have outlived the retirement's own destroy.
   async #settleEffect(): Promise<void> {
-    if (this.#read()?.retired !== true) return;
-    await this.#container.destroy();
+    const state = this.#read();
+    if (state === null || state.phase === "live") return;
+    await this.#destroy(state.deadline);
     throw new SandboxFenceError("retired");
+  }
+
+  // One destroy attempt. The incarnation is marked retiring and a retry is scheduled before the
+  // container is touched, so a failure or a restart mid-destroy still leaves a retry behind.
+  async #destroy(deadline: number): Promise<void> {
+    const attempts = this.#retiring(deadline);
+    if (attempts < MAX_TEARDOWN_ATTEMPTS) {
+      await this.#container.wake(this.#clock() + teardownRetryDelay(attempts));
+    }
+    try {
+      await this.#container.destroy();
+    } catch (error) {
+      // Another destroy may have confirmed retirement meanwhile; this failure unconfirms it.
+      if (this.#read()?.phase !== "retiring")
+        this.#write({ phase: "retiring", deadline, attempts });
+      throw error;
+    }
+    this.#write({ phase: "retired", deadline });
+  }
+
+  // Records one more unconfirmed destroy and returns how many there have been in a row.
+  #retiring(deadline: number): number {
+    const state = this.#read();
+    const attempts = state?.phase === "retiring" ? state.attempts + 1 : 1;
+    this.#write({ phase: "retiring", deadline, attempts });
+    return attempts;
   }
 
   #remaining(deadline: number): number {
@@ -166,16 +223,20 @@ export class SandboxFence {
     const value: unknown = this.#storage.kv.get(KEY);
     if (value === undefined) return null;
     if (
-      typeof value !== "object" ||
-      value === null ||
-      !("deadline" in value) ||
-      !("retired" in value) ||
-      typeof value.deadline !== "number" ||
-      typeof value.retired !== "boolean"
+      typeof value === "object" &&
+      value !== null &&
+      "phase" in value &&
+      "deadline" in value &&
+      typeof value.deadline === "number"
     ) {
-      throw new Error("stored sandbox fence is not valid");
+      const { deadline } = value;
+      if (value.phase === "live" || value.phase === "retired")
+        return { phase: value.phase, deadline };
+      if (value.phase === "retiring" && "attempts" in value && typeof value.attempts === "number") {
+        return { phase: "retiring", deadline, attempts: value.attempts };
+      }
     }
-    return { deadline: value.deadline, retired: value.retired };
+    throw new Error("stored sandbox fence is not valid");
   }
 
   #write(state: FenceState): void {

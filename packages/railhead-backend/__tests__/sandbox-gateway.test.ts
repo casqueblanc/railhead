@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import {
   CANDIDATE_REF_PREFIX,
-  grantedPolicy,
+  parseSandboxGrant,
   parseSandboxPolicy,
+  type SandboxGrant,
   type SandboxPolicy,
 } from "../src/sandbox/policy";
 import { RailheadSandbox } from "../src/sandbox/sandboxObject";
@@ -23,6 +24,8 @@ const POLICY: SandboxPolicy = {
   write: { repo: "main-repo", refPrefix: `${CANDIDATE_REF_PREFIX}chk_attempt1/` },
 };
 
+function noop(): void {}
+
 /** One pkt-line, written by hand so the tests do not reuse the subject's parser. */
 function pkt(payload: string): string {
   return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
@@ -36,6 +39,11 @@ function push(...commands: string[]): string {
     "0000" +
     PACK
   );
+}
+
+/** A grant for `policy` that outlives every test. */
+function live(policy: SandboxPolicy): SandboxGrant {
+  return { policy, expiresAt: Date.now() + 3_600_000 };
 }
 
 function url(repo: string, op: string, host = HOST): string {
@@ -60,6 +68,7 @@ function recorder(): GatewayDeps & {
       minted.push([repo, scope]);
       return `tok-${scope}-${repo}`;
     },
+    now: Date.now,
     fetch: async (request) => {
       forwarded.push({
         url: request.url,
@@ -83,7 +92,7 @@ describe("serveGitGateway", () => {
       headers: { Authorization: "Bearer sandbox-supplied" },
     });
 
-    const response = await serveGitGateway(request, POLICY, deps);
+    const response = await serveGitGateway(request, live(POLICY), deps);
 
     expect(response.status).toBe(200);
     expect(deps.minted).toEqual([["fork-a", "read"]]);
@@ -101,7 +110,7 @@ describe("serveGitGateway", () => {
     const body = push(`${ZERO} ${NEW} ${CANDIDATE_REF_PREFIX}chk_attempt1/head`);
     const request = new Request(url("main-repo", "git-receive-pack"), { method: "POST", body });
 
-    const response = await serveGitGateway(request, POLICY, deps);
+    const response = await serveGitGateway(request, live(POLICY), deps);
 
     expect(response.status).toBe(200);
     expect(deps.minted).toEqual([["main-repo", "write"]]);
@@ -125,7 +134,7 @@ describe("serveGitGateway", () => {
       body: stream,
     });
 
-    const response = await serveGitGateway(request, POLICY, deps);
+    const response = await serveGitGateway(request, live(POLICY), deps);
 
     expect(response.status).toBe(200);
     expect(encoder.encode(deps.forwarded[0]?.body)).toEqual(body);
@@ -145,7 +154,7 @@ describe("serveGitGateway", () => {
       body: push(command),
     });
 
-    expect(await refusal(await serveGitGateway(request, POLICY, deps))).toBe("ref");
+    expect(await refusal(await serveGitGateway(request, live(POLICY), deps))).toBe("ref");
     expect(deps.minted).toEqual([]);
     expect(deps.forwarded).toEqual([]);
   });
@@ -160,7 +169,7 @@ describe("serveGitGateway", () => {
       ),
     });
 
-    expect(await refusal(await serveGitGateway(request, POLICY, deps))).toBe("ref");
+    expect(await refusal(await serveGitGateway(request, live(POLICY), deps))).toBe("ref");
     expect(deps.forwarded).toEqual([]);
   });
 
@@ -179,7 +188,7 @@ describe("serveGitGateway", () => {
     const deps = recorder();
     const request = new Request(url("main-repo", "git-receive-pack"), { method: "POST", body });
 
-    expect(await refusal(await serveGitGateway(request, POLICY, deps))).toBe("push");
+    expect(await refusal(await serveGitGateway(request, live(POLICY), deps))).toBe("push");
     expect(deps.forwarded).toEqual([]);
   });
 
@@ -220,7 +229,9 @@ describe("serveGitGateway", () => {
   ])("refuses %s without minting a token", async (_name, target, reason) => {
     const deps = recorder();
 
-    expect(await refusal(await serveGitGateway(new Request(target), POLICY, deps))).toBe(reason);
+    expect(await refusal(await serveGitGateway(new Request(target), live(POLICY), deps))).toBe(
+      reason,
+    );
     expect(deps.minted).toEqual([]);
     expect(deps.forwarded).toEqual([]);
   });
@@ -235,8 +246,8 @@ describe("serveGitGateway", () => {
       method: "POST",
     });
 
-    expect(await refusal(await serveGitGateway(readOnly, POLICY, deps))).toBe("read-only");
-    expect(await refusal(await serveGitGateway(wrongMethod, POLICY, deps))).toBe("method");
+    expect(await refusal(await serveGitGateway(readOnly, live(POLICY), deps))).toBe("read-only");
+    expect(await refusal(await serveGitGateway(wrongMethod, live(POLICY), deps))).toBe("method");
     expect(deps.minted).toEqual([]);
   });
 
@@ -250,7 +261,9 @@ describe("serveGitGateway", () => {
       });
     const fetchRequest = new Request(`${url("main-repo", "info/refs")}?service=git-upload-pack`);
 
-    expect(await refusal(await serveGitGateway(pushRequest(), readOnly, deps))).toBe("read-only");
+    expect(await refusal(await serveGitGateway(pushRequest(), live(readOnly), deps))).toBe(
+      "read-only",
+    );
     expect(await refusal(await serveGitGateway(fetchRequest, null, deps))).toBe("policy");
     expect(deps.forwarded).toEqual([]);
   });
@@ -350,11 +363,117 @@ describe("RailheadSandbox outbound handlers", () => {
   });
 });
 
-describe("grantedPolicy", () => {
-  it("grants the policy until expiresAt and nothing from then on", () => {
-    const grant = { policy: POLICY, expiresAt: 5_000 };
-    expect(grantedPolicy(grant, 4_999)).toEqual(POLICY);
-    expect(grantedPolicy(grant, 5_000)).toBeNull();
+describe("serveGitGateway at the grant's deadline", () => {
+  const EXPIRES = 5_000_000;
+
+  /** Recording dependencies whose clock the test sets. */
+  function clocked(): ReturnType<typeof recorder> & { at: (ms: number) => void } {
+    let now = EXPIRES - 1_000;
+    return { ...recorder(), now: () => now, at: (ms) => (now = ms) };
+  }
+
+  it("forwards a request that arrives just before the deadline", async () => {
+    const deps = clocked();
+    deps.at(EXPIRES - 1);
+
+    const response = await serveGitGateway(
+      fetchRefs(),
+      { policy: POLICY, expiresAt: EXPIRES },
+      deps,
+    );
+
+    expect(response.status).toBe(200);
+    expect(deps.forwarded).toHaveLength(1);
+  });
+
+  it("forwards nothing when the token mint finishes after the deadline", async () => {
+    const deps = clocked();
+    const mint = deps.mint;
+    deps.mint = async (repo, scope) => {
+      const token = await mint(repo, scope);
+      deps.at(EXPIRES);
+      return token;
+    };
+
+    const response = await serveGitGateway(
+      fetchRefs(),
+      { policy: POLICY, expiresAt: EXPIRES },
+      deps,
+    );
+
+    expect(await refusal(response)).toBe("policy");
+    expect(deps.minted).toEqual([["main-repo", "read"]]);
+    expect(deps.forwarded).toEqual([]);
+  });
+
+  it("mints and forwards nothing when a push's commands finish arriving after the deadline", async () => {
+    const deps = clocked();
+    const bytes = encoder.encode(push(`${ZERO} ${NEW} ${CANDIDATE_REF_PREFIX}chk_attempt1/head`));
+    let send = noop;
+    const sent = new Promise<void>((done) => (send = done));
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await sent;
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const request = new Request(url("main-repo", "git-receive-pack"), { method: "POST", body });
+
+    const pending = serveGitGateway(request, { policy: POLICY, expiresAt: EXPIRES }, deps);
+    // The sandbox sends its commands only once the deadline has passed.
+    deps.at(EXPIRES);
+    send();
+    const response = await pending;
+
+    expect(await refusal(response)).toBe("policy");
+    expect(deps.minted).toEqual([]);
+    expect(deps.forwarded).toEqual([]);
+  });
+
+  it("stops waiting on a push whose commands never arrive once the deadline passes", async () => {
+    const deps = recorder();
+    // The sandbox opens a push and never sends its commands.
+    const body = new ReadableStream<Uint8Array>({ pull: () => new Promise<void>(noop) });
+    const request = new Request(url("main-repo", "git-receive-pack"), { method: "POST", body });
+
+    const response = await serveGitGateway(
+      request,
+      { policy: POLICY, expiresAt: Date.now() + 50 },
+      deps,
+    );
+
+    expect(await refusal(response)).toBe("policy");
+    expect(deps.minted).toEqual([]);
+    expect(deps.forwarded).toEqual([]);
+  });
+
+  it("aborts the upstream request at the deadline", async () => {
+    const signals: AbortSignal[] = [];
+    const deps: GatewayDeps = {
+      ...recorder(),
+      fetch: async (forwarded) => {
+        signals.push(forwarded.signal);
+        return new Response("upstream");
+      },
+    };
+
+    await serveGitGateway(fetchRefs(), { policy: POLICY, expiresAt: Date.now() + 50 }, deps);
+    const [signal] = signals;
+    if (signal === undefined) throw new Error("nothing was forwarded");
+    expect(signal.aborted).toBe(false);
+    await new Promise<void>((done) => signal.addEventListener("abort", () => done()));
+
+    expect(signal.aborted).toBe(true);
+  });
+});
+
+describe("parseSandboxGrant", () => {
+  it("returns a grant whatever its deadline, which the gateway checks at each use", () => {
+    expect(parseSandboxGrant({ policy: POLICY, expiresAt: 5_000 })).toEqual({
+      policy: POLICY,
+      expiresAt: 5_000,
+    });
   });
 
   it.each([
@@ -364,6 +483,6 @@ describe("grantedPolicy", () => {
     ["an invalid policy", { policy: { ...POLICY, host: "" }, expiresAt: 5_000 }],
     ["null", null],
   ])("refuses a grant with %s", (_name, value) => {
-    expect(grantedPolicy(value, 1_000)).toBeNull();
+    expect(parseSandboxGrant(value)).toBeNull();
   });
 });

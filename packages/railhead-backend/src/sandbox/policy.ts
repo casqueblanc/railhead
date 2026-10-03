@@ -61,14 +61,16 @@ export interface SandboxGrant {
   expiresAt: number;
 }
 
-/** The policy `value` grants at `now`, or `null` when it is not a valid grant or has lapsed. */
-export function grantedPolicy(value: unknown, now: number): SandboxPolicy | null {
+/**
+ * Validates `value` as a grant and returns it, or `null`. Whether it has lapsed is for the caller to
+ * check, each time it is about to use it.
+ */
+export function parseSandboxGrant(value: unknown): SandboxGrant | null {
   if (!isRecord(value)) return null;
   const { expiresAt } = value;
-  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || now >= expiresAt) {
-    return null;
-  }
-  return parseSandboxPolicy(value["policy"]);
+  if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt)) return null;
+  const policy = parseSandboxPolicy(value["policy"]);
+  return policy === null ? null : { policy, expiresAt };
 }
 
 function isCandidatePrefix(prefix: string): boolean {

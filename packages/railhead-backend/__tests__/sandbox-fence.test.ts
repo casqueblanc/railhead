@@ -2,12 +2,15 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
+  MAX_TEARDOWN_ATTEMPTS,
   START_PROBE,
   SandboxFence,
   SandboxFenceError,
+  teardownRetryDelay,
   type FencedContainer,
 } from "../src/sandbox/fence";
 import { CANDIDATE_REF_PREFIX, type SandboxGrant, type SandboxPolicy } from "../src/sandbox/policy";
+import { wakeTime } from "../src/sandbox/sandboxObject";
 
 const POLICY: SandboxPolicy = {
   host: "acct.artifacts.cloudflare.net",
@@ -16,7 +19,8 @@ const POLICY: SandboxPolicy = {
   write: { repo: "main-repo", refPrefix: `${CANDIDATE_REF_PREFIX}chk_attempt1/` },
 };
 
-const START = 1_000_000;
+// Not on a whole second, so a scheduler that keeps whole seconds would wake the fence early.
+const START = 1_000_900;
 const DEADLINE = START + 60_000;
 
 function noop(): void {}
@@ -32,14 +36,20 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 
 /**
  * A container that, like the SDK's, starts on any command and stops on destroy. Each operation can
- * be paused with `hold` until the test releases it.
+ * be paused with `hold` until the test releases it. Its scheduler is the SDK's as well: it keeps
+ * each wake-up in whole seconds, rounded down, and runs it once.
  */
 class FakeContainer {
   running = false;
   destroys = 0;
   destroyFails = false;
+  /** Whether the next destroy never returns, as when the object restarts during it. */
+  destroyHangs = false;
   grants: SandboxGrant[] = [];
-  expiries: number[] = [];
+  /** Every wake-up the fence asked for, in milliseconds. */
+  wakes: number[] = [];
+  /** The wake-ups still scheduled, in the seconds the SDK keeps. */
+  scheduled: { seconds: number }[] = [];
   commands: { command: string; timeoutMs: number }[] = [];
   readonly #held = new Map<string, Promise<void>>();
 
@@ -65,11 +75,16 @@ class FakeContainer {
     },
     destroy: async () => {
       this.destroys += 1;
+      if (this.destroyHangs) {
+        this.destroyHangs = false;
+        await new Promise<void>(noop);
+      }
       if (this.destroyFails) throw new Error("scripted destroy failure");
       this.running = false;
     },
-    scheduleExpiry: async (deadline) => {
-      this.expiries.push(deadline);
+    wake: async (at) => {
+      this.wakes.push(at);
+      this.scheduled.push({ seconds: Math.floor(at / 1_000) });
     },
   };
 }
@@ -80,6 +95,11 @@ interface Harness {
   advance: (ms: number) => void;
   /** A second fence over the same storage, as after the object restarted. */
   reopen: () => SandboxFence;
+  /**
+   * The object's alarm, as the SDK runs it: every wake-up due now runs once on a fresh fence and is
+   * then removed, whether it succeeded or failed. One scheduled while they run waits for the next.
+   */
+  alarm: () => Promise<void>;
 }
 
 /** Runs `body` with a fence over the storage of a Durable Object no other test touches. */
@@ -89,11 +109,21 @@ function withFence(body: (harness: Harness) => Promise<void>): Promise<void> {
     let now = START;
     const clock = () => now;
     const fake = new FakeContainer();
+    const reopen = () => new SandboxFence(state.storage, fake.container, clock);
     await body({
-      fence: new SandboxFence(state.storage, fake.container, clock),
+      fence: reopen(),
       fake,
       advance: (ms) => (now += ms),
-      reopen: () => new SandboxFence(state.storage, fake.container, clock),
+      reopen,
+      alarm: async () => {
+        const due = fake.scheduled.filter((wake) => wake.seconds * 1_000 <= now);
+        for (const wake of due) {
+          await reopen()
+            .expire()
+            .catch(() => undefined);
+          fake.scheduled.splice(fake.scheduled.indexOf(wake), 1);
+        }
+      },
     });
   });
 }
@@ -120,27 +150,36 @@ describe("sandbox fence", () => {
 
       expect(fake.running).toBe(true);
       expect(fake.grants).toEqual([{ policy: POLICY, expiresAt: DEADLINE }]);
-      expect(fake.expiries).toEqual([DEADLINE]);
+      expect(fake.wakes).toEqual([DEADLINE]);
       expect(fake.commands).toEqual([{ command: START_PROBE, timeoutMs: 60_000 }]);
     });
   });
 
-  it("retires at the scheduled deadline with no other traffic, and refuses commands afterwards", async () => {
-    await withFence(async ({ fence, fake, advance, reopen }) => {
+  it("retires at its deadline with no other traffic though the scheduler wakes it early", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
       await fence.start(POLICY, DEADLINE);
 
-      // An early alarm changes nothing.
-      advance(59_999);
-      await fence.expire();
+      // The scheduler kept the deadline's whole second and wakes the fence 900 ms early.
+      advance(59_100);
+      await alarm();
       expect(fake.running).toBe(true);
 
-      advance(1);
-      // The alarm runs on whatever instance the object has then.
-      await reopen().expire();
+      advance(900);
+      await alarm();
       expect(fake.running).toBe(false);
       expect(await refusal(fence.exec({ command: "true", timeoutMs: 1_000 }))).toBe("retired");
       expect(fake.running).toBe(false);
     });
+  });
+
+  it("schedules wake-ups the SDK cannot run before their time", () => {
+    expect(wakeTime(1_060_900).getTime()).toBe(1_061_000);
+    expect(wakeTime(1_060_001).getTime()).toBe(1_061_000);
+    expect(wakeTime(1_060_000).getTime()).toBe(1_060_000);
+    // The SDK keeps whole seconds, rounding down: the second it keeps is never before the wake-up.
+    for (const at of [DEADLINE, DEADLINE + 1, DEADLINE + 999]) {
+      expect(Math.floor(wakeTime(at).getTime() / 1_000) * 1_000).toBeGreaterThanOrEqual(at);
+    }
   });
 
   it("cuts a command to the remaining lifetime and refuses a result that arrives after it", async () => {
@@ -234,6 +273,73 @@ describe("sandbox fence", () => {
 
       fake.destroyFails = false;
       await reopen().retire();
+      expect(fake.running).toBe(false);
+    });
+  });
+
+  it("destroys at the deadline a container whose release failed, with no other traffic", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyFails = true;
+      await expect(fence.retire()).rejects.toThrow("scripted destroy failure");
+      fake.destroyFails = false;
+
+      advance(60_000);
+      await alarm();
+
+      expect(fake.running).toBe(false);
+    });
+  });
+
+  it("retries a destroy that failed at the deadline, with no other traffic", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyFails = true;
+      advance(60_000);
+      await alarm();
+      expect(fake.running).toBe(true);
+
+      fake.destroyFails = false;
+      advance(teardownRetryDelay(1));
+      await alarm();
+
+      expect(fake.running).toBe(false);
+      expect(fake.destroys).toBe(2);
+    });
+  });
+
+  it("retries a destroy cut off by a restart", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyHangs = true;
+      // The release never returns: the object restarted while it waited on the container.
+      void fence.retire();
+      await flush();
+      expect(fake.running).toBe(true);
+
+      advance(teardownRetryDelay(1));
+      await alarm();
+
+      expect(fake.running).toBe(false);
+    });
+  });
+
+  it("stops retrying on its own after the last attempt, leaving the release to the repository", async () => {
+    await withFence(async ({ fence, fake, advance, alarm }) => {
+      await fence.start(POLICY, DEADLINE);
+      fake.destroyFails = true;
+      advance(60_000);
+      for (let i = 0; i < MAX_TEARDOWN_ATTEMPTS + 4; i += 1) {
+        await alarm();
+        advance(teardownRetryDelay(MAX_TEARDOWN_ATTEMPTS));
+      }
+
+      expect(fake.destroys).toBe(MAX_TEARDOWN_ATTEMPTS);
+      expect(fake.scheduled).toEqual([]);
+      expect(fake.running).toBe(true);
+
+      fake.destroyFails = false;
+      await fence.retire();
       expect(fake.running).toBe(false);
     });
   });

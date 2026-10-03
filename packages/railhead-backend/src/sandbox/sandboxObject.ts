@@ -14,7 +14,7 @@ import { ContainerProxy, Sandbox, getSandbox } from "@cloudflare/sandbox";
 import type { SandboxCommand, SandboxDriver } from "./entry";
 import { SandboxFence } from "./fence";
 import { serveGitGateway } from "./gateway";
-import { grantedPolicy, type SandboxPolicy } from "./policy";
+import { parseSandboxGrant, type SandboxPolicy } from "./policy";
 
 export { ContainerProxy };
 
@@ -49,8 +49,8 @@ export class RailheadSandbox extends Sandbox<Env> {
           ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
         }),
       destroy: () => this.destroy(),
-      scheduleExpiry: async (deadline) => {
-        await this.schedule(new Date(deadline), "railheadExpire");
+      wake: async (at) => {
+        await this.schedule(wakeTime(at), "railheadExpire");
       },
     },
     Date.now,
@@ -73,7 +73,7 @@ export class RailheadSandbox extends Sandbox<Env> {
     await this.#fence.retire();
   }
 
-  /** Runs at the deadline `railheadStart` scheduled. */
+  /** Runs when the fence asked to be woken: at the deadline, or to retry a teardown. */
   async railheadExpire(): Promise<void> {
     await this.#fence.expire();
   }
@@ -85,15 +85,24 @@ RailheadSandbox.outbound = () =>
 
 RailheadSandbox.outboundHandlers = {
   [GIT_GATEWAY]: (request: Request, env: Env, ctx: { params?: unknown }) =>
-    serveGitGateway(request, grantedPolicy(ctx.params, Date.now()), {
+    serveGitGateway(request, parseSandboxGrant(ctx.params), {
       mint: async (repo, scope) => {
         using handle = await env.ARTIFACTS.get(repo);
         const token = await handle.createToken(scope, TOKEN_TTL_SECONDS);
         return token.plaintext;
       },
       fetch: (forwarded) => fetch(forwarded),
+      now: Date.now,
     }),
 };
+
+/**
+ * When to schedule a wake-up meant for `at`. The SDK stores a scheduled time in whole seconds,
+ * rounding down, so `at` is rounded up to the next second to keep the wake-up from running early.
+ */
+export function wakeTime(at: number): Date {
+  return new Date(Math.ceil(at / 1_000) * 1_000);
+}
 
 /**
  * Opens the named sandbox. The SDK refuses a name it cannot use, such as one over 63 characters,
