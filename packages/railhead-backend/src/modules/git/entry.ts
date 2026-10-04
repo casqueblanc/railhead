@@ -1,21 +1,10 @@
 // Git: the smart-HTTP gateway between agents' Git clients and Artifacts, implemented by
-// `createGitGateway` in `src/git/`. It streams to Artifacts remotes, and the Worker has no
-// `ARTIFACTS` binding yet, so this slot still answers every request 503 without reading its body or
-// reaching Artifacts. Once the binding is declared, the factory becomes:
-//
-//   (context, ports) => createGitGateway({
-//     log: context.log,
-//     storage: context.storage,
-//     clock: context.clock,
-//     // The Repo's wake resolves whether its alarm write succeeded, which the gateway needs
-//     // before it releases a push.
-//     wake: context.wake,
-//     ports,
-//     remote: artifactsRemotes(context.env.ARTIFACTS),
-//     upstream: (request) => fetch(request),
-//   })
+// `createGitGateway` in `src/git/`. It streams each request to the Artifacts remote the binding
+// names for the repository.
 
 import type { GitAccess } from "../../contracts/claims";
+import { createGitGateway } from "../../git/gateway";
+import { artifactsRemotes } from "../../git/remotes";
 import type { ModuleFactory } from "../../repo/composeRepo";
 
 /** The remote a Git request names, parsed from its path by the gateway. */
@@ -36,12 +25,15 @@ export interface GitPort {
 }
 
 /** Builds the Git module of one repository. */
-export const git: ModuleFactory<GitPort> = () => ({
-  serve: async () =>
-    new Response("The git module is not available.\n", {
-      status: 503,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    }),
-  // It forwards no push, so it owes no reconciliation.
-  resume: async () => undefined,
-});
+export const git: ModuleFactory<GitPort> = (context, ports) =>
+  createGitGateway({
+    log: context.log,
+    storage: context.storage,
+    clock: context.clock,
+    // The Repo's wake resolves whether its alarm write succeeded, which the gateway needs before it
+    // releases a push.
+    wake: context.wake,
+    ports,
+    remote: artifactsRemotes(context.env.ARTIFACTS),
+    upstream: (request) => fetch(request),
+  });
