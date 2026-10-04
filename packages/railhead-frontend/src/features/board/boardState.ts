@@ -983,6 +983,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       for (const ref of decisions) knownDecisionVersion(state, ref);
       const run = known(state.checkRuns, checkRunId, "check run");
       check(run.candidate === candidate, `intent ${intentId} cites a check of another candidate`);
+      check(
+        run.unreported === null,
+        `intent ${intentId} cites a check run that ended without a report`,
+      );
       return {
         ...endHolds(state, draft, claims, "superseded", seq, checkRunId),
         intents: draft.put(state.intents, intentId, {

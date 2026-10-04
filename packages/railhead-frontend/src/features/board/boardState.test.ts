@@ -1179,6 +1179,23 @@ describe("check runs that end without a report", () => {
     });
     expect(halted.cursor).toBe(1);
   });
+
+  it("halts on an intent citing the timed-out run", () => {
+    const steps = [
+      ...uploadPrelude(),
+      checkTimedOut(run, synthCommit(1)),
+      intend("int_synthlate", synthCommit(0), synthCommit(1), [UPLOAD.atlasClaim], [], run),
+    ];
+    const halted = fold(syntheticLog("an intent on a timed-out run", steps).events);
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: steps.length,
+        message: "intent int_synthlate cites a check run that ended without a report",
+      },
+    });
+  });
 });
 
 describe("totals and recent activity", () => {
