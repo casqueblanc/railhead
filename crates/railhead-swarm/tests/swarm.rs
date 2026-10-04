@@ -6,10 +6,9 @@
 //! Its `pin` route shows a ready claim queued while its wave is not full, and in the wave's batch
 //! once it is: forming until every claim in it is ready, then checking.
 //! A clean merge moves main; a conflict reopens the claim at the next generation and routes a
-//! `conflict` inbox item to its agent. By default the agent's status keeps showing its last claim
-//! once it merged, the positive evidence the driver needs to count a landing; the real backend
-//! does not show it yet (#237), and [`Status::HidesClosed`] reproduces that: the driver reports
-//! such a task as unverified. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
+//! `conflict` inbox item to its agent. By default the agent's status names its last closed claim
+//! and why it closed, as the real backend does; [`Status`] models the other shapes the driver
+//! handles. Git reaches the fake's repositories through a `url.<dir>.insteadOf` rewrite of
 //! the origin's `/git/` URLs, so every remote keeps the address the backend named.
 //!
 //! The agents and the backend are both simulated; nothing here measures Railhead itself.
@@ -122,17 +121,22 @@ enum ClaimState {
     Ready,
     Merged,
     Expired,
+    Released,
+    TakenOver,
 }
 
 /// What the fake's `status` shows once a claim closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
-    /// The agent's last claim, merged included.
+    /// The active claim, and the last closed claim with its reason.
+    ReportsClosed,
+    /// The agent's last claim as its active one, merged included, and no closed claim.
     ShowsMerged,
-    /// Only an active claim, as the real backend does today.
+    /// Only an active claim, and no closed claim.
     HidesClosed,
-    /// The last claim, but a ready claim expires on the poll after the first that saw it ready.
-    ExpiresReady,
+    /// As [`Status::ReportsClosed`], but a ready claim closes in this state on the poll after the
+    /// first that saw it ready.
+    ClosesReady(ClaimState),
 }
 
 #[derive(Debug)]
@@ -145,6 +149,8 @@ struct Claim {
     base: String,
     ready_commit: Option<String>,
     ready_seq: u64,
+    /// The main commit that landed it.
+    landed: Option<String>,
 }
 
 /// How the fake loses the answer to a request it carried out.
@@ -189,7 +195,7 @@ struct State {
     paused: bool,
     /// Status requests that pass before the train moves on one.
     held_polls: u64,
-    /// Polls that saw a ready claim, for [`Status::ExpiresReady`].
+    /// Polls that saw a ready claim, for [`Status::ClosesReady`].
     ready_polls: u64,
     /// Whether `ready` answers nothing in time and records nothing.
     stall_ready: bool,
@@ -238,7 +244,8 @@ impl Fake {
             ClaimState::Working => "working",
             ClaimState::Ready => "ready",
             ClaimState::Merged => "merged",
-            ClaimState::Expired => "expired",
+            // The wire's claim states have no other closed state.
+            ClaimState::Expired | ClaimState::Released | ClaimState::TakenOver => "expired",
         };
         json!({"claimId": claim.id, "issueId": claim.issue, "generation": claim.generation,
             "base": claim.base, "state": state, "readyCommit": claim.ready_commit,
@@ -288,19 +295,40 @@ impl Fake {
         let last = state.claims.iter().rposition(|claim| claim.agent == agent);
         match self.status {
             Status::ShowsMerged => last,
-            Status::HidesClosed => Self::active(state, agent),
-            Status::ExpiresReady => {
+            Status::ReportsClosed | Status::HidesClosed => Self::active(state, agent),
+            Status::ClosesReady(closes) => {
                 let claim = last.and_then(|index| state.claims.get_mut(index))?;
                 if claim.state == ClaimState::Ready {
                     state.ready_polls += 1;
                     if state.ready_polls > 1 {
-                        claim.state = ClaimState::Expired;
+                        claim.state = closes;
                     }
                 }
-                // Like the real backend, an expired claim leaves the status.
+                // Like the real backend, a closed claim leaves the status.
                 Self::active(state, agent)
             }
         }
+    }
+
+    /// The closed claim `status` names: the agent's most recently closed one.
+    fn closed(&self, state: &State, agent: usize) -> Value {
+        if matches!(self.status, Status::ShowsMerged | Status::HidesClosed) {
+            return Value::Null;
+        }
+        let Some(claim) = state.claims.iter().rev().find(|claim| {
+            claim.agent == agent && !matches!(claim.state, ClaimState::Working | ClaimState::Ready)
+        }) else {
+            return Value::Null;
+        };
+        let reason = match claim.state {
+            ClaimState::Merged => json!({"kind": "merged", "commit": claim.landed}),
+            ClaimState::Expired => json!({"kind": "expired"}),
+            ClaimState::Released => json!({"kind": "released"}),
+            ClaimState::TakenOver => json!({"kind": "taken_over"}),
+            ClaimState::Working | ClaimState::Ready => return Value::Null,
+        };
+        json!({"claimId": claim.id, "issueId": claim.issue, "generation": claim.generation,
+            "reason": reason, "closedAt": 1})
     }
 
     fn agent_view(agent: usize) -> Value {
@@ -343,6 +371,7 @@ impl Fake {
             base,
             ready_commit: None,
             ready_seq: 0,
+            landed: None,
         });
         state.wave.push(number);
         let claim = state.claims.last().map(|claim| self.view(claim));
@@ -517,6 +546,7 @@ impl Fake {
             git(&main, &["update-ref", "refs/heads/main", &landed])?;
             if let Some(claim) = state.claims.get_mut(index) {
                 claim.state = ClaimState::Merged;
+                claim.landed = Some(landed);
             }
             state.last_landed = Some(id);
         } else {
@@ -617,9 +647,9 @@ impl Fake {
                     .shown(&mut state, agent)
                     .and_then(|index| state.claims.get(index))
                     .map(|claim| self.view(claim));
-                // The fake reports no closed claim; `Status` models what the driver sees instead.
+                let closed = self.closed(&state, agent);
                 Ok(success(
-                    &json!({"agent": Self::agent_view(agent), "claim": claim, "closed": null}),
+                    &json!({"agent": Self::agent_view(agent), "claim": claim, "closed": closed}),
                     &Self::digest(&state, agent),
                 ))
             }
@@ -716,7 +746,7 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
 /// A world with `agents` joined agents and a main holding a README, plus the scaffold when
 /// `scaffolded`.
 async fn world(agents: usize, wave_size: usize, scaffolded: bool) -> anyhow::Result<World> {
-    world_with(agents, wave_size, scaffolded, Status::ShowsMerged).await
+    world_with(agents, wave_size, scaffolded, Status::ReportsClosed).await
 }
 
 async fn world_with(
@@ -1152,8 +1182,38 @@ async fn a_home_joined_to_another_repository_starts_nothing() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn a_claim_that_closes_without_evidence_is_unverified_not_a_landing() -> anyhow::Result<()> {
-    // The fake lands the claim but, like today's backend, drops it from the status.
+async fn a_claim_reported_closed_as_merged_lands() -> anyhow::Result<()> {
+    // The status shows only the active claim; the landing reads as the closed claim's reason.
+    let world = world_with(1, 1, false, Status::ReportsClosed).await?;
+    let scenario = world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(0), "{:?}", run.of_type("failed"));
+    assert_eq!(
+        run.steps_of("swarm-00"),
+        [
+            "claimed", "pushed", "ready", "landed", "claimed", "pushed", "ready", "landed"
+        ]
+    );
+    assert_eq!(
+        (
+            run.total("landings"),
+            run.total("unverified"),
+            run.total("failures"),
+            run.total("agentsDone")
+        ),
+        (Some(2), Some(0), Some(0), Some(1))
+    );
+    assert_eq!(
+        run.summary()?.pointer("/readyToLanded/samples"),
+        Some(&json!(2))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_that_leaves_the_status_without_a_closed_reason_is_unverified() -> anyhow::Result<()>
+{
+    // The fake lands the claim, but its status names no closed claim.
     let world = world_with(1, 1, false, Status::HidesClosed).await?;
     let scenario = world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     let run = run(&mut world.driver(&scenario)?)?;
@@ -1173,11 +1233,8 @@ async fn a_claim_that_closes_without_evidence_is_unverified_not_a_landing() -> a
         ]
     );
     for unverified in run.of_type("unverified") {
-        assert_eq!(
-            unverified.get("needs"),
-            Some(&json!("casqueblanc/railhead#237"))
-        );
         assert_eq!(unverified.get("class"), Some(&json!("disjoint")));
+        assert_eq!(unverified.get("needs"), None);
     }
     assert_eq!(
         (
@@ -1202,26 +1259,50 @@ async fn a_claim_that_closes_without_evidence_is_unverified_not_a_landing() -> a
 }
 
 #[tokio::test]
-async fn a_ready_claim_that_expires_between_polls_is_not_a_landing() -> anyhow::Result<()> {
-    // A wave of 2 with one agent never lands; the ready claim expires on the second poll and
-    // leaves the status, which cannot say so until #237: it is unverified, never landed.
-    let world = world_with(1, 2, false, Status::ExpiresReady).await?;
-    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
-    let run = run(&mut world.driver(&scenario)?)?;
-    assert_eq!(run.code, Some(0), "{:?}", run.of_type("failed"));
-    assert_eq!(
-        run.steps_of("swarm-00"),
-        ["claimed", "pushed", "ready", "unverified"]
-    );
-    assert_eq!(
-        (run.total("landings"), run.total("unverified")),
-        (Some(0), Some(1))
-    );
-    assert_eq!(world.state().ready_polls, 2);
-    assert!(
-        world.main_file(&disjoint_path("swarm-00", 0)).is_err(),
-        "main changed although nothing landed"
-    );
+async fn a_ready_claim_that_closes_without_landing_reports_why_and_stops() -> anyhow::Result<()> {
+    for (closes, reason, total) in [
+        (ClaimState::Expired, "expired", "expired"),
+        (ClaimState::Released, "released", "released"),
+        (ClaimState::TakenOver, "takenOver", "takenOver"),
+    ] {
+        // A wave of 2 with one agent never lands; the ready claim closes on the second poll.
+        let world = world_with(1, 2, false, Status::ClosesReady(closes)).await?;
+        let scenario =
+            world.scenario_of(1, 2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+        let run = run(&mut world.driver(&scenario)?)?;
+        // The agent no longer holds the task, so it stops before its second one.
+        assert_eq!(run.code, Some(1), "{reason}");
+        assert_eq!(
+            run.steps_of("swarm-00"),
+            ["claimed", "pushed", "ready", "closed"],
+            "{reason}"
+        );
+        let closed = run.of_type("closed");
+        assert_eq!(
+            closed.first().and_then(|event| event.get("reason")),
+            Some(&json!(reason))
+        );
+        assert_eq!(
+            closed.first().and_then(|event| event.get("class")),
+            Some(&json!("disjoint"))
+        );
+        assert_eq!(
+            (
+                run.total(total),
+                run.total("landings"),
+                run.total("unverified"),
+                run.total("failures"),
+                run.total("agentsDone")
+            ),
+            (Some(1), Some(0), Some(0), Some(0), Some(0)),
+            "{reason}"
+        );
+        assert_eq!(world.state().ready_polls, 2, "{reason}");
+        assert!(
+            world.main_file(&disjoint_path("swarm-00", 0)).is_err(),
+            "main changed although nothing landed"
+        );
+    }
     Ok(())
 }
 
@@ -1556,6 +1637,39 @@ async fn a_pin_that_closed_between_runs_without_evidence_is_unverified_not_redon
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_released_between_runs_is_reported_and_stops_the_rerun() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let (scenario, pinned) = interrupt_after_the_first_pin(&world)?;
+    if let Some(claim) = world.state().claims.first_mut() {
+        claim.state = ClaimState::Released;
+    }
+    let rerun = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(rerun.code, Some(1));
+    assert_eq!(rerun.steps_of("swarm-00"), ["adopted", "closed"]);
+    let closed = rerun.of_type("closed");
+    assert_eq!(
+        closed.first().and_then(|e| e.get("claimId")),
+        Some(&json!(pinned))
+    );
+    assert_eq!(
+        closed.first().and_then(|e| e.get("reason")),
+        Some(&json!("released"))
+    );
+    assert_eq!(
+        (
+            rerun.total("released"),
+            rerun.total("landings"),
+            rerun.total("pushes")
+        ),
+        (Some(1), Some(0), Some(0))
+    );
+    // Nothing was claimed again.
+    assert_eq!(world.state().claims.len(), 1);
+    Ok(())
+}
+
 /// Runs the driver expecting it to refuse to start, and returns what it printed on stderr.
 async fn refused(world: &World, command: &mut Command) -> anyhow::Result<String> {
     let requests = world
@@ -1823,6 +1937,7 @@ async fn a_ready_whose_answer_was_lost_is_read_back_not_repeated() -> anyhow::Re
     for (lost, status, outcome) in [
         (Lost::Late, Status::ShowsMerged, "landed"),
         (Lost::Busy, Status::ShowsMerged, "landed"),
+        (Lost::Busy, Status::ReportsClosed, "landed"),
         (Lost::Busy, Status::HidesClosed, "unverified"),
     ] {
         // The fake records the pin and lands it, but `rh ready` times out or reads a retryable

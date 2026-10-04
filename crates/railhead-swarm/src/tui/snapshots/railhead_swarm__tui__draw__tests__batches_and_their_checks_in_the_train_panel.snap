@@ -5,7 +5,7 @@ expression: "render(&view, 140, 24)?.backend()"
 ---
 " SIMULATED RUN  00:02  running  casqueblanc/demo · 6 agents × 1 rounds · seed 211                                                           "
 "pushes 0 (0.0/min)  landings 0 (0.0/min)  ready→landed p50 - p95 -                                                                          "
-"auto-merged 0  routed 0  redos 0  unverified 0  stalls 0  failures 0  done 0/6                                                              "
+"auto-merged 0  routed 0  redos 0  unlanded 0  stalls 0  failures 0  done 0/6                                                                "
 "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "┌ Agents ───────────────────────────────────────────────────────────────────┐┌ Train ──────────────────────────────────────────────────────┐"
 "│ agent    step       gen claim          land last event                    ││waiting 6  landed 0  unverified 0                            │"

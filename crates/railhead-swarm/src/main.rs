@@ -23,9 +23,9 @@
 //! Ctrl-C does.
 //!
 //! The exit code is 0 only when every agent finished every planned task; 1 when an agent failed or
-//! stalled, or the run timed out; 130 on Ctrl-C; 2 when the run could not start. A task whose claim
-//! closed without a closed reason is reported as unverified, not as a failure, until
-//! casqueblanc/railhead#237 adds that reason to the agent wire.
+//! stalled, or whose claim closed without landing, or the run timed out; 130 on Ctrl-C; 2 when the
+//! run could not start. A task whose claim left the status without a closed reason is reported as
+//! unverified, not as a failure.
 //!
 //! ```text
 //! railhead-swarm --scenario crates/railhead-swarm/scenarios/local.json \
@@ -367,8 +367,16 @@ async fn finish_view(tui: Tui, summary: &Summary) -> anyhow::Result<()> {
     tui.show(&Event::Summary(summary.clone())).await;
     tui.finish().context("showing the run")?;
     eprintln!(
-        "railhead-swarm: {} pushes, {} landings, {} unverified, {} failures ({})",
-        summary.pushes, summary.landings, summary.unverified, summary.failures, summary.label
+        "railhead-swarm: {} pushes, {} landings, {} expired, {} released, {} taken over, \
+         {} unverified, {} failures ({})",
+        summary.pushes,
+        summary.landings,
+        summary.expired,
+        summary.released,
+        summary.taken_over,
+        summary.unverified,
+        summary.failures,
+        summary.label
     );
     Ok(())
 }

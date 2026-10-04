@@ -137,4 +137,4 @@
 {"ts":1791107500937,"elapsedMs":11201,"simulated":true,"type":"agentState","agent":"swarm-01","state":"waiting"}
 {"ts":1791107501188,"elapsedMs":11451,"simulated":true,"type":"landed","agent":"swarm-01","claimId":"clm_swarm0011","class":"overlapping","readyToLandedMs":241}
 {"ts":1791107501297,"elapsedMs":11560,"simulated":true,"type":"agentState","agent":"swarm-01","state":"done"}
-{"ts":1791107501297,"elapsedMs":11560,"simulated":true,"type":"summary","label":"measured on a simulated run","stoppedBy":"completed","durationMs":11560,"pushes":14,"readies":14,"landings":12,"unverified":0,"autoMergedOverlaps":2,"routedConflicts":2,"redos":2,"stalls":0,"failures":0,"agentsDone":4,"readyToLanded":{"samples":12,"p50Ms":781,"p95Ms":2485}}
+{"ts":1791107501297,"elapsedMs":11560,"simulated":true,"type":"summary","label":"measured on a simulated run","stoppedBy":"completed","durationMs":11560,"pushes":14,"readies":14,"landings":12,"expired":0,"released":0,"takenOver":0,"unverified":0,"autoMergedOverlaps":2,"routedConflicts":2,"redos":2,"stalls":0,"failures":0,"agentsDone":4,"readyToLanded":{"samples":12,"p50Ms":781,"p95Ms":2485}}
