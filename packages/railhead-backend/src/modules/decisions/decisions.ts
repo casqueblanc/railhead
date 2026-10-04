@@ -33,7 +33,7 @@
 //
 // - `transfer`, called inside a takeover's transaction, moves the claim's dependencies to the new
 //   holder and queues it the current version of each decision, delivering what was pending.
-// - `relied`, called inside the transaction that authorizes or lands the claim's work, records the
+// - `relied`, called inside the train's transaction that lands the claim's work, records the
 //   versions that work relied on. A version recorded later, or one already newer, makes the
 //   obligation `rework`: the work cannot follow it any more, so it must be redone. The rework goes
 //   to whoever holds the claim's dependency now, which after a takeover is the successor, even when
@@ -122,7 +122,7 @@ const MIGRATIONS: readonly string[] = [
     PRIMARY KEY (decision_id, claim_id)
   ) STRICT`,
   "CREATE INDEX decision_claims_claim ON decision_claims (claim_id)",
-  // The newest version the claim's authorized or merged work relied on, or `NULL` before any.
+  // The newest version the claim's merged work relied on, or `NULL` before any.
   "ALTER TABLE decision_claims ADD COLUMN relied INTEGER CHECK (relied IS NULL OR relied > 0)",
   // What each version asks of each dependent claim. `agent_id` and `item` name its latest delivery,
   // since item numbers are per agent, or are both `NULL` while no current holder could receive it.
