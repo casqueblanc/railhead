@@ -63,6 +63,9 @@ const worker = defineRailheadWorker({
     // characters. Each repository derives its challenge and token keys from it; without it agents
     // cannot log in. Replacing it ends every session.
     SESSION_SIGNING_SECRET: bindings.secret(),
+    // Workers AI, for Clef's conflict classification. Only the conflicts module calls it, through
+    // `@railhead/ai`. It has no local simulation: every call reaches the remote service.
+    AI: bindings.ai(),
   },
   exports: {
     Repo: { type: "durable-object", storage: "sqlite" },

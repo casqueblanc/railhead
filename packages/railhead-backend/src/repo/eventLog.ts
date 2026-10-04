@@ -14,7 +14,8 @@
 // observation is only a wake-up: it carries no events, and an observer reads them from storage.
 
 import {
-  EVENT_SCHEMA_VERSION,
+  eventVersion,
+  isReadableVersion,
   isId,
   REOPEN_REASON_BEFORE_REASONS,
   validateEvent,
@@ -280,7 +281,7 @@ export class EventLog {
 
   #append(seq: number, actor: Actor, payload: EventPayload): RailheadEvent {
     const event: RailheadEvent = {
-      v: EVENT_SCHEMA_VERSION,
+      v: eventVersion(payload.type),
       seq,
       at: this.#clock(),
       repo: this.#repo,
@@ -316,7 +317,7 @@ function readStoredEvent(seq: number, body: string): RailheadEvent {
   if (event.seq !== seq) {
     throw new EventLogError("corrupt_log", `the row at sequence ${seq} holds another sequence`);
   }
-  if (event.v !== EVENT_SCHEMA_VERSION) {
+  if (!isReadableVersion(event.v)) {
     throw new EventLogError(
       "corrupt_log",
       `the event at sequence ${seq} has unsupported schema version ${event.v}`,

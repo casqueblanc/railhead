@@ -18,11 +18,13 @@ import type {
 } from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
 import type { ClaimPin, EpisodePin } from "./claims";
+import type { GrantFor } from "./principals";
 import type { PortResult } from "./result";
 
 /**
  * A check definition as read from main, never from the change being checked. A candidate that
- * edits its own definition is held for a person, not checked with the edited definition.
+ * edits its own definition is held for a person, and checked with the edited definition only once
+ * that person approves exactly it.
  */
 export interface CheckDefinition {
   /** The check's name. */
@@ -173,8 +175,8 @@ export interface CheckPort {
   definitions(main: CommitSha): Promise<PortResult<CheckDefinition[]>>;
   /**
    * Starts the run for a persisted attempt. A repeat for the same attempt starts nothing new. A
-   * candidate that edits the definition or a path it protects is refused with `check_held` and
-   * never run.
+   * candidate that edits the definition or a path it protects is refused with `check_held` and not
+   * run until a person approves it with `approve`; it then runs the candidate's own definition.
    */
   start(attempt: CheckAttempt): Promise<PortResult<{ attemptId: CheckRunId }>>;
   /**
@@ -183,6 +185,14 @@ export interface CheckPort {
    * result than one already recorded, is refused with `check_mismatch`.
    */
   report(run: CheckRunReport): Promise<PortResult<CheckAttempt>>;
+  /**
+   * Approves running the candidate's own definition for one held attempt. It re-reads that
+   * definition and refuses with `action_stale` unless the attempt is still held on the grant's
+   * candidate, the definition still has the grant's digest and the train still holds the attempt.
+   * The approval is recorded on the attempt with a `check.approved` event; the attempt then runs
+   * with that definition. A repeat of the recorded approval answers as the first did.
+   */
+  approve(grant: GrantFor<"check.approve">): Promise<PortResult<{ checkRunId: CheckRunId }>>;
   /**
    * What was recorded for an attempt this module held or started: its candidate, the command its
    * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its output.
@@ -264,6 +274,22 @@ export interface TrainPort {
    * again. It writes nothing, so a repeat is harmless.
    */
   armWake(): Promise<boolean>;
+  /**
+   * Returns a held attempt a person approved to the train: an active batch still holding it asks
+   * the check port to start it again under a fresh deadline, and a pin parked alone for it goes to
+   * the front of the queue to revive its batch on the same candidate. Returns `false`, changing
+   * nothing, when the train holds no such attempt (`holds` is false), such as a shared batch that
+   * already expired or a parked pin a later generation of its claim superseded. A fence method
+   * like `attemptOutcome`: call it inside the caller's `log.transaction`, then `resume` once that
+   * transaction committed.
+   */
+  release(attemptId: CheckRunId): boolean;
+  /**
+   * Whether the train may still run `attemptId`, an attempt it held: an active batch still has it,
+   * or its pin is parked for it or queued to revive it. The checks module keeps such an attempt so
+   * its approval finds it. A fence reader like `attemptOutcome`.
+   */
+  holds(attemptId: CheckRunId): boolean;
   /**
    * Called by the Repo's alarm. Moves accepted work the train still owes, if it is due, and asks
    * for the next wake itself. It never throws for a port's failure.

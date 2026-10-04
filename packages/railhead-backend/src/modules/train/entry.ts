@@ -16,6 +16,8 @@ export const train: ModuleFactory<TrainPort> = (context, ports) => {
     answered,
     pinView,
     armWake,
+    release,
+    holds,
     resume,
     startup,
   } = createTrain(context, ports);
@@ -27,6 +29,8 @@ export const train: ModuleFactory<TrainPort> = (context, ports) => {
     answered,
     pinView,
     armWake,
+    release,
+    holds,
     resume,
     startup,
   };

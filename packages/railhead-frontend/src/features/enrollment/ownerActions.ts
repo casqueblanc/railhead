@@ -119,6 +119,7 @@ const matching = (action: EnrollmentAction, result: OwnerActionResult): Enrollme
       return action.kind === result.kind && action.agentId === result.agentId ? result : null;
     case "issue.file":
     case "decision.record":
+    case "check.approve":
       return null;
     default:
       return unreachable(result);

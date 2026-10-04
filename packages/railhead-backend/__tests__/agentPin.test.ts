@@ -9,9 +9,11 @@ import { unavailableTrain } from "../src/contracts/unavailable";
 import { parseAgentResponse } from "../src/contracts/wireShape";
 import { dispatchAgent, type AgentReply } from "../src/gateway/agentDispatch";
 import {
+  expireHeldPins,
   insertBatch,
   insertEntry,
   markCheckHeld,
+  readEntry,
   recordCandidate,
   recordCheckResult,
   settleEntry,
@@ -219,6 +221,21 @@ describe("pin", () => {
       expect(await state()).toEqual({ kind: "dropped", reason: "check_failed" });
       settleEntry(sql, pinOf("clm_atlas01"), "landed", null, NOW);
       expect(await state()).toEqual({ kind: "landed" });
+    });
+  });
+
+  it("reports a held pin that expired while parked as dropped for check_held", async () => {
+    await withPins(async ({ sql, claims, pin }) => {
+      claims.set(ATLAS, claim("clm_atlas01", "ready"));
+      insertEntry(sql, pinOf("clm_atlas01"), 1, NOW);
+      const state = async () => pinData(await pin(ATLAS)).pin?.state;
+
+      settleEntry(sql, pinOf("clm_atlas01"), "parked", "check_held", NOW);
+      expect(await state()).toEqual({ kind: "parked", reason: "check_held" });
+      // The train records the expiry as `held_expired`; the wire keeps the reason older `rh` reads.
+      expect(expireHeldPins(sql, { parkedBy: NOW, keep: 16 }, NOW + 1)).toBe(1);
+      expect(readEntry(sql, "clm_atlas01", 1)).toMatchObject({ reason: "held_expired" });
+      expect(await state()).toEqual({ kind: "dropped", reason: "check_held" });
     });
   });
 

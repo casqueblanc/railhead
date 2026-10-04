@@ -85,15 +85,18 @@ const runOf = (state: BoardState, intent: IntentState): TrainRun => {
     intentId: intent.intentId,
     expectedMain: intent.expectedMain,
     candidate: intent.candidate,
-    claims: intent.claims.map((claimId) => {
-      const claim = own(state.claims, claimId);
-      const issue = claim === undefined ? undefined : own(state.issues, claim.issueId);
-      return { claimId, issueTitle: issue?.title ?? claimId };
-    }),
+    claims: intent.claims.map((claimId) => trainClaim(state, claimId)),
     decisions: intent.decisions,
     checks: { checkRunId: intent.checkRunId, candidate: intent.candidate, counts },
     outcome: outcomeOf(intent),
   };
+};
+
+/** A claim the train carried, titled by its issue, or by its id when the issue is unknown. */
+export const trainClaim = (state: BoardState, claimId: string): TrainClaim => {
+  const claim = own(state.claims, claimId);
+  const issue = claim === undefined ? undefined : own(state.issues, claim.issueId);
+  return { claimId, issueTitle: issue?.title ?? claimId };
 };
 
 const own = <T>(record: Readonly<Record<string, T>>, key: string): T | undefined =>

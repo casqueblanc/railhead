@@ -172,6 +172,10 @@ async function act(ports: RepoPorts, grant: HumanGrant): Promise<PortResult<Owne
       const result = await ports.decisions.record({ ...grant, action });
       return result.ok ? ok({ kind: action.kind, ...result.value }) : result;
     }
+    case "check.approve": {
+      const result = await ports.checks.approve({ ...grant, action });
+      return result.ok ? ok({ kind: action.kind, ...result.value }) : result;
+    }
     default: {
       const unreachable: never = action;
       return unreachable;

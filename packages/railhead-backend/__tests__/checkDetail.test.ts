@@ -36,11 +36,11 @@ async function repositoryWithAttempts(): Promise<{ name: string; failed: string;
   const failed = `chk_${"a".repeat(32)}`;
   const held = `chk_${"b".repeat(32)}`;
   await runInDurableObject(stub, (_instance, state) => {
-    const attempts = new AttemptTable(state.storage);
+    const attempts = new AttemptTable(state.storage, () => false);
     const identity = { candidate: CANDIDATE, expectedMain: MAIN, digest: DIGEST };
     attempts.start({ ...identity, attemptId: failed }, "pnpm test", SANDBOX, 2_000, 1_000);
     attempts.report(failed, "fail", "<b>1 failed</b>", "e".repeat(64), 1_500, 1_500);
-    attempts.hold({ ...identity, attemptId: held }, "pnpm test", ["acceptance"], 1_000);
+    attempts.hold({ ...identity, attemptId: held }, "pnpm test", ["acceptance"], null, 1_000);
   });
   return { name, failed, held };
 }

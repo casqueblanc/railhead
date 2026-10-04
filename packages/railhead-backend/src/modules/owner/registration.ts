@@ -16,7 +16,7 @@ import { decodeBase64Url, equalBytes, sha256 } from "./encoding";
 export const MAX_ATTESTATION_OBJECT_BYTES = 4096;
 
 /** The only credential algorithm enrollment requests: ES256 (COSE -7). */
-export const ENROLLMENT_ALGORITHM = -7;
+const ENROLLMENT_ALGORITHM = -7;
 
 const FLAG_USER_PRESENT = 0x01;
 const FLAG_USER_VERIFIED = 0x04;
