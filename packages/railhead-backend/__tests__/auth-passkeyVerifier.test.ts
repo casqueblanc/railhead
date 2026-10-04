@@ -252,6 +252,30 @@ describe("actionChallenge", () => {
       { kind: "decision.record", decisionId: "dec_1", option: "a", expectedVersion: null },
       { kind: "decision.record", decisionId: "dec_1", option: "a", expectedVersion: 0 },
       { kind: "decision.record", decisionId: "dec_1", option: "b", expectedVersion: 0 },
+      {
+        kind: "check.approve",
+        checkRunId: "chk_1",
+        candidate: "a".repeat(40),
+        digest: "c".repeat(64),
+      },
+      {
+        kind: "check.approve",
+        checkRunId: "chk_2",
+        candidate: "a".repeat(40),
+        digest: "c".repeat(64),
+      },
+      {
+        kind: "check.approve",
+        checkRunId: "chk_1",
+        candidate: "b".repeat(40),
+        digest: "c".repeat(64),
+      },
+      {
+        kind: "check.approve",
+        checkRunId: "chk_1",
+        candidate: "a".repeat(40),
+        digest: "d".repeat(64),
+      },
     ];
     const seen = new Set([challenge]);
     for (const other of actions) seen.add(await challengeFor({ ...binding, action: other }));

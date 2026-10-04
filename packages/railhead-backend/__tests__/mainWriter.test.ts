@@ -2,7 +2,6 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
-  EVENT_SCHEMA_VERSION,
   type ClaimId,
   type CommitSha,
   type DecisionRef,
@@ -319,7 +318,7 @@ function mainEvent(
   at: number = NOW,
 ): unknown {
   return {
-    v: EVENT_SCHEMA_VERSION,
+    v: 1,
     seq,
     at,
     repo: REPO,

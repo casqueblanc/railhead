@@ -7,6 +7,7 @@ import { enrollmentEntry } from "../../features/enrollment/entry";
 import { issuesEntry } from "../../features/issues/entry";
 import { metricsEntry } from "../../features/metrics/entry";
 import { phoneEntry } from "../../features/phone/entry";
+import { heldChecksEntry } from "../../features/train/heldEntry";
 import { TrainOutcomes } from "../../features/train/TrainOutcomes";
 import { BoardUnavailable } from "./BoardUnavailable";
 import { FeatureSlot } from "./FeatureSlot";
@@ -20,6 +21,7 @@ interface HomePageProps {
 const SECTIONS = [
   { id: "questions", label: "Questions" },
   { id: "claims", label: "Claims" },
+  { id: "held", label: "Held checks" },
   { id: "train", label: "Train" },
   { id: "agents", label: "Agents" },
   { id: "issues", label: "Issues" },
@@ -38,7 +40,7 @@ const Anchor = ({ id, children }: { id: SectionId; children: ReactNode }) => (
 );
 
 /**
- * The board: questions, claim lanes and train outcomes first, then each leaf feature in its fixed
+ * The board: questions, claim lanes, held checks and train outcomes first, then each leaf feature in its fixed
  * slot. The page gets its data and actions only through `ports`.
  */
 export const HomePage = ({ ports }: HomePageProps) => {
@@ -74,6 +76,14 @@ export const HomePage = ({ ports }: HomePageProps) => {
           </Anchor>
           <Anchor id="claims">
             <ClaimLanes feed={feed} onRetry={onReconnect} />
+          </Anchor>
+          <Anchor id="held">
+            <FeatureSlot
+              entry={heldChecksEntry}
+              props={{ feed, owner, enrollment, onRetry: onReconnect }}
+              title="Held checks"
+              unavailable="This board cannot approve held checks yet."
+            />
           </Anchor>
           <Anchor id="train">
             <TrainOutcomes feed={feed} checks={checks} onRetry={onReconnect} />

@@ -30,6 +30,7 @@ import {
   type CheckRunParams,
 } from "../src/checks/workflow";
 import { fail, ok, type PortResult } from "../src/contracts/result";
+import type { GrantFor } from "../src/contracts/principals";
 import { unavailableChecks } from "../src/contracts/unavailable";
 import type { CheckAttempt, CheckPort, CheckReport } from "../src/contracts/train";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
@@ -40,7 +41,7 @@ import {
   recordCandidate,
   requestCheck,
 } from "../src/modules/train/store";
-import { CHECK_DEADLINE_MS, createTrain } from "../src/modules/train/scheduler";
+import { CHECK_DEADLINE_MS, createTrain, HELD_PARK_TTL_MS } from "../src/modules/train/scheduler";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { MAX_SANDBOX_LIFETIME_MS, type Admission } from "../src/sandbox/admission";
 import type { SandboxPolicy } from "../src/sandbox/policy";
@@ -54,6 +55,8 @@ const NOW = 1_800_000_000_000;
 const HOST = `${"0".repeat(32)}.artifacts.cloudflare.net`;
 const MAIN_REPO = "rh-m-main";
 const SANDBOX = `sbx-${"f".repeat(32)}`;
+const CLAIM = "clm_heldpin01";
+const OWNER_ID = "usr_lemarier";
 const COMMAND = "pnpm test";
 
 const encoder = new TextEncoder();
@@ -273,6 +276,12 @@ class World {
     });
   recorded: PortResult<CheckAttempt> | null = null;
   createFails = false;
+  /** Attempts returned to the train, and whether the train still holds the next one. */
+  released: string[] = [];
+  trainHolds = true;
+  /** Held attempts the train may still run, which the attempt table keeps. */
+  heldByTrain = new Set<string>();
+  resumes = 0;
 }
 
 interface Harness {
@@ -280,6 +289,8 @@ interface Harness {
   repository: FakeRepository;
   world: World;
   attempts: AttemptTable;
+  /** The repository's event log. */
+  log: EventLog;
   /** The object's SQL storage. */
   sql: SqlStorage;
   /** Whether the Worker is configured for checks; when not, `main` is `null`. */
@@ -291,10 +302,11 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
   const stub = env.REPO.getByName(crypto.randomUUID());
   return runInDurableObject(stub, async (_instance, state) => {
     const repoId = `rep_${"9".repeat(64)}`;
+    const log = EventLog.open(state.storage, repoId);
     const context: RepoContext = {
       repoId,
       storage: state.storage,
-      log: EventLog.open(state.storage, repoId),
+      log,
       clock: () => NOW,
       env,
       wake: async () => true,
@@ -330,6 +342,14 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
           world.reports.push(report);
           return world.recorded ?? ok(await attempt());
         },
+        release: (attemptId) => {
+          if (world.trainHolds) world.released.push(attemptId);
+          return world.trainHolds;
+        },
+        holds: (attemptId) => world.heldByTrain.has(attemptId),
+        resume: async () => {
+          world.resumes += 1;
+        },
       },
     });
     let configured = true;
@@ -339,10 +359,11 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       host: HOST,
       reader: repository,
     };
-    const attempts = new AttemptTable(state.storage);
+    const attempts = new AttemptTable(state.storage, (attemptId) => ports().train.holds(attemptId));
     const checks = createChecks({
       repoId,
       attempts,
+      log,
       main: async () => (configured ? source : null),
       runs: {
         create: async (id, params) => {
@@ -358,6 +379,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
       repository,
       world,
       attempts,
+      log,
       sql: state.storage.sql,
       configure: (value) => {
         configured = value;
@@ -374,7 +396,7 @@ async function attempt(fields: Partial<CheckAttempt> = {}): Promise<CheckAttempt
     attemptId: ATTEMPT,
     expectedMain: MAIN,
     candidate: CANDIDATE,
-    pins: [],
+    pins: [{ claimId: CLAIM, generation: 1, commit: OTHER, episode: 1 }],
     definition: check.definition,
     decisions: [],
     createdAt: NOW,
@@ -522,6 +544,7 @@ describe("checks.start", () => {
       expect(attempts.get(ATTEMPT)?.state).toEqual({
         kind: "held",
         paths: [CHECK_DEFINITION_PATH],
+        digest: await digestOf(definitionText({ command: "true" })),
       });
       // A repeat stays held without reading the candidate again.
       expect(await checks.start(await attempt())).toEqual(held);
@@ -538,7 +561,11 @@ describe("checks.start", () => {
       });
 
       expect((await checks.start(await attempt())).ok).toBe(false);
-      expect(attempts.get(ATTEMPT)?.state).toEqual({ kind: "held", paths: ["acceptance"] });
+      expect(attempts.get(ATTEMPT)?.state).toEqual({
+        kind: "held",
+        paths: ["acceptance"],
+        digest: await digestOf(definitionText()),
+      });
       expect(world.created).toEqual([]);
     });
   });
@@ -593,6 +620,278 @@ describe("checks.start", () => {
       expect(await checks.start(base)).toEqual(
         fail("unavailable", "Checks have no Artifacts repository."),
       );
+    });
+  });
+});
+
+/** SHA-256 of a definition's text, as the checks module digests its bytes. */
+function digestOf(text: string): Promise<string> {
+  return sha256Hex(encoder.encode(text));
+}
+
+/** The owner's grant approving `fields`, over the fixture attempt and candidate by default. */
+function approval(
+  digest: string,
+  fields: Partial<GrantFor<"check.approve">> = {},
+): GrantFor<"check.approve"> {
+  return {
+    kind: "human",
+    userId: OWNER_ID,
+    repoId: `rep_${"9".repeat(64)}`,
+    grantId: "pkc_first",
+    action: { kind: "check.approve", checkRunId: ATTEMPT, candidate: CANDIDATE, digest },
+    ...fields,
+  };
+}
+
+/** The types and data of every event in `log`. */
+function loggedEvents(log: EventLog): { type: string; actor: string; data: unknown }[] {
+  return log.replay(0, 100).events.map((event) => ({
+    type: event.type,
+    actor: event.actor.id,
+    data: event.data,
+  }));
+}
+
+/** Holds the fixture attempt on a candidate that rewrites its command; returns that digest. */
+async function heldOnRewrite(harness: Harness): Promise<string> {
+  const text = definitionText({ command: "true" });
+  harness.repository.commit(CANDIDATE, {
+    [CHECK_DEFINITION_PATH]: text,
+    "acceptance/a.test.ts": "expect(413)",
+  });
+  await harness.checks.start(await attempt());
+  return digestOf(text);
+}
+
+describe("checks.approve", () => {
+  it("records the approval with its event, returns the attempt and runs the candidate's definition", async () => {
+    await withChecks(async (harness) => {
+      const { checks, world, attempts, log } = harness;
+      const digest = await heldOnRewrite(harness);
+
+      expect(await checks.approve(approval(digest))).toEqual(ok({ checkRunId: ATTEMPT }));
+      expect(attempts.get(ATTEMPT)?.approval).toEqual({
+        userId: OWNER_ID,
+        grantId: "pkc_first",
+        digest,
+        approvedAt: NOW,
+      });
+      expect(world.released).toEqual([ATTEMPT]);
+      expect(world.resumes).toBe(1);
+      expect(loggedEvents(log)).toEqual([
+        {
+          type: "train.held",
+          actor: "sys_checks",
+          data: {
+            checkRunId: ATTEMPT,
+            expectedMain: MAIN,
+            candidate: CANDIDATE,
+            claims: [CLAIM],
+            paths: [CHECK_DEFINITION_PATH],
+            digest,
+          },
+        },
+        {
+          type: "check.approved",
+          actor: OWNER_ID,
+          data: { checkRunId: ATTEMPT, candidate: CANDIDATE, digest },
+        },
+      ]);
+
+      // The train asks again: the approved attempt runs the candidate's command, under the
+      // attempt's own identity, so its report still matches.
+      const mainDigest = (await attempt()).definition.digest;
+      expect(await checks.start(await attempt())).toEqual(ok({ attemptId: ATTEMPT }));
+      expect(world.created.map(({ params }) => [params.command, params.digest])).toEqual([
+        ["true", mainDigest],
+      ]);
+      expect(attempts.get(ATTEMPT)?.state).toEqual({
+        kind: "started",
+        sandbox: SANDBOX,
+        deadline: NOW + Math.min(MAX_SANDBOX_LIFETIME_MS, 600_000 + RUN_OVERHEAD_MS),
+      });
+      const reported = await checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest: mainDigest,
+        result: "pass",
+        log: "ok",
+        finishedAt: NOW,
+      });
+      expect(reported.ok).toBe(true);
+      expect(attempts.get(ATTEMPT)?.approval?.digest).toBe(digest);
+    });
+  });
+
+  it("answers a repeat of the recorded grant as the first, and refuses any other grant", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      await harness.checks.approve(approval(digest));
+
+      expect(await harness.checks.approve(approval(digest))).toEqual(ok({ checkRunId: ATTEMPT }));
+      const other = await harness.checks.approve(approval(digest, { grantId: "pkc_second" }));
+      expect(other.ok ? null : other.code).toBe("action_stale");
+      expect(harness.world.released).toEqual([ATTEMPT]);
+      expect(loggedEvents(harness.log).map((event) => event.type)).toEqual([
+        "train.held",
+        "check.approved",
+      ]);
+    });
+  });
+
+  it("answers a repeat of the recorded grant after the attempt started and after it reported", async () => {
+    await withChecks(async (harness) => {
+      const { checks, attempts, world, log } = harness;
+      const digest = await heldOnRewrite(harness);
+      await checks.approve(approval(digest));
+      const mainDigest = (await attempt()).definition.digest;
+      expect(await checks.start(await attempt())).toEqual(ok({ attemptId: ATTEMPT }));
+      expect(attempts.get(ATTEMPT)?.state.kind).toBe("started");
+
+      expect(await checks.approve(approval(digest))).toEqual(ok({ checkRunId: ATTEMPT }));
+      const otherWhileStarted = await checks.approve(approval(digest, { grantId: "pkc_second" }));
+      expect(otherWhileStarted.ok ? null : otherWhileStarted.code).toBe("action_stale");
+
+      const reported = await checks.report({
+        attemptId: ATTEMPT,
+        candidate: CANDIDATE,
+        digest: mainDigest,
+        result: "pass",
+        log: "ok",
+        finishedAt: NOW,
+      });
+      expect(reported.ok).toBe(true);
+      expect(attempts.get(ATTEMPT)?.state.kind).toBe("reported");
+
+      expect(await checks.approve(approval(digest))).toEqual(ok({ checkRunId: ATTEMPT }));
+      const otherWhileReported = await checks.approve(approval(digest, { grantId: "pkc_second" }));
+      expect(otherWhileReported.ok ? null : otherWhileReported.code).toBe("action_stale");
+      // A repeat records nothing more and returns nothing to the train again.
+      expect(attempts.get(ATTEMPT)?.approval?.grantId).toBe("pkc_first");
+      expect(world.released).toEqual([ATTEMPT]);
+      expect(loggedEvents(log).map((event) => event.type)).toEqual([
+        "train.held",
+        "check.approved",
+      ]);
+    });
+  });
+
+  it("refuses a digest that is not the held definition's, approving nothing", async () => {
+    await withChecks(async (harness) => {
+      await heldOnRewrite(harness);
+      const stale = await harness.checks.approve(approval(await digestOf(definitionText())));
+
+      expect(stale.ok ? null : stale.code).toBe("action_stale");
+      expect(harness.attempts.get(ATTEMPT)?.approval).toBeNull();
+      expect(harness.world.released).toEqual([]);
+      expect(loggedEvents(harness.log).map((event) => event.type)).toEqual(["train.held"]);
+    });
+  });
+
+  it("refuses when the candidate's definition read at the time of use is not the one named", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      harness.repository.commit(CANDIDATE, {
+        [CHECK_DEFINITION_PATH]: definitionText({ command: "rm -rf /" }),
+        "acceptance/a.test.ts": "expect(413)",
+      });
+
+      const stale = await harness.checks.approve(approval(digest));
+      expect(stale.ok ? null : stale.code).toBe("action_stale");
+      expect(harness.attempts.get(ATTEMPT)?.approval).toBeNull();
+      expect(harness.world.released).toEqual([]);
+    });
+  });
+
+  it("refuses when the train no longer holds the attempt, recording nothing", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      harness.world.trainHolds = false;
+
+      const stale = await harness.checks.approve(approval(digest));
+      expect(stale.ok ? null : stale.code).toBe("action_stale");
+      expect(harness.attempts.get(ATTEMPT)?.approval).toBeNull();
+      expect(harness.world.resumes).toBe(0);
+      expect(loggedEvents(harness.log).map((event) => event.type)).toEqual(["train.held"]);
+      // Still held: the next start refuses without running.
+      expect((await harness.checks.start(await attempt())).ok).toBe(false);
+      expect(harness.world.created).toEqual([]);
+    });
+  });
+
+  it("refuses an attempt that is not held, and a candidate with no valid definition", async () => {
+    await withChecks(async (harness) => {
+      // Not held: an ordinary candidate starts at once.
+      await harness.checks.start(await attempt());
+      const running = await harness.checks.approve(approval(await digestOf(definitionText())));
+      expect(running.ok ? null : running.code).toBe("action_stale");
+    });
+    await withChecks(async (harness) => {
+      // The candidate deletes its definition: held with nothing to approve.
+      harness.repository.commit(CANDIDATE, { "acceptance/a.test.ts": "expect(413)" });
+      await harness.checks.start(await attempt());
+      expect(harness.attempts.get(ATTEMPT)?.state).toEqual({
+        kind: "held",
+        paths: [CHECK_DEFINITION_PATH],
+        digest: null,
+      });
+      const none = await harness.checks.approve(approval(await digestOf(definitionText())));
+      expect(none.ok ? null : none.code).toBe("action_stale");
+      expect(harness.world.released).toEqual([]);
+    });
+  });
+
+  it("refuses a grant for another repository, action or malformed digest before reading", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      const reads = harness.repository.reads;
+      const action = approval(digest).action;
+      for (const grant of [
+        approval(digest, { repoId: `rep_${"8".repeat(64)}` }),
+        approval(digest, { grantId: "" }),
+        approval(digest, { action: { ...action, digest: digest.toUpperCase() } }),
+        approval(digest, { action: { ...action, candidate: "main" } }),
+        approval(digest, { action: { ...action, checkRunId: "int_merge01" } }),
+      ]) {
+        const refused = await harness.checks.approve(grant);
+        expect(refused.ok ? null : refused.code).toBe("invalid_request");
+      }
+      expect(harness.repository.reads).toBe(reads);
+      expect(harness.attempts.get(ATTEMPT)?.approval).toBeNull();
+    });
+  });
+
+  it("refuses as unavailable when the definition cannot be read, approving nothing", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      harness.repository.failing = true;
+
+      const refused = await harness.checks.approve(approval(digest));
+      expect(refused.ok ? null : refused.code).toBe("unavailable");
+      harness.configure(false);
+      harness.repository.failing = false;
+      const unconfigured = await harness.checks.approve(approval(digest));
+      expect(unconfigured.ok ? null : unconfigured.code).toBe("unavailable");
+      expect(harness.attempts.get(ATTEMPT)?.approval).toBeNull();
+      expect(harness.world.released).toEqual([]);
+    });
+  });
+
+  it("runs nothing when the approved definition no longer reads back with its digest", async () => {
+    await withChecks(async (harness) => {
+      const digest = await heldOnRewrite(harness);
+      await harness.checks.approve(approval(digest));
+      harness.repository.commit(CANDIDATE, {
+        [CHECK_DEFINITION_PATH]: definitionText({ command: "curl evil" }),
+        "acceptance/a.test.ts": "expect(413)",
+      });
+
+      const refused = await harness.checks.start(await attempt());
+      expect(refused.ok ? null : refused.code).toBe("check_mismatch");
+      expect(harness.world.admissions).toEqual([]);
+      expect(harness.world.created).toEqual([]);
+      expect(harness.attempts.get(ATTEMPT)?.state.kind).toBe("held");
     });
   });
 });
@@ -957,11 +1256,47 @@ describe("the attempt table", () => {
       // A run whose sandbox deadline is still ahead may yet report.
       attempts.start(identity(0), COMMAND, SANDBOX, NOW, 0);
       for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1)
-        attempts.hold(identity(i), COMMAND, ["a"], i);
+        attempts.hold(identity(i), COMMAND, ["a"], null, i);
 
       expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
       expect(attempts.get(identity(1).attemptId)).toBeNull();
       expect(attempts.get(identity(MAX_STORED_ATTEMPTS).attemptId)?.state.kind).toBe("held");
+    });
+  });
+
+  it("keeps a held attempt while the train may still run it, then drops it like a settled one", async () => {
+    await withChecks(async ({ attempts, world }) => {
+      const ids: string[] = [];
+      for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1) {
+        attempts.hold(identity(i), COMMAND, ["a"], null, i);
+        ids.push(identity(i).attemptId);
+      }
+      world.heldByTrain.add(identity(1).attemptId);
+
+      // The oldest attempt is the train's: the next oldest goes instead, and the bound holds.
+      attempts.hold(
+        identity(MAX_STORED_ATTEMPTS + 1),
+        COMMAND,
+        ["a"],
+        null,
+        MAX_STORED_ATTEMPTS + 1,
+      );
+      expect(attempts.get(identity(1).attemptId)?.state.kind).toBe("held");
+      expect(attempts.get(identity(2).attemptId)).toBeNull();
+      ids.push(identity(MAX_STORED_ATTEMPTS + 1).attemptId);
+      expect(rowCount(attempts, ids)).toBe(MAX_STORED_ATTEMPTS);
+
+      // Once the train no longer holds it, it is the oldest settled attempt again.
+      world.heldByTrain.clear();
+      attempts.hold(
+        identity(MAX_STORED_ATTEMPTS + 2),
+        COMMAND,
+        ["a"],
+        null,
+        MAX_STORED_ATTEMPTS + 2,
+      );
+      expect(attempts.get(identity(1).attemptId)).toBeNull();
+      expect(attempts.get(identity(3).attemptId)?.state.kind).toBe("held");
     });
   });
 
@@ -984,15 +1319,15 @@ describe("the attempt table", () => {
     await withChecks(async ({ attempts }) => {
       attempts.start(identity(0), COMMAND, SANDBOX, NOW, NOW);
       for (let i = 1; i < MAX_STORED_ATTEMPTS; i += 1)
-        attempts.hold(identity(i), COMMAND, ["a"], NOW + i);
+        attempts.hold(identity(i), COMMAND, ["a"], null, NOW + i);
 
       // At one millisecond before the window closes, a held attempt goes instead.
-      attempts.hold(identity(MAX_STORED_ATTEMPTS), COMMAND, ["a"], NOW + REPORT_GRACE_MS - 1);
+      attempts.hold(identity(MAX_STORED_ATTEMPTS), COMMAND, ["a"], null, NOW + REPORT_GRACE_MS - 1);
       expect(attempts.get(identity(0).attemptId)?.state.kind).toBe("started");
       expect(attempts.get(identity(1).attemptId)).toBeNull();
 
       // Once it has closed, the abandoned run is the oldest settled attempt.
-      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), COMMAND, ["a"], NOW + REPORT_GRACE_MS);
+      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), COMMAND, ["a"], null, NOW + REPORT_GRACE_MS);
       expect(attempts.get(identity(0).attemptId)).toBeNull();
     });
   });
@@ -1002,7 +1337,7 @@ describe("the attempt table", () => {
       const digest = await started(harness);
       const late = NOW + 2 * REPORT_GRACE_MS;
       for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1)
-        harness.attempts.hold(identity(i), COMMAND, ["a"], late);
+        harness.attempts.hold(identity(i), COMMAND, ["a"], null, late);
 
       const result = await harness.checks.report({
         attemptId: ATTEMPT,
@@ -1099,7 +1434,7 @@ async function startedRepository(): Promise<{
   const digest = "d".repeat(64);
   await runInDurableObject(stub, async (_instance, state) => {
     const now = Date.now();
-    new AttemptTable(state.storage).start(
+    new AttemptTable(state.storage, () => false).start(
       { attemptId, candidate: CANDIDATE, expectedMain: MAIN, digest },
       COMMAND,
       SANDBOX,
@@ -1167,7 +1502,7 @@ async function trainResults(stub: DurableObjectStub<Repo>, attemptId: string): P
 async function storedState(stub: DurableObjectStub<Repo>, attemptId: string) {
   return runInDurableObject(
     stub,
-    async (_instance, state) => new AttemptTable(state.storage).get(attemptId)?.state,
+    async (_instance, state) => new AttemptTable(state.storage, () => false).get(attemptId)?.state,
   );
 }
 
@@ -1493,7 +1828,7 @@ describe("a held check through the train", () => {
         readsAgain,
         batches: train.batches(3),
         entry: train.entries(1)[0],
-        held: new AttemptTable(state.storage).get(first?.attemptId ?? "")?.state,
+        held: new AttemptTable(state.storage, () => false).get(first?.attemptId ?? "")?.state,
       };
     });
 
@@ -1508,7 +1843,11 @@ describe("a held check through the train", () => {
     // No backoff: the only wake asked for while held is the attempt's deadline.
     expect(seen.wakeWhileHeld).toBe(seen.first?.checkDeadline);
     expect(seen.readsAgain).toBe(seen.reads);
-    expect(seen.held).toEqual({ kind: "held", paths: [CHECK_DEFINITION_PATH] });
+    expect(seen.held).toEqual({
+      kind: "held",
+      paths: [CHECK_DEFINITION_PATH],
+      digest: await digestOf(definitionText({ command: "true" })),
+    });
     // Past the deadline the held batch fails as held. The pin, held alone, is parked out of the
     // queue with its pin kept: no new batch holds it again, no retry is counted, nothing is dropped.
     expect(seen.batches.map((batch) => [batch.state, batch.failure])).toEqual([
@@ -1520,5 +1859,363 @@ describe("a held check through the train", () => {
     // Nothing ran: no sandbox admitted and started, no Workflow created.
     expect(starts).toEqual([]);
     expect(creates).toEqual([]);
+  });
+  it.each([
+    { hold: "parked", fill: false },
+    { hold: "parked", fill: true },
+    { hold: "active", fill: true },
+  ] as const)(
+    "runs a $hold pin's candidate definition once the owner approves it, on the same attempt (table filled: $fill)",
+    async ({ hold, fill }) => {
+      const { stub, repoId } = await initializedRepository();
+      const repository = new FakeRepository();
+      repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: definitionText() });
+      const rewritten = definitionText({ command: "true" });
+      repository.commit(CANDIDATE, { [CHECK_DEFINITION_PATH]: rewritten });
+      const { configured, starts } = heldEnvironment(repository);
+      const pin = { claimId: "clm_heldpin01", generation: 1, commit: OTHER };
+      const digest = await digestOf(rewritten);
+
+      const seen = await runInDurableObject(stub, async (_instance, state) => {
+        let now = NOW;
+        const log = EventLog.open(state.storage, repoId);
+        const context: RepoContext = {
+          repoId,
+          storage: state.storage,
+          log,
+          clock: () => now,
+          env: configured,
+          wake: async () => true,
+        };
+        const composed = composeRepo(context);
+        const created: CheckRunParams[] = [];
+        const attempts = new AttemptTable(state.storage, (attemptId) =>
+          ports().train.holds(attemptId),
+        );
+        const checks = createChecks({
+          repoId,
+          attempts,
+          log,
+          main: async () => ({
+            name: MAIN_REPO,
+            namespace: "railhead",
+            host: HOST,
+            reader: repository,
+          }),
+          runs: { create: async (_id, params) => void created.push(params) },
+          clock: () => now,
+          ports: () => ports(),
+        });
+        let composes = 0;
+        const ports = (): RepoPorts => ({
+          ...composed,
+          claims: {
+            ...composed.claims,
+            pin: async () => ok(pin),
+            currentGeneration: () => pin.generation,
+            readyPin: () => ({ pin, episode: 1, decisions: [] }),
+          },
+          decisions: {
+            ...composed.decisions,
+            requirements: async () => ok([]),
+            currentVersions: () => [],
+          },
+          mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
+          merge: {
+            compose: async () => {
+              composes += 1;
+              return ok({ kind: "clean", candidate: CANDIDATE });
+            },
+            discard: async () => ok({ removed: 0 }),
+          },
+          checks,
+          train,
+        });
+        const train = queueing(createTrain(context, ports), log);
+
+        await train.enqueue(pin, 1);
+        const held = train.batches(1)[0];
+        if (hold === "parked") {
+          now = (held?.checkDeadline ?? NOW) + 1;
+          await train.drive();
+        }
+        const waiting = train.entries(1)[0]?.state;
+        const heldId = held?.attemptId ?? "";
+        // More attempts than the table keeps, all recorded after the held one.
+        if (fill) {
+          for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1) {
+            attempts.hold(identity(i), COMMAND, ["a"], null, now + i);
+          }
+        }
+        const kept = attempts.get(heldId)?.state.kind;
+        const oldestFiller = attempts.get(identity(1).attemptId);
+        const grant: GrantFor<"check.approve"> = {
+          ...approval(digest),
+          repoId,
+          action: {
+            kind: "check.approve",
+            checkRunId: held?.attemptId ?? "",
+            candidate: CANDIDATE,
+            digest,
+          },
+        };
+        const approved = await checks.approve(grant);
+        return {
+          held,
+          waiting,
+          kept,
+          oldestFiller,
+          approved,
+          composes,
+          created,
+          batch: train.batches(1)[0],
+          entry: train.entries(1)[0]?.state,
+          events: log.replay(0, 100).events.map((event) => event.type),
+        };
+      });
+
+      expect(seen.waiting).toBe(hold === "parked" ? "parked" : "batched");
+      // The table kept the held attempt the train may still run, and dropped an older filler instead.
+      expect(seen.kept).toBe("held");
+      if (fill) expect(seen.oldestFiller).toBeNull();
+      expect(seen.approved).toEqual(ok({ checkRunId: seen.held?.attemptId }));
+      // The batch came back on its own candidate and attempt; nothing was composed again.
+      expect(seen.composes).toBe(1);
+      expect(seen.batch).toMatchObject({
+        batchId: seen.held?.batchId,
+        state: "checking",
+        attemptId: seen.held?.attemptId,
+        candidate: CANDIDATE,
+        checkStarted: true,
+      });
+      expect(seen.entry).toBe("batched");
+      // It runs the approved command, under the attempt's identity on main's definition.
+      expect(
+        seen.created.map((params) => [params.attemptId, params.command, params.digest]),
+      ).toEqual([[seen.held?.attemptId, "true", seen.held?.definition.digest]]);
+      expect(starts).toHaveLength(1);
+      expect(seen.events).toEqual(["train.held", "check.approved"]);
+    },
+  );
+
+  it("refuses an approval once a newer generation superseded the parked pin, changing nothing", async () => {
+    const { stub, repoId } = await initializedRepository();
+    const repository = new FakeRepository();
+    repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: definitionText() });
+    const rewritten = definitionText({ command: "true" });
+    repository.commit(CANDIDATE, { [CHECK_DEFINITION_PATH]: rewritten });
+    // The next generation's candidate leaves the definition alone, so it runs at once.
+    const NEXT = "4".repeat(40);
+    repository.commit(NEXT, { [CHECK_DEFINITION_PATH]: definitionText() });
+    const { configured } = heldEnvironment(repository);
+    const first = { claimId: "clm_heldpin01", generation: 1, commit: OTHER };
+    const second = { claimId: "clm_heldpin01", generation: 2, commit: "5".repeat(40) };
+    const digest = await digestOf(rewritten);
+
+    const seen = await runInDurableObject(stub, async (_instance, state) => {
+      let now = NOW;
+      let current = first;
+      const log = EventLog.open(state.storage, repoId);
+      const context: RepoContext = {
+        repoId,
+        storage: state.storage,
+        log,
+        clock: () => now,
+        env: configured,
+        wake: async () => true,
+      };
+      const composed = composeRepo(context);
+      const attempts = new AttemptTable(state.storage, (attemptId) =>
+        ports().train.holds(attemptId),
+      );
+      const checks = createChecks({
+        repoId,
+        attempts,
+        log,
+        main: async () => ({
+          name: MAIN_REPO,
+          namespace: "railhead",
+          host: HOST,
+          reader: repository,
+        }),
+        runs: { create: async () => {} },
+        clock: () => now,
+        ports: () => ports(),
+      });
+      const ports = (): RepoPorts => ({
+        ...composed,
+        claims: {
+          ...composed.claims,
+          pin: async () => ok(current),
+          currentGeneration: () => current.generation,
+          readyPin: () => ({ pin: current, episode: current.generation, decisions: [] }),
+        },
+        decisions: {
+          ...composed.decisions,
+          requirements: async () => ok([]),
+          currentVersions: () => [],
+        },
+        mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
+        merge: {
+          compose: async (_main, pins) =>
+            ok({ kind: "clean", candidate: pins[0]?.generation === 2 ? NEXT : CANDIDATE }),
+          discard: async () => ok({ removed: 0 }),
+        },
+        checks,
+        train,
+      });
+      const train = queueing(createTrain(context, ports), log);
+
+      await train.enqueue(first, 1);
+      const held = train.batches(1)[0];
+      now = (held?.checkDeadline ?? NOW) + 1;
+      await train.drive();
+      const parked = train.entries(1)[0]?.state;
+      const heldId = held?.attemptId ?? "";
+      const holdsWhileParked = train.holds(heldId);
+
+      // A new push supersedes the parked generation before anyone approves it.
+      current = second;
+      await train.enqueue(second, 2);
+      const snapshot = () => ({
+        attempt: attempts.get(heldId),
+        batches: train.batches(8),
+        entries: train.entries(8),
+        events: log.replay(0, 100).events.map((event) => event.type),
+      });
+      const before = snapshot();
+      const approved = await checks.approve({
+        ...approval(digest),
+        repoId,
+        action: { kind: "check.approve", checkRunId: heldId, candidate: CANDIDATE, digest },
+      });
+      return {
+        parked,
+        holdsWhileParked,
+        holdsAfter: train.holds(heldId),
+        before,
+        approved,
+        after: snapshot(),
+      };
+    });
+
+    expect(seen.parked).toBe("parked");
+    expect(seen.holdsWhileParked).toBe(true);
+    expect(seen.holdsAfter).toBe(false);
+    expect(seen.approved).toEqual(
+      fail("action_stale", "The train no longer holds that check; nothing changed."),
+    );
+    // No approval recorded, no event, and neither the train nor the attempt moved.
+    expect(seen.after).toEqual(seen.before);
+    expect(seen.after.attempt?.state.kind).toBe("held");
+    expect(seen.after.attempt?.approval).toBeNull();
+    expect(seen.after.events).not.toContain("check.approved");
+    expect(seen.after.entries.map((entry) => [entry.pin.generation, entry.state])).toContainEqual([
+      1,
+      "parked",
+    ]);
+  });
+
+  it("prunes an expired parked pin's attempt past the bound and refuses its approval", async () => {
+    const { stub, repoId } = await initializedRepository();
+    const repository = new FakeRepository();
+    repository.commit(MAIN, { [CHECK_DEFINITION_PATH]: definitionText() });
+    const rewritten = definitionText({ command: "true" });
+    repository.commit(CANDIDATE, { [CHECK_DEFINITION_PATH]: rewritten });
+    const { configured } = heldEnvironment(repository);
+    const pin = { claimId: "clm_heldpin01", generation: 1, commit: OTHER };
+    const digest = await digestOf(rewritten);
+
+    const seen = await runInDurableObject(stub, async (_instance, state) => {
+      let now = NOW;
+      const log = EventLog.open(state.storage, repoId);
+      const context: RepoContext = {
+        repoId,
+        storage: state.storage,
+        log,
+        clock: () => now,
+        env: configured,
+        wake: async () => true,
+      };
+      const composed = composeRepo(context);
+      const attempts = new AttemptTable(state.storage, (attemptId) =>
+        ports().train.holds(attemptId),
+      );
+      const checks = createChecks({
+        repoId,
+        attempts,
+        log,
+        main: async () => ({
+          name: MAIN_REPO,
+          namespace: "railhead",
+          host: HOST,
+          reader: repository,
+        }),
+        runs: { create: async () => {} },
+        clock: () => now,
+        ports: () => ports(),
+      });
+      const ports = (): RepoPorts => ({
+        ...composed,
+        claims: {
+          ...composed.claims,
+          pin: async () => ok(pin),
+          currentGeneration: () => pin.generation,
+          readyPin: () => ({ pin, episode: 1, decisions: [] }),
+        },
+        decisions: {
+          ...composed.decisions,
+          requirements: async () => ok([]),
+          currentVersions: () => [],
+        },
+        mainWriter: { ...composed.mainWriter, head: async () => ok(MAIN) },
+        merge: {
+          compose: async () => ok({ kind: "clean", candidate: CANDIDATE }),
+          discard: async () => ok({ removed: 0 }),
+        },
+        checks,
+        train,
+      });
+      const train = queueing(createTrain(context, ports), log);
+
+      await train.enqueue(pin, 1);
+      const heldId = train.batches(1)[0]?.attemptId ?? "";
+      now = (train.batches(1)[0]?.checkDeadline ?? NOW) + 1;
+      await train.drive();
+      const parked = train.entries(1)[0]?.state;
+      // A full table keeps the attempt while the train may still run it.
+      for (let i = 1; i <= MAX_STORED_ATTEMPTS; i += 1) {
+        attempts.hold(identity(i), COMMAND, ["a"], null, now + i);
+      }
+      const keptWhileParked = attempts.get(heldId)?.state.kind;
+
+      now += HELD_PARK_TTL_MS;
+      await train.resume();
+      const entry = train.entries(1)[0];
+      attempts.hold(identity(MAX_STORED_ATTEMPTS + 1), COMMAND, ["a"], null, now);
+      const approved = await checks.approve({
+        ...approval(digest),
+        repoId,
+        action: { kind: "check.approve", checkRunId: heldId, candidate: CANDIDATE, digest },
+      });
+      return {
+        parked,
+        keptWhileParked,
+        entry,
+        afterExpiry: attempts.get(heldId),
+        approved,
+        events: log.replay(0, 100).events.map((event) => event.type),
+      };
+    });
+
+    expect(seen.parked).toBe("parked");
+    expect(seen.keptWhileParked).toBe("held");
+    expect(seen.entry).toMatchObject({ state: "dropped", reason: "held_expired" });
+    // Expired, it was the oldest settled attempt, so the next insert past the bound removed it.
+    expect(seen.afterExpiry).toBeNull();
+    expect(seen.approved).toEqual(
+      fail("action_stale", "That check is no longer held for that definition."),
+    );
+    expect(seen.events).toEqual(["train.held"]);
   });
 });

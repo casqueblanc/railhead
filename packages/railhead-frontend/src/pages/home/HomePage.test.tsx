@@ -25,6 +25,7 @@ vi.mock("../../features/issues/entry", () => ({ issuesEntry: { kind: "unavailabl
 vi.mock("../../features/phone/entry", () => ({ phoneEntry: { kind: "unavailable" } }));
 vi.mock("../../features/app/entry", () => ({ appEntry: { kind: "unavailable" } }));
 vi.mock("../../features/metrics/entry", () => ({ metricsEntry: { kind: "unavailable" } }));
+vi.mock("../../features/train/heldEntry", () => ({ heldChecksEntry: { kind: "unavailable" } }));
 
 const reversal = foldEvents(emptyBoardState(SYNTH_REPO), decisionReversal.events);
 const openQuestion = foldEvents(
@@ -108,6 +109,7 @@ describe("HomePage", () => {
     expect(text()).toContain("Decided");
     expect(sectionHeadings()).toEqual([
       "Claims",
+      "Held checks",
       "Train",
       "Agents",
       "Issues",
@@ -118,13 +120,13 @@ describe("HomePage", () => {
     expect(text()).toContain("Show upload limits");
     const links = [...container.querySelectorAll("nav a")].map((a) => a.getAttribute("href"));
     for (const href of links) expect(container.querySelector(href ?? "")).not.toBeNull();
-    expect(links).toHaveLength(8);
+    expect(links).toHaveLength(9);
   });
 
   it("shows an unavailable state in every slot whose feature is not installed", async () => {
     await render(ports());
 
-    expect(text().match(/Not available\./g)).toHaveLength(5);
+    expect(text().match(/Not available\./g)).toHaveLength(6);
     expect(text()).toContain("This board cannot invite, confirm or revoke agents yet.");
   });
 
@@ -140,7 +142,7 @@ describe("HomePage", () => {
     await render(ports({ connection: "lost" }));
 
     expect(text()).toContain("Enrollment installed");
-    expect(text().match(/Not available\./g)).toHaveLength(4);
+    expect(text().match(/Not available\./g)).toHaveLength(5);
     const last = received.at(-1);
     expect(last && Object.keys(last).toSorted()).toEqual(["enrollment", "feed", "owner"]);
     expect(last?.owner).toEqual({ kind: "unavailable", reason: "offline" });

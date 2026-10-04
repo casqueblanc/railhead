@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RailheadEvent } from "@railhead/shared/events";
+import { eventVersion, type RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { mixedBatch } from "../../../../../fixtures/board/mixedBatch";
@@ -24,6 +24,7 @@ import {
   checkResult,
   decide,
   inbox,
+  intend,
   moveMain,
   push,
   ready,
@@ -53,7 +54,7 @@ const after = (log: SyntheticLog, predicate: (event: RailheadEvent) => boolean):
 
 /** `step` as the next event of `state`'s log. */
 const next = (state: BoardState, step: SyntheticStep): RailheadEvent => ({
-  v: 1,
+  v: eventVersion(step.type),
   seq: state.cursor + 1,
   at: SYNTH_START_MS + state.cursor * 1000,
   repo: SYNTH_REPO,
@@ -172,12 +173,12 @@ describe("foldEvent on events it must not apply", () => {
   it("halts on an unsupported schema version and ignores everything after", () => {
     const newer = {
       ...next(base, { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: UPLOAD.birch } }),
-      v: 2,
+      v: 3,
     };
     const halted = foldEvent(base, newer);
     expect(halted.stream).toEqual({
       kind: "halted",
-      fault: { kind: "unsupported_version", seq, version: 2 },
+      fault: { kind: "unsupported_version", seq, version: 3 },
     });
     expect(halted.cursor).toBe(base.cursor);
     expect(halted.agents).toBe(base.agents);
@@ -283,6 +284,161 @@ describe("foldEvent on events it must not apply", () => {
     const halted = append(pending, moveMain("int_synth01", "updated", synthCommit(9)));
     expect(halted.stream.kind).toBe("halted");
     expect(atlasAdapted(halted)).toBe(false);
+  });
+});
+
+describe("held checks and their approval", () => {
+  const HELD_RUN = "chk_synthheld01";
+  const DIGEST = "d".repeat(64);
+  const held = (
+    digest: string | null = DIGEST,
+    claims: string[] = [UPLOAD.atlasClaim],
+    checkRunId = HELD_RUN,
+  ): SyntheticStep => ({
+    type: "train.held",
+    actor: { kind: "system", id: "sys_checks" },
+    data: {
+      checkRunId,
+      expectedMain: synthCommit(0),
+      candidate: synthCommit(9),
+      claims,
+      paths: [".railhead/check.json", "acceptance"],
+      digest,
+    },
+  });
+  const approved = (digest = DIGEST, candidate = synthCommit(9)): SyntheticStep => ({
+    type: "check.approved",
+    actor: SYNTH_OWNER,
+    data: { checkRunId: HELD_RUN, candidate, digest },
+  });
+  const before = fold(
+    syntheticLog("Synthetic held check", [
+      ...uploadPrelude(),
+      ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), []),
+    ]).events,
+  );
+
+  it("records the held paths and claims, then who approved the definition", () => {
+    const heldState = append(before, held());
+    expect(heldState.heldChecks[HELD_RUN]).toEqual({
+      checkRunId: HELD_RUN,
+      seq: heldState.cursor,
+      expectedMain: synthCommit(0),
+      candidate: synthCommit(9),
+      claims: [UPLOAD.atlasClaim],
+      paths: [".railhead/check.json", "acceptance"],
+      digest: DIGEST,
+      approval: null,
+      ended: null,
+    });
+    const approvedState = append(heldState, approved());
+    expect(approvedState.stream).toEqual({ kind: "consistent" });
+    expect(approvedState.heldChecks[HELD_RUN]?.approval).toEqual({
+      userId: SYNTH_OWNER.id,
+      seq: approvedState.cursor,
+    });
+    // The input state is unchanged by the later fold.
+    expect(heldState.heldChecks[HELD_RUN]?.approval).toBeNull();
+  });
+
+  it.each([
+    ["another definition", () => append(append(before, held()), approved("e".repeat(64)))],
+    ["another candidate", () => append(append(before, held()), approved(DIGEST, synthCommit(8)))],
+    ["a candidate with no definition", () => append(append(before, held(null)), approved())],
+    ["a check that was never held", () => append(before, approved())],
+    ["a second approval", () => append(append(append(before, held()), approved()), approved())],
+    ["a second hold of the same run", () => append(append(before, held()), held())],
+    ["a hold naming an unknown claim", () => append(before, held(DIGEST, ["clm_synthghost"]))],
+  ])("halts on %s", (_name, apply) => {
+    const halted = apply();
+    expect(halted.stream).toMatchObject({ kind: "halted", fault: { kind: "inconsistent" } });
+  });
+
+  const OTHER_RUN = "chk_synthheld02";
+
+  it("ends an older hold once a later attempt holds one of its claims, and no other hold", () => {
+    const both = append(
+      append(before, held(DIGEST, [UPLOAD.atlasClaim, UPLOAD.birchClaim])),
+      held(DIGEST, [UPLOAD.birchClaim], "chk_synthbirch1"),
+    );
+    // The shared hold split: Atlas is held again alone.
+    const split = append(both, held(DIGEST, [UPLOAD.atlasClaim], OTHER_RUN));
+    expect(both.heldChecks[HELD_RUN]?.ended).toEqual({ reason: "superseded", seq: both.cursor });
+    expect(split.heldChecks[HELD_RUN]?.ended).toEqual({ reason: "superseded", seq: both.cursor });
+    expect(split.heldChecks["chk_synthbirch1"]?.ended).toBeNull();
+    expect(split.heldChecks[OTHER_RUN]?.ended).toBeNull();
+  });
+
+  it.each([
+    [
+      "reassigned to a new holder",
+      {
+        type: "claim.reassigned",
+        actor: SYNTH_TRAIN,
+        data: { claimId: UPLOAD.atlasClaim, from: UPLOAD.atlas, to: UPLOAD.birch, generation: 2 },
+      },
+      "superseded",
+    ],
+    ["reopened", reopen([]), "dropped"],
+    [
+      "expired",
+      {
+        type: "claim.expired",
+        actor: SYNTH_TRAIN,
+        data: { claimId: UPLOAD.atlasClaim, generation: 1 },
+      },
+      "dropped",
+    ],
+  ] satisfies [string, SyntheticStep, string][])(
+    "ends a waiting hold when its claim is %s",
+    (_name, step, reason) => {
+      const ended = append(append(before, held()), step);
+      expect(ended.stream).toEqual({ kind: "consistent" });
+      expect(ended.heldChecks[HELD_RUN]?.ended).toEqual({ reason, seq: ended.cursor });
+    },
+  );
+
+  it("ends an approved hold the train never ran, and keeps the first end", () => {
+    const approvedState = append(append(before, held()), approved());
+    const reopened = append(approvedState, reopen([]));
+    const expired = append(reopened, {
+      type: "claim.expired",
+      actor: SYNTH_TRAIN,
+      data: { claimId: UPLOAD.atlasClaim, generation: 1 },
+    });
+    expect(expired.heldChecks[HELD_RUN]?.ended).toEqual({
+      reason: "dropped",
+      seq: reopened.cursor,
+    });
+    expect(expired.heldChecks[HELD_RUN]?.approval).not.toBeNull();
+  });
+
+  it("keeps a hold open through the intent of its own run, and ends it at another run's", () => {
+    const ran = append(
+      append(append(before, held()), approved()),
+      checkResult(HELD_RUN, synthCommit(9), "acceptance", "pass"),
+    );
+    const own = append(
+      ran,
+      intend("int_synthown1", synthCommit(0), synthCommit(9), [UPLOAD.atlasClaim], [], HELD_RUN),
+    );
+    expect(own.heldChecks[HELD_RUN]?.ended).toBeNull();
+
+    const waiting = append(before, held());
+    const other = append(
+      append(waiting, checkResult(OTHER_RUN, synthCommit(8), "acceptance", "pass")),
+      intend("int_synthother", synthCommit(0), synthCommit(8), [UPLOAD.atlasClaim], [], OTHER_RUN),
+    );
+    expect(other.heldChecks[HELD_RUN]?.ended).toEqual({ reason: "superseded", seq: other.cursor });
+  });
+
+  it("leaves holds alone when a claim they do not name moves on", () => {
+    const state = append(append(before, held()), {
+      type: "claim.expired",
+      actor: SYNTH_TRAIN,
+      data: { claimId: UPLOAD.birchClaim, generation: 1 },
+    });
+    expect(state.heldChecks[HELD_RUN]?.ended).toBeNull();
   });
 });
 
@@ -881,5 +1037,44 @@ describe("totals and recent activity", () => {
 
     expect(empty.totals).toEqual({ humanActions: 0, earliestAt: null, lastAt: null });
     expect(empty.recent).toEqual([]);
+  });
+});
+
+describe("schema versions", () => {
+  const held = syntheticLog("Synthetic held check at schema version 2", [
+    ...uploadPrelude(),
+    {
+      type: "train.held",
+      actor: SYNTH_TRAIN,
+      data: {
+        checkRunId: "chk_synthheld",
+        expectedMain: synthCommit(0),
+        candidate: synthCommit(9),
+        claims: [UPLOAD.atlasClaim],
+        paths: [".railhead/check.json"],
+        digest: null,
+      },
+    },
+  ]);
+
+  it("reads a version 1 history followed by a version 2 held check", () => {
+    const board = fold(held.events);
+    expect(held.events.at(-1)?.v).toBe(2);
+    expect(board.stream).toEqual({ kind: "consistent" });
+    expect(board.cursor).toBe(held.events.length);
+  });
+
+  it("halts on a held check stamped at version 1 as an invalid event", () => {
+    const events = held.events.map((event) =>
+      event.type === "train.held" ? { ...event, v: 1 } : event,
+    );
+    expect(fold(events).stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "invalid_event",
+        seq: held.events.length,
+        message: "train.held is written at schema version 2",
+      },
+    });
   });
 });

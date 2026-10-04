@@ -2,10 +2,22 @@
 // generation stands, and the state of the batch holding it. The caller decides whose pin it may
 // read; this module reads only the entry it is given and the active batch.
 
-import type { PinBatchState, PinTrainState, PinView } from "@railhead/shared/agent-api";
+import type {
+  PinBatchState,
+  PinLeaveReason,
+  PinTrainState,
+  PinView,
+} from "@railhead/shared/agent-api";
 import type { ClaimId } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../../contracts/result";
-import { activeBatch, queuePosition, readEntry, type BatchRecord, type QueueEntry } from "./store";
+import {
+  activeBatch,
+  queuePosition,
+  readEntry,
+  type BatchRecord,
+  type DropReason,
+  type QueueEntry,
+} from "./store";
 
 /**
  * The train's view of the entry of `claimId` at exactly `generation`, or `null` when the queue holds
@@ -49,11 +61,33 @@ function trainState(sql: SqlStorage, entry: QueueEntry): PinTrainState | null {
     case "landed":
       return { kind: "landed" };
     case "dropped":
-      return reason === null ? null : { kind: "dropped", reason };
+      return reason === null ? null : { kind: "dropped", reason: leaveReason(reason) };
     case "parked":
-      return reason === null ? null : { kind: "parked", reason };
+      return reason === null ? null : { kind: "parked", reason: leaveReason(reason) };
     default:
       return unreachable(entry.state);
+  }
+}
+
+/**
+ * The agent-facing reason for `reason`. A held pin that expired while parked reports `check_held`:
+ * it left the train waiting for a person, and the agent's next step is the same as for any drop, a
+ * new push. The wire value predates the expiry, so an older `rh` still reads it.
+ */
+function leaveReason(reason: DropReason): PinLeaveReason {
+  switch (reason) {
+    case "held_expired":
+      return "check_held";
+    case "pin_changed":
+    case "requirements_refused":
+    case "check_failed":
+    case "compose_failed":
+    case "retries_exhausted":
+    case "conflict":
+    case "check_held":
+      return reason;
+    default:
+      return unreachable(reason);
   }
 }
 

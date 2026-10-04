@@ -792,10 +792,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_origin_is_reported() -> anyhow::Result<()> {
-        // A port that was just free; nothing listens on it once the listener is dropped.
+        // The local port of an open connection: held by it for the whole test, so no server another
+        // test starts concurrently can take it, and with nothing listening on it a connection to it
+        // is refused. A port released before the request could be taken in between, and a socket
+        // bound without listening makes macOS drop the connection attempt until the timeout.
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let origin: Origin = format!("http://{}", listener.local_addr()?).parse()?;
-        drop(listener);
+        let held = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let origin: Origin = format!("http://{}", held.local_addr()?).parse()?;
         let client = Client::with_timeout(
             &origin,
             &"casqueblanc/demo".parse()?,
@@ -808,6 +811,7 @@ mod tests {
             matches!(result, Err(Error::Unreachable(AgentRoute::Status))),
             "{result:?}"
         );
+        drop((held, listener));
         Ok(())
     }
 }

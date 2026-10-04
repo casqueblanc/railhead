@@ -81,12 +81,41 @@ describe("EventLog transactions", () => {
 
       expect(committed.value).toBe("opened");
       expect(committed.events).toEqual([
-        { v: EVENT_SCHEMA_VERSION, seq: 1, at: NOW, repo: REPO, actor: HUMAN, ...issue(1) },
-        { v: EVENT_SCHEMA_VERSION, seq: 2, at: NOW, repo: REPO, actor: HUMAN, ...issue(2) },
+        { v: 1, seq: 1, at: NOW, repo: REPO, actor: HUMAN, ...issue(1) },
+        { v: 1, seq: 2, at: NOW, repo: REPO, actor: HUMAN, ...issue(2) },
       ]);
       expect(rowCount(storage, "claims")).toBe(1);
       expect(log.head()).toBe(2);
       expect(log.replay(0, 10)).toEqual({ events: committed.events, head: 2 });
+    });
+  });
+
+  it("stamps each event with the schema version its type was introduced at", async () => {
+    await withStorage((storage) => {
+      const log = openLog(storage);
+      const held: EventPayload = {
+        type: "train.held",
+        data: {
+          checkRunId: "chk_run0001",
+          expectedMain: "a".repeat(40),
+          candidate: "b".repeat(40),
+          claims: ["clm_42abcd"],
+          paths: [".railhead/check.json"],
+          digest: null,
+        },
+      };
+
+      log.transaction((tx) => {
+        tx.append(HUMAN, issue(1));
+        tx.append(SYSTEM, held);
+      });
+
+      // A reader of version 1 refuses `v: 2` before reading the type, so it stops on the held
+      // check with a version fault (the board reloads into newer code) instead of a corrupt log.
+      expect(log.replay(0, 10).events.map(({ type, v }) => [type, v])).toEqual([
+        ["issue.filed", 1],
+        ["train.held", 2],
+      ]);
     });
   });
 
@@ -242,7 +271,7 @@ describe("EventLog transactions", () => {
         "CREATE TABLE events (seq INTEGER PRIMARY KEY CHECK (seq > 0), body TEXT NOT NULL) STRICT",
       ]);
       const stored = {
-        v: EVENT_SCHEMA_VERSION,
+        v: 1,
         seq: 1,
         at: NOW,
         repo: REPO,
@@ -447,7 +476,10 @@ describe("EventLog replay", () => {
     await withStorage((storage) => {
       const log = openLog(storage);
       log.transaction((tx) => tx.append(HUMAN, issue(1)));
-      storage.sql.exec("UPDATE events SET body = json_set(body, '$.v', 2) WHERE seq = 1");
+      storage.sql.exec(
+        "UPDATE events SET body = json_set(body, '$.v', ?) WHERE seq = 1",
+        EVENT_SCHEMA_VERSION + 1,
+      );
 
       expect(() => log.replay(0, 10)).toThrow(refusal("corrupt_log"));
     });

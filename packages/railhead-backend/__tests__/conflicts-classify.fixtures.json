@@ -1,0 +1,239 @@
+[
+  {
+    "id": "c01-routes",
+    "spike": "#7",
+    "label": "compatible",
+    "conflict": {
+      "path": "src/router.ts",
+      "base": "router.get(\"/health\", health);\n",
+      "ours": "router.get(\"/health\", health);\nrouter.get(\"/issues\", listIssues);\n",
+      "theirs": "router.get(\"/health\", health);\nrouter.get(\"/claims\", listClaims);\n",
+      "oursIntent": "Add the endpoint that lists issues.",
+      "theirsIntent": "Add the endpoint that lists claims."
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "compatible",
+          "probabilities": {
+            "compatible": 0.982,
+            "contradictory": 0.018
+          },
+          "confidence": 0.9293
+        }
+      },
+      "usage": {
+        "input_tokens": 357,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "c11-two-optional-params",
+    "spike": "#7",
+    "label": "compatible",
+    "conflict": {
+      "path": "src/git.ts",
+      "base": "export async function fetchRef(repo: string, ref: string): Promise<Commit> {\n  return request(repo, ref);\n}\n",
+      "ours": "export async function fetchRef(repo: string, ref: string, signal?: AbortSignal): Promise<Commit> {\n  return request(repo, ref, { signal });\n}\n",
+      "theirs": "export async function fetchRef(repo: string, ref: string, depth?: number): Promise<Commit> {\n  return request(repo, ref, { depth });\n}\n",
+      "oursIntent": "Let a caller cancel a fetch.",
+      "theirsIntent": "Let a caller ask for a shallow fetch."
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "compatible",
+          "probabilities": {
+            "compatible": 0.7956,
+            "contradictory": 0.2044
+          },
+          "confidence": 0.3495
+        }
+      },
+      "usage": {
+        "input_tokens": 416,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "d10-same-key-two-values",
+    "spike": "#7",
+    "label": "contradictory",
+    "conflict": {
+      "path": "src/config.ts",
+      "base": "export const fleet = {\n  lifetimeMinutes: 30,\n};\n",
+      "ours": "export const fleet = {\n  lifetimeMinutes: 30,\n  maxAgents: 3,\n};\n",
+      "theirs": "export const fleet = {\n  lifetimeMinutes: 30,\n  maxAgents: 10,\n};\n",
+      "oursIntent": "Cap a fleet invite at three agents.",
+      "theirsIntent": "Cap a fleet invite at ten agents."
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "contradictory",
+          "probabilities": {
+            "compatible": 0.016,
+            "contradictory": 0.984
+          },
+          "confidence": 0.937
+        }
+      },
+      "usage": {
+        "input_tokens": 383,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "merge-93afa71d-core_tauri_src_test_mock_runtime.rs-3",
+    "spike": "#14",
+    "label": "compatible",
+    "source": {
+      "repository": "tauri-apps/tauri",
+      "merge": "93afa71d9a180b37d568f7442a3853fb41dd8553",
+      "licence": "MIT OR Apache-2.0 (tauri-apps/tauri)"
+    },
+    "conflict": {
+      "path": "core/tauri/src/test/mock_runtime.rs",
+      "base": "      clipboard: Default::default(),",
+      "ours": "      run_tx: tx,",
+      "theirs": "      clipboard: Default::default(),\n      run_tx: tx,",
+      "oursIntent": "Merge remote-tracking branch 'origin/dev' into next (#7212)",
+      "theirsIntent": "feat(core): expose test utils (#4752)"
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "compatible",
+          "probabilities": {
+            "compatible": 0.917,
+            "contradictory": 0.083
+          },
+          "confidence": 0.6954
+        }
+      },
+      "usage": {
+        "input_tokens": 358,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "merge-c6c59cf2-tooling_bundler_src_bundle_windows_templates_installer.nsi-1",
+    "spike": "#14",
+    "label": "compatible",
+    "source": {
+      "repository": "tauri-apps/tauri",
+      "merge": "c6c59cf2373258b626b00a26f4de4331765dd487",
+      "licence": "MIT OR Apache-2.0 (tauri-apps/tauri)"
+    },
+    "conflict": {
+      "path": "tooling/bundler/src/bundle/windows/templates/installer.nsi",
+      "base": "",
+      "ours": "!include \"FileAssociation.nsh\"",
+      "theirs": "!include \"StrFunc.nsh\"\n${StrCase}\n${StrLoc}",
+      "oursIntent": "feat: add file association support, closes #3736 (#4320)",
+      "theirsIntent": "feat(nsis): support choosing compression algorithms, closes #7685 (#7776)"
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "compatible",
+          "probabilities": {
+            "compatible": 0.8991,
+            "contradictory": 0.1009
+          },
+          "confidence": 0.637
+        }
+      },
+      "usage": {
+        "input_tokens": 371,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "merge-a9b87c05-tooling_cli_node_package.json-1",
+    "spike": "#14",
+    "label": "contradictory",
+    "source": {
+      "repository": "tauri-apps/tauri",
+      "merge": "a9b87c057d6d9c72444745405d00aa2f6547d912",
+      "licence": "MIT OR Apache-2.0 (tauri-apps/tauri)"
+    },
+    "conflict": {
+      "path": "tooling/cli/node/package.json",
+      "base": "  \"version\": \"1.5.5\",",
+      "ours": "  \"version\": \"2.0.0-alpha.20\",",
+      "theirs": "  \"version\": \"1.5.8\",",
+      "oursIntent": "chore(utils): add change file for #7964",
+      "theirsIntent": "Apply Version Updates From Current Changes (v1) (#8377)"
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "contradictory",
+          "probabilities": {
+            "compatible": 0.0295,
+            "contradictory": 0.9705
+          },
+          "confidence": 0.8854
+        }
+      },
+      "usage": {
+        "input_tokens": 366,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "id": "merge-1092865e-.github_workflows_test-core.yml-1",
+    "spike": "#14",
+    "label": "contradictory",
+    "source": {
+      "repository": "tauri-apps/tauri",
+      "merge": "1092865e67647112b5ed8b1bb0359b5ba2a934bd",
+      "licence": "MIT OR Apache-2.0 (tauri-apps/tauri)"
+    },
+    "conflict": {
+      "path": ".github/workflows/test-core.yml",
+      "base": "              args: --features compression,wry,isolation,custom-protocol,api-all,cli,updater,system-tray,windows7-compat,http-multipart,",
+      "ours": "              args: --features native-tls-vendored,compression,wry,isolation,custom-protocol,api-all,cli,updater,system-tray,windows7-compat,http-multipart,",
+      "theirs": "              args: --features compression,wry,linux-protocol-headers,isolation,custom-protocol,api-all,cli,updater,system-tray,windows7-compat,http-multipart,",
+      "oursIntent": "fix(ci): minimum rustc is now 1.59",
+      "theirsIntent": "refactor: move Linux custom protocol headers support behind feature flag (#5683)"
+    },
+    "response": {
+      "model": "clef",
+      "answers": {
+        "relation": {
+          "type": "choice",
+          "choice": "compatible",
+          "probabilities": {
+            "compatible": 0.9643,
+            "contradictory": 0.0357
+          },
+          "confidence": 0.8625
+        }
+      },
+      "usage": {
+        "input_tokens": 453,
+        "output_tokens": 0
+      }
+    }
+  }
+]

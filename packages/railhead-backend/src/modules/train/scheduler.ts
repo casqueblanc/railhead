@@ -71,11 +71,25 @@
 // pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
 // queue, so it cannot hold the pins behind it.
 //
+// A person's approval of the held attempt (`release`, inside the checks module's transaction) is the
+// way back, on the same candidate and attempt: composing again would make another candidate, held
+// again. An active batch still holding it is asked to start the attempt again under a fresh
+// deadline. A pin parked alone goes back to the front of the queue marked with the attempt, and when
+// it is next its failed batch is revived as the active one, after its pin is checked to be current,
+// rather than composed. A shared batch that expired is gone: its pins went on alone.
+//
 // Each compose runs under a fresh merge attempt, recorded on the batch before the merge port is
 // called. When the batch settles, or a new compose of it supersedes that attempt, the attempt is
 // queued for discard, and the Repo's alarm asks the merge port to delete its candidate refs once
-// its compose can no longer push. A failed discard is tried again on the alarm, with a delay that
-// doubles from `DISCARD_BASE_MS` up to `DISCARD_MAX_MS`, until it succeeds; each wake tries at most
+// its compose can no longer push. A batch that failed holding one pin keeps its candidate for the
+// approval that may revive it, unless the pin was readied again while batched. Its attempt is
+// queued once that pin is superseded by a newer ready episode or generation or dropped on its way
+// back, or when the revived batch settles. At most one parked pin per claim can still return, and
+// a parked pin expires: `HELD_PARK_TTL_MS` after it was parked, on the alarm, or as soon as
+// `MAX_PARKED_HELD` newer ones are parked. An expired pin is dropped as
+// `held_expired` and its attempt queued for discard, so an approval of it is stale and the checks
+// module may prune its row. A failed discard is tried again on the alarm, with a delay that doubles
+// from `DISCARD_BASE_MS` up to `DISCARD_MAX_MS`, until it succeeds; each wake tries at most
 // `MAX_DISCARDS_PER_WAKE`, outside any drive, so cleanup never holds up a batch.
 
 import {
@@ -120,16 +134,23 @@ import {
   countPending,
   deferCommit,
   dueDiscards,
+  expireHeldPins,
   hasMovableWork,
   highestGeneration,
+  holdsAttempt,
   insertBatch,
   insertEntry,
   markCheckHeld,
   markCheckStarted,
   migrateTrain,
   nextDiscardAt,
+  oldestHeldParkAt,
+  releaseActiveHold,
+  requeueApproved,
+  reviveHeldBatch,
   owesWork,
   promoteDeferred,
+  queueHeldDiscard,
   readDrive,
   readEntry,
   readWake,
@@ -144,6 +165,7 @@ import {
   requestCheck,
   retryDiscard,
   settleBatch,
+  settleHeldBatch,
   settleEntry,
   waitingEntries,
   writeDrive,
@@ -231,6 +253,19 @@ export const DISCARD_MAX_MS = 60 * 60_000;
 
 /** Most discards one wake of the Repo's alarm tries, so cleanup holds few sandboxes at once. */
 export const MAX_DISCARDS_PER_WAKE = 4;
+
+/**
+ * How long a pin parked for a person's approval keeps its candidate before it expires. A held
+ * attempt waits for a person, so it is given a day rather than a check's deadline.
+ */
+export const HELD_PARK_TTL_MS = 24 * 60 * 60_000;
+
+/**
+ * Most parked pins that can still return to a held batch, each keeping its candidate refs and its
+ * held attempt. Parking one more expires the longest-parked. A pin is parked only after its
+ * attempt's `CHECK_DEADLINE_MS`, so this bound is below the `HELD_PARK_TTL_MS` worth of parks.
+ */
+export const MAX_PARKED_HELD = 16;
 
 /** Most rows a diagnostic read returns. */
 export const MAX_DIAGNOSTIC_ROWS = 64;
@@ -350,7 +385,7 @@ export function createTrain(
 
   // A restarted train asks again for the wake it owes: the alarm may never have been set.
   const startupWake = confirmStartupWake();
-  wakeForDiscards();
+  wakeForCleanup();
 
   /** Drives the train. `settling` keeps an exhausted wake exhausted, for the slow settle wake. */
   function drive(settling = false): Promise<DriveOutcome> {
@@ -469,7 +504,7 @@ export function createTrain(
       outcome.kind === "superseded";
     const exhausted = context.storage.transactionSync((): boolean => {
       // A batch the drive settled, or a compose it superseded, may have queued a discard.
-      wakeForDiscards();
+      wakeForCleanup();
       return holds(generation) && recordDebt(now, { kind: failed ? "failed" : "clean" });
     });
     if (exhausted) {
@@ -570,6 +605,7 @@ export function createTrain(
     const waiting = waitingEntries(sql, MAX_BATCH);
     const first = waiting[0];
     if (first === undefined) return stop({ kind: "idle" });
+    if (first.approvedAttempt !== null) return revive(generation, first, first.approvedAttempt);
     const members = first.isolate ? [first] : takeWhile(waiting, (entry) => !entry.isolate);
 
     // Each claim's requirements are read before its pin. A pin that answers was recorded under the
@@ -662,6 +698,33 @@ export function createTrain(
       default:
         return unreachable(formed);
     }
+  }
+
+  /** Revives the held batch `entry` returns to, once its pin is still the claim's current one. */
+  async function revive(
+    generation: number,
+    entry: QueueEntry,
+    attemptId: CheckRunId,
+  ): Promise<Step> {
+    const current = await bounded(generation, "claims", () =>
+      ports().claims.pin(entry.pin.claimId),
+    );
+    if (!current.ok && isTransient(current.code))
+      return blocked(null, "pin_unavailable", current.code);
+    if (!current.ok || !samePin(current.value, entry.pin)) {
+      dropEntries(generation, [entry], "pin_changed");
+      return CONTINUE;
+    }
+    const now = clock();
+    fenced(generation, () => {
+      const stored = readEntry(sql, entry.pin.claimId, entry.pin.generation);
+      if (stored?.state !== "queued" || stored.approvedAttempt !== attemptId) return;
+      // A batch that cannot be revived leaves the pin parked again, as it was before the approval.
+      if (!reviveHeldBatch(sql, attemptId, entry.pin, now)) {
+        settleEntry(sql, entry.pin, "parked", "check_held", now);
+      }
+    });
+    return CONTINUE;
   }
 
   async function advance(generation: number, batch: BatchRecord): Promise<Step> {
@@ -894,14 +957,16 @@ export function createTrain(
   /**
    * Settles the active batch inside the caller's transaction. The failures counted so far belonged
    * to that batch, so the wake keeps its due time with a fresh count: work the settlement exposes
-   * gets its own retries, even in a settle drive that started exhausted.
+   * gets its own retries, even in a settle drive that started exhausted. A `held` batch fails for
+   * waiting but keeps its merge attempt, for the approval that may revive it.
    */
   function closeBatch(
     batchId: number,
-    outcome: { state: "landed" } | { state: "failed"; failure: BatchFailure },
+    outcome: { state: "landed" } | { state: "failed"; failure: BatchFailure } | { state: "held" },
     now: number,
   ): void {
-    settleBatch(sql, batchId, outcome, now);
+    if (outcome.state === "held") settleHeldBatch(sql, batchId, now);
+    else settleBatch(sql, batchId, outcome, now);
     const wake = readWake(sql);
     if (wake !== null && wake.failures !== 0) writeWake(sql, { dueAt: wake.dueAt, failures: 0 });
   }
@@ -909,8 +974,22 @@ export function createTrain(
   /** Settles a failed batch's entries, before any newer commit they held is queued. */
   function requeueFailed(batch: BatchRecord, failure: BatchFailure, now: number): void {
     const entries = orderAsBatch(batch, batchedEntries(sql));
-    closeBatch(batch.batchId, { state: "failed", failure }, now);
     const held = failure === "check_held";
+    // A pin held alone that stays parked keeps this batch's candidate for an approval that revives
+    // the batch on it, until the pin can no longer return (`queueHeldDiscard`). A pin readied again
+    // while batched goes on as fresh work instead, and one whose claim queued a newer generation
+    // during the hold can never return, so either way the candidate is discarded with the batch.
+    const [lone] = entries;
+    const superseded =
+      lone !== undefined && highestGeneration(sql, lone.pin.claimId) > lone.pin.generation;
+    const parks =
+      held &&
+      entries.length === 1 &&
+      lone !== undefined &&
+      !renewed(lone) &&
+      lone.nextCommit === null &&
+      !superseded;
+    closeBatch(batch.batchId, parks ? { state: "held" } : { state: "failed", failure }, now);
     const definitive = isDefinitive(failure);
     const returned: Returned[] = [];
     for (const entry of entries) {
@@ -919,8 +998,10 @@ export function createTrain(
       } else if (held && entries.length === 1) {
         // Held alone, the pin is the one that edits a protected path. It is parked, keeping its
         // pin, so the queue behind it moves. A new push enqueues the claim's next generation as a
-        // new entry. The approval action (#174) is the other way back: it will requeue this entry.
-        settleEntry(sql, entry.pin, "parked", "check_held", now);
+        // new entry; an approval of the held attempt returns this one (`release`). A pin that new
+        // entry already superseded is dropped instead.
+        if (superseded) settleEntry(sql, entry.pin, "dropped", "pin_changed", now);
+        else settleEntry(sql, entry.pin, "parked", "check_held", now);
       } else if (held) {
         // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
         returned.push({ pin: entry.pin, isolate: true, retries: entry.retries });
@@ -936,6 +1017,8 @@ export function createTrain(
       }
     }
     requeueFront(sql, returned, now);
+    // Each parked pin keeps a candidate and an attempt: past the bound, the oldest expire.
+    if (parks) expireHeld(now);
   }
 
   /**
@@ -1001,7 +1084,10 @@ export function createTrain(
     fenced(generation, () => {
       for (const entry of entries) {
         // A ready episode queued during the reads is newer than what they judged; keep it.
-        if (stillObserved(entry)) settleEntry(sql, entry.pin, "dropped", reason, now);
+        if (!stillObserved(entry)) continue;
+        settleEntry(sql, entry.pin, "dropped", reason, now);
+        // An approved pin dropped on its way back to its held batch never returns to it.
+        if (entry.approvedAttempt !== null) queueHeldDiscard(sql, entry, now);
       }
     });
   }
@@ -1050,10 +1136,14 @@ export function createTrain(
   }
 
   /**
-   * Called by the Repo's alarm: drives the train if it is due, then discards what was due when the
-   * alarm fired.
+   * Called by the Repo's alarm: expires parked held pins that are due, drives the train if it is
+   * due, then discards what was due when the alarm fired.
    */
   async function resume(): Promise<void> {
+    context.storage.transactionSync(() => {
+      expireHeld(clock());
+      wakeForCleanup();
+    });
     const firedAt = await resumeDrive();
     if (nextDiscardAt(sql) === null) return;
     await discardDue(firedAt ?? clock());
@@ -1083,7 +1173,7 @@ export function createTrain(
         context.storage.transactionSync(() => {
           if (result.ok) completeDiscard(sql, discard.attempt);
           else retryDiscard(sql, { ...discard, dueAt: clock() + discardDelay(failures), failures });
-          wakeForDiscards();
+          wakeForCleanup();
         });
         if (!result.ok) {
           console.error(
@@ -1098,7 +1188,7 @@ export function createTrain(
         }
       }
     } finally {
-      context.storage.transactionSync(() => wakeForDiscards());
+      context.storage.transactionSync(() => wakeForCleanup());
     }
   }
 
@@ -1135,10 +1225,18 @@ export function createTrain(
     return false;
   }
 
-  /** Asks the Repo's alarm for the earliest pending discard, if any. */
-  function wakeForDiscards(): void {
-    const next = nextDiscardAt(sql);
+  /** Asks the Repo's alarm for the earliest pending discard or parked pin expiry, if any. */
+  function wakeForCleanup(): void {
+    const discard = nextDiscardAt(sql);
+    const parked = oldestHeldParkAt(sql);
+    const expiry = parked === null ? null : parked + HELD_PARK_TTL_MS;
+    const next = discard === null ? expiry : expiry === null ? discard : Math.min(discard, expiry);
     if (next !== null) context.wake(next);
+  }
+
+  /** Expires the parked held pins past `HELD_PARK_TTL_MS` or beyond `MAX_PARKED_HELD`. */
+  function expireHeld(now: number): void {
+    expireHeldPins(sql, { parkedBy: now - HELD_PARK_TTL_MS, keep: MAX_PARKED_HELD }, now);
   }
 
   /** Drives the train if its wake is due. Returns the time it read, or `null` when it read none. */
@@ -1234,7 +1332,8 @@ export function createTrain(
         "The pin needs a claim, a positive generation, a commit and a positive episode.",
       );
     }
-    if (highestGeneration(sql, pin.claimId) > pin.generation) {
+    const highest = highestGeneration(sql, pin.claimId);
+    if (highest > pin.generation) {
       return fail("stale_generation", "A newer generation of this claim is queued.");
     }
     const existing = readEntry(sql, pin.claimId, pin.generation);
@@ -1280,6 +1379,13 @@ export function createTrain(
       }
       if (existing === null) insertEntry(sql, pin, episode, now);
       else requeueEntry(sql, pin, episode, now);
+    }
+    // A held pin this episode or generation supersedes, parked or approved on its way back, can no
+    // longer return to its batch.
+    const previous = existing ?? readEntry(sql, pin.claimId, highest);
+    if (previous !== null && returnsToHeld(previous)) {
+      queueHeldDiscard(sql, previous, now);
+      wakeForCleanup();
     }
     // Every accepted episode is owed a drive, which also restarts a wake whose retries ran out,
     // so work it leaves runnable is never stranded. The Repo's alarm starts the drive once the
@@ -1341,6 +1447,31 @@ export function createTrain(
     return value;
   }
 
+  function release(attemptId: CheckRunId): boolean {
+    const now = clock();
+    // A parked pin past its time is expired here rather than revived, even before the alarm fires.
+    expireHeld(now);
+    wakeForCleanup();
+    // The same fence `holds` reads: a parked pin a later generation superseded is stale, so its
+    // attempt goes back to nothing even though its entry is still parked.
+    if (!holdsAttempt(sql, attemptId)) return false;
+    const batch = batchByAttempt(sql, attemptId);
+    if (batch === null) return false;
+    let released = false;
+    if (batch.state === "checking" && batch.checkHeld) {
+      released = releaseActiveHold(sql, attemptId, now);
+    } else if (
+      batch.state === "failed" &&
+      batch.failure === "check_held" &&
+      batch.pins.length === 1
+    ) {
+      const [pin] = batch.pins;
+      released = pin !== undefined && requeueApproved(sql, pin, attemptId, now);
+    }
+    if (released) recordDebt(now, { kind: "start", alarmAt: now + DRIVE_LEASE_MS });
+    return released;
+  }
+
   return {
     queue,
     recordCheck,
@@ -1349,6 +1480,8 @@ export function createTrain(
     pinView: async (claimId, generation) => readPinView(sql, claimId, generation),
     armWake,
     startup: () => startupWake,
+    release,
+    holds: (attemptId) => holdsAttempt(sql, attemptId),
     resume,
     drive,
     batches: (limit) => recentBatches(sql, boundLimit(limit)),
@@ -1395,6 +1528,14 @@ type Returned = { pin: ClaimPin; isolate: boolean; retries: number };
  */
 function renewed(entry: QueueEntry): boolean {
   return entry.episode !== entry.batchedEpisode;
+}
+
+/** Whether `entry` may still return to a held batch: parked for it, or approved on its way back. */
+function returnsToHeld(entry: QueueEntry): boolean {
+  return (
+    (entry.state === "parked" && entry.reason === "check_held") ||
+    (entry.state === "queued" && entry.approvedAttempt !== null)
+  );
 }
 
 /** A renewed entry returned to the queue as fresh work for its newer episode. */

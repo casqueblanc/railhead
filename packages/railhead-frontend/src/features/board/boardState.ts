@@ -18,7 +18,7 @@
 
 import { INVITE_TTL_MS } from "@railhead/shared/board-api";
 import {
-  EVENT_SCHEMA_VERSION,
+  isReadableVersion,
   validateEvent,
   type AgentId,
   type CheckResult,
@@ -39,6 +39,7 @@ import {
   type RailheadEvent,
   type RefusalReason,
   type RepoId,
+  type UserId,
 } from "@railhead/shared/events";
 
 /** How many recent pushes a claim keeps for its lane. Older pushes remain in the log. */
@@ -181,6 +182,34 @@ export interface CheckRunState {
   results: readonly CheckEntryState[];
 }
 
+/**
+ * A check attempt held because its candidate edits the trusted check definition or a path it
+ * protects. Nothing runs until a person approves the candidate's own definition, named by `digest`.
+ */
+export interface HeldCheckState {
+  checkRunId: CheckRunId;
+  /** Sequence number of the `train.held` event. */
+  seq: number;
+  expectedMain: CommitSha;
+  candidate: CommitSha;
+  claims: readonly ClaimId[];
+  /** The protected paths the candidate edits. */
+  paths: readonly string[];
+  /** SHA-256 of the candidate's definition, or `null` when it has none to approve. */
+  digest: string | null;
+  /** The person who approved running it, and when, or `null` while it waits. */
+  approval: { userId: UserId; seq: number } | null;
+  /** The event after which the train can no longer run this attempt, or `null` while it may. */
+  ended: { reason: HeldEndReason; seq: number } | null;
+}
+
+/**
+ * Why the train can no longer run a held attempt. `superseded`: a later attempt took one of its
+ * claims, or a claim moved to a new generation. `dropped`: a claim was reopened or expired, so its
+ * pin is gone.
+ */
+export type HeldEndReason = "superseded" | "dropped";
+
 /** What became of a merge intent. Only `landed` means the candidate is on main. */
 export type IntentLanding =
   | { kind: "pending" }
@@ -274,6 +303,9 @@ export interface BoardState {
   /** Keyed by `inboxKey`. */
   inbox: Readonly<Record<string, InboxItemState>>;
   checkRuns: Readonly<Record<CheckRunId, CheckRunState>>;
+  heldChecks: Readonly<Record<CheckRunId, HeldCheckState>>;
+  /** The latest held attempt naming each claim, so the event that ends it finds it directly. */
+  heldByClaim: Readonly<Record<ClaimId, CheckRunId>>;
   intents: Readonly<Record<IntentId, IntentState>>;
   /** In log order. */
   conflicts: readonly ConflictState[];
@@ -299,6 +331,8 @@ export const emptyBoardState = (repo: RepoId): BoardState => ({
   decisions: {},
   inbox: {},
   checkRuns: {},
+  heldChecks: {},
+  heldByClaim: {},
   intents: {},
   conflicts: [],
   totals: { humanActions: 0, earliestAt: null, lastAt: null },
@@ -442,7 +476,7 @@ class FoldDraft {
 /** `foldEvent`, writing through `draft`. */
 const foldInto = (state: BoardState, event: RailheadEvent, draft: FoldDraft): BoardState => {
   if (state.stream.kind === "halted") return state;
-  if (event.v !== EVENT_SCHEMA_VERSION) {
+  if (!isReadableVersion(event.v)) {
     return halt(state, { kind: "unsupported_version", seq: event.seq, version: event.v });
   }
   try {
@@ -733,7 +767,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       check(claim.phase === "ready", `claim ${claimId} cannot reopen while ${claim.phase}`);
       for (const ref of decisions) knownDecisionVersion(state, ref);
       return {
-        ...state,
+        ...endHolds(state, draft, [claimId], "dropped", seq),
         claims: draft.put(state.claims, claimId, { ...claim, phase: "working", ready: null }),
       };
     }
@@ -742,7 +776,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
       check(claim.phase !== "expired", `claim ${claimId} already expired`);
-      return { ...state, claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }) };
+      return {
+        ...endHolds(state, draft, [claimId], "dropped", seq),
+        claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }),
+      };
     }
     case "claim.reassigned": {
       const { claimId, from, to, generation } = event.data;
@@ -751,7 +788,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       check(generation > claim.generation, `claim ${claimId} reassigned to an old generation`);
       confirmedAgent(state, to);
       return {
-        ...state,
+        ...endHolds(state, draft, [claimId], "superseded", seq),
         claims: draft.put(state.claims, claimId, {
           ...claim,
           agentId: to,
@@ -911,7 +948,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       const run = known(state.checkRuns, checkRunId, "check run");
       check(run.candidate === candidate, `intent ${intentId} cites a check of another candidate`);
       return {
-        ...state,
+        ...endHolds(state, draft, claims, "superseded", seq, checkRunId),
         intents: draft.put(state.intents, intentId, {
           intentId,
           expectedMain,
@@ -949,9 +986,72 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         intents: draft.put(state.intents, intentId, { ...intent, landing }),
       };
     }
+    case "train.held": {
+      const { checkRunId, expectedMain, candidate, claims, paths, digest } = event.data;
+      check(
+        own(state.heldChecks, checkRunId) === undefined,
+        `check run ${checkRunId} was held twice`,
+      );
+      for (const claimId of claims) known(state.claims, claimId, "claim");
+      const ended = endHolds(state, draft, claims, "superseded", seq, checkRunId);
+      let { heldByClaim } = ended;
+      for (const claimId of claims) heldByClaim = draft.put(heldByClaim, claimId, checkRunId);
+      return {
+        ...ended,
+        heldByClaim,
+        heldChecks: draft.put(ended.heldChecks, checkRunId, {
+          checkRunId,
+          seq,
+          expectedMain,
+          candidate,
+          claims,
+          paths,
+          digest,
+          approval: null,
+          ended: null,
+        }),
+      };
+    }
+    case "check.approved": {
+      const { checkRunId, candidate, digest } = event.data;
+      const held = known(state.heldChecks, checkRunId, "held check");
+      check(held.candidate === candidate, `approval of ${checkRunId} names another candidate`);
+      check(held.digest === digest, `approval of ${checkRunId} names another definition`);
+      check(held.approval === null, `check run ${checkRunId} was approved twice`);
+      return {
+        ...state,
+        heldChecks: draft.put(state.heldChecks, checkRunId, {
+          ...held,
+          approval: { userId: event.actor.id, seq },
+        }),
+      };
+    }
     default:
       return unreachable(event);
   }
+};
+
+/**
+ * Ends the latest held attempt of each of `claimIds` at `seq`, unless it is `except` (the attempt
+ * the event itself continues) or already ended. Its claims' pins left it, so the train never runs it.
+ */
+const endHolds = (
+  state: BoardState,
+  draft: FoldDraft,
+  claimIds: readonly ClaimId[],
+  reason: HeldEndReason,
+  seq: number,
+  except: CheckRunId | null = null,
+): BoardState => {
+  let { heldChecks } = state;
+  for (const claimId of claimIds) {
+    const checkRunId = own(state.heldByClaim, claimId);
+    if (checkRunId === undefined || checkRunId === except) continue;
+    const held = known(heldChecks, checkRunId, "held check");
+    if (held.ended !== null) continue;
+    heldChecks = draft.put(heldChecks, checkRunId, { ...held, ended: { reason, seq } });
+  }
+  return heldChecks === state.heldChecks ? state : { ...state, heldChecks };
 };
 
 const unreachable = (value: never): never => {
