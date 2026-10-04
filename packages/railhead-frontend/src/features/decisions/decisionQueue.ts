@@ -33,7 +33,7 @@ export interface DecisionView {
   options: readonly QuestionOption[];
   /** Newest first. Empty while the decision waits for its first answer. */
   versions: readonly DecisionVersionView[];
-  /** Live claims that asked for the decision or were sent one of its versions. */
+  /** Live claims the decision's questions name or that were sent one of its versions. */
   affectedClaims: readonly ClaimId[];
   /** One row per agent for the current version; empty while unanswered. */
   ripple: readonly RippleRow[];
@@ -83,7 +83,7 @@ const decisionView = (
     : [];
   const versions = recorded.toReversed().map((version) => versionView(state, version));
 
-  const claims = new Set<ClaimId>(questions.map((question) => question.claimId));
+  const claims = new Set<ClaimId>(questions.flatMap((question) => question.claimIds));
   for (const item of Object.values(state.inbox)) {
     if (item.entry.kind !== "conflict" && item.entry.decision.decisionId === decisionId) {
       claims.add(item.claimId);

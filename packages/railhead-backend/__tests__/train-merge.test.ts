@@ -23,14 +23,21 @@ import {
   type MergeDeps,
 } from "../src/train/merge/compose";
 import {
+  MAX_PATH_LENGTH,
+  MAX_REGION_LENGTH,
+  MAX_REGIONS,
+} from "../src/train/classification/classify";
+import {
   discardCommand,
   fetchCommand,
   parseBinary,
   parseCommit,
   parseDiscarded,
   parsePartner,
+  parseRegions,
   parseRemote,
   pushCommand,
+  regionsCommand,
   remoteUrl,
 } from "../src/train/merge/script";
 
@@ -48,7 +55,7 @@ const OID = (n: number) => n.toString(16).padStart(40, "0");
 type Reply = Partial<BoundedOutput> & { exitCode: number };
 
 /** Which step a command is, recognized by the Git command it runs. */
-type StepName = "init" | "fetch" | "merge" | "partner" | "binary" | "push" | "discard";
+type StepName = "init" | "fetch" | "merge" | "partner" | "binary" | "regions" | "push" | "discard";
 
 function stepOf(command: string): StepName {
   if (command.includes("git push --porcelain --prune")) return "discard";
@@ -56,6 +63,7 @@ function stepOf(command: string): StepName {
   if (command.includes("git fetch")) return "fetch";
   if (command.includes("try_partner")) return "partner";
   if (command.includes("git diff --numstat")) return "binary";
+  if (command.includes("git merge-file")) return "regions";
   if (command.includes("git push")) return "push";
   if (command.includes("git merge -q --no-ff --no-edit")) return "merge";
   throw new Error(`unexpected command: ${command}`);
@@ -67,6 +75,8 @@ class ScriptedDriver {
   readonly commands: SandboxCommand[] = [];
   readonly destroyed: string[] = [];
   readonly replies: Partial<Record<StepName, Reply[]>> = {};
+  /** Answers a step from its command, before `replies`. */
+  readonly respond: Partial<Record<StepName, (command: string) => Reply>> = {};
   /** Whether a start fails. */
   startFails = false;
   /** Runs before each command, after it is recorded. */
@@ -82,7 +92,8 @@ class ScriptedDriver {
       const step = stepOf(command.command);
       this.onExec(step);
       const queue = this.replies[step] ?? [];
-      const reply = queue.length > 1 ? queue.shift() : queue[0];
+      const reply =
+        this.respond[step]?.(command.command) ?? (queue.length > 1 ? queue.shift() : queue[0]);
       return { stdout: "", stderr: "", truncated: false, exitCode: 0, ...reply };
     },
     destroy: async (name) => {
@@ -174,6 +185,36 @@ function textConflict(path: string, base: number): string {
   ]);
 }
 
+/** One region's three sides, as the regions step prints them. */
+interface Sides {
+  base: string;
+  ours: string;
+  theirs: string;
+}
+
+const SIDES: Sides = { base: "a\n", ours: "a\nb\n", theirs: "a\nc\n" };
+
+/** The nonce a regions command marks its output with. */
+function nonceOf(command: string): string {
+  const nonce = /-L ([a-z0-9]+) /.exec(command)?.[1];
+  if (nonce === undefined) throw new Error("no nonce in the regions command");
+  return nonce;
+}
+
+/** What the regions step prints for `files`, each its regions in order or `opaque`. */
+function printedRegions(nonce: string, files: readonly (readonly Sides[] | "opaque")[]): string {
+  const blocks = files.map((file, index) => {
+    const head = `${nonce} file ${index}\n`;
+    if (file === "opaque") return `${head}${nonce} opaque\n`;
+    const regions = file.map(
+      ({ base, ours, theirs }) =>
+        `<<<<<<< ${nonce}\n${ours}||||||| ${nonce}\n${base}=======\n${theirs}>>>>>>> ${nonce}\n`,
+    );
+    return head + regions.join("");
+  });
+  return `${blocks.join("")}${nonce} end\n`;
+}
+
 /** The policy of another attempt holding a sandbox. */
 function otherPolicy(n: number): SandboxPolicy {
   return {
@@ -251,18 +292,110 @@ describe("compose", () => {
         },
       ];
       fake.replies.binary = [{ exitCode: 0, stdout: `0\t1\t1\t${OID(2)} => ${OID(3)}\n1\t\n` }];
+      const second: Sides = { base: "x\r\n", ours: "", theirs: "y\r\n" };
+      fake.respond.regions = (command) => ({
+        exitCode: 0,
+        stdout: printedRegions(nonceOf(command), [[SIDES, SIDES], [second]]),
+      });
 
       const result = await harness.merge.compose(MAIN, [PIN_C, PIN_A, PIN_B]);
 
       expect(result).toEqual(
-        ok({ kind: "conflict", pins: [PIN_A, PIN_B], paths: ["src/app.ts", "a\nb"] }),
+        ok({
+          kind: "conflict",
+          pins: [PIN_A, PIN_B],
+          paths: ["src/app.ts", "a\nb"],
+          regions: [
+            { path: "src/app.ts", ...SIDES },
+            { path: "src/app.ts", ...SIDES },
+            { path: "a\nb", ...second },
+          ],
+        }),
       );
-      expect(fake.steps()).toEqual(["init", "fetch", "merge", "partner", "binary"]);
+      expect(fake.steps()).toEqual(["init", "fetch", "merge", "partner", "binary", "regions"]);
+      // Each path's base, ours and theirs blobs, in index order.
+      const regions = fake.commands[5]?.command ?? "";
+      expect(regions).toContain(`regions 0 ${OID(1)} ${OID(2)} ${OID(3)}`);
+      expect(regions).toContain(`regions 1 ${OID(10)} ${OID(11)} ${OID(12)}`);
       const partner = fake.commands[3]?.command ?? "";
       // Partners are main, then each earlier pin, in order.
       expect(partner).toContain(`try_partner 0 ${MAIN} ${PIN_B.commit}`);
       expect(partner).toContain(`try_partner 2 ${PIN_A.commit} ${PIN_B.commit}`);
       expect(fake.commands.some((command) => command.command.includes("git push"))).toBe(false);
+      await expectReleased(harness);
+    });
+  });
+
+  it.each([
+    {
+      name: "more paths than the classifier takes regions",
+      paths: MAX_REGIONS + 1,
+      reply: null,
+    },
+    {
+      name: "a path longer than the classifier takes",
+      paths: 1,
+      long: true,
+      reply: null,
+    },
+    {
+      name: "more regions than the classifier takes",
+      paths: 1,
+      reply: (nonce: string) => ({
+        exitCode: 0,
+        stdout: printedRegions(nonce, [Array.from({ length: MAX_REGIONS + 1 }, () => SIDES)]),
+      }),
+    },
+    {
+      name: "a side longer than the classifier takes",
+      paths: 1,
+      reply: (nonce: string) => ({
+        exitCode: 0,
+        stdout: printedRegions(nonce, [[{ ...SIDES, theirs: "x".repeat(MAX_REGION_LENGTH + 1) }]]),
+      }),
+    },
+    {
+      name: "a path whose blobs could forge a separator",
+      paths: 2,
+      reply: (nonce: string) => ({
+        exitCode: 0,
+        stdout: printedRegions(nonce, [[SIDES], "opaque"]),
+      }),
+    },
+    {
+      name: "a listing cut short",
+      paths: 1,
+      reply: (nonce: string) => ({
+        exitCode: 0,
+        stdout: printedRegions(nonce, [[SIDES]]),
+        truncated: true,
+      }),
+    },
+    {
+      name: "a regions step that failed",
+      paths: 1,
+      reply: () => ({ exitCode: 2 }),
+    },
+  ])("reports the conflict without its text for $name", async ({ paths, long, reply }) => {
+    const names = Array.from({ length: paths }, (_, i) =>
+      long === true ? "d/".repeat(MAX_PATH_LENGTH / 2) + `f${i}` : `f${i}`,
+    );
+    await withMerge(async (harness) => {
+      const { fake } = harness;
+      fake.replies.merge = [{ exitCode: 42 }];
+      fake.replies.partner = [
+        {
+          exitCode: 0,
+          stdout: `partner 1\n${names.map((n, i) => textConflict(n, i * 3)).join("")}`,
+        },
+      ];
+      fake.replies.binary = [{ exitCode: 0, stdout: names.map((_, i) => `${i}\t\n`).join("") }];
+      if (reply !== null) fake.respond.regions = (command) => reply(nonceOf(command));
+
+      expect(await harness.merge.compose(MAIN, [PIN_A, PIN_B])).toEqual(
+        ok({ kind: "conflict", pins: [PIN_A, PIN_B], paths: names, regions: [] }),
+      );
+      expect(fake.steps().includes("regions")).toBe(reply !== null);
       await expectReleased(harness);
     });
   });
@@ -782,6 +915,52 @@ describe("merge script", () => {
     expect(() => fetchCommand([target, target], 16, 0)).toThrow();
     expect(() => pushCommand(target.url, CANDIDATE, "refs/heads/main", 10)).toThrow();
     expect(() => pushCommand(target.url, CANDIDATE, "refs/heads/candidate/../main", 10)).toThrow();
+  });
+
+  it("builds a regions command only for a checked nonce and object IDs", () => {
+    const blobs = { base: OID(1), ours: OID(2), theirs: OID(3) };
+    const nonce = "0123456789abcdef";
+    expect(regionsCommand(nonce, [blobs], 5)).toContain(`regions 0 ${OID(1)} ${OID(2)} ${OID(3)}`);
+    for (const bad of ["short", "0123456789ABCDEF", "0123456789abcdef'x", ""]) {
+      expect(() => regionsCommand(bad, [blobs], 5)).toThrow();
+    }
+    expect(() => regionsCommand(nonce, [{ ...blobs, ours: "HEAD" }], 5)).toThrow();
+  });
+
+  it("reads regions whose text holds marker-like lines without the nonce", () => {
+    const nonce = "0123456789abcdef";
+    const forged: Sides = {
+      base: "<<<<<<< 0123456789abcdee\n",
+      ours: `${nonce} end\n>>>>>>> other\n`,
+      theirs: "||||||| x\n",
+    };
+    expect(parseRegions(printedRegions(nonce, [[forged, SIDES]]), nonce, 1)).toEqual([
+      { file: 0, ...forged },
+      { file: 0, ...SIDES },
+    ]);
+    // CRLF marker lines, as Git writes them in a file that uses CRLF.
+    const crlf = printedRegions(nonce, [[SIDES]]).replace(
+      /(<{7}|\|{7}|={7}|>{7})( [a-z0-9]+)?\n/g,
+      "$1$2\r\n",
+    );
+    expect(parseRegions(crlf, nonce, 1)).toEqual([{ file: 0, ...SIDES }]);
+  });
+
+  it("rejects regions output that is opaque, incomplete or not what the command prints", () => {
+    const nonce = "0123456789abcdef";
+    const good = printedRegions(nonce, [[SIDES], [SIDES]]);
+    expect(parseRegions(good, nonce, 2)).toHaveLength(2);
+    expect(parseRegions(good, nonce, 3)).toBeNull();
+    expect(parseRegions(good, "fedcba9876543210", 2)).toBeNull();
+    expect(parseRegions(printedRegions(nonce, [[SIDES], "opaque"]), nonce, 2)).toBeNull();
+    expect(parseRegions(printedRegions(nonce, [[], [SIDES]]), nonce, 2)).toBeNull();
+    expect(parseRegions(printedRegions(nonce, [[SIDES], []]), nonce, 2)).toBeNull();
+    expect(parseRegions(good.replace(`${nonce} end\n`, ""), nonce, 2)).toBeNull();
+    expect(
+      parseRegions(good.replace(`>>>>>>> ${nonce}\n${nonce} end`, `${nonce} end`), nonce, 2),
+    ).toBeNull();
+    expect(parseRegions(good.replace(`${nonce} file 1`, `${nonce} file 2`), nonce, 2)).toBeNull();
+    expect(parseRegions("", nonce, 0)).toBeNull();
   });
 
   it("parses unmerged entries whose paths hold newlines and status-like text", () => {

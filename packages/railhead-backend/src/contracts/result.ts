@@ -45,7 +45,8 @@ export type PortName =
   | "checks"
   | "train"
   | "authorization"
-  | "mainWriter";
+  | "mainWriter"
+  | "conflicts";
 
 /** A successful result. */
 export function ok<T>(value: T): PortResult<T> {

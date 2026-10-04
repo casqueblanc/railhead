@@ -83,6 +83,18 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+/// Deserializes a field that may be omitted but is never `null`.
+///
+/// Use with `#[serde(default, deserialize_with)]`: serde then reads a missing key as `None`, and
+/// this refuses a `null`, as the TypeScript shape check refuses one for an optional field.
+pub(crate) fn omissible<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MAX_SAFE_INTEGER, SafeInteger};

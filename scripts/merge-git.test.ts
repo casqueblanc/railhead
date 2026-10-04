@@ -26,8 +26,10 @@ import {
   parseCommit,
   parseDiscarded,
   parsePartner,
+  parseRegions,
   partnerCommand,
   pushCommand,
+  regionsCommand,
   type FetchTarget,
 } from "../packages/railhead-backend/src/train/merge/script.ts";
 
@@ -233,6 +235,65 @@ describe("merge commands with real Git", () => {
     assert.equal(binary.status, 0);
     // logo.bin is binary; shared.txt is text.
     assert.deepEqual(parseBinary(binary.stdout, pairs.length), new Set([0]));
+  });
+
+  test("prints each text region's diff3 sides, and marks a path that could forge a separator", () => {
+    const work = join(root, "work");
+    git(work, "checkout", "-q", "-b", "r", main);
+    commit(
+      {
+        "notes.txt": "head\none\nmiddle\ntwo\ntail\n",
+        "dos.txt": "a\r\nb\r\n",
+        "sep.txt": "x\n=======\ny\n",
+      },
+      "r",
+    );
+    git(work, "checkout", "-q", "-b", "p", "r");
+    commit(
+      {
+        "notes.txt": "head\nONE-p\nmiddle\nTWO-p\ntail\n",
+        "dos.txt": "a\r\nP\r\n",
+        "sep.txt": "x\n=======\np\n",
+      },
+      "p",
+    );
+    git(work, "checkout", "-q", "-b", "q", "r");
+    commit(
+      {
+        "notes.txt": "head\nONE-q\nmiddle\nTWO-q\ntail\n",
+        "dos.txt": "a\r\nQ\r\n",
+        "sep.txt": "x\n=======\nq\n",
+      },
+      "q",
+    );
+    git(work, "checkout", "-q", "main");
+    const [p, q] = [pin("p"), pin("q")];
+    init();
+    assert.equal(run(fetchCommand([{ url: mainUrl, commit: main }, p, q], 16, SECONDS)).status, 0);
+    assert.equal(run(mergeCommand(main, [p.commit, q.commit], SECONDS)).status, CONFLICT_EXIT + 2);
+    const partner = run(partnerCommand(q.commit, [main, p.commit], SECONDS));
+    const found = parsePartner(partner.stdout);
+    assert.ok(found !== null && found.kind === "partner");
+    const blobs = (path: string) => {
+      const stage = (n: number) =>
+        found.entries.find((entry) => entry.path === path && entry.stage === n)?.object ?? "";
+      return { base: stage(1), ours: stage(2), theirs: stage(3) };
+    };
+    const nonce = "0123456789abcdef0123456789abcdef";
+
+    const text = run(regionsCommand(nonce, [blobs("notes.txt"), blobs("dos.txt")], SECONDS));
+    assert.equal(text.status, 0);
+    // Ours is the partner (p), theirs the conflicting pin (q).
+    assert.deepEqual(parseRegions(text.stdout, nonce, 2), [
+      { file: 0, base: "one\n", ours: "ONE-p\n", theirs: "ONE-q\n" },
+      { file: 0, base: "two\n", ours: "TWO-p\n", theirs: "TWO-q\n" },
+      { file: 1, base: "b\r\n", ours: "P\r\n", theirs: "Q\r\n" },
+    ]);
+
+    const forgeable = run(regionsCommand(nonce, [blobs("notes.txt"), blobs("sep.txt")], SECONDS));
+    assert.equal(forgeable.status, 0);
+    assert.ok(forgeable.stdout.includes(`${nonce} file 1\n${nonce} opaque\n`));
+    assert.equal(parseRegions(forgeable.stdout, nonce, 2), null);
   });
 
   test("reports partner none when no single earlier commit conflicts", () => {

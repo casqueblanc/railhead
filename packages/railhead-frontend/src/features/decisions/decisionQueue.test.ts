@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import {
+  CONFLICT,
+  conflictQuestion,
+  parkedConflict,
+  parkedPair,
+} from "../../../../../fixtures/board/parkedConflict";
+import {
   SYNTH_REPO,
   SYNTH_TRAIN,
   seqWhere,
@@ -35,6 +41,13 @@ const ask = (
     ],
   },
 });
+
+/** The open conflict decision on a consistent board folded from `steps`. */
+const openConflict = (steps: SyntheticStep[]) => {
+  const state = fold(syntheticLog("Synthetic parked pair", steps).events);
+  expect(state.stream).toEqual({ kind: "consistent" });
+  return decisionQueue(state).open.find((view) => view.decisionId === CONFLICT.decision);
+};
 
 const isDecision = (version: number) => (event: RailheadEvent) =>
   event.type === "decision.recorded" && event.data.version === version;
@@ -139,5 +152,51 @@ describe("decisionQueue", () => {
     const view = decisionQueue(fold(log.events)).decided[0];
     expect(view?.decisionId).toBe(UPLOAD.decision);
     expect(view?.affectedClaims).toEqual([]);
+  });
+
+  describe("a parked train conflict", () => {
+    it("shows both claims before the owner answers", () => {
+      const queue = decisionQueue(fold(parkedConflict.events));
+      const [view] = queue.open;
+      expect(view?.decisionId).toBe(CONFLICT.decision);
+      expect(view?.affectedClaims).toEqual([UPLOAD.atlasClaim, UPLOAD.birchClaim]);
+      expect(view?.versions).toEqual([]);
+      // It holds up more work than atlas's own question, so it comes first.
+      expect(queue.open.map((open) => open.decisionId)).toEqual([
+        CONFLICT.decision,
+        UPLOAD.decision,
+      ]);
+    });
+
+    it("counts only the question's claim for an event written before claimIds", () => {
+      const view = openConflict([...parkedPair(), conflictQuestion(null)]);
+      expect(view?.affectedClaims).toEqual([UPLOAD.atlasClaim]);
+    });
+
+    it("stops counting a claim of the pair once it expires", () => {
+      const view = openConflict([
+        ...parkedPair(),
+        conflictQuestion([UPLOAD.atlasClaim, UPLOAD.birchClaim]),
+        {
+          type: "claim.expired",
+          actor: SYNTH_TRAIN,
+          data: { claimId: UPLOAD.birchClaim, generation: 1 },
+        },
+      ]);
+      expect(view?.affectedClaims).toEqual([UPLOAD.atlasClaim]);
+    });
+
+    it("halts the board on a question naming a claim the log never opened", () => {
+      const steps = [...parkedPair(), conflictQuestion([UPLOAD.atlasClaim, "clm_synthghost"])];
+      const state = fold(syntheticLog("Synthetic unknown claim", steps).events);
+      expect(state.stream).toEqual({
+        kind: "halted",
+        fault: {
+          kind: "inconsistent",
+          seq: steps.length,
+          message: "claim clm_synthghost was never recorded",
+        },
+      });
+    });
   });
 });

@@ -804,6 +804,7 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
           decisionId: string(d, "decisionId", p),
           text: string(d, "text", p),
           options: list(d, "options", p, readOption),
+          ...(d.claimIds === undefined ? {} : { claimIds: list(d, "claimIds", p, stringItem) }),
         },
       };
     case "decision.recorded":
