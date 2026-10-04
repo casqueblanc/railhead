@@ -59,15 +59,14 @@ export interface ArtifactsPort {
    * Revokes the tokens for `repo` that `cutoff` covers, as `ready` and lease expiry require, and
    * never a token minted after the attempt began, so a late sweep cannot end a newer holder's
    * access. `revoked` means no covered token can still be used: the listing covered every token and
-   * each covered live one was revoked, or every token the fork may hold has expired.
+   * each covered live one was revoked.
    *
-   * `pending_debt` means a covered token may still be live: the listing could not cover every
-   * token, or a token of no recorded mint is too recent to place before the cutoff while a later
-   * mint has not answered. It is not a revocation: a caller must not grant a new holder write access
-   * to `repo` until a later call returns `revoked`. After a partial listing `token` refuses `repo`,
-   * and that debt ends by itself at most `MAX_TOKEN_TTL_MS` plus clock skew after it was recorded.
-   * The debt keeps `cutoff`, and every later sweep for it, a token request's included, revokes only
-   * what `cutoff` covers.
+   * `pending_debt` means a covered token may still be live: a token of no recorded mint is too
+   * recent to place before the cutoff while a later mint has not answered. It is not a revocation:
+   * a caller must not grant a new holder write access to `repo` until a later call returns
+   * `revoked`. A listing that cannot cover every live token is an `internal` failure, not a
+   * `pending_debt`: the adapter keeps a fork below one page of tokens, so it means Artifacts changed
+   * its listing, and `token` refuses `repo` while it lasts.
    */
   revokeTokens(repo: ArtifactsRepoName, cutoff: MintCutoff): Promise<PortResult<TokenRevocation>>;
 }

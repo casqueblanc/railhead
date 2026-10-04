@@ -8,7 +8,7 @@ import {
   createArtifactsAdapter,
   forkRepoName,
   mainRepoName,
-  TOKEN_DEBT_RETRY_MS,
+  TOKEN_PAGE_SIZE,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
 import type { ArtifactsPort, ArtifactsRepoName } from "../src/contracts/artifacts";
@@ -341,10 +341,6 @@ function stored(
 }
 
 /** Every stored revocation barrier, by claim and attempt. */
-function debts(sql: SqlStorage): number {
-  return sql.exec("SELECT 1 FROM artifacts_sweep_debts").toArray().length;
-}
-
 function barriers(sql: SqlStorage): { claim_id: string; attempt: number; expires_at: number }[] {
   return sql
     .exec<{ claim_id: string; attempt: number; expires_at: number }>(
@@ -1018,11 +1014,11 @@ describe("takeover", () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
       const former = setup.fake.mintFor(fork, "write", 3600);
-      // Each listing page holds only the fork's revoked initial token and hides the former holder's.
-      setup.fake.pageTokens(1, "creation");
+      // As if Artifacts stopped listing tokens: each page hides the former holder's.
+      setup.fake.pageTokens(0);
       setup.fake.advance(CLAIM_LEASE_MS);
 
-      // The adapter reports a debt: the former holder's token is still live, so nobody may write.
+      // The sweep fails: the former holder's token is still live, so nobody may write.
       expectFailure(await setup.port.work(agent(2)), "busy");
       expectFailure(await setup.port.claim(agent(2), claim.issueId), "busy");
       expectFailure(
@@ -1051,7 +1047,7 @@ describe("takeover", () => {
 
       // The next alarm's listing covers every token; only now does the successor get the claim and
       // a write grant.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
       expect(setup.fake.accepts(former.plaintext)).toBe(false);
@@ -1116,8 +1112,13 @@ describe("takeover", () => {
           clean === "earlier" ? [holds[0], holds[1]] : [holds[1], holds[0]];
 
         const answer = async (sweep: "clean" | "partial"): Promise<void> => {
-          if (sweep === "clean") setup.fake.pageTokens(null);
-          else setup.fake.pageTokens(1, "creation");
+          if (sweep === "clean") {
+            setup.fake.pageTokens(TOKEN_PAGE_SIZE);
+          } else {
+            // A live token the empty page hides, whichever sweep answered first.
+            setup.fake.mintFor(fork, "write", 3600);
+            setup.fake.pageTokens(0);
+          }
           (sweep === "clean" ? cleanHold : partialHold)?.resolve();
           await (sweep === "clean" ? cleanSweep : partialSweep);
         };
@@ -1143,7 +1144,7 @@ describe("takeover", () => {
         expect(setup.wakes).toContain(retry);
 
         // The alarm retries at the retry time; a full listing settles the claim for the successor.
-        setup.fake.pageTokens(null);
+        setup.fake.pageTokens(TOKEN_PAGE_SIZE);
         await fireAlarm(setup);
         expect(setup.revoked).toEqual([fork, fork, fork]);
         expect(stored(setup.sql, claim.claimId).revoke_due).toBeNull();
@@ -1161,7 +1162,7 @@ describe("takeover", () => {
       const { claim, fork } = await setup.open();
       const newer = await setup.file("Add downloads");
       const former = setup.fake.mintFor(fork, "write", 3600);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       setup.fake.advance(CLAIM_LEASE_MS);
 
       // While the release is pending, another agent is told to wait rather than handed the newer issue.
@@ -1175,7 +1176,7 @@ describe("takeover", () => {
       expect(setup.fake.accepts(former.plaintext)).toBe(true);
 
       // Once a sweep settles, the expired claim goes first and the newer issue to the next agent.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(setup.fake.accepts(former.plaintext)).toBe(false);
       expect(await setup.port.work(agent(2))).toMatchObject({
@@ -1194,7 +1195,7 @@ describe("takeover", () => {
       const { claim, fork } = await setup.open();
       const newer = await setup.file("Add downloads");
       setup.fake.mintFor(fork, "write", 3600);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       setup.fake.advance(CLAIM_LEASE_MS);
 
       // Its own expired claim is never offered back, but it still waits rather than skip ahead.
@@ -1204,7 +1205,7 @@ describe("takeover", () => {
       expect(claimsOn(setup, newer)).toBe(0);
 
       // Once a sweep settles, the former holder gets the newer issue and a successor the old claim.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(await setup.port.work(agent(1))).toMatchObject({
         ok: true,
@@ -1238,7 +1239,7 @@ describe("takeover", () => {
 
       // The next sweep reaches Artifacts but lists the tokens only in part, so the claim stays owed.
       setup.fake.failRevocations(0);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       await fireAlarm(setup);
       expect(stored(setup.sql, opened.value.claim.claimId).revoke_due).not.toBeNull();
       expectFailure(await setup.port.claim(agent(2), newer), "busy");
@@ -1251,7 +1252,7 @@ describe("takeover", () => {
       });
 
       // Once a sweep settles, the newer issue is free to claim.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(setup.fake.accepts(former.plaintext)).toBe(false);
       expect(await setup.port.claim(agent(3), newer)).toMatchObject({
@@ -1322,7 +1323,7 @@ describe("takeover", () => {
       const newerId = newer.value.claim.claimId;
       // Only the older fork holds a token the partial listing hides, so only its sweep stays owed.
       const former = setup.fake.mintFor(older.fork, "write", 3600);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       setup.fake.advance(CLAIM_LEASE_MS);
       await setup.port.resume();
       expect(stored(setup.sql, older.claim.claimId)).toMatchObject({
@@ -1344,7 +1345,7 @@ describe("takeover", () => {
       expect(setup.fake.accepts(former.plaintext)).toBe(true);
 
       // Once the older sweep settles, the claims go in issue order.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(setup.fake.accepts(former.plaintext)).toBe(false);
       expect(await setup.port.work(agent(3))).toMatchObject({
@@ -1611,11 +1612,11 @@ describe("revocation at ready", () => {
       const { claim, fork } = await setup.open();
       setup.push(fork, WORK);
       const live = setup.fake.mintFor(fork, "write", 3600);
-      // The listing hides the live token, so Artifacts reports a debt rather than `revoked`.
-      setup.fake.pageTokens(1, "creation");
+      // The listing hides the live token, so the sweep fails rather than report `revoked`.
+      setup.fake.pageTokens(0);
       const ready = { generation: 1, commit: WORK };
 
-      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "busy");
+      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "internal");
       expect(stored(setup.sql, claim.claimId)).toMatchObject({
         state: "ready",
         revoke_due: setup.fake.clock() + REVOKE_RETRY_MS,
@@ -1625,11 +1626,11 @@ describe("revocation at ready", () => {
       expect(setup.wakes).toContain(setup.fake.clock() + REVOKE_RETRY_MS);
 
       // The holder's repeat revokes again; still partial, it is still refused.
-      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "busy");
+      expectFailure(await setup.port.ready(agent(1), claim.claimId, ready), "internal");
       expect(setup.revoked).toEqual([fork, fork]);
 
       // The alarm's retry sees every token; only then does the train get the pin.
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       await fireAlarm(setup);
       expect(setup.revoked).toEqual([fork, fork, fork]);
       expect(stored(setup.sql, claim.claimId)).toMatchObject({ state: "ready", revoke_due: null });
@@ -1666,10 +1667,10 @@ describe("revocation at ready", () => {
       await record(setup, asked.value.decisionId, "chunk", null);
       await ackAll(setup, agent(1));
       setup.fake.mintFor(fork, "write", 3600);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       expectFailure(
         await setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
-        "busy",
+        "internal",
       );
 
       // A newer version supersedes the pin; the holder works again and owes no revocation.
@@ -1702,15 +1703,18 @@ describe("revocation at ready", () => {
       setup.fake.mintFor(first.fork, "write", 3600);
       setup.fake.mintFor(second.fork, "write", 3600);
       // Both listings are partial, so both pins owe a revocation the alarm retries.
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       for (const [n, { claimId }, commit] of [
         [1, first, WORK],
         [2, second, SUCCESSOR],
       ] as const) {
-        expectFailure(await setup.port.ready(agent(n), claimId, { generation: 1, commit }), "busy");
+        expectFailure(
+          await setup.port.ready(agent(n), claimId, { generation: 1, commit }),
+          "internal",
+        );
       }
       expect(setup.revoked).toEqual([first.fork, second.fork]);
-      setup.fake.pageTokens(null);
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
       setup.fake.advance(REVOKE_RETRY_MS);
 
       // The alarm reads both due claims, then waits on the first claim's sweep.
@@ -1936,7 +1940,7 @@ describe("revocation at ready", () => {
     });
   });
 
-  it("keeps a new holder's token when a lost sweep resumes on a partial listing and its debt is retried", async () => {
+  it("keeps a new holder's token when a lost sweep resumes on a partial listing", async () => {
     await withTakeover(async (setup) => {
       const { claim, fork } = await setup.open();
       const decisionId = await decideOnce(setup, agent(1), claim.claimId);
@@ -1965,25 +1969,22 @@ describe("revocation at ready", () => {
       const token = await rebooted.artifacts.token(fork, "write", 120_000);
       if (!token.ok) throw new Error(`token refused: ${token.code}`);
 
-      // A resumes while the listing shows only the revoked initial token: its sweep owes a debt.
-      setup.fake.pageTokens(1, "creation");
+      // A resumes while the listing shows no token: its sweep fails and records nothing.
+      setup.fake.pageTokens(0);
       stalled.resolve();
-      expectFailure(await pending, "busy");
+      expectFailure(await pending, "internal");
       expect(setup.fake.accepts(token.value.value)).toBe(true);
-      expect(debts(setup.sql)).toBe(1);
       expect(stored(setup.sql, claim.claimId)).toMatchObject({
         state: "working",
         revoke_due: null,
       });
 
-      // The holder's next token request retries the debt under A's cutoff, which the token is after.
-      setup.fake.pageTokens(null);
-      setup.fake.advance(TOKEN_DEBT_RETRY_MS);
-      const again = await rebooted.artifacts.token(fork, "write", 120_000);
+      // Once the listing is whole the holder gets a further token, and the first one still works.
+      setup.fake.pageTokens(TOKEN_PAGE_SIZE);
+      const again = await rebooted.artifacts.token(fork, "read", 120_000);
       if (!again.ok) throw new Error(`token refused: ${again.code}`);
       expect(setup.fake.accepts(token.value.value)).toBe(true);
       expect(setup.fake.accepts(again.value.value)).toBe(true);
-      expect(debts(setup.sql)).toBe(0);
       expect(setup.revoked).toEqual([fork, fork]);
     });
   });
@@ -2002,8 +2003,8 @@ describe("revocation at ready", () => {
       expectFailure(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId)), "busy");
       setup.fake.mintFor(fork, "write", 3600);
 
-      // The new sweep's listing is partial, so Artifacts reports a debt, not a revocation.
-      setup.fake.pageTokens(1, "live-first");
+      // The new sweep's listing is partial, so it fails rather than report a revocation.
+      setup.fake.pageTokens(0);
       setup.fake.advance(REVOCATION_BARRIER_MS);
       await rebooted.claims.resume();
       expect(setup.revoked).toEqual([fork, fork]);
@@ -2013,14 +2014,14 @@ describe("revocation at ready", () => {
         revoke_due: null,
       });
 
-      // The claim grants the push, and the adapter refuses its token while the debt stands.
+      // The claim grants the push, and the adapter refuses its token while the listing is partial.
       expect(await rebooted.claims.authorizeGit(push(agent(1), claim.claimId))).toMatchObject({
         ok: true,
         value: { scope: "write" },
       });
-      // A partial listing may hide a live token, so none is minted until a later sweep is clean.
+      // A partial listing may hide a live token, so none is minted while it stays partial.
       const minted = setup.fake.tokensMinted;
-      expectFailure(await rebooted.artifacts.token(fork, "write", 120_000), "busy");
+      expectFailure(await rebooted.artifacts.token(fork, "write", 120_000), "internal");
       expect(setup.fake.tokensMinted).toBe(minted);
     });
   });
@@ -2062,10 +2063,10 @@ describe("revocation at ready", () => {
       const { claim, fork } = await setup.open();
       setup.push(fork, WORK);
       setup.fake.mintFor(fork, "write", 3600);
-      setup.fake.pageTokens(1, "creation");
+      setup.fake.pageTokens(0);
       expectFailure(
         await setup.port.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
-        "busy",
+        "internal",
       );
       const owedAt = setup.fake.clock() + REVOKE_RETRY_MS;
       const read = {
