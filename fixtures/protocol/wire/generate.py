@@ -751,7 +751,7 @@ CHECK_DIGEST = hashlib.sha256(b'{"name":"test","command":"pnpm test","timeoutMs"
 
 
 # The schema version each type is written at, when later than 1: the version that introduced it.
-EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "train.unreported": 2, "claim.merged": 2, "claim.released": 2}
+EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "train.unreported": 2, "claim.merged": 2, "claim.released": 2, "train.held_expired": 3}
 
 
 def event(seq: int, type_: str, actor: dict, data: dict) -> dict:
@@ -792,6 +792,7 @@ def events_fixture() -> dict:
         ("train.unreported", SYSTEM, {"checkRunId": "chk_run0003", "candidate": SHA_OTHER, "outcome": "timed_out"}),
         ("claim.merged", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_OTHER}),
         ("claim.released", AGENT_ACTOR, {"claimId": "clm_43abcd", "generation": 1}),
+        ("train.held_expired", SYSTEM, {"checkRunId": "chk_run0002", "candidate": SHA_OTHER, "reason": "timed_out"}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -807,6 +808,7 @@ def events_fixture() -> dict:
         ("unknown actor kind", {**opened, "actor": {"kind": "robot", "id": AGENT}}),
         ("tag and data of different types", {**opened, "type": "claim.expired", "data": {"claimId": "clm_42abcd"}}),
         ("unknown unreported outcome", {**events[24], "data": {**events[24]["data"], "outcome": "lost"}}),
+        ("unknown held expiry reason", {**events[27], "data": {**events[27]["data"], "reason": "approved"}}),
         ("question claims written as null", {**asked, "data": {**asked["data"], "claimIds": None}}),
     ]
     invariant = [
@@ -827,6 +829,9 @@ def events_fixture() -> dict:
         ("merge recorded by an agent", {**events[25], "actor": AGENT_ACTOR}, "recorded by the system"),
         ("release recorded by the system", {**events[26], "actor": SYSTEM}, "by the agent itself"),
         ("release written at version 1", {**events[26], "v": 1}, "schema version"),
+        ("held expiry asserted by an agent", {**events[27], "actor": AGENT_ACTOR}, "by the system"),
+        ("held expiry asserted by a person", {**events[27], "actor": HUMAN}, "by the system"),
+        ("held expiry written at version 2", {**events[27], "v": 2}, "schema version"),
         ("question claims not led by its claim", {**system_asked, "data": {**system_asked["data"], "claimIds": ["clm_43abcd", "clm_42abcd"]}}, "claimIds"),
         ("question claims naming a claim twice", {**system_asked, "data": {**system_asked["data"], "claimIds": ["clm_42abcd", "clm_42abcd"]}}, "claimIds"),
         ("question claims left empty", {**system_asked, "data": {**system_asked["data"], "claimIds": []}}, "claimIds"),

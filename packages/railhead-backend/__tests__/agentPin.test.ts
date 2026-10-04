@@ -233,7 +233,8 @@ describe("pin", () => {
       settleEntry(sql, pinOf("clm_atlas01"), "parked", "check_held", NOW);
       expect(await state()).toEqual({ kind: "parked", reason: "check_held" });
       // The train records the expiry as `held_expired`; the wire keeps the reason older `rh` reads.
-      expect(expireHeldPins(sql, { parkedBy: NOW, keep: 16 }, NOW + 1)).toBe(1);
+      // No held batch is stored here, so no attempt is returned for the log.
+      expect(expireHeldPins(sql, { parkedBy: NOW, keep: 16 }, NOW + 1)).toEqual([]);
       expect(readEntry(sql, "clm_atlas01", 1)).toMatchObject({ reason: "held_expired" });
       expect(await state()).toEqual({ kind: "dropped", reason: "check_held" });
     });

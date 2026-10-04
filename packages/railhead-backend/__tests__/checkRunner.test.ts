@@ -342,7 +342,7 @@ function withChecks(body: (harness: Harness) => Promise<void>): Promise<void> {
           world.reports.push(report);
           return world.recorded ?? ok(await attempt());
         },
-        release: (attemptId) => {
+        release: (_tx, attemptId) => {
           if (world.trainHolds) world.released.push(attemptId);
           return world.trainHolds;
         },
@@ -2204,7 +2204,8 @@ describe("a held check through the train", () => {
         entry,
         afterExpiry: attempts.get(heldId),
         approved,
-        events: log.replay(0, 100).events.map((event) => event.type),
+        heldId,
+        events: log.replay(0, 100).events,
       };
     });
 
@@ -2216,6 +2217,11 @@ describe("a held check through the train", () => {
     expect(seen.approved).toEqual(
       fail("action_stale", "That check is no longer held for that definition."),
     );
-    expect(seen.events).toEqual(["train.held"]);
+    // The expiry is in the log once, so the board ends the hold before the approval is refused.
+    expect(seen.events.map((event) => event.type)).toEqual(["train.held", "train.held_expired"]);
+    expect(seen.events[1]).toMatchObject({
+      actor: { kind: "system", id: "sys_train" },
+      data: { checkRunId: seen.heldId, candidate: CANDIDATE, reason: "timed_out" },
+    });
   });
 });

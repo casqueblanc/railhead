@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eventVersion, type RailheadEvent } from "@railhead/shared/events";
+import { eventVersion, type HeldExpiryReason, type RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { mixedBatch } from "../../../../../fixtures/board/mixedBatch";
@@ -181,12 +181,12 @@ describe("foldEvent on events it must not apply", () => {
   it("halts on an unsupported schema version and ignores everything after", () => {
     const newer = {
       ...next(base, { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: UPLOAD.birch } }),
-      v: 3,
+      v: 4,
     };
     const halted = foldEvent(base, newer);
     expect(halted.stream).toEqual({
       kind: "halted",
-      fault: { kind: "unsupported_version", seq, version: 3 },
+      fault: { kind: "unsupported_version", seq, version: 4 },
     });
     expect(halted.cursor).toBe(base.cursor);
     expect(halted.agents).toBe(base.agents);
@@ -319,6 +319,15 @@ describe("held checks and their approval", () => {
     actor: SYNTH_OWNER,
     data: { checkRunId: HELD_RUN, candidate, digest },
   });
+  const heldExpired = (
+    reason: HeldExpiryReason = "timed_out",
+    checkRunId = HELD_RUN,
+    candidate = synthCommit(9),
+  ): SyntheticStep => ({
+    type: "train.held_expired",
+    actor: SYNTH_TRAIN,
+    data: { checkRunId, candidate, reason },
+  });
   const before = fold(
     syntheticLog("Synthetic held check", [
       ...uploadPrelude(),
@@ -357,6 +366,11 @@ describe("held checks and their approval", () => {
     ["a second approval", () => append(append(append(before, held()), approved()), approved())],
     ["a second hold of the same run", () => append(append(before, held()), held())],
     ["a hold naming an unknown claim", () => append(before, held(DIGEST, ["clm_synthghost"]))],
+    ["an expiry of a check that was never held", () => append(before, heldExpired())],
+    [
+      "an expiry naming another candidate",
+      () => append(append(before, held()), heldExpired("timed_out", HELD_RUN, synthCommit(8))),
+    ],
   ])("halts on %s", (_name, apply) => {
     const halted = apply();
     expect(halted.stream).toMatchObject({ kind: "halted", fault: { kind: "inconsistent" } });
@@ -405,6 +419,39 @@ describe("held checks and their approval", () => {
       expect(ended.heldChecks[HELD_RUN]?.ended).toEqual({ reason, seq: ended.cursor });
     },
   );
+
+  it.each(["timed_out", "over_limit"] as const)(
+    "ends a waiting hold the train expired as %s",
+    (reason) => {
+      const waiting = append(before, held());
+      const expired = append(waiting, heldExpired(reason));
+      expect(expired.stream).toEqual({ kind: "consistent" });
+      expect(expired.heldChecks[HELD_RUN]?.ended).toEqual({ reason, seq: expired.cursor });
+      expect(waiting.heldChecks[HELD_RUN]?.ended).toBeNull();
+    },
+  );
+
+  it("keeps a hold's first end when the train expires it afterwards", () => {
+    const reopened = append(append(before, held()), reopen([]));
+    const expired = append(reopened, heldExpired("over_limit"));
+    expect(expired.stream).toEqual({ kind: "consistent" });
+    expect(expired.heldChecks[HELD_RUN]?.ended).toEqual({
+      reason: "dropped",
+      seq: reopened.cursor,
+    });
+  });
+
+  it("keeps a hold from a log written before held expiries waiting", () => {
+    const log = syntheticLog("Synthetic held check before expiries", [
+      ...uploadPrelude(),
+      ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), []),
+      held(),
+    ]).events;
+    expect(Math.max(...log.map((event) => event.v))).toBe(2);
+    const state = fold(log);
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(state.heldChecks[HELD_RUN]?.ended).toBeNull();
+  });
 
   it("ends an approved hold the train never ran, and keeps the first end", () => {
     const approvedState = append(append(before, held()), approved());

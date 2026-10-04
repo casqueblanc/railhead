@@ -287,9 +287,10 @@ export interface TrainPort {
    * already expired or a parked pin a later generation of its claim superseded, or when a pin's
    * claim is no longer ready at the generation and episode it was batched in. A fence method
    * like `attemptOutcome`: call it inside the caller's `log.transaction`, then `resume` once that
-   * transaction committed.
+   * transaction committed. A parked pin past its time expires first, recording `train.held_expired`
+   * in `tx`.
    */
-  release(attemptId: CheckRunId): boolean;
+  release(tx: EventTransaction, attemptId: CheckRunId): boolean;
   /**
    * Whether the train may still run `attemptId`, an attempt it held: an active batch still has it,
    * or its pin is parked for it or queued to revive it. The checks module keeps such an attempt so

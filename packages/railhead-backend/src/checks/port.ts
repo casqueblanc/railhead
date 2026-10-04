@@ -233,7 +233,7 @@ export function createChecks(deps: ChecksDeps): CheckPort {
         // A repeat of the recorded approval: the train already has the attempt back.
         if (recordedApproval(current, grant)) return ok({ checkRunId: action.checkRunId });
         if (current === null || !approvable(current, grant)) return stale;
-        if (!ports().train.release(action.checkRunId)) {
+        if (!ports().train.release(tx, action.checkRunId)) {
           return fail("action_stale", "The train no longer holds that check; nothing changed.");
         }
         const now = clock();
