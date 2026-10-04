@@ -138,6 +138,8 @@ pub enum Endpoint<'a> {
         /// The claim.
         claim_id: &'a str,
     },
+    /// `GET /pin`.
+    Pin,
     /// `GET /inbox`, with an optional page size.
     Inbox {
         /// Items per page, from 1 to [`MAX_INBOX_PAGE`].
@@ -175,6 +177,7 @@ impl Endpoint<'_> {
             Self::Claim => AgentRoute::Claim,
             Self::Ready { .. } => AgentRoute::Ready,
             Self::Release { .. } => AgentRoute::Release,
+            Self::Pin => AgentRoute::Pin,
             Self::Inbox { .. } => AgentRoute::Inbox,
             Self::Ack { .. } => AgentRoute::Ack,
             Self::Ask { .. } => AgentRoute::Ask,
@@ -204,7 +207,8 @@ impl Endpoint<'_> {
             | Self::Session
             | Self::Status
             | Self::Work
-            | Self::Claim => (path.to_owned(), None),
+            | Self::Claim
+            | Self::Pin => (path.to_owned(), None),
             Self::Ready { claim_id } | Self::Release { claim_id } | Self::Ask { claim_id } => (
                 path.replace("{claimId}", &id(IdKind::Claim, claim_id, "claimId")?),
                 None,

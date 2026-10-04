@@ -3,6 +3,8 @@
 //!
 //! The fake's train lands claims in waves: it hands out claims until a wave is full, then lands
 //! the wave once every claim in it is ready, in the order they were pinned, with `git merge-tree`.
+//! Its `pin` route shows a ready claim queued while its wave is not full, and in the wave's batch
+//! once it is: forming until every claim in it is ready, then checking.
 //! A clean merge moves main; a conflict reopens the claim at the next generation and routes a
 //! `conflict` inbox item to its agent. By default the agent's status keeps showing its last claim
 //! once it merged, the positive evidence the driver needs to count a landing; the real backend
@@ -204,6 +206,12 @@ struct State {
     limit_status_ms: Option<u64>,
     /// When each `status` request arrived, and whether it was refused.
     statuses: Vec<(std::time::Instant, bool)>,
+    /// Waves landed, so the current wave's batch is the next.
+    waves: u64,
+    /// `pin` requests received.
+    pins: u64,
+    /// Whether `pin` answers that the train module is not installed.
+    pin_unavailable: bool,
 }
 
 /// The fake backend.
@@ -447,6 +455,7 @@ impl Fake {
         });
         if done {
             state.wave.clear();
+            state.waves += 1;
         }
         Ok(())
     }
@@ -534,6 +543,42 @@ impl Fake {
         Ok(())
     }
 
+    /// Where the fake's train holds the agent's ready claim.
+    fn pin(&self, state: &State, agent: usize) -> Value {
+        let Some(claim) = Self::active(state, agent)
+            .and_then(|index| state.claims.get(index))
+            .filter(|claim| claim.state == ClaimState::Ready)
+        else {
+            return Value::Null;
+        };
+        let in_wave: Vec<&Claim> = state
+            .wave
+            .iter()
+            .filter_map(|&index| state.claims.get(index))
+            .filter(|claim| claim.state != ClaimState::Merged)
+            .collect();
+        let train = if state.wave.len() < self.wave_size {
+            let position = in_wave
+                .iter()
+                .filter(|other| {
+                    other.state == ClaimState::Ready && other.ready_seq <= claim.ready_seq
+                })
+                .count();
+            json!({"kind": "queued", "position": position})
+        } else {
+            let batch_id = state.waves + 1;
+            if in_wave.iter().all(|other| other.state == ClaimState::Ready) {
+                json!({"kind": "batched", "batchId": batch_id, "batch": "checking",
+                    "checkRunId": format!("chk_wave{batch_id:04}")})
+            } else {
+                json!({"kind": "batched", "batchId": batch_id, "batch": "forming",
+                    "checkRunId": null})
+            }
+        };
+        json!({"claimId": claim.id, "generation": claim.generation,
+            "commit": claim.ready_commit, "nextCommit": null, "state": train})
+    }
+
     fn handle(&self, request: &Request) -> anyhow::Result<ResponseTemplate> {
         let token = request
             .headers
@@ -596,6 +641,16 @@ impl Fake {
                     Some(Lost::Busy) => failure(AgentErrorCode::Busy, Some(0)),
                     None => answer,
                 })
+            }
+            ("GET", ["pin"]) => {
+                state.pins += 1;
+                if state.pin_unavailable {
+                    return Ok(failure(AgentErrorCode::Unavailable, None));
+                }
+                Ok(success(
+                    &json!({"pin": self.pin(&state, agent)}),
+                    &Self::digest(&state, agent),
+                ))
             }
             ("GET", ["inbox"]) => {
                 let digest = Self::digest(&state, agent);
@@ -856,13 +911,22 @@ impl Run {
         self.summary().ok()?.get(field)?.as_u64()
     }
 
-    /// The types of `agent`'s events, in order.
+    /// The train states `agent`'s `pinState` events reported, in order.
+    fn trains_of(&self, agent: &str) -> Vec<&Value> {
+        self.of_type("pinState")
+            .into_iter()
+            .filter(|event| event.get("agent").and_then(Value::as_str) == Some(agent))
+            .filter_map(|event| event.get("train"))
+            .collect()
+    }
+
+    /// The types of `agent`'s events other than state changes and pin reads, in order.
     fn steps_of(&self, agent: &str) -> Vec<String> {
         self.events
             .iter()
             .filter(|event| event.get("agent").and_then(Value::as_str) == Some(agent))
             .filter_map(|event| event.get("type").and_then(Value::as_str))
-            .filter(|kind| *kind != "agentState")
+            .filter(|kind| !matches!(*kind, "agentState" | "pinState"))
             .map(str::to_owned)
             .collect()
     }
@@ -1176,6 +1240,19 @@ async fn a_claim_that_never_lands_stalls_its_agent() -> anyhow::Result<()> {
     assert_eq!(
         (run.total("stalls"), run.total("landings")),
         (Some(1), Some(0))
+    );
+    // The pin was read on every poll that found the claim ready, and reported once: it never moved.
+    assert_eq!(
+        run.trains_of("swarm-00"),
+        [&json!({"kind": "queued", "position": 1})]
+    );
+    let (pins, statuses) = {
+        let state = world.state();
+        (state.pins, u64::try_from(state.statuses.len())?)
+    };
+    assert!(
+        pins > 1 && pins <= statuses,
+        "{pins} pin reads, {statuses} polls"
     );
     assert_eq!(
         run.summary()?.pointer("/readyToLanded/p50Ms"),
@@ -2031,5 +2108,59 @@ async fn a_retry_delay_on_a_status_poll_is_waited_out() -> anyhow::Result<()> {
     );
     drop(state);
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_waiting_pin_is_reported_as_its_batch_forms_and_is_checked() -> anyhow::Result<()> {
+    // The train holds the full wave: its batch forms, then is checked, and never lands.
+    let world = world(2, 2, false).await?;
+    world.state().paused = true;
+    let bounds = json!({"landTimeoutSecs": 2, "runTimeoutSecs": 60, "pollMs": 50});
+    let scenario = world.scenario(2, "casqueblanc/demo", &mix(1, 0, 0), &bounds)?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    assert_eq!(run.code, Some(1));
+    assert_eq!(run.total("stalls"), Some(2));
+    let checking = json!({"kind": "batched", "batchId": 1, "batch": "checking",
+        "checkRunId": "chk_wave0001"});
+    let forming = json!({"kind": "batched", "batchId": 1, "batch": "forming",
+        "checkRunId": null});
+    for agent in ["swarm-00", "swarm-01"] {
+        let trains = run.trains_of(agent);
+        assert_eq!(trains.last(), Some(&&checking), "{agent}: {trains:?}");
+        // Only changes are reported, and a batch only moves forward.
+        assert!(
+            trains.windows(2).all(|pair| pair.first() != pair.last()),
+            "{trains:?}"
+        );
+        assert!(
+            trains
+                .iter()
+                .all(|train| **train == forming || **train == checking),
+            "{agent}: {trains:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_pin_is_reported_once_and_the_agent_keeps_waiting() -> anyhow::Result<()> {
+    let world = world(1, 2, false).await?;
+    world.state().pin_unavailable = true;
+    let bounds = json!({"landTimeoutSecs": 1, "runTimeoutSecs": 60, "pollMs": 50});
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &bounds)?;
+    let run = run(&mut world.driver(&scenario)?)?;
+    // The refusal cannot be fixed by repeating it: one read, one report, and the agent waits on
+    // its status until the land timeout, as it would without the pin.
+    assert_eq!(
+        run.trains_of("swarm-00"),
+        [&json!({"kind": "unreadable", "code": "unavailable"})]
+    );
+    assert_eq!(world.state().pins, 1);
+    assert_eq!(
+        run.steps_of("swarm-00"),
+        ["claimed", "pushed", "ready", "stalled"]
+    );
+    assert_eq!(run.total("failures"), Some(0));
     Ok(())
 }

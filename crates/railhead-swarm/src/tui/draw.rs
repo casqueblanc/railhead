@@ -10,8 +10,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
-use super::view::{Overlap, Phase, Stage, View, class_label, seconds};
-use crate::events::StopReason;
+use super::view::{
+    Lane, Overlap, Phase, Pin, Stage, View, batch_label, class_label, leave_label, seconds,
+};
+use crate::events::{StopReason, TrainState};
 
 /// The narrowest terminal the view lays out.
 pub const MIN_WIDTH: u16 = 80;
@@ -21,9 +23,6 @@ pub const MIN_HEIGHT: u16 = 16;
 
 /// From this width on, the panels sit beside the lanes.
 const WIDE: u16 = 120;
-
-/// The issue that adds the train's batches and checks to what an agent can read.
-pub const TRAIN_STATE_NEEDS: &str = "#277";
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
@@ -295,16 +294,13 @@ fn clock_ms(at: std::time::Duration) -> String {
 }
 
 fn draw_train(frame: &mut Frame, area: Rect, view: &View) {
-    let block = panel("Train").title_bottom(Line::styled(
-        format!(" batches, checks: not visible ({TRAIN_STATE_NEEDS}) "),
-        DIM,
-    ));
+    let block = panel("Train");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let waiting = view.waiting();
+    let waiting = view.waiting().len();
     let mut lines = vec![Line::from(
         [
-            stat("waiting ", waiting.len().to_string()),
+            stat("waiting ", waiting.to_string()),
             stat("landed ", view.tally.landings.to_string()),
             stat("unverified ", view.tally.unverified.to_string()),
         ]
@@ -312,19 +308,56 @@ fn draw_train(frame: &mut Frame, area: Rect, view: &View) {
         .flatten()
         .collect::<Vec<_>>(),
     )];
-    // Pins first, then the latest landings in the rows left.
-    let room = usize::from(inner.height).saturating_sub(1);
-    for (lane, pin) in waiting.iter().take(room) {
-        let waited =
-            u64::try_from(view.now.saturating_sub(pin.since).as_millis()).unwrap_or(u64::MAX);
+    // Batches with their pins, then the other pins, then the latest landings in the rows left.
+    let train = view.train_panel();
+    for batch in &train.batches {
+        let check = batch
+            .check_run_id
+            .map_or_else(|| "no check run".to_owned(), str::to_owned);
         lines.push(Line::from(vec![
-            Span::styled("pinned  ", Style::new().fg(Color::LightBlue)),
-            Span::raw(format!("{} {:>6} ", lane.name, seconds(waited))),
-            Span::styled(pin.claim_id.clone(), DIM),
+            Span::styled(
+                format!("batch {} ", batch.id),
+                Style::new()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{} ", batch_label(batch.state))),
+            Span::styled(check, DIM),
         ]));
+        for (lane, pin) in &batch.pins {
+            lines.push(pin_line("  ", Color::LightBlue, lane, pin, view, None));
+        }
     }
-    let landed_rows = room.saturating_sub(waiting.len());
-    for landing in view.landed.iter().rev().take(landed_rows) {
+    for (lane, pin) in &train.others {
+        let (label, color, detail) = match &pin.train {
+            Some(TrainState::Queued { position }) => {
+                (format!("queued #{position}"), Color::LightBlue, None)
+            }
+            Some(TrainState::Parked { reason }) => (
+                "parked".to_owned(),
+                Color::Yellow,
+                Some(leave_label(*reason)),
+            ),
+            Some(TrainState::Dropped { reason }) => {
+                ("dropped".to_owned(), Color::Red, Some(leave_label(*reason)))
+            }
+            Some(TrainState::Landed) => ("merged".to_owned(), Color::Green, None),
+            Some(TrainState::Unreadable { code }) => {
+                ("pinned".to_owned(), Color::LightBlue, Some(code.as_str()))
+            }
+            Some(TrainState::Batched { .. } | TrainState::Absent) | None => {
+                ("pinned".to_owned(), Color::LightBlue, None)
+            }
+        };
+        lines.push(pin_line(&label, color, lane, pin, view, detail));
+    }
+    let room = usize::from(inner.height);
+    for landing in view
+        .landed
+        .iter()
+        .rev()
+        .take(room.saturating_sub(lines.len()))
+    {
         let waited = landing
             .ready_to_landed_ms
             .map_or_else(|| "-".to_owned(), seconds);
@@ -338,6 +371,28 @@ fn draw_train(frame: &mut Frame, area: Rect, view: &View) {
         ]));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One waiting pin: its label, agent, how long it has waited, its claim and any detail.
+fn pin_line<'a>(
+    label: &str,
+    color: Color,
+    lane: &Lane,
+    pin: &Pin,
+    view: &View,
+    detail: Option<&str>,
+) -> Line<'a> {
+    let waited = u64::try_from(view.now.saturating_sub(pin.since).as_millis()).unwrap_or(u64::MAX);
+    let mut dim = pin.claim_id.clone();
+    if let Some(detail) = detail {
+        dim.push(' ');
+        dim.push_str(detail);
+    }
+    Line::from(vec![
+        Span::styled(format!("{label:<7} "), Style::new().fg(color)),
+        Span::raw(format!("{} {:>6} ", lane.name, seconds(waited))),
+        Span::styled(dim, DIM),
+    ])
 }
 
 fn draw_conflicts(frame: &mut Frame, area: Rect, view: &View) {
@@ -464,6 +519,13 @@ mod tests {
     fn a_finished_run_at_80_columns() -> anyhow::Result<()> {
         let view = replayed(Duration::MAX)?;
         insta::assert_snapshot!(render(&view, 80, 24)?.backend());
+        Ok(())
+    }
+
+    #[test]
+    fn batches_and_their_checks_in_the_train_panel() -> anyhow::Result<()> {
+        let view = crate::tui::view::tests::waiting_on_the_train();
+        insta::assert_snapshot!(render(&view, 140, 24)?.backend());
         Ok(())
     }
 

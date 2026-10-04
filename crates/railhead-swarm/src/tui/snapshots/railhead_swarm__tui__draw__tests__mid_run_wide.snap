@@ -1,6 +1,6 @@
 ---
 source: crates/railhead-swarm/src/tui/draw.rs
-assertion_line: 439
+assertion_line: 507
 expression: "render(&view, 140, 30)?.backend()"
 ---
 " SIMULATED RUN  00:01  running  casqueblanc/demo · 4 agents × 3 rounds · seed 211                                                           "
@@ -19,7 +19,7 @@ expression: "render(&view, 140, 30)?.backend()"
 "│                                                                           ││                                                             │"
 "│                                                                           ││                                                             │"
 "│                                                                           ││                                                             │"
-"│                                                                           │└ batches, checks: not visible (#277) ────────────────────────┘"
+"│                                                                           │└─────────────────────────────────────────────────────────────┘"
 "│                                                                           │┌ Conflicts ──────────────────────────────────────────────────┐"
 "│                                                                           ││auto-merged 0  routed 1                                      │"
 "│                                                                           ││routed      swarm/contested.txt swarm-01 clm_swarm0001 vs clm│"

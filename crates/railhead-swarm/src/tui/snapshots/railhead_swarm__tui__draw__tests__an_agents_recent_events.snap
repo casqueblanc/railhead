@@ -1,6 +1,6 @@
 ---
 source: crates/railhead-swarm/src/tui/draw.rs
-assertion_line: 462
+assertion_line: 530
 expression: "render(&view, 120, 30)?.backend()"
 ---
 " SIMULATED RUN  00:11  ended: completed  casqueblanc/demo · 4 agents × 3 rounds · seed 211                              "
@@ -19,7 +19,7 @@ expression: "render(&view, 120, 30)?.backend()"
 "│   +3.0s landed clm_swarm0001 in 0.2s                           ││landed  swarm-03   0.8s disjoint clm_swarm0005      │"
 "│   +3.7s claimed clm_swarm0007 gen 1                            ││landed  swarm-01   0.2s overlap clm_swarm0001       │"
 "│   +3.8s pushed 3d9c6d9 overlap swarm/contested.txt             ││landed  swarm-00   0.1s disjoint clm_swarm0003      │"
-"│   +4.5s ready 3d9c6d9                                          │└ batches, checks: not visible (#277) ───────────────┘"
+"│   +4.5s ready 3d9c6d9                                          │└────────────────────────────────────────────────────┘"
 "│   +6.1s landed clm_swarm0007 in 1.6s                           │┌ Conflicts ─────────────────────────────────────────┐"
 "│   +7.1s claimed clm_swarm0011 gen 1                            ││auto-merged 2  routed 2                             │"
 "│   +7.5s pushed 443e1c5 overlap swarm/contested.txt             ││routed→redo swarm/contested.txt swarm-01 clm_swarm00│"
