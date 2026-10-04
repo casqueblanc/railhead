@@ -944,6 +944,37 @@ describe("askSystem", () => {
     });
   });
 
+  it("counts a system question that names the claim second toward its agent's quota", async () => {
+    await withDecisions(async (h) => {
+      holdBoth(h);
+      const asked = askSystem(h, { ...SYSTEM, claims: SYSTEM.claims.toReversed() });
+      if (!asked.ok) throw new Error(asked.code);
+      for (let n = 0; n < MAX_QUESTIONS_PER_CLAIM - 1; n += 1) {
+        await h.ask({ requestId: requestId(n) });
+      }
+      const before = h.events().length;
+
+      const over = await h.decisions.ask(h.agent(), CLAIM, {
+        ...ASK,
+        requestId: "req_uploadover000001",
+      });
+
+      expect(over).toMatchObject({ ok: false, code: "quota_exceeded" });
+      expect(h.events()).toHaveLength(before);
+      expect(h.count("questions")).toBe(MAX_QUESTIONS_PER_CLAIM);
+      // The other claim holds the system question's second dependency.
+      expect(h.count("decision_claims")).toBe(MAX_QUESTIONS_PER_CLAIM + 1);
+
+      // Withdrawing the system question drops the dependency, so the agent may ask once more.
+      expect(withdraw(h, asked.value.decisionId)).toBe(true);
+      const last = await h.decisions.ask(h.agent(), CLAIM, {
+        ...ASK,
+        requestId: "req_uploadover000001",
+      });
+      expect(last).toMatchObject({ ok: true, value: { state: "open" } });
+    });
+  });
+
   function withdraw(h: Harness, decisionId: string, asker: SystemId = SYSTEM.asker): boolean {
     return h.log.transaction((tx) => h.decisions.withdraw(tx, asker, decisionId)).value;
   }

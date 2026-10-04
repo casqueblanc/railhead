@@ -1,8 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { ClaimView, ReadyRequest } from "@railhead/shared/agent-api";
-import type { DecisionRef, RailheadEvent } from "@railhead/shared/events";
+import type { AskRequest, ClaimView, ReadyRequest } from "@railhead/shared/agent-api";
+import { MAX_LIST_LENGTH, type DecisionRef, type RailheadEvent } from "@railhead/shared/events";
 import {
   ARTIFACTS_LIMITS,
   createArtifactsAdapter,
@@ -151,6 +151,20 @@ function request(commit: string, generation = 1): ReadyRequest {
   return { generation, commit };
 }
 
+/** Agent 1's `n`th question about uploads on its claim at generation 1. */
+function question(n: number): AskRequest {
+  return {
+    generation: 1,
+    requestId: `req_upload${String(n).padStart(10, "0")}`,
+    text: "Should uploads above 10 MB be rejected or chunked?",
+    options: [
+      { key: "reject", label: "Reject them" },
+      { key: "chunk", label: "Upload them in chunks" },
+    ],
+    scope: ["src/upload.ts"],
+  };
+}
+
 function types(events: RailheadEvent[]): string[] {
   return events.map((event) => event.type);
 }
@@ -238,6 +252,77 @@ describe("ready", () => {
         ok: true,
         value: { claimId: claim.claimId, generation: 1, commit: WORK },
       });
+    });
+  });
+
+  it("pins a claim at its decision quota after a train question named it second", async () => {
+    await withReady(async (setup) => {
+      const { claim, fork } = await setup.open();
+      setup.push(fork, WORK);
+      const filed = await setup.port.fileIssue(grant("Add downloads"));
+      if (!filed.ok) throw new Error(`filing refused: ${filed.code}`);
+      const other = await setup.port.work(agent(2));
+      if (!other.ok) throw new Error(`claim refused: ${other.code}`);
+      const train = setup.log.transaction((tx) =>
+        setup.decisions.askSystem(tx, {
+          asker: "sys_train",
+          key: "conflict_1",
+          claims: [
+            { claimId: other.value.claim.claimId, generation: 1 },
+            { claimId: claim.claimId, generation: 1 },
+          ],
+          text: "Both claims changed src/upload.ts. Which change should main keep?",
+          options: [
+            { key: "keep_first", label: "Keep the first change" },
+            { key: "keep_second", label: "Keep the second change" },
+          ],
+          scope: ["src/upload.ts"],
+        }),
+      ).value;
+      if (!train.ok) throw new Error(`train question refused: ${train.code}`);
+      const decisionIds = [train.value.decisionId];
+      for (let n = 1; n < MAX_LIST_LENGTH; n += 1) {
+        const asked = await setup.decisions.ask(agent(1), claim.claimId, question(n));
+        if (!asked.ok) throw new Error(`ask ${n} refused: ${asked.code}`);
+        decisionIds.push(asked.value.decisionId);
+      }
+      expectFailure(
+        await setup.decisions.ask(agent(1), claim.claimId, question(MAX_LIST_LENGTH)),
+        "quota_exceeded",
+      );
+      for (const [n, decisionId] of decisionIds.entries()) {
+        const recorded = await setup.decisions.record({
+          kind: "human",
+          userId: "usr_owner0001",
+          repoId: REPO,
+          grantId: crypto.randomUUID(),
+          action: {
+            kind: "decision.record",
+            decisionId,
+            option: n === 0 ? "keep_first" : "chunk",
+            expectedVersion: null,
+          },
+        });
+        if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
+      }
+      for (;;) {
+        const delivered = await setup.inbox.pending(agent(1), 16);
+        if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
+        if (delivered.value.items.length === 0) break;
+        for (const { item } of delivered.value.items) {
+          const acked = await setup.inbox.ack(agent(1), item, "Follow the decision.");
+          if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
+        }
+      }
+
+      const head = setup.log.head();
+
+      const result = await setup.port.ready(agent(1), claim.claimId, request(WORK));
+
+      expect(result).toMatchObject({ ok: true, value: { claim: { state: "ready" } } });
+      const [ready] = setup.log.replay(head, 1).events;
+      expect(ready?.type).toBe("claim.ready");
+      expect(ready?.type === "claim.ready" && ready.data.decisions).toHaveLength(MAX_LIST_LENGTH);
     });
   });
 
