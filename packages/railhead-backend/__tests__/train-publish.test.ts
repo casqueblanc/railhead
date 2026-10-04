@@ -4,7 +4,7 @@
 
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { CommitSha, RailheadEvent } from "@railhead/shared/events";
 import type { ClaimPin, ReadyPin } from "../src/contracts/claims";
 import type { ReadyGate } from "../src/contracts/inbox";
@@ -267,9 +267,18 @@ function withRepo<R>(
       inbox: { ...real.inbox, readyGateNow },
       claims: {
         ...real.claims,
+        // As the real pin, refused while the claim's inbox gate blocks. Without it a requeued entry
+        // whose gate blocks is neither formed nor dropped, and each drive spins through `MAX_STEPS`.
         pin: async (claimId) => {
           const found = current.get(claimId);
-          return found === undefined ? fail("not_found", "No such claim.") : ok(found);
+          if (found === undefined) return fail("not_found", "No such claim.");
+          if (gates.get(claimId)?.kind === "blocked") {
+            return fail(
+              "unacked_decision",
+              "An inbox item affecting the claim is not acknowledged.",
+            );
+          }
+          return ok(found);
         },
         currentGeneration,
         readyPin,
@@ -373,6 +382,24 @@ async function pass(h: Harness): Promise<CheckAttempt> {
   });
   expect(recorded).toEqual(ok(attempt));
   return attempt;
+}
+
+/**
+ * Runs `train.startup()` with its retry backoff on a controlled clock, so a loaded runner cannot
+ * spend the test's time limit on real sleeps. The clock jumps only to a sleep already scheduled.
+ */
+async function startupOnFakeTimers(train: Train): Promise<boolean> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const startup = { settled: false };
+    const started = train.startup().finally(() => {
+      startup.settled = true;
+    });
+    while (!startup.settled) await vi.advanceTimersToNextTimerAsync();
+    return await started;
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 /** The intent of the newest batch; fails the test when it has none. */
@@ -586,6 +613,10 @@ describe("the train publishes through the real main writer", () => {
       expect(batchStates(h.train)[0]).toEqual(["failed", "main_rejected"]);
       expect(ref.updates).toHaveLength(1);
       expect(ref.main).toBe(MAIN);
+      // The requeued pin is refused while its gate blocks, so the drive drops it and owes nothing.
+      expect(states(h.train)).toEqual({ clm_claim001: "dropped" });
+      expect(readWake(h.sql)).toBeNull();
+      expect(h.started).toHaveLength(1);
     });
   });
 
@@ -914,7 +945,7 @@ describe("the train's settle wake", () => {
         [pin(1)],
         async (h) => {
           // The first attempt failed; a later one stored the alarm.
-          expect(await h.train.startup()).toBe(true);
+          expect(await startupOnFakeTimers(h.train)).toBe(true);
           expect(owed).toBeDefined();
           expect(await h.storedAlarm()).toBe(owed);
 
@@ -942,7 +973,7 @@ describe("the train's settle wake", () => {
       ref,
       [pin(1)],
       async (h) => {
-        expect(await h.train.startup()).toBe(false);
+        expect(await startupOnFakeTimers(h.train)).toBe(false);
         expect(await h.storedAlarm()).toBeNull();
         // The wake row still owes the settlement, so a ready's `armWake` asks again.
         expect(readWake(h.sql)?.failures).toBe(EXHAUSTED_FAILURES);
@@ -966,7 +997,7 @@ describe("the train's settle wake", () => {
       [pin(1)],
       async (h) => {
         // Every startup write failed: the Repo resets on this, so no alarm and no call remains.
-        expect(await h.train.startup()).toBe(false);
+        expect(await startupOnFakeTimers(h.train)).toBe(false);
         expect(await h.storedAlarm()).toBeNull();
         expect(batchStates(h.train)).toEqual([["passed", null]]);
 
