@@ -11,6 +11,9 @@
       "invocation_logs": false
     }
   },
+  "ai": {
+    "binding": "AI"
+  },
   "r2_buckets": [
     {
       "binding": "BACKUP_BUCKET",
