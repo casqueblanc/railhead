@@ -204,6 +204,10 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: HUMAN,
     data: { checkRunId: "chk_run0001", candidate: SHA_B, digest: DIGEST },
   },
+  "train.unreported": {
+    actor: SYSTEM,
+    data: { checkRunId: "chk_run0001", candidate: SHA_B, outcome: "timed_out" },
+  },
 };
 
 const EVENT_TYPES = Object.keys(VALID) as EventType[];
@@ -249,15 +253,21 @@ describe("validateEvent", () => {
       expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
     });
 
-    it("writes the held check and merge events at version 2 and every older type at version 1", () => {
+    it("writes the held check, unreported check and merge events at version 2 and every older type at version 1", () => {
       const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
-      expect(later.toSorted()).toEqual(["check.approved", "claim.merged", "train.held"]);
+      expect(later.toSorted()).toEqual([
+        "check.approved",
+        "claim.merged",
+        "train.held",
+        "train.unreported",
+      ]);
       expect(EVENT_SCHEMA_VERSION).toBe(2);
     });
 
     it.each([
       ["train.held", 1],
       ["check.approved", 1],
+      ["train.unreported", 1],
       ["claim.merged", 1],
       ["issue.filed", 2],
     ] as const)("rejects %s stamped at version %s", (type, v) => {
@@ -301,10 +311,15 @@ describe("validateEvent", () => {
       expect(() => validateEvent(event("train.held", HUMAN))).toThrow(/by the system/);
     });
 
+    it("refuses an unreported check asserted by a person", () => {
+      expect(() => validateEvent(event("train.unreported", HUMAN))).toThrow(/by the system/);
+    });
+
     it.each([
       "train.check",
       "train.main",
       "train.held",
+      "train.unreported",
       "claim.reassigned",
       "claim.reopened",
       "claim.adapted",
@@ -461,6 +476,18 @@ describe("validateEvent", () => {
     it("rejects an approval naming a non-check attempt", () => {
       const bad = withData("check.approved", (d) => ({ ...d, checkRunId: "int_merge01" }));
       expect(() => validateEvent(bad)).toThrow(/checkRunId/);
+    });
+
+    it("rejects an unreported check naming a non-check attempt or a short candidate", () => {
+      const run = withData("train.unreported", (d) => ({ ...d, checkRunId: "int_merge01" }));
+      expect(() => validateEvent(run)).toThrow(/checkRunId/);
+      const candidate = withData("train.unreported", (d) => ({ ...d, candidate: "c".repeat(39) }));
+      expect(() => validateEvent(candidate)).toThrow(/candidate/);
+    });
+
+    it("rejects an unreported check with an outcome it does not define", () => {
+      const bad = withData("train.unreported", (d) => ({ ...d, outcome: "lost" as "timed_out" }));
+      expect(() => validateEvent(bad)).toThrow(/outcome/);
     });
 
     it("rejects a held check with no paths, no claims or a repeated path", () => {

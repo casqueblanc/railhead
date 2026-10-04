@@ -1075,6 +1075,40 @@ describe("held check events", () => {
   });
 });
 
+describe("unreported check events", () => {
+  const unreported: Extract<RailheadEvent, { type: "train.unreported" }> = {
+    ...header(4),
+    v: 2,
+    actor: { kind: "system", id: "sys_train" },
+    type: "train.unreported",
+    data: { checkRunId: "chk_synthlate", candidate: sha("b"), outcome: "timed_out" },
+  };
+  const log = (data: unknown, v = 2) =>
+    fileOf({ events: [...issues(3), { ...unreported, v, data }], head: 4 });
+
+  it("copies the event's fields exactly and drops the ones the schema does not define", () => {
+    const result = parseCapture(log({ ...unreported.data, note: SECRET }));
+    if (!result.ok) throw new Error(`refused: ${JSON.stringify(result.error)}`);
+    expect(result.capture.events.slice(3)).toEqual([unreported]);
+    expect(JSON.stringify(result.capture)).not.toContain(SECRET);
+  });
+
+  it.each([
+    ["an outcome it does not define", { ...unreported.data, outcome: "lost" }, "outcome"],
+    ["no candidate", { ...unreported.data, candidate: undefined }, "candidate"],
+  ])("refuses an unreported event with %s by its path", (_label, data, field) => {
+    expect(parsedError(log(data))).toEqual({ kind: "malformed", path: `events[3].data.${field}` });
+  });
+
+  it("refuses an unreported event stamped at version 1", () => {
+    expect(parsedError(log(unreported.data, 1))).toEqual({
+      kind: "invalid_event",
+      seq: 4,
+      message: "train.unreported is written at schema version 2",
+    });
+  });
+});
+
 describe("serializeCapture", () => {
   it("refuses a capture whose UTF-8 encoding is past the size limit", () => {
     // Each "é" is one UTF-16 unit but two UTF-8 bytes, so the text fits by length and not by size.

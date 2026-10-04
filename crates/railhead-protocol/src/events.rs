@@ -133,6 +133,14 @@ pub enum CheckResult {
     Error,
 }
 
+/// Why a check attempt ended without a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreportedOutcome {
+    /// The attempt's deadline passed before the runner reported, so the train failed its batch.
+    TimedOut,
+}
+
 /// The classification of a conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -253,6 +261,9 @@ pub enum EventPayload {
     /// A person approved running a held candidate's own definition.
     #[serde(rename = "check.approved")]
     CheckApproved(CheckApproved),
+    /// A check attempt ended without a report.
+    #[serde(rename = "train.unreported")]
+    TrainUnreported(TrainUnreported),
 }
 
 /// Who may record an event type: `HUMAN_ONLY_EVENTS`, `AGENT_ONLY_EVENTS`, `SYSTEM_ONLY_EVENTS`.
@@ -293,6 +304,7 @@ impl EventPayload {
             Self::TrainMain(_) => "train.main",
             Self::TrainHeld(_) => "train.held",
             Self::CheckApproved(_) => "check.approved",
+            Self::TrainUnreported(_) => "train.unreported",
         }
     }
 
@@ -323,7 +335,10 @@ impl EventPayload {
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
             | Self::TrainMain(_) => 1,
-            Self::TrainHeld(_) | Self::CheckApproved(_) | Self::ClaimMerged(_) => 2,
+            Self::TrainHeld(_)
+            | Self::CheckApproved(_)
+            | Self::TrainUnreported(_)
+            | Self::ClaimMerged(_) => 2,
         }
     }
 
@@ -348,7 +363,8 @@ impl EventPayload {
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
             | Self::TrainMain(_)
-            | Self::TrainHeld(_) => Recorder::System,
+            | Self::TrainHeld(_)
+            | Self::TrainUnreported(_) => Recorder::System,
             Self::IssueFiled(_)
             | Self::ClaimOpened(_)
             | Self::ClaimPushed(_)
@@ -385,7 +401,8 @@ impl EventPayload {
             | Self::TrainIntent(_)
             | Self::TrainMain(_)
             | Self::TrainHeld(_)
-            | Self::CheckApproved(_) => None,
+            | Self::CheckApproved(_)
+            | Self::TrainUnreported(_) => None,
         }
     }
 
@@ -415,6 +432,7 @@ impl EventPayload {
             Self::TrainMain(data) => data.validate(),
             Self::TrainHeld(data) => data.validate(),
             Self::CheckApproved(data) => data.validate(),
+            Self::TrainUnreported(data) => data.validate(),
         }
     }
 }

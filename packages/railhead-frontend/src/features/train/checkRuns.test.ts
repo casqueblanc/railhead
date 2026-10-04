@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { SYNTH_REPO, synthCommit, syntheticLog } from "../../../../../fixtures/board/syntheticLog";
-import { checkResult, sizeDecision } from "../../../../../fixtures/board/uploadSteps";
+import {
+  checkResult,
+  checkTimedOut,
+  sizeDecision,
+} from "../../../../../fixtures/board/uploadSteps";
 import { emptyBoardState, foldEvents, type BoardState } from "../board/boardState";
 import { MAX_LISTED_CHECK_RUNS, checkRuns } from "./checkRuns";
 
@@ -47,6 +51,25 @@ describe("checkRuns", () => {
       intents: ["int_synth11"],
     });
     expect(omitted).toBe(0);
+  });
+
+  it("lists a timed-out run by when it ended, with no results", () => {
+    const state = fold(
+      syntheticLog("Synthetic timed-out run", [
+        checkResult("chk_synthbefore", synthCommit(1), "test", "pass"),
+        checkTimedOut("chk_synthlate", synthCommit(2)),
+        checkResult("chk_synthafter", synthCommit(3), "test", "fail"),
+      ]).events,
+    );
+
+    const { runs: listed } = checkRuns(state);
+
+    expect(listed.map((run) => [run.checkRunId, run.overall])).toEqual([
+      ["chk_synthafter", "fail"],
+      ["chk_synthlate", "timed_out"],
+      ["chk_synthbefore", "pass"],
+    ]);
+    expect(listed[1]).toMatchObject({ candidate: synthCommit(2), results: [], intents: [] });
   });
 
   it("lists a failed run no merge cites, and ranks failure over an error", () => {

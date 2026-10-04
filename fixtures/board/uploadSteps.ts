@@ -170,6 +170,13 @@ export const checkResult = (
   data: { checkRunId, candidate, check, result, acceptance },
 });
 
+/** A check run whose deadline passed with no report. */
+export const checkTimedOut = (checkRunId: CheckRunId, candidate: CommitSha): SyntheticStep => ({
+  type: "train.unreported",
+  actor: SYNTH_TRAIN,
+  data: { checkRunId, candidate, outcome: "timed_out" },
+});
+
 /** A merge intent for the given claims, authorised against `decisions`. */
 export const intend = (
   intentId: IntentId,

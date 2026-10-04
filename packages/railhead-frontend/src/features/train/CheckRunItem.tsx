@@ -13,14 +13,19 @@ interface CheckRunItemProps {
 }
 
 /**
- * One check run: the exact candidate, each result as the log recorded it, and one click away the
- * command and output the backend kept. Check names are repository content.
+ * One check run: the exact candidate, each result as the log recorded it or that it timed out, and
+ * one click away the command and output the backend kept. Check names are repository content.
  */
 export const CheckRunItem = ({ run, checks }: CheckRunItemProps) => {
   const [open, setOpen] = useState(false);
   const { load, onRetry } = useCheckDetail(
     checks,
-    { checkRunId: run.checkRunId, candidate: run.candidate, results: run.results.length },
+    {
+      checkRunId: run.checkRunId,
+      candidate: run.candidate,
+      results: run.results.length,
+      timedOut: run.overall === "timed_out",
+    },
     open,
   );
   const headingId = `check-${run.checkRunId}`;
@@ -41,7 +46,12 @@ export const CheckRunItem = ({ run, checks }: CheckRunItemProps) => {
           {run.candidate}
         </span>
       </Text>
-      <ul className="grid gap-1 text-sm">
+      {run.overall === "timed_out" && (
+        <Text variant="secondary">
+          No report arrived before the deadline, so the train failed its batch.
+        </Text>
+      )}
+      <ul className="grid gap-1 text-sm empty:hidden">
         {run.results.map((entry, index) => (
           // A run may record the same check more than once; the log order is the identity.
           <li key={index} className="break-words">

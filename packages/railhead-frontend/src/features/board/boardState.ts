@@ -39,6 +39,7 @@ import {
   type RailheadEvent,
   type RefusalReason,
   type RepoId,
+  type UnreportedOutcome,
   type UserId,
 } from "@railhead/shared/events";
 
@@ -185,8 +186,10 @@ export interface CheckEntryState {
 export interface CheckRunState {
   checkRunId: CheckRunId;
   candidate: CommitSha;
-  /** In log order. */
+  /** In log order. Empty for a run that ended without a report. */
   results: readonly CheckEntryState[];
+  /** How the run ended without a report, from its `train.unreported` event, or `null`. */
+  unreported: { outcome: UnreportedOutcome; seq: number } | null;
 }
 
 /**
@@ -942,8 +945,14 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           `acceptance check names option ${acceptance.option}, which its decision does not offer`,
         );
       }
-      const run = own(state.checkRuns, checkRunId) ?? { checkRunId, candidate, results: [] };
+      const run = own(state.checkRuns, checkRunId) ?? {
+        checkRunId,
+        candidate,
+        results: [],
+        unreported: null,
+      };
       check(run.candidate === candidate, `check run ${checkRunId} changed its candidate`);
+      check(run.unreported === null, `check run ${checkRunId} reported after it ended`);
       return {
         ...state,
         checkRuns: draft.put(state.checkRuns, checkRunId, {
@@ -974,6 +983,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       for (const ref of decisions) knownDecisionVersion(state, ref);
       const run = known(state.checkRuns, checkRunId, "check run");
       check(run.candidate === candidate, `intent ${intentId} cites a check of another candidate`);
+      check(
+        run.unreported === null,
+        `intent ${intentId} cites a check run that ended without a report`,
+      );
       return {
         ...endHolds(state, draft, claims, "superseded", seq, checkRunId),
         intents: draft.put(state.intents, intentId, {
@@ -1050,6 +1063,23 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         heldChecks: draft.put(state.heldChecks, checkRunId, {
           ...held,
           approval: { userId: event.actor.id, seq },
+        }),
+      };
+    }
+    case "train.unreported": {
+      const { checkRunId, candidate, outcome } = event.data;
+      // The train refuses a report once the attempt has ended, and ends an attempt only once.
+      check(
+        own(state.checkRuns, checkRunId) === undefined,
+        `check run ${checkRunId} already reported or ended`,
+      );
+      return {
+        ...state,
+        checkRuns: draft.put(state.checkRuns, checkRunId, {
+          checkRunId,
+          candidate,
+          results: [],
+          unreported: { outcome, seq },
         }),
       };
     }

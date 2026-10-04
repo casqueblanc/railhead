@@ -6,7 +6,7 @@ import { boardMetrics, type BoardMetrics } from "./metrics";
 
 /**
  * Raw totals counted from the log: questions, human actions, reported checks including failures,
- * changes landed, active claims and the recent window. Every number is a count of recorded events.
+ * checks that timed out or were held, changes landed, active claims and the recent window. Every number is a count of recorded events.
  */
 export const TotalsPanel = ({ feed }: { feed: BoardFeed }) => {
   const headingId = useId();
@@ -103,6 +103,8 @@ const Counts = ({ metrics }: { metrics: BoardMetrics }) => {
         <Count label="Checks reported" value={checksReported} />
         <Count label="Checks failed" value={checks.fail} />
         <Count label="Checks that could not run" value={checks.error} />
+        <Count label="Checks timed out" value={metrics.checksTimedOut} />
+        <Count label="Checks held for a person" value={metrics.checksHeld} />
         <Count label="Changes landed" value={metrics.changesLanded} />
         <Count label="Active claims" value={metrics.activeClaims} />
       </dl>
@@ -118,11 +120,6 @@ const Counts = ({ metrics }: { metrics: BoardMetrics }) => {
           </dl>
         </div>
       )}
-      {/* The log has no event for these yet: casqueblanc/railhead#240. */}
-      <Text variant="secondary">
-        Checks count once they report. A check that times out or is held for a person is not counted
-        yet.
-      </Text>
     </>
   );
 };

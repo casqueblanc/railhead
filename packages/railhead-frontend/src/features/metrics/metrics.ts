@@ -24,11 +24,12 @@ export interface BoardMetrics {
   questionsAsked: number;
   /** Events a person recorded: invites, confirmations, revocations, filed issues and decisions. */
   humanActions: number;
-  /**
-   * Check results reported, by result. A failure and a check that could not run both count; a
-   * check that timed out or is held for a person has no result in the log and is not counted.
-   */
+  /** Check results reported, by result. A failure and a check that could not run both count. */
   checks: Readonly<Record<CheckResult, number>>;
+  /** Check runs that ended without a report because their deadline passed. */
+  checksTimedOut: number;
+  /** Check runs held for a person because their candidate edits protected check paths. */
+  checksHeld: number;
   /** Claims carried by merges that moved main to their candidate. */
   changesLanded: number;
   /** Claims being worked on or waiting to merge. */
@@ -40,14 +41,18 @@ export interface BoardMetrics {
 /** Counts the board's measured totals. */
 export const boardMetrics = (state: BoardState): BoardMetrics => {
   const checks: Record<CheckResult, number> = { pass: 0, fail: 0, error: 0 };
+  let checksTimedOut = 0;
   for (const run of Object.values(state.checkRuns)) {
     for (const entry of run.results) checks[entry.result] += 1;
+    if (run.unreported?.outcome === "timed_out") checksTimedOut += 1;
   }
   const claims = Object.values(state.claims);
   return {
     questionsAsked: Object.keys(state.questions).length,
     humanActions: state.totals.humanActions,
     checks,
+    checksTimedOut,
+    checksHeld: Object.keys(state.heldChecks).length,
     changesLanded: claims.reduce((sum, claim) => sum + claim.landings.length, 0),
     activeClaims: claims.filter((claim) => claim.phase === "working" || claim.phase === "ready")
       .length,

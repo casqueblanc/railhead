@@ -8,7 +8,11 @@ import {
   synthCommit,
   syntheticLog,
 } from "../../../../../fixtures/board/syntheticLog";
-import { checkResult, uploadPrelude } from "../../../../../fixtures/board/uploadSteps";
+import {
+  checkResult,
+  checkTimedOut,
+  uploadPrelude,
+} from "../../../../../fixtures/board/uploadSteps";
 import { emptyBoardState, foldEvents } from "../board/boardState";
 import type { BoardFeed } from "../claims/boardFeed";
 import { TotalsPanel } from "./TotalsPanel";
@@ -52,6 +56,8 @@ describe("TotalsPanel", () => {
       ["Checks reported", "5"],
       ["Checks failed", "0"],
       ["Checks that could not run", "0"],
+      ["Checks timed out", "0"],
+      ["Checks held for a person", "0"],
       ["Changes landed", "2"],
       ["Active claims", "0"],
       ["Claims opened", "2"],
@@ -62,8 +68,24 @@ describe("TotalsPanel", () => {
     expect(text()).toContain(`Counted from events 1–${complete.cursor}.`);
     expect(text()).not.toMatch(/%|per minute|rate/i);
     expect(text()).not.toContain("Checks run");
-    expect(text()).toContain(
-      "Checks count once they report. A check that times out or is held for a person is not counted yet.",
+    expect(text()).not.toContain("not counted yet");
+  });
+
+  it("counts a run that timed out on its own, not as reported", async () => {
+    const board = foldEvents(
+      emptyBoardState(SYNTH_REPO),
+      syntheticLog("A timed-out check", [
+        ...uploadPrelude(),
+        checkTimedOut("chk_synthlate", synthCommit(2)),
+      ]).events,
+    );
+    await render({ kind: "board", board, connection: "live", recovered: false });
+
+    expect(counts()).toEqual(
+      expect.arrayContaining([
+        ["Checks reported", "0"],
+        ["Checks timed out", "1"],
+      ]),
     );
   });
 

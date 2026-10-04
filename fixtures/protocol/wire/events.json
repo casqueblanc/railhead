@@ -451,6 +451,22 @@
         "kind": "system",
         "id": "sys_train"
       },
+      "type": "train.unreported",
+      "data": {
+        "checkRunId": "chk_run0003",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "outcome": "timed_out"
+      }
+    },
+    {
+      "v": 2,
+      "seq": 26,
+      "at": 1790000000026,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
       "type": "claim.merged",
       "data": {
         "claimId": "clm_42abcd",
@@ -589,6 +605,25 @@
         "type": "claim.expired",
         "data": {
           "claimId": "clm_42abcd"
+        }
+      }
+    },
+    {
+      "name": "unknown unreported outcome",
+      "value": {
+        "v": 2,
+        "seq": 25,
+        "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "lost"
         }
       }
     }
@@ -838,11 +873,51 @@
       "error": "digest"
     },
     {
-      "name": "merge naming a branch for its commit",
+      "name": "unreported check asserted by an agent",
       "value": {
         "v": 2,
         "seq": 25,
         "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "timed_out"
+        }
+      },
+      "error": "by the system"
+    },
+    {
+      "name": "unreported check written at version 1",
+      "value": {
+        "v": 1,
+        "seq": 25,
+        "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "timed_out"
+        }
+      },
+      "error": "schema version"
+    },
+    {
+      "name": "merge naming a branch for its commit",
+      "value": {
+        "v": 2,
+        "seq": 26,
+        "at": 1790000000026,
         "repo": "rep_demo0001",
         "actor": {
           "kind": "system",
@@ -861,8 +936,8 @@
       "name": "merge recorded by an agent",
       "value": {
         "v": 2,
-        "seq": 25,
-        "at": 1790000000025,
+        "seq": 26,
+        "at": 1790000000026,
         "repo": "rep_demo0001",
         "actor": {
           "kind": "agent",

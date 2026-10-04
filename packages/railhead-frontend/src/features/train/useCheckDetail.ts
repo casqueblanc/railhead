@@ -9,31 +9,36 @@ import type { CheckRunId, CommitSha } from "@railhead/shared/events";
 import type { CheckDetailPort, CheckDetailUnavailableReason } from "../board/boardPorts";
 
 /**
- * A run's detail once it reported. A listed run always has: the backend records the report before
- * it appends the run's first result to the log.
+ * A listed run's detail. A run with a result in the log has reported: the backend records the report
+ * before it appends the run's first result. A run that timed out was started and may hold a report
+ * that arrived after its deadline, which the train refused.
  */
-export type ReportedCheckDetail = CheckDetail & {
-  state: Extract<CheckDetailState, { kind: "reported" }>;
+export type ListedCheckDetail = CheckDetail & {
+  state: Exclude<CheckDetailState, { kind: "held" }>;
 };
 
 /** What the board knows of one run's recorded detail. */
 export type CheckDetailLoad =
   | { kind: "closed" }
   | { kind: "loading" }
-  | { kind: "loaded"; detail: ReportedCheckDetail }
+  | { kind: "loaded"; detail: ListedCheckDetail; timedOut: boolean }
   /**
-   * The backend refused, or its answer does not match the listed run: another run or commit, or
-   * no report.
+   * The backend refused, or its answer does not match the listed run: another run or commit, or a
+   * state the run cannot be in.
    */
   | { kind: "failed"; code: BoardErrorCode | "mismatch" }
   /** The board cannot ask right now. */
   | { kind: "unavailable"; reason: CheckDetailUnavailableReason };
 
-/** The run the board asks about. `results` counts its results in the log so far. */
+/**
+ * The run the board asks about. `results` counts its results in the log so far; `timedOut` says it
+ * ended without a report.
+ */
 export interface CheckRunKey {
   checkRunId: CheckRunId;
   candidate: CommitSha;
   results: number;
+  timedOut: boolean;
 }
 
 /**
@@ -48,8 +53,8 @@ export const useCheckDetail = (
 ): { load: CheckDetailLoad; onRetry: () => void } => {
   const [attempt, setAttempt] = useState(0);
   const [settled, setSettled] = useState<{ key: string; load: CheckDetailLoad } | null>(null);
-  const { checkRunId, candidate } = run;
-  const key = `${checkRunId}/${candidate}/${run.results}/${attempt}`;
+  const { checkRunId, candidate, timedOut } = run;
+  const key = `${checkRunId}/${candidate}/${run.results}/${timedOut}/${attempt}`;
   const onReadCheck = port.kind === "available" ? port.onReadCheck : null;
   const answered = settled?.key === key;
 
@@ -59,7 +64,7 @@ export const useCheckDetail = (
     // The live port never rejects; any other port that does is shown as a failed read.
     void onReadCheck(checkRunId).then(
       (result) => {
-        if (current) setSettled({ key, load: loadOf(result, checkRunId, candidate) });
+        if (current) setSettled({ key, load: loadOf(result, run) });
       },
       () => {
         if (current) setSettled({ key, load: { kind: "failed", code: "internal" } });
@@ -68,7 +73,7 @@ export const useCheckDetail = (
     return () => {
       current = false;
     };
-  }, [open, onReadCheck, answered, checkRunId, candidate, key]);
+  }, [open, onReadCheck, answered, checkRunId, candidate, timedOut, key]);
 
   const onRetry = () => setAttempt((count) => count + 1);
   if (!open) return { load: { kind: "closed" }, onRetry };
@@ -81,8 +86,7 @@ export const useCheckDetail = (
 
 const loadOf = (
   result: BoardResult<CheckDetail>,
-  checkRunId: CheckRunId,
-  candidate: CommitSha,
+  { checkRunId, candidate, timedOut }: CheckRunKey,
 ): CheckDetailLoad => {
   if (!result.ok) return { kind: "failed", code: result.code };
   const detail = result.value;
@@ -90,9 +94,10 @@ const loadOf = (
   if (
     detail.checkRunId !== checkRunId ||
     detail.candidate !== candidate ||
-    state.kind !== "reported"
+    state.kind === "held" ||
+    (state.kind === "started" && !timedOut)
   ) {
     return { kind: "failed", code: "mismatch" };
   }
-  return { kind: "loaded", detail: { ...detail, state } };
+  return { kind: "loaded", detail: { ...detail, state }, timedOut };
 };

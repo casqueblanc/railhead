@@ -4,6 +4,7 @@ import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import {
   SYNTH_REPO,
   SYNTH_START_MS,
+  SYNTH_TRAIN,
   synthCommit,
   syntheticLog,
   withReplayOverlap,
@@ -12,6 +13,7 @@ import {
 import {
   UPLOAD,
   checkResult,
+  checkTimedOut,
   push,
   uploadPrelude,
 } from "../../../../../fixtures/board/uploadSteps";
@@ -42,6 +44,8 @@ describe("boardMetrics", () => {
       // Two invites, two confirmations, two filed issues and one decision.
       humanActions: 7,
       checks: { pass: 5, fail: 0, error: 0 },
+      checksTimedOut: 0,
+      checksHeld: 0,
       // Birch's merge landed, and atlas's after a rejected first intent.
       changesLanded: 2,
       activeClaims: 0,
@@ -75,11 +79,55 @@ describe("boardMetrics", () => {
     expect(metrics.recent?.checksReported).toBe(3);
   });
 
+  it("counts a run that timed out apart from reported results, and never as reported", () => {
+    const state = fold(
+      syntheticLog("Synthetic timed-out check", [
+        ...uploadPrelude(),
+        checkTimedOut("chk_synthlate", synthCommit(2)),
+        checkResult("chk_synthnext", synthCommit(3), "test", "pass"),
+      ]).events,
+    );
+
+    const metrics = boardMetrics(state);
+
+    expect(metrics.checksTimedOut).toBe(1);
+    expect(metrics.checks).toEqual({ pass: 1, fail: 0, error: 0 });
+    expect(metrics.recent?.checksReported).toBe(1);
+  });
+
+  it("counts a run held for a person, which has no result either", () => {
+    const state = fold(
+      syntheticLog("Synthetic held check", [
+        ...uploadPrelude(),
+        {
+          type: "train.held",
+          actor: SYNTH_TRAIN,
+          data: {
+            checkRunId: "chk_synthheld",
+            expectedMain: synthCommit(0),
+            candidate: synthCommit(2),
+            claims: [UPLOAD.atlasClaim],
+            paths: ["railhead.checks.json"],
+            digest: null,
+          },
+        },
+      ]).events,
+    );
+
+    const metrics = boardMetrics(state);
+
+    expect(metrics.checksHeld).toBe(1);
+    expect(metrics.checksTimedOut).toBe(0);
+    expect(metrics.checks).toEqual({ pass: 0, fail: 0, error: 0 });
+  });
+
   it("reports nothing recent and only zeros for a log with no events", () => {
     expect(boardMetrics(emptyBoardState(SYNTH_REPO))).toEqual({
       questionsAsked: 0,
       humanActions: 0,
       checks: { pass: 0, fail: 0, error: 0 },
+      checksTimedOut: 0,
+      checksHeld: 0,
       changesLanded: 0,
       activeClaims: 0,
       recent: null,
