@@ -51,7 +51,7 @@ export interface SystemQuestion {
   key: string;
   /**
    * The claims whose work depends on the answer, each at the generation the asker read it at, all
-   * different. The first is the question's claim in `question.asked`.
+   * different. `question.asked` names them all in `claimIds`, the first also as its `claimId`.
    */
   claims: { claimId: ClaimId; generation: number }[];
   /** The question, as an agent's question is bounded. */

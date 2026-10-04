@@ -17,6 +17,7 @@ mod commands {
     pub mod claim;
     pub mod credential;
     pub mod join;
+    pub mod pin;
     pub mod ready;
     pub mod release;
     pub mod status;
@@ -70,6 +71,8 @@ enum Command {
     Ready(commands::ready::Args),
     /// Give up the clone's claim when the agent cannot finish it.
     Release(commands::release::Args),
+    /// Show where the agent's pin stands on the merge train.
+    Pin(commands::pin::Args),
     /// Show the agent, its claim and its inbox.
     Status(commands::status::Args),
     /// Read unacknowledged inbox items.
@@ -105,6 +108,8 @@ pub enum CommandName {
     Ready,
     /// `rh release`.
     Release,
+    /// `rh pin`.
+    Pin,
     /// `rh status`.
     Status,
     /// `rh sync`.
@@ -124,6 +129,7 @@ impl fmt::Display for CommandName {
             Self::Claim => "claim",
             Self::Ready => "ready",
             Self::Release => "release",
+            Self::Pin => "pin",
             Self::Status => "status",
             Self::Sync => "sync",
             Self::Ack => "ack",
@@ -424,6 +430,7 @@ fn run(cli: &Cli, out: &mut Output<'_>) -> Result<()> {
         Command::Claim(args) => as_agent(cli, |agent| commands::claim::run(agent, args, out)),
         Command::Ready(args) => as_agent(cli, |agent| commands::ready::run(agent, args, out)),
         Command::Release(args) => as_agent(cli, |agent| commands::release::run(agent, args, out)),
+        Command::Pin(args) => as_agent(cli, |agent| commands::pin::run(agent, args, out)),
         Command::Status(args) => as_agent(cli, |agent| commands::status::run(agent, args, out)),
         Command::Sync(args) => as_agent(cli, |agent| commands::sync::run(agent, args, out)),
         Command::Ack(args) => as_agent(cli, |agent| commands::ack::run(agent, args, out)),

@@ -1,6 +1,6 @@
 ---
 source: crates/railhead-swarm/src/tui/draw.rs
-assertion_line: 430
+assertion_line: 498
 expression: "render(&View::new(), 120, 24)?.backend()"
 ---
 " SIMULATED RUN  00:00  running  starting                                                                                "
@@ -16,7 +16,7 @@ expression: "render(&View::new(), 120, 24)?.backend()"
 "│                                                                ││                                                    │"
 "│                                                                ││                                                    │"
 "│                                                                ││                                                    │"
-"│                                                                │└ batches, checks: not visible (#277) ───────────────┘"
+"│                                                                │└────────────────────────────────────────────────────┘"
 "│                                                                │┌ Conflicts ─────────────────────────────────────────┐"
 "│                                                                ││auto-merged 0  routed 0                             │"
 "│                                                                ││No overlapping edits yet.                           │"

@@ -292,6 +292,16 @@ describe("events on the wire", () => {
     expect(() => validateEvent(parseEvent(events.largestSafeSeq))).not.toThrow();
   });
 
+  it("accepts a question naming every claim its decision depends on", () => {
+    const event = parseEvent(events.systemQuestion);
+    expect(() => validateEvent(event)).not.toThrow();
+    expect(event.type === "question.asked" && event.data.claimIds).toEqual([
+      "clm_42abcd",
+      "clm_43abcd",
+    ]);
+    expect(JSON.parse(JSON.stringify(event))).toEqual(events.systemQuestion);
+  });
+
   it.each(events.rejectedShape)("refuses by shape: $name", ({ value }) => {
     expect(() => parseEvent(value)).toThrow(TypeError);
   });

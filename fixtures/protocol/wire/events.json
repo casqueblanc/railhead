@@ -524,6 +524,34 @@
       "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   },
+  "systemQuestion": {
+    "v": 1,
+    "seq": 7,
+    "at": 1790000000007,
+    "repo": "rep_demo0001",
+    "actor": {
+      "kind": "system",
+      "id": "sys_train"
+    },
+    "type": "question.asked",
+    "data": {
+      "questionId": "qst_upload1",
+      "claimId": "clm_42abcd",
+      "decisionId": "dec_upload1",
+      "text": "Should uploads above 10 MB be rejected or chunked?",
+      "options": [
+        {
+          "key": "reject",
+          "label": "Reject them"
+        },
+        {
+          "key": "chunk",
+          "label": "Upload them in chunks"
+        }
+      ],
+      "claimIds": ["clm_42abcd", "clm_43abcd"]
+    }
+  },
   "rejectedShape": [
     {
       "name": "unknown event type",
@@ -674,6 +702,37 @@
           "checkRunId": "chk_run0002",
           "candidate": "cccccccccccccccccccccccccccccccccccccccc",
           "reason": "approved"
+        }
+      }
+    },
+    {
+      "name": "question claims written as null",
+      "value": {
+        "v": 1,
+        "seq": 7,
+        "at": 1790000000007,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "question.asked",
+        "data": {
+          "questionId": "qst_upload1",
+          "claimId": "clm_42abcd",
+          "decisionId": "dec_upload1",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ],
+          "claimIds": null
         }
       }
     }
@@ -1099,6 +1158,102 @@
         }
       },
       "error": "schema version"
+    },
+    {
+      "name": "question claims not led by its claim",
+      "value": {
+        "v": 1,
+        "seq": 7,
+        "at": 1790000000007,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "question.asked",
+        "data": {
+          "questionId": "qst_upload1",
+          "claimId": "clm_42abcd",
+          "decisionId": "dec_upload1",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ],
+          "claimIds": ["clm_43abcd", "clm_42abcd"]
+        }
+      },
+      "error": "claimIds"
+    },
+    {
+      "name": "question claims naming a claim twice",
+      "value": {
+        "v": 1,
+        "seq": 7,
+        "at": 1790000000007,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "question.asked",
+        "data": {
+          "questionId": "qst_upload1",
+          "claimId": "clm_42abcd",
+          "decisionId": "dec_upload1",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ],
+          "claimIds": ["clm_42abcd", "clm_42abcd"]
+        }
+      },
+      "error": "claimIds"
+    },
+    {
+      "name": "question claims left empty",
+      "value": {
+        "v": 1,
+        "seq": 7,
+        "at": 1790000000007,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "question.asked",
+        "data": {
+          "questionId": "qst_upload1",
+          "claimId": "clm_42abcd",
+          "decisionId": "dec_upload1",
+          "text": "Should uploads above 10 MB be rejected or chunked?",
+          "options": [
+            {
+              "key": "reject",
+              "label": "Reject them"
+            },
+            {
+              "key": "chunk",
+              "label": "Upload them in chunks"
+            }
+          ],
+          "claimIds": []
+        }
+      },
+      "error": "claimIds"
     }
   ]
 }

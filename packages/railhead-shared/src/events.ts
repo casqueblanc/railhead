@@ -330,6 +330,9 @@ export type EventPayload =
         decisionId: DecisionId;
         text: string;
         options: QuestionOption[];
+        // Every claim the decision depends on, `claimId` first. A system question sets it, so a
+        // train conflict question names both claims; an event without it depends on `claimId` alone.
+        claimIds?: ClaimId[];
       };
     }
   | {
@@ -661,6 +664,15 @@ function validatePayload(event: EventPayload): void {
       requireId("decision", event.data.decisionId, "decisionId");
       requireText(event.data.text, MAX_QUESTION_LENGTH, "text");
       requireOptions(event.data.options);
+      if (event.data.claimIds !== undefined) {
+        const { claimIds } = event.data;
+        requireList(claimIds, "claimIds");
+        requireUnique(claimIds, "claimIds");
+        claimIds.forEach((id, index) => requireId("claim", id, `claimIds[${index}]`));
+        if (claimIds[0] !== event.data.claimId) {
+          throw new Error("claimIds must start with the question's claimId");
+        }
+      }
       return;
     case "decision.recorded":
       requireId("decision", event.data.decisionId, "decisionId");

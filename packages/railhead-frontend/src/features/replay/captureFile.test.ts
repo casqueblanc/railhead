@@ -8,6 +8,7 @@ import {
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
+import { parkedConflict } from "../../../../../fixtures/board/parkedConflict";
 import {
   SYNTH_OWNER,
   SYNTH_REPO,
@@ -733,7 +734,7 @@ describe("captureLog redaction", () => {
 });
 
 describe("parseCapture", () => {
-  it.each([decisionReversal, checkBeforeLand, optionResults])(
+  it.each([decisionReversal, checkBeforeLand, optionResults, parkedConflict])(
     "reads back what serializeCapture wrote: $description",
     (log) => {
       const capture = syntheticCapture(log);
@@ -782,6 +783,20 @@ describe("parseCapture", () => {
     expect(parsedError(fileOf({ events, head: 4 }))).toEqual({
       kind: "malformed",
       path: "events[3].data.reason",
+    });
+  });
+
+  it("refuses question claims written as null", () => {
+    const { events } = syntheticCapture(parkedConflict);
+    const at = events.findIndex(
+      (event) => event.type === "question.asked" && event.actor.kind === "system",
+    );
+    const nulled: unknown[] = events.map((event, index) =>
+      index === at ? { ...event, data: { ...event.data, claimIds: null } } : event,
+    );
+    expect(parsedError(fileOf({ events: nulled, head: events.length }))).toEqual({
+      kind: "malformed",
+      path: `events[${at}].data.claimIds`,
     });
   });
 

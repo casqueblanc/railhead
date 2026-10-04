@@ -93,19 +93,24 @@
 // from `DISCARD_BASE_MS` up to `DISCARD_MAX_MS`, until it succeeds; each wake tries at most
 // `MAX_DISCARDS_PER_WAKE`, outside any drive, so cleanup never holds up a batch.
 //
-// A conflict parks its pair and owes the owner a question, the conservative route while no
-// classifier tells overlap from disagreement. Only a pair whose entries both still hold the ready
-// episode the merge composed is parked; when either was readied again during the merge, both go
-// back to the queue to be composed again, and nothing is asked about the older work. The park
-// commits first; each drive then asks the owed question through the decisions port inside its own
-// transaction, before it forms or advances a batch. A question refused as invalid returns the pair
-// to the queue unasked, each entry to be merged alone, since asking again cannot help and the two
-// together would conflict again. Any other refused question, whether the decisions module is
-// missing or the claims' decision quota is spent, is never final: the pair stays parked,
-// the question stays owed and is due again after a delay that doubles from `QUESTION_BASE_MS` up to
-// `QUESTION_MAX_MS`, and the wake is kept for it, while the drive goes on with the rest of the
-// queue. Each retry first checks that both claims are still held, so releasing either returns the
-// pair to the queue unasked.
+// A conflict goes to the conflicts port first, outside any transaction and bounded like every port
+// call, with the conflicted regions and both claims' issue titles. Its verdict is recorded only
+// while the drive still holds the train and the batch is still composing under the same merge
+// attempt. A `redo` drops the later pin, reopens its claim as `lost_conflict` for its agent to redo
+// on the new base, and returns the earlier pin to the queue: the redone work is composed and
+// checked again like any pin. Every other verdict, including a port that does not answer, parks the
+// pair and owes the owner a question. Only a pair whose entries both still hold the ready episode
+// the merge composed is routed; when either was readied again during the merge or its
+// classification, both go back to the queue to be composed again, and nothing is asked about the
+// older work. The park commits first; each drive then asks the owed question through the decisions
+// port inside its own transaction, before it forms or advances a batch. A question refused as
+// invalid returns the pair to the queue unasked, each entry to be merged alone, since asking again
+// cannot help and the two together would conflict again. Any other refused question, whether the
+// decisions module is missing or the claims' decision quota is spent, is never final: the pair
+// stays parked, the question stays owed and is due again after a delay that doubles from
+// `QUESTION_BASE_MS` up to `QUESTION_MAX_MS`, and the wake is kept for it, while the drive goes on
+// with the rest of the queue. Each retry first checks that both claims are still held, so releasing
+// either returns the pair to the queue unasked.
 // The question's decision depends on both claims, so the answer reaches both holders and
 // supersedes both pins. The transaction that records the answer calls `answered`, which returns
 // the pair to the queue and records the drive it is owed, so the answer and the train's wake
@@ -131,6 +136,7 @@ import {
   type IntentId,
 } from "@railhead/shared/events";
 import type { SystemQuestion } from "../../contracts/decisions";
+import type { ConflictInput, ConflictVerdict } from "../../train/classification/classify";
 import type { ClaimPin, EpisodePin } from "../../contracts/claims";
 import {
   fail,
@@ -945,7 +951,7 @@ export function createTrain(
         return CONTINUE;
       }
       case "conflict":
-        routeConflict(generation, batch, outcome);
+        await routeConflict(generation, batch, attempt, outcome);
         return CONTINUE;
       case "error":
         failBatch(generation, batch, composeFailure(outcome.reason));
@@ -1236,17 +1242,23 @@ export function createTrain(
   }
 
   /**
-   * Parks a conflicting pair, owes the owner a question about it and records `train.conflict`,
-   * which the board shows with both claims and the path. With no classifier installed, every
-   * conflict is treated as a disagreement and given `route: "question"`. The batch's other pins go
-   * back to the front unchanged. When either of the pair was readied again during the merge,
-   * nothing is parked, asked or recorded: both go back to the front, the renewed one as fresh work.
+   * Routes a conflicting pair by the conflicts port's verdict and records `train.conflict`, which
+   * the board shows with both claims, the path and the verdict. On `redo`, the losing (later) pin is
+   * dropped and its claim reopened as `lost_conflict`, and the earlier pin goes back to the front
+   * with the batch's other pins; nothing is merged without composing and checking again. On
+   * `question`, the pair is parked and the owner is owed a question. When either of the pair was
+   * readied again during the merge or its classification, nothing is parked, asked, reopened or
+   * recorded: both go back to the front, the renewed one as fresh work.
+   *
+   * Classification is a model call, so it runs before the transaction, which records its verdict
+   * only while this drive holds the train and the batch is still composing under `attempt`.
    */
-  function routeConflict(
+  async function routeConflict(
     generation: number,
     batch: BatchRecord,
+    attempt: string,
     outcome: Extract<MergeOutcome, { kind: "conflict" }>,
-  ): void {
+  ): Promise<void> {
     const [first, second] = outcome.pins;
     // The path becomes the question's scope, so a conflict on paths no question can name, such as
     // one holding a control character, fails the batch as a compose it cannot use: its pins are
@@ -1262,9 +1274,18 @@ export function createTrain(
       failBatch(generation, batch, "compose_unsupported");
       return;
     }
+    const verdict = await classify(generation, outcome);
     const now = clock();
     log.transaction((tx) => {
       if (!holds(generation)) throw new DriveSuperseded();
+      const active = activeBatch(sql);
+      if (
+        active?.batchId !== batch.batchId ||
+        active.state !== "composing" ||
+        active.mergeAttempt !== attempt
+      ) {
+        return;
+      }
       const entries = orderAsBatch(batch, batchedEntries(sql));
       closeBatch(batch.batchId, { state: "failed", failure: "conflict" }, now);
       const pair = entries.filter(
@@ -1273,42 +1294,77 @@ export function createTrain(
       // A pair readied again during the merge, with the same commit or a deferred newer one, is
       // newer work than the merge composed, so both entries are composed again rather than parked
       // behind a question about the older work.
-      const parks =
+      const routes =
         pair.length === 2 && !pair.some((entry) => renewed(entry) || entry.nextCommit !== null);
-      const parked = (entry: QueueEntry) => parks && pair.includes(entry);
-      for (const entry of entries.filter(parked)) {
-        settleEntry(sql, entry.pin, "parked", "conflict", now);
+      const redo = routes && verdict.route === "redo";
+      // On a redo only the losing pin leaves the queue; on a question both are parked.
+      const settled = (entry: QueueEntry) =>
+        routes && pair.includes(entry) && (!redo || samePin(entry.pin, second));
+      for (const entry of entries.filter(settled)) {
+        if (redo) settleEntry(sql, entry.pin, "dropped", "conflict", now);
+        else settleEntry(sql, entry.pin, "parked", "conflict", now);
       }
       requeueFront(
         sql,
         entries
-          .filter((entry) => !parked(entry))
+          .filter((entry) => !settled(entry))
           .map((entry) => (renewed(entry) ? asFreshWork(entry) : entry)),
         now,
       );
       promoteDeferred(sql, now);
-      if (!parks) return;
-      insertConflict(
-        sql,
-        batch.batchId,
-        [
-          { claimId: first.claimId, generation: first.generation },
-          { claimId: second.claimId, generation: second.generation },
-        ],
-        path,
-        now,
-      );
+      if (!routes) return;
+      if (!redo) {
+        insertConflict(
+          sql,
+          batch.batchId,
+          [
+            { claimId: first.claimId, generation: first.generation },
+            { claimId: second.claimId, generation: second.generation },
+          ],
+          path,
+          now,
+        );
+      }
       tx.append(TRAIN_ACTOR, {
         type: "train.conflict",
         data: {
           claims: [first.claimId, second.claimId],
           path,
-          class: "contradictory",
-          probability: 0,
-          route: "question",
+          class: verdict.class,
+          probability: verdict.probability,
+          route: verdict.route,
         },
       });
+      const loser = pair.find((entry) => samePin(entry.pin, second));
+      // A claim no longer ready with the losing pin in its episode was already reopened or taken
+      // over, so there is nothing left to redo. While the claim's decision versions are unknown the
+      // reopen throws and the whole route rolls back: the batch stays composing for the next drive.
+      if (redo && loser !== undefined) {
+        ports().claims.reopen(tx, loser.pin, loser.episode, "lost_conflict");
+      }
     });
+  }
+
+  /**
+   * The conflicts port's verdict on `outcome`, with each claim's issue title as its intent. A port
+   * that does not answer within the bound on a port call leaves the conflict a question.
+   */
+  async function classify(
+    generation: number,
+    outcome: Extract<MergeOutcome, { kind: "conflict" }>,
+  ): Promise<ConflictVerdict> {
+    const [first, second] = outcome.pins;
+    const input: ConflictInput = {
+      regions: outcome.regions,
+      oursIntent: ports().claims.intent(first.claimId) ?? "",
+      theirsIntent: ports().claims.intent(second.claimId) ?? "",
+    };
+    const classified = await bounded(generation, "conflicts", async () =>
+      ok(await ports().conflicts.classify(input)),
+    );
+    return classified.ok
+      ? classified.value
+      : { route: "question", class: "contradictory", probability: 0, reason: "timeout" };
   }
 
   function dropEntries(
