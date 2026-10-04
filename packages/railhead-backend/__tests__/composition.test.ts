@@ -707,6 +707,14 @@ describe("agent HTTP routes", () => {
         "invalid_request",
       ],
       [
+        agentRequest(name, "/claims/clm_42abcd/release", {
+          body: JSON.stringify({ generation: 0 }),
+          headers: { ...JSON_HEADERS, ...bearer },
+        }),
+        400,
+        "invalid_request",
+      ],
+      [
         agentRequest(name, "/inbox?limit=0", { method: "GET", headers: bearer }),
         400,
         "invalid_request",

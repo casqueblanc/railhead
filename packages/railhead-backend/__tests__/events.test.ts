@@ -96,6 +96,10 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", generation: 1 },
   },
+  "claim.released": {
+    actor: AGENT,
+    data: { claimId: "clm_42abcd", generation: 1 },
+  },
   "claim.reassigned": {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", from: "agt_atlas01", to: "agt_ember01", generation: 2 },
@@ -253,11 +257,12 @@ describe("validateEvent", () => {
       expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
     });
 
-    it("writes the held check, unreported check and merge events at version 2 and every older type at version 1", () => {
+    it("writes the held check, unreported check, merge and release events at version 2 and every older type at version 1", () => {
       const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
       expect(later.toSorted()).toEqual([
         "check.approved",
         "claim.merged",
+        "claim.released",
         "train.held",
         "train.unreported",
       ]);

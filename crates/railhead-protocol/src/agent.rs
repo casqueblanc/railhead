@@ -89,6 +89,8 @@ pub enum AgentRoute {
     Claim,
     /// Pin a commit for the train.
     Ready,
+    /// Give up a working claim.
+    Release,
     /// Where the calling agent's pin stands on the train.
     Pin,
     /// Unacknowledged inbox items.
@@ -103,7 +105,7 @@ pub enum AgentRoute {
 
 impl AgentRoute {
     /// Every route, in the order of the route table.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Join,
         Self::Challenge,
         Self::Session,
@@ -111,6 +113,7 @@ impl AgentRoute {
         Self::Work,
         Self::Claim,
         Self::Ready,
+        Self::Release,
         Self::Pin,
         Self::Inbox,
         Self::Ack,
@@ -129,6 +132,7 @@ impl AgentRoute {
             Self::Work => "work",
             Self::Claim => "claim",
             Self::Ready => "ready",
+            Self::Release => "release",
             Self::Pin => "pin",
             Self::Inbox => "inbox",
             Self::Ack => "ack",
@@ -148,6 +152,7 @@ impl AgentRoute {
             | Self::Work
             | Self::Claim
             | Self::Ready
+            | Self::Release
             | Self::Ack
             | Self::Ask => Method::Post,
         }
@@ -164,6 +169,7 @@ impl AgentRoute {
             Self::Work => "/work",
             Self::Claim => "/claims",
             Self::Ready => "/claims/{claimId}/ready",
+            Self::Release => "/claims/{claimId}/release",
             Self::Pin => "/pin",
             Self::Inbox => "/inbox",
             Self::Ack => "/inbox/{item}/ack",
@@ -181,6 +187,7 @@ impl AgentRoute {
             | Self::Work
             | Self::Claim
             | Self::Ready
+            | Self::Release
             | Self::Pin
             | Self::Inbox
             | Self::Ack
@@ -198,6 +205,7 @@ impl AgentRoute {
             | Self::Session
             | Self::Claim
             | Self::Ready
+            | Self::Release
             | Self::Ack
             | Self::Ask => true,
             Self::Status | Self::Work | Self::Pin | Self::Inbox | Self::Question => false,
@@ -543,7 +551,9 @@ pub enum ClosedReason {
     },
     /// The lease lapsed; the work is not merged and waits for a successor.
     Expired,
-    /// The expired claim was given to another agent, which now holds it.
+    /// The agent gave the claim up; the work waits for a successor.
+    Released,
+    /// The expired or released claim was given to another agent, which now holds it.
     TakenOver,
 }
 
@@ -824,6 +834,33 @@ pub struct ReadyResult {
     /// The claim, now `ready` with its pinned commit.
     pub claim: ClaimView,
     /// `true` when this exact pin was already recorded.
+    pub repeated: bool,
+}
+
+/// `release`: give up a working claim. The claim is in the path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    /// The ownership generation the agent last saw.
+    pub generation: SafeInteger,
+}
+
+impl ReleaseRequest {
+    /// Checks the rules `validateAgentRequest` applies to a release request.
+    ///
+    /// # Errors
+    ///
+    /// When the generation is not positive.
+    pub fn validate(&self) -> Result<()> {
+        require_positive(self.generation, "generation")
+    }
+}
+
+/// `release` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseResult {
+    /// The claim as the agent's closed claim, with the reason `released`.
+    pub closed: ClosedClaimView,
+    /// `true` when this release was already recorded.
     pub repeated: bool,
 }
 

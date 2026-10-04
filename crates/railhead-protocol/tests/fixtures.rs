@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use railhead_protocol::{
     AckRequest, AckResult, AgentResponse, AgentRoute, AskRequest, ChallengeRequest,
     ChallengeResult, ClaimRequest, ClaimResult, Error, InboxResult, JoinRequest, JoinResult,
-    MAX_SAFE_INTEGER, Method, PinResult, QuestionResult, ReadyRequest, ReadyResult, SessionRequest,
-    SessionResult, StatusResult, decode_event,
+    MAX_SAFE_INTEGER, Method, PinResult, QuestionResult, ReadyRequest, ReadyResult, ReleaseRequest,
+    ReleaseResult, SessionRequest, SessionResult, StatusResult, decode_event,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -17,7 +17,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const EVENTS: &str = include_str!("../../../fixtures/protocol/wire/events.json");
 
-const ROUTES: [(AgentRoute, &str); 12] = [
+const ROUTES: [(AgentRoute, &str); 13] = [
     (
         AgentRoute::Join,
         include_str!("../../../fixtures/protocol/wire/agent/join.json"),
@@ -45,6 +45,10 @@ const ROUTES: [(AgentRoute, &str); 12] = [
     (
         AgentRoute::Ready,
         include_str!("../../../fixtures/protocol/wire/agent/ready.json"),
+    ),
+    (
+        AgentRoute::Release,
+        include_str!("../../../fixtures/protocol/wire/agent/release.json"),
     ),
     (
         AgentRoute::Pin,
@@ -114,7 +118,7 @@ fn decodes_and_round_trips_one_event_of_every_type() -> TestResult {
         assert_eq!(text(value, "type")?, event.payload.type_name());
         types.insert(event.payload.type_name());
     }
-    assert_eq!(types.len(), 26, "every event type has one fixture");
+    assert_eq!(types.len(), 27, "every event type has one fixture");
     Ok(())
 }
 
@@ -158,8 +162,8 @@ fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestRes
         }
     }
     assert_eq!(
-        newer, 4,
-        "train.held, check.approved, train.unreported and claim.merged"
+        newer, 5,
+        "train.held, check.approved, train.unreported, claim.merged and claim.released"
     );
     Ok(())
 }
@@ -244,6 +248,7 @@ fn decode_request(route: AgentRoute, body: &Value) -> Result<Value, Box<dyn std:
         AgentRoute::Session => request(body, SessionRequest::validate),
         AgentRoute::Claim => request(body, ClaimRequest::validate),
         AgentRoute::Ready => request(body, ReadyRequest::validate),
+        AgentRoute::Release => request(body, ReleaseRequest::validate),
         AgentRoute::Ack => request(body, AckRequest::validate),
         AgentRoute::Ask => request(body, AskRequest::validate),
         AgentRoute::Status
@@ -277,6 +282,7 @@ fn decode_response(route: AgentRoute, body: &Value) -> Result<Value, Box<dyn std
         AgentRoute::Status => response::<StatusResult>(body),
         AgentRoute::Work | AgentRoute::Claim => response::<ClaimResult>(body),
         AgentRoute::Ready => response::<ReadyResult>(body),
+        AgentRoute::Release => response::<ReleaseResult>(body),
         AgentRoute::Pin => response::<PinResult>(body),
         AgentRoute::Inbox => response::<InboxResult>(body),
         AgentRoute::Ack => response::<AckResult>(body),

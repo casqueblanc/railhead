@@ -19,6 +19,7 @@ import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
+import { migrateClaims } from "../src/modules/claims/store";
 
 const REPO = "rep_closed00001";
 const ROOT = "1".repeat(40);
@@ -33,6 +34,7 @@ interface Setup {
   claims: ClaimsPort;
   decisions: DecisionsPort;
   sql: SqlStorage;
+  storage: DurableObjectStorage;
   log: EventLog;
   events: () => RailheadEvent[];
   /** Files an issue titled `title` and returns its id. */
@@ -76,6 +78,7 @@ function withClaims<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
       claims,
       decisions: ports.decisions,
       sql: state.storage.sql,
+      storage: state.storage,
       log,
       events: () => log.replay(0, 256).events,
       async file(title) {
@@ -290,6 +293,207 @@ describe("a merged claim", () => {
       expect(asked).toMatchObject({ ok: false, code: "claim_closed" });
       expect(setup.events()).toHaveLength(before);
       expect(setup.sql.exec("SELECT 1 FROM questions").toArray()).toHaveLength(0);
+    });
+  });
+});
+
+describe("releasing a claim", () => {
+  it("closes a working claim as released, and a repeat returns the same release", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      const releasedAt = setup.fake.clock();
+      const closed = {
+        claimId: claim.claimId,
+        issueId: claim.issueId,
+        generation: 1,
+        reason: { kind: "released" },
+        closedAt: releasedAt,
+      };
+
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toEqual(
+        ok({ closed, repeated: false }),
+      );
+      expect(setup.events().at(-1)).toMatchObject({
+        v: 2,
+        actor: { kind: "agent", id: agent(1).agentId },
+        type: "claim.released",
+        data: { claimId: claim.claimId, generation: 1 },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(closed));
+      expect(await setup.claims.activeClaim(agent(1))).toEqual(ok(null));
+      // The fork takes no more pushes from its former holder.
+      expect(
+        await setup.claims.authorizeGit({
+          principal: agent(1),
+          target: { kind: "fork", claimId: claim.claimId },
+          operation: "push",
+        }),
+      ).toMatchObject({ ok: false, code: "claim_closed" });
+
+      const count = setup.events().length;
+      setup.fake.advance(1);
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toEqual(
+        ok({ closed, repeated: true }),
+      );
+      expect(setup.events()).toHaveLength(count);
+    });
+  });
+
+  it("offers the released claim to a successor, which takes it over at the next generation", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toMatchObject({
+        ok: true,
+      });
+
+      // No lease has lapsed: the successor's call revokes the fork's tokens, then takes it over.
+      expect(await setup.claims.work(agent(2))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, generation: 2, state: "working" } },
+      });
+      expect(setup.events().at(-1)).toMatchObject({
+        type: "claim.reassigned",
+        data: { claimId: claim.claimId, from: agent(1).agentId, to: agent(2).agentId },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: claim.claimId, generation: 1, reason: { kind: "taken_over" } },
+      });
+      // The former holder's repeat no longer holds the claim.
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toMatchObject({
+        ok: false,
+        code: "stale_generation",
+      });
+    });
+  });
+
+  it("refuses a stale generation and another agent's release, and changes nothing", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      const count = setup.events().length;
+
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 2 })).toMatchObject({
+        ok: false,
+        code: "stale_generation",
+      });
+      expect(await setup.claims.release(agent(2), claim.claimId, { generation: 1 })).toMatchObject({
+        ok: false,
+        code: "stale_generation",
+      });
+      expect(setup.events()).toHaveLength(count);
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: claim.claimId, state: "working" },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(null));
+    });
+  });
+
+  it("refuses a ready claim, whose pin stays on the train", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      const commit = "3".repeat(40);
+      await setup.push(claim.claimId, commit);
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit }),
+      ).toMatchObject({ ok: true });
+      const count = setup.events().length;
+
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toMatchObject({
+        ok: false,
+        code: "after_ready",
+      });
+      expect(setup.events()).toHaveLength(count);
+      expect(setup.claims.readyPin(claim.claimId)?.pin).toEqual({
+        claimId: claim.claimId,
+        generation: 1,
+        commit,
+      });
+    });
+  });
+
+  it("refuses a claim whose lease lapsed, recording the expiry rather than a release", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      setup.fake.advance(CLAIM_LEASE_MS);
+
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 1 })).toMatchObject({
+        ok: false,
+        code: "claim_closed",
+      });
+      expect(setup.events().at(-1)).toMatchObject({
+        type: "claim.expired",
+        data: { claimId: claim.claimId, generation: 1 },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { reason: { kind: "expired" } },
+      });
+    });
+  });
+
+  it("refuses a malformed request, an unknown claim and another repository's agent", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      const count = setup.events().length;
+
+      expect(await setup.claims.release(agent(1), claim.claimId, { generation: 0 })).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+      expect(await setup.claims.release(agent(1), "not-a-claim", { generation: 1 })).toMatchObject({
+        ok: false,
+        code: "invalid_request",
+      });
+      expect(
+        await setup.claims.release(agent(1), "clm_unknown01", { generation: 1 }),
+      ).toMatchObject({ ok: false, code: "claim_closed" });
+      expect(
+        await setup.claims.release(agent(1, "rep_elsewhere01"), claim.claimId, { generation: 1 }),
+      ).toMatchObject({ ok: false, code: "unauthenticated" });
+      expect(setup.events()).toHaveLength(count);
+    });
+  });
+
+  it("keeps closed claims recorded before `released` was a reason", async () => {
+    await withClaims(async (setup) => {
+      const first = await setup.open(agent(1));
+      setup.fake.advance(CLAIM_LEASE_MS);
+      expect(await setup.claims.activeClaim(agent(1))).toEqual(ok(null));
+
+      // Put back the table as the previous migration left it, with its row.
+      const { sql } = setup;
+      sql.exec(`CREATE TABLE claims_closed_old (
+        agent_id TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL REFERENCES claims_claims (claim_id),
+        issue_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        reason TEXT NOT NULL CHECK (reason IN ('merged', 'expired', 'taken_over')),
+        commit_sha TEXT,
+        closed_at INTEGER NOT NULL,
+        CHECK ((reason = 'merged') = (commit_sha IS NOT NULL))
+      ) STRICT`);
+      sql.exec("INSERT INTO claims_closed_old SELECT * FROM claims_closed");
+      sql.exec("DROP TABLE claims_closed");
+      sql.exec("ALTER TABLE claims_closed_old RENAME TO claims_closed");
+      sql.exec("UPDATE railhead_migrations SET version = version - 4 WHERE owner = 'claims'");
+      expect(() =>
+        sql.exec(
+          "UPDATE claims_closed SET reason = 'released' WHERE agent_id = ?",
+          agent(1).agentId,
+        ),
+      ).toThrow();
+
+      migrateClaims(setup.storage);
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: first.claimId, reason: { kind: "expired" } },
+      });
+
+      const second = await setup.open(agent(1));
+      expect(await setup.claims.release(agent(1), second.claimId, { generation: 1 })).toMatchObject(
+        { ok: true, value: { closed: { claimId: second.claimId, reason: { kind: "released" } } } },
+      );
     });
   });
 });
