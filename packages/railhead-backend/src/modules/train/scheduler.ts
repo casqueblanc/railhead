@@ -1333,6 +1333,15 @@ export function createTrain(
   }
 
   /**
+   * Whether the claim of `pin` is still ready with it, at its generation and episode. A fence read:
+   * call it inside the transaction whose write relies on it.
+   */
+  function stillReadyAs(pin: EpisodePin): boolean {
+    const ready = ports().claims.readyPin(pin.claimId);
+    return ready !== null && samePin(ready.pin, pin) && ready.episode === pin.episode;
+  }
+
+  /**
    * Drives without throwing, so a port that rejects or a broken invariant cannot turn a committed
    * result into a thrown error; the drive has already asked for its retry. The error is logged by
    * name only, never with its message, which may carry a port's text.
@@ -1677,6 +1686,10 @@ export function createTrain(
     if (!holdsAttempt(sql, attemptId)) return false;
     const batch = batchByAttempt(sql, attemptId);
     if (batch === null) return false;
+    // The approval is for the pins as batched. A pin whose claim was reopened or reassigned since
+    // is no longer ready at that episode, so the approved run could never land it: refuse rather
+    // than spend the approval.
+    if (!batch.pins.every(stillReadyAs)) return false;
     let released = false;
     if (batch.state === "checking" && batch.checkHeld) {
       released = releaseActiveHold(sql, attemptId, now);

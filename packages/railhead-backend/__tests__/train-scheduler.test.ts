@@ -2149,10 +2149,10 @@ describe("train approvals of held checks", () => {
       await train.resume();
       if (heldBatch?.attemptId == null) throw new Error("no hold");
 
-      // The claim's agent pushed again while the approval was pending.
-      fakes.ready(pin(1, 2, sha("9")));
       port.approve();
       expect(train.release(heldBatch.attemptId)).toBe(true);
+      // The claim moved on after the approval, before the train drove the pin back.
+      fakes.ready(pin(1, 2, sha("9")));
       await train.resume();
 
       expect(states(train)).toEqual({ "clm_claim001@1": "dropped" });
@@ -3394,10 +3394,10 @@ describe("candidate discards", () => {
       const [attempt] = fakes.composeAttempts;
       if (heldBatch?.attemptId == null) throw new Error("no hold");
 
-      // The claim moved on while the approval was pending, before any new generation was queued.
-      fakes.ready(pin(1, 2, sha("9")));
       port.approve();
       expect(train.release(heldBatch.attemptId)).toBe(true);
+      // The claim moved on after the approval, before any new generation was queued.
+      fakes.ready(pin(1, 2, sha("9")));
       expect(pendingDiscards(sql)).toEqual([]);
       await train.resume();
       expect(states(train)).toEqual({ "clm_claim001@1": "dropped" });

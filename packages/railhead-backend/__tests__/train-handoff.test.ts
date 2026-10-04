@@ -84,6 +84,8 @@ interface Setup {
   conflict: [ClaimPin, ClaimPin] | null;
   /** The path the merge port names for that conflict. */
   conflictPath: string;
+  /** While set, the check port holds every attempt for a person's approval (`check_held`). */
+  holdChecks: boolean;
   /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
   decide(claimId: string, decisionId?: string): Promise<DecisionRef>;
   /** Acknowledges every inbox item agent `n`, 1 unless given, has pending. */
@@ -266,7 +268,9 @@ function withHandoff<T>(
           ok([{ name: "test", source: main, digest: "d".repeat(64), acceptance: null }]),
         start: async (attempt) => {
           started.push(attempt);
-          return ok({ attemptId: attempt.attemptId });
+          return setup.holdChecks
+            ? fail("check_held", "The candidate edits protected check paths.")
+            : ok({ attemptId: attempt.attemptId });
         },
         report: async () => fail("unavailable", "Not used."),
         detail: async () => fail("unavailable", "Not used."),
@@ -370,6 +374,7 @@ function withHandoff<T>(
       versionsKnown: true,
       conflict: null,
       conflictPath: "src/upload.ts",
+      holdChecks: false,
       fake,
       holdNextPin() {
         const reached = signal();
@@ -2044,6 +2049,86 @@ describe("a ready claim reopened for rework", () => {
           unavailableClaims.reopen(tx, loser, episode, "lost_conflict"),
         ),
       ).toThrow(UnavailableError);
+    });
+  });
+});
+
+/** Readies `WORK` for agent 1 under a check port that holds it; returns the pin and its attempt. */
+async function readyHeld(setup: Setup): Promise<{ pin: ClaimPin; attemptId: string }> {
+  setup.holdChecks = true;
+  const claim = await setup.open(WORK);
+  const ready = await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK });
+  expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
+  await setup.train.resume();
+  const attemptId = setup.started.at(-1)?.attemptId;
+  if (attemptId === undefined) throw new Error("no check was started");
+  expect(setup.train.batches(1)[0]).toMatchObject({ attemptId, checkHeld: true });
+  return { pin: { claimId: claim.claimId, generation: 1, commit: WORK }, attemptId };
+}
+
+/** Drives the held batch past its deadline, so its pin is parked for the held attempt. */
+async function parkHeld(setup: Setup): Promise<void> {
+  const due = readWake(setup.sql)?.dueAt;
+  if (due === undefined) throw new Error("no drive is owed");
+  setup.advance(due - setup.now());
+  await setup.train.resume();
+  expect(setup.entries()).toEqual([{ commit: WORK, state: "parked", next: null }]);
+}
+
+/** Approves the held attempt as the checks module does: `release` inside a transaction. */
+function approveHeld(setup: Setup, attemptId: string): boolean {
+  return setup.log.transaction(() => setup.train.release(attemptId)).value;
+}
+
+describe("an approval of a held check", () => {
+  it("returns a parked pin whose claim is still ready at its episode", async () => {
+    await withHandoff(async (setup) => {
+      const { attemptId } = await readyHeld(setup);
+      await parkHeld(setup);
+
+      expect(approveHeld(setup, attemptId)).toBe(true);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "queued", next: null }]);
+    });
+  });
+
+  it("is refused once the parked pin's claim was reopened, leaving the pin parked", async () => {
+    await withHandoff(async (setup) => {
+      const { pin, attemptId } = await readyHeld(setup);
+      await parkHeld(setup);
+      expect(reopenLost(setup, pin, episodeOf(setup, pin))).toBe(true);
+
+      expect(approveHeld(setup, attemptId)).toBe(false);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "parked", next: null }]);
+      await setup.train.resume();
+      expect(setup.started).toHaveLength(1);
+    });
+  });
+
+  it("is refused once the parked pin's claim was reassigned, before the new owner readied it", async () => {
+    await withHandoff(async (setup) => {
+      const { pin, attemptId } = await readyHeld(setup);
+      await parkHeld(setup);
+      expect(reopenLost(setup, pin, episodeOf(setup, pin))).toBe(true);
+      setup.advance(CLAIM_LEASE_MS);
+      await setup.claims.resume();
+      const taken = await setup.claims.work(agent(2));
+      expect(taken).toMatchObject({ ok: true, value: { claim: { claimId: pin.claimId } } });
+      expect(setup.claims.currentGeneration(pin.claimId)).toBe(2);
+
+      expect(approveHeld(setup, attemptId)).toBe(false);
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "parked", next: null }]);
+      await setup.train.resume();
+      expect(setup.started).toHaveLength(1);
+    });
+  });
+
+  it("is refused while the batch still waits, once its claim was reopened", async () => {
+    await withHandoff(async (setup) => {
+      const { pin, attemptId } = await readyHeld(setup);
+      expect(reopenLost(setup, pin, episodeOf(setup, pin))).toBe(true);
+
+      expect(approveHeld(setup, attemptId)).toBe(false);
+      expect(setup.train.batches(1)[0]).toMatchObject({ attemptId, checkHeld: true });
     });
   });
 });
