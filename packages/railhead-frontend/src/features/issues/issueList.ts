@@ -59,7 +59,7 @@ const statusOf = (board: BoardState, claim: ClaimState): IssueStatus => {
     case "working":
     case "ready":
       return { kind: "claimed", agent: board.agents[claim.agentId]?.name ?? claim.agentId };
-    case "landed":
+    case "merged":
       return { kind: "landed" };
     case "expired":
       return OPEN;

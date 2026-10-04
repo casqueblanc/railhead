@@ -97,6 +97,8 @@ interface Setup {
   holdNextPin(): { reached: Promise<void>; release(): void };
   /** Makes reads of main wait until the returned function releases them. */
   holdMain(): { reached: Promise<void>; release: () => void };
+  /** Makes the next update of main wait, once applied, until the returned function releases it. */
+  holdUpdate(): { reached: Promise<void>; release: () => void };
   /** The Artifacts fake behind the adapter. */
   fake: FakeArtifacts;
   /** The commit main is at. */
@@ -178,6 +180,7 @@ function withHandoff<T>(
     const started: CheckAttempt[] = [];
     const published: string[] = [];
     let held: { reach(): void; released: Promise<void> } | null = null;
+    let updateGate: { reach(): void; released: Promise<void> } | null = null;
     const base = composeRepo(context);
     // Main moves only by a conditional update, as the main writer's ref allows.
     let mainAt: CommitSha = MAIN;
@@ -186,6 +189,12 @@ function withHandoff<T>(
       update: async (expected, next) => {
         if (mainAt !== expected) return ok({ kind: "rejected", actual: mainAt });
         mainAt = next;
+        const gate = updateGate;
+        updateGate = null;
+        if (gate !== null) {
+          gate.reach();
+          await gate.released;
+        }
         return ok({ kind: "updated" });
       },
     };
@@ -379,6 +388,12 @@ function withHandoff<T>(
             released.resolve();
           },
         };
+      },
+      holdUpdate() {
+        const reached = signal();
+        const released = signal();
+        updateGate = { reach: reached.resolve, released: released.promise };
+        return { reached: reached.promise, release: released.resolve };
       },
       main: () => mainAt,
       mainUp: true,
@@ -1420,8 +1435,8 @@ describe("a re-ready of a commit that already landed", () => {
       const wake = readWake(setup.sql);
       expect(
         await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: WORK }),
-      ).toMatchObject({ ok: true, value: { repeated: true, claim: { state: "ready" } } });
-      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      ).toMatchObject({ ok: true, value: { repeated: true, claim: { state: "merged" } } });
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
       expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
       expect(setup.train.batches(8)).toHaveLength(1);
       expect(setup.log.head()).toBe(head);
@@ -1459,6 +1474,259 @@ describe("a re-ready of a commit that already landed", () => {
         await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: LATER }),
       ).toMatchObject({ ok: true, value: { repeated: false } });
       expect(setup.entries()).toEqual([{ commit: LATER, state: "queued", next: null }]);
+    });
+  });
+});
+
+/** Runs the train until the pin readied last has a started check, passes that check and lands it. */
+async function landNext(setup: Setup): Promise<void> {
+  await setup.train.resume();
+  const attempt = setup.started.at(-1);
+  if (attempt === undefined) throw new Error("no check was started");
+  const recorded = await setup.train.recordCheck({
+    attemptId: attempt.attemptId,
+    candidate: attempt.candidate,
+    result: "pass",
+    logDigest: null,
+    finishedAt: attempt.createdAt,
+  });
+  expect(recorded.ok).toBe(true);
+  await setup.train.resume();
+}
+
+function eventTypes(setup: Setup): string[] {
+  return setup.log.replay(0, 256).events.map((event) => event.type);
+}
+
+describe("a landed claim", () => {
+  it("is merged with the landed commit, so its agent's next work gets a second issue", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const landedAt = setup.main();
+      expect(landedAt).not.toBe(MAIN);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(await setup.claims.activeClaim(agent(1))).toEqual(ok(null));
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(
+        ok({
+          claimId: claim.claimId,
+          issueId: claim.issueId,
+          generation: 1,
+          reason: { kind: "merged", commit: landedAt },
+          closedAt: setup.now(),
+        }),
+      );
+
+      const second = await setup.open();
+      expect(second.claimId).not.toBe(claim.claimId);
+      expect(second.issueId).not.toBe(claim.issueId);
+      expect(second.state).toBe("working");
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+    });
+  });
+
+  it("appends claim.merged in the landing, after main moved", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const events = setup.log.replay(0, 256).events;
+      const moved = events.findIndex((event) => event.type === "train.main");
+      const merged = events.findIndex((event) => event.type === "claim.merged");
+      expect(moved).toBeGreaterThan(-1);
+      expect(merged).toBeGreaterThan(moved);
+      expect(events[merged]).toMatchObject({
+        actor: { kind: "system" },
+        data: { claimId: claim.claimId, generation: 1, commit: setup.main() },
+      });
+    });
+  });
+
+  it("stays ready, with no claim.merged, when it is readied again while its batch publishes", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const update = setup.holdUpdate();
+      const landing = landNext(setup);
+      await update.reached;
+
+      // Main has moved. A superseding version reopens the claim and the holder readies the same
+      // commit under it, so the batch's result belongs to the old episode.
+      await setup.decide(claim.claimId, first.decisionId);
+      await setup.ackAll();
+      const again = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(again).toMatchObject({ ok: true, value: { repeated: false } });
+      update.release();
+      await landing;
+
+      const published = setup.main();
+      expect(published).not.toBe(MAIN);
+      const types = eventTypes(setup);
+      expect(types).toContain("train.main");
+      expect(types).not.toContain("claim.merged");
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(await setup.claims.lastClosed(agent(1))).toEqual(ok(null));
+      // The renewed pin went back to the train, to be checked under the new version.
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      expect(setup.started.length).toBeGreaterThan(1);
+    });
+  });
+
+  it("refuses a push and a new ready, while a fetch of its fork still works", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const head = setup.log.head();
+      const target = { kind: "fork", claimId: claim.claimId } as const;
+
+      expect(
+        await setup.claims.authorizeGit({ principal: agent(1), target, operation: "push" }),
+      ).toMatchObject({ ok: false, code: "claim_closed" });
+      expect(
+        await setup.claims.authorizeGit({ principal: agent(1), target, operation: "fetch" }),
+      ).toMatchObject({ ok: true, value: { scope: "read" } });
+      await setup.push(claim.claimId, LATER);
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: LATER }),
+      ).toMatchObject({ ok: false, code: "claim_closed" });
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(setup.log.head()).toBe(head);
+    });
+  });
+
+  it("reopens on a superseding decision while its holder is free, and lands the rework", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const landedAt = setup.main();
+
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      const events = setup.log.replay(0, 256).events;
+      const reopened = events.at(-1);
+      expect(reopened).toMatchObject({
+        type: "claim.reopened",
+        data: {
+          claimId: claim.claimId,
+          generation: 1,
+          reason: "decision_superseded",
+          decisions: [second],
+        },
+      });
+      // In the transaction that recorded the version and queued it to the holder.
+      expect(events.at(-2)?.type).toBe("inbox.queued");
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: claim.claimId, state: "working", readyCommit: null },
+      });
+
+      // The holder adapts: it pushes, acknowledges the new version and readies the rework.
+      expect(
+        await setup.claims.authorizeGit({
+          principal: agent(1),
+          target: { kind: "fork", claimId: claim.claimId },
+          operation: "push",
+        }),
+      ).toMatchObject({ ok: true, value: { scope: "write", fence: { generation: 1 } } });
+      await setup.push(claim.claimId, LATER);
+      await setup.ackAll();
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit: LATER }),
+      ).toMatchObject({ ok: true, value: { repeated: false, claim: { state: "ready" } } });
+
+      await landNext(setup);
+      expect(setup.main()).not.toBe(landedAt);
+      expect(setup.published).toHaveLength(2);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: claim.claimId, reason: { kind: "merged", commit: setup.main() } },
+      });
+    });
+  });
+
+  it("waits for rework while its holder works another claim, and reopens once that one lands", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const busy = await setup.open(LATER);
+
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      expect(eventTypes(setup)).not.toContain("claim.reopened");
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: busy.claimId },
+      });
+      // The version reached the holder's inbox for the merged claim all the same.
+      const pending = await setup.inbox.pending(agent(1), 16);
+      expect(pending).toMatchObject({
+        ok: true,
+        value: { items: [{ claimId: claim.claimId, decision: { version: 2 } }] },
+      });
+
+      // The holder lands its other claim; that landing reopens the merged one.
+      await setup.ackAll();
+      expect(
+        (await setup.claims.ready(agent(1), busy.claimId, { generation: 1, commit: LATER })).ok,
+      ).toBe(true);
+      await landNext(setup);
+      expect(claimState(setup.sql, busy.claimId)).toBe("merged");
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(setup.log.replay(0, 256).events.at(-1)).toMatchObject({
+        type: "claim.reopened",
+        data: {
+          claimId: claim.claimId,
+          generation: 1,
+          reason: "decision_superseded",
+          decisions: [second],
+        },
+      });
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: busy.claimId, reason: { kind: "merged" } },
+      });
+      expect(await setup.claims.work(agent(1))).toMatchObject({
+        ok: true,
+        value: { claim: { claimId: claim.claimId, state: "working" }, resumed: true },
+      });
+    });
+  });
+
+  it("waits for rework while its holder works another claim, and reopens once that one expires", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const busy = await setup.open();
+      await setup.decide(claim.claimId, first.decisionId);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+
+      setup.advance(CLAIM_LEASE_MS);
+      // The holder's status read records the lapse, and the merged claim reopens in that transaction.
+      expect(await setup.claims.activeClaim(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: claim.claimId, state: "working" },
+      });
+      expect(claimState(setup.sql, busy.claimId)).toBe("expired");
+      expect(eventTypes(setup).slice(-2)).toEqual(["claim.expired", "claim.reopened"]);
+      expect(await setup.claims.lastClosed(agent(1))).toMatchObject({
+        ok: true,
+        value: { claimId: busy.claimId, reason: { kind: "expired" } },
+      });
+    });
+  });
+
+  it("stays merged when a decision another claim depends on changes", async () => {
+    await withHandoff(async (setup) => {
+      const { claim } = await readyUnderFirst(setup);
+      await landNext(setup);
+      const other = await setup.open();
+      const question = await setup.decide(other.claimId);
+      await setup.decide(other.claimId, question.decisionId);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(claimState(setup.sql, other.claimId)).toBe("working");
+      expect(eventTypes(setup)).not.toContain("claim.reopened");
     });
   });
 });

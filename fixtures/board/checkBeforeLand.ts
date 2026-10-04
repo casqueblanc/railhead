@@ -9,6 +9,7 @@ import {
   inbox,
   intend,
   moveMain,
+  merge,
   push,
   ready,
   sizeDecision,
@@ -64,6 +65,7 @@ export const checkBeforeLand = syntheticLog("Synthetic acceptance check before l
     "chk_synth11",
   ),
   moveMain("int_synth10", "updated", synthCommit(7)),
+  merge(UPLOAD.birchClaim, synthCommit(7)),
   moveMain("int_synth11", "rejected", synthCommit(7)),
   checkResult("chk_synth12", synthCommit(8), "test", "pass"),
   intend(
@@ -75,6 +77,7 @@ export const checkBeforeLand = syntheticLog("Synthetic acceptance check before l
     "chk_synth12",
   ),
   moveMain("int_synth12", "reconciled", synthCommit(8)),
+  merge(UPLOAD.atlasClaim, synthCommit(8)),
   checkResult("chk_synth13", synthCommit(8), "accept-reject", "pass", {
     decision: sizeDecision(1),
     option: "reject",

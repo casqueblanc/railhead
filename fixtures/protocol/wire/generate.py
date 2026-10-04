@@ -223,6 +223,9 @@ def claim_view(state: str = "working", ready: str | None = None, generation: int
     }
 
 
+def closed_view(reason: dict, claim: str = "clm_42abcd") -> dict:
+    return {"claimId": claim, "issueId": "iss_upload1", "generation": 1, "reason": reason, "closedAt": NOW - 60_000}
+
 
 def pin_view(state: dict, next_commit: str | None = None) -> dict:
     return {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_HEAD, "nextCommit": next_commit, "state": state}
@@ -396,12 +399,27 @@ def agent_fixtures() -> dict:
                 exchange(
                     "shows the agent, its claim and its inbox first",
                     request(None, True),
-                    success({"agent": AGENT_VIEW, "claim": claim_view()}, DIGEST, "sync"),
+                    success({"agent": AGENT_VIEW, "claim": claim_view(), "closed": None}, DIGEST, "sync"),
                 ),
                 exchange(
                     "an agent without a claim",
                     request(None, True),
-                    success({"agent": AGENT_VIEW, "claim": None}, EMPTY_DIGEST, "work"),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": None}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim merged with the landed main commit",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "merged", "commit": SHA_OTHER})}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim expired",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "expired"})}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "the agent's last claim was taken over, and it holds a new one",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": claim_view(), "closed": closed_view({"kind": "taken_over"}, "clm_41abcd")}, EMPTY_DIGEST, None),
                 ),
                 exchange(
                     "refuses a revoked agent at its next call",
@@ -690,7 +708,7 @@ CHECK_DIGEST = hashlib.sha256(b'{"name":"test","command":"pnpm test","timeoutMs"
 
 
 # The schema version each type is written at, when later than 1: the version that introduced it.
-EVENT_VERSIONS = {"train.held": 2, "check.approved": 2}
+EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "claim.merged": 2}
 
 
 def event(seq: int, type_: str, actor: dict, data: dict) -> dict:
@@ -728,6 +746,7 @@ def events_fixture() -> dict:
         ("claim.adapted", SYSTEM, {"claimId": "clm_42abcd", "intentId": "int_merge01", "decision": {"decisionId": "dec_upload1", "version": 1}}),
         ("train.held", SYSTEM, {"checkRunId": "chk_run0002", "expectedMain": SHA_BASE, "candidate": SHA_OTHER, "claims": ["clm_42abcd"], "paths": [".railhead/check.json"], "digest": CHECK_DIGEST}),
         ("check.approved", HUMAN, {"checkRunId": "chk_run0002", "candidate": SHA_OTHER, "digest": CHECK_DIGEST}),
+        ("claim.merged", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_OTHER}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -752,6 +771,8 @@ def events_fixture() -> dict:
         ("held path outside the repository", {**events[22], "data": {**events[22]["data"], "paths": ["../check.json"]}}, "paths"),
         ("check approval recorded by the system", {**events[23], "actor": SYSTEM}, "by a person"),
         ("check approval with an uppercase digest", {**events[23], "data": {**events[23]["data"], "digest": CHECK_DIGEST.upper()}}, "digest"),
+        ("merge naming a branch for its commit", {**events[-1], "data": {**events[-1]["data"], "commit": "main"}}, "commit"),
+        ("merge recorded by an agent", {**events[-1], "actor": AGENT_ACTOR}, "recorded by the system"),
     ]
     return {
         "valid": events,

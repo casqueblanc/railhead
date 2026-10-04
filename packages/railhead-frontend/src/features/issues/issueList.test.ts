@@ -49,7 +49,7 @@ describe("issueList", () => {
     if (claim === undefined) throw new Error("fixture lost atlas's claim");
     const landed: BoardState = {
       ...board,
-      claims: { ...board.claims, [UPLOAD.atlasClaim]: { ...claim, phase: "landed" } },
+      claims: { ...board.claims, [UPLOAD.atlasClaim]: { ...claim, phase: "merged" } },
     };
 
     expect(issueList(landed).rows.at(-1)?.status).toEqual({ kind: "landed" });

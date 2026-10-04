@@ -88,6 +88,10 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
       decisions: [{ decisionId: "dec_upload1", version: 2 }],
     },
   },
+  "claim.merged": {
+    actor: SYSTEM,
+    data: { claimId: "clm_42abcd", generation: 1, commit: SHA_B },
+  },
   "claim.expired": {
     actor: SYSTEM,
     data: { claimId: "clm_42abcd", generation: 1 },
@@ -245,15 +249,16 @@ describe("validateEvent", () => {
       expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
     });
 
-    it("writes the held check events at version 2 and every older type at version 1", () => {
+    it("writes the held check and merge events at version 2 and every older type at version 1", () => {
       const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
-      expect(later).toEqual(["train.held", "check.approved"]);
+      expect(later.toSorted()).toEqual(["check.approved", "claim.merged", "train.held"]);
       expect(EVENT_SCHEMA_VERSION).toBe(2);
     });
 
     it.each([
       ["train.held", 1],
       ["check.approved", 1],
+      ["claim.merged", 1],
       ["issue.filed", 2],
     ] as const)("rejects %s stamped at version %s", (type, v) => {
       expect(() => validateEvent({ ...event(type), v })).toThrow(/is written at schema version/);

@@ -590,6 +590,32 @@ export interface ClaimView {
   task: { title: string; body: string };
 }
 
+/** Why a claim stopped being its agent's, read from the event that closed it. */
+export type ClosedReason =
+  /** The pin landed: the train published `commit` to main with it, and the claim is merged. */
+  | { kind: "merged"; commit: CommitSha }
+  /** The lease lapsed (`claim.expired`): the work is not merged and waits for a successor. */
+  | { kind: "expired" }
+  /** The expired claim was given to another agent (`claim.reassigned`), which now holds it. */
+  | { kind: "taken_over" };
+
+/**
+ * The agent's most recently closed claim. Only the latest is kept per agent; a later closing
+ * replaces it, and a claim that expired and was then taken over reads as `taken_over`.
+ */
+export interface ClosedClaimView {
+  /** The claim. */
+  claimId: ClaimId;
+  /** The issue it worked on. */
+  issueId: IssueId;
+  /** The ownership generation the agent held it at. */
+  generation: number;
+  /** Why it closed. */
+  reason: ClosedReason;
+  /** When it closed. */
+  closedAt: number;
+}
+
 /** A decision version as an agent's inbox shows it. Every text field is untrusted. */
 export interface DecisionView {
   /** The decision. */
@@ -700,6 +726,8 @@ export interface StatusResult {
   agent: AgentView;
   /** Its active claim, or `null`. */
   claim: ClaimView | null;
+  /** Its most recently closed claim, or `null` when none has closed. Kept after a new claim. */
+  closed: ClosedClaimView | null;
 }
 
 /** `claim`: claim a named issue. */

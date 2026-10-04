@@ -148,7 +148,7 @@ describe("ClaimLanes", () => {
         kind: "halted",
         fault: {
           kind: "inconsistent",
-          seq: 43,
+          seq: 46,
           message: "intent int_synth02 already has an outcome",
         },
       },
@@ -156,8 +156,8 @@ describe("ClaimLanes", () => {
     await render(live(halted));
 
     const alert = container.querySelector("[role=alert]");
-    expect(alert?.textContent).toContain("Board stopped at event 43");
-    expect(alert?.textContent).toContain("Showing the board through event 42");
+    expect(alert?.textContent).toContain("Board stopped at event 46");
+    expect(alert?.textContent).toContain("Showing the board through event 45");
     expect(headings()).toHaveLength(2);
     await act(async () => button("Reload board").click());
     expect(onRetry).toHaveBeenCalledOnce();
@@ -167,7 +167,7 @@ describe("ClaimLanes", () => {
     const gapped = foldEvents(emptyBoardState(SYNTH_REPO), withLostEvents(decisionReversal, [30]));
     await render(live(gapped));
 
-    expect(text()).toContain("Waiting for events 30–42");
+    expect(text()).toContain("Waiting for events 30–45");
     expect(text()).toContain("Showing the board through event 29");
     expect(container.querySelector("[role=alert]")).toBeNull();
   });
@@ -181,6 +181,6 @@ describe("ClaimLanes", () => {
     await render({ kind: "board", board: complete, connection: "live", recovered: true });
     expect(text()).not.toContain("Disconnected");
     expect(text()).toContain("Back in sync");
-    expect(text()).toContain("Caught up through event 42");
+    expect(text()).toContain("Caught up through event 45");
   });
 });

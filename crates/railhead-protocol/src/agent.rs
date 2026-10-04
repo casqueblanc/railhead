@@ -532,6 +532,37 @@ pub struct ClaimView {
     pub task: Task,
 }
 
+/// Why a claim stopped being its agent's, read from the event that closed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClosedReason {
+    /// The pin landed: the train published `commit` to main with it.
+    Merged {
+        /// The main commit the landing published.
+        commit: String,
+    },
+    /// The lease lapsed; the work is not merged and waits for a successor.
+    Expired,
+    /// The expired claim was given to another agent, which now holds it.
+    TakenOver,
+}
+
+/// The agent's most recently closed claim. Only the latest is kept per agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedClaimView {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The `iss_` issue it worked on.
+    pub issue_id: String,
+    /// The ownership generation the agent held it at.
+    pub generation: SafeInteger,
+    /// Why it closed.
+    pub reason: ClosedReason,
+    /// When it closed, in milliseconds since the Unix epoch.
+    pub closed_at: SafeInteger,
+}
+
 /// A decision version as an agent's inbox shows it. Every text field is untrusted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -733,6 +764,9 @@ pub struct StatusResult {
     /// Its active claim.
     #[serde(deserialize_with = "nullable")]
     pub claim: Option<ClaimView>,
+    /// Its most recently closed claim, kept after it takes a new one.
+    #[serde(deserialize_with = "nullable")]
+    pub closed: Option<ClosedClaimView>,
 }
 
 /// `claim`: claim a named issue.

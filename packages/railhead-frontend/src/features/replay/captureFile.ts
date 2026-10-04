@@ -659,6 +659,7 @@ const EVENT_TYPES: Readonly<Record<EventType, true>> = {
   "claim.ready": true,
   "claim.refused": true,
   "claim.reopened": true,
+  "claim.merged": true,
   "claim.expired": true,
   "claim.reassigned": true,
   "claim.adapted": true,
@@ -756,6 +757,15 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
               ? REOPEN_REASON_BEFORE_REASONS
               : oneOf(d, "reason", p, ["lost_conflict", "decision_superseded", "check_failed"]),
           decisions: list(d, "decisions", p, readDecisionRef),
+        },
+      };
+    case "claim.merged":
+      return {
+        type,
+        data: {
+          claimId: string(d, "claimId", p),
+          generation: integer(d, "generation", p),
+          commit: string(d, "commit", p),
         },
       };
     case "claim.expired":

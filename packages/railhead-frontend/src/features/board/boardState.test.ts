@@ -25,6 +25,7 @@ import {
   decide,
   inbox,
   intend,
+  merge,
   moveMain,
   push,
   ready,
@@ -67,8 +68,14 @@ const append = (state: BoardState, step: SyntheticStep): BoardState =>
 const atlasAdapted = (state: BoardState): boolean =>
   isClaimAdapted(state, UPLOAD.atlasClaim, UPLOAD.decision);
 
+const birchAdapted = (state: BoardState): boolean =>
+  isClaimAdapted(state, UPLOAD.birchClaim, UPLOAD.decision);
+
 const isMain = (intentId: string) => (event: RailheadEvent) =>
   event.type === "train.main" && event.data.intentId === intentId;
+
+const isMerge = (claimId: string) => (event: RailheadEvent) =>
+  event.type === "claim.merged" && event.data.claimId === claimId;
 
 const isCheck = (checkRunId: string) => (event: RailheadEvent) =>
   event.type === "train.check" && event.data.checkRunId === checkRunId;
@@ -536,7 +543,12 @@ describe("a ready claim whose decision is superseded", () => {
     expect(atlas(before)?.phase).toBe("ready");
     const reopened = append(before, reopen());
     expect(reopened.stream).toEqual({ kind: "consistent" });
-    expect(atlas(reopened)).toMatchObject({ phase: "working", head: synthCommit(1), ready: null });
+    expect(atlas(reopened)).toMatchObject({
+      phase: "working",
+      head: synthCommit(1),
+      ready: null,
+      reopened: "ready",
+    });
 
     const readyAgain = append(
       append(reopened, push(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), synthCommit(2))),
@@ -546,6 +558,7 @@ describe("a ready claim whose decision is superseded", () => {
     expect(atlas(readyAgain)).toMatchObject({
       phase: "ready",
       ready: { commit: synthCommit(2), decisions: [sizeDecision(2)] },
+      reopened: null,
     });
   });
 
@@ -574,7 +587,7 @@ describe("a ready claim whose decision is superseded", () => {
     });
   });
 
-  it("halts on a reopen of a claim that is not ready", () => {
+  it("halts on a reopen of a claim that is neither ready nor merged", () => {
     const reopened = append(before, reopen());
     const halted = append(reopened, reopen());
     expect(halted.stream).toEqual({
@@ -591,6 +604,58 @@ describe("a ready claim whose decision is superseded", () => {
     const halted = append(before, reopen([sizeDecision(3)]));
     expect(halted.stream.kind).toBe("halted");
     expect(atlas(halted)?.phase).toBe("ready");
+  });
+});
+
+const isReopen = (event: RailheadEvent) => event.type === "claim.reopened";
+
+describe("a merged claim through the decision reversal", () => {
+  it("shows the landed claim as merged until the superseding decision reopens it", () => {
+    // Main moving names no claim as merged; the backend's `claim.merged` does.
+    const published = after(decisionReversal, isMain("int_synth01"));
+    expect(atlas(published)).toMatchObject({ phase: "ready", landings: ["int_synth01"] });
+    const landed = after(decisionReversal, isMerge(UPLOAD.atlasClaim));
+    expect(atlas(landed)).toMatchObject({ phase: "merged", reopened: null });
+
+    // The new version reaches atlas first, then the reopen, in the decision's transaction.
+    const queued = through(decisionReversal, seqWhere(decisionReversal, isReopen) - 1);
+    expect(atlas(queued)?.phase).toBe("merged");
+    const reopened = after(decisionReversal, isReopen);
+    expect(reopened.stream).toEqual({ kind: "consistent" });
+    expect(atlas(reopened)).toMatchObject({
+      phase: "working",
+      reopened: "merged",
+      ready: null,
+      head: synthCommit(2),
+    });
+  });
+
+  it("merges the rework again once it lands", () => {
+    const state = fold(decisionReversal.events);
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(atlas(state)).toMatchObject({
+      phase: "merged",
+      reopened: null,
+      head: synthCommit(4),
+      landings: ["int_synth01", "int_synth02"],
+    });
+  });
+
+  it("halts on a push to the merged claim before it is reopened", () => {
+    const merged = through(decisionReversal, seqWhere(decisionReversal, isReopen) - 1);
+    const halted = append(
+      merged,
+      push(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(2), synthCommit(4)),
+    );
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: merged.cursor + 1,
+        message: `claim ${UPLOAD.atlasClaim} cannot take a push while merged`,
+      },
+    });
+    expect(atlas(halted)?.head).toBe(synthCommit(2));
   });
 });
 
@@ -654,8 +719,8 @@ describe("decision ripple and adaptation through a reversal", () => {
   });
 
   it("marks the claim adapted once the backend records its landed work adapted", () => {
-    const landed = after(decisionReversal, isMain("int_synth01"));
-    expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("landed");
+    const landed = after(decisionReversal, isMerge(UPLOAD.atlasClaim));
+    expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("merged");
     expect(atlasAdapted(landed)).toBe(false);
     const state = after(decisionReversal, (e) => e.type === "claim.adapted");
     expect(atlasAdapted(state)).toBe(true);
@@ -751,8 +816,10 @@ describe("acceptance checks before and after landing", () => {
   });
 
   it("lands on a reconciled push but adapts only when the backend records it", () => {
-    const landed = after(checkBeforeLand, isMain("int_synth12"));
-    expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("landed");
+    const published = after(checkBeforeLand, isMain("int_synth12"));
+    expect(published.claims[UPLOAD.atlasClaim]?.phase).toBe("ready");
+    const landed = after(checkBeforeLand, isMerge(UPLOAD.atlasClaim));
+    expect(landed.claims[UPLOAD.atlasClaim]?.phase).toBe("merged");
     expect(atlasAdapted(landed)).toBe(false);
     // A pass on the landed commit after the landing is not the check the intent rests on.
     const checked = fold(checkBeforeLand.events);
@@ -807,9 +874,9 @@ describe("acceptance results for old and current options", () => {
 
   it("follows the recorded adaptation, not later results on the landed commit", () => {
     const checked = fold(optionResults.events);
-    expect(atlasAdapted(checked)).toBe(false);
-    const state = append(checked, adapt(UPLOAD.atlasClaim, "int_synth24", sizeDecision(2)));
-    expect(atlasAdapted(state)).toBe(true);
+    expect(birchAdapted(checked)).toBe(false);
+    const state = append(checked, adapt(UPLOAD.birchClaim, "int_synth24", sizeDecision(2)));
+    expect(birchAdapted(state)).toBe(true);
 
     const regressed = append(
       state,
@@ -819,7 +886,7 @@ describe("acceptance results for old and current options", () => {
       }),
     );
     expect(regressed.stream).toEqual({ kind: "consistent" });
-    expect(atlasAdapted(regressed)).toBe(true);
+    expect(birchAdapted(regressed)).toBe(true);
   });
 
   it("does not count an adaptation recorded for an older version", () => {
@@ -836,7 +903,7 @@ describe("claim.adapted", () => {
   it("adapts only the claim the backend recorded in a two-claim batch", () => {
     const state = fold(mixedBatch.events);
     expect(state.stream).toEqual({ kind: "consistent" });
-    expect(birch(state)?.phase).toBe("landed");
+    expect(birch(state)?.phase).toBe("merged");
     expect(atlasAdapted(state)).toBe(true);
     expect(isClaimAdapted(state, UPLOAD.birchClaim, UPLOAD.decision)).toBe(false);
     expect(ripple(state)).toEqual([
@@ -850,6 +917,25 @@ describe("claim.adapted", () => {
     ]);
   });
 
+  it("halts on a push to a merged claim that was not reopened", () => {
+    const state = fold(mixedBatch.events);
+    const head = birch(state)?.head ?? null;
+    const halted = append(
+      state,
+      push(UPLOAD.birch, UPLOAD.birchClaim, synthCommit(40), synthCommit(41)),
+    );
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: state.cursor + 1,
+        message: `claim ${UPLOAD.birchClaim} cannot take a push while merged`,
+      },
+    });
+    expect(birch(halted)?.phase).toBe("merged");
+    expect(birch(halted)?.head).toBe(head);
+  });
+
   it("records a repeated adaptation once", () => {
     const state = fold(mixedBatch.events);
     const repeated = append(state, adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(1)));
@@ -861,7 +947,7 @@ describe("claim.adapted", () => {
   it.each([
     [
       "an intent that has not landed",
-      () => through(mixedBatch, last(mixedBatch) - 2),
+      () => through(mixedBatch, seqWhere(mixedBatch, isMain("int_synth30")) - 1),
       adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(1)),
       "did not land",
     ],
@@ -884,6 +970,58 @@ describe("claim.adapted", () => {
       "",
     ],
   ])("halts on an adaptation for %s", (_name, start, step, message) => {
+    const before = start();
+    const state = append(before, step);
+    expect(state.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: before.cursor + 1,
+        message: expect.stringContaining(message),
+      },
+    });
+    expect(state.claims).toBe(before.claims);
+  });
+});
+
+/** The two-claim batch just after main moved, before the backend closed either claim. */
+const published = () => after(mixedBatch, isMain("int_synth30"));
+
+describe("claim.merged", () => {
+  it("merges only the claims the backend closed, so a requeued pin stays ready", () => {
+    const before = published();
+    expect([atlas(before)?.phase, birch(before)?.phase]).toEqual(["ready", "ready"]);
+    expect(birch(before)?.landings).toEqual(["int_synth30"]);
+
+    // The backend merged atlas and sent birch's renewed pin back to the train.
+    const state = append(before, merge(UPLOAD.atlasClaim, synthCommit(3)));
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(atlas(state)?.phase).toBe("merged");
+    expect(birch(state)?.phase).toBe("ready");
+    expect(birch(state)?.ready).toEqual(birch(before)?.ready);
+  });
+
+  it.each([
+    [
+      "an unknown claim",
+      () => published(),
+      merge("clm_synthnone", synthCommit(3)),
+      "clm_synthnone",
+    ],
+    [
+      "a claim already merged",
+      () => fold(mixedBatch.events),
+      merge(UPLOAD.atlasClaim, synthCommit(3)),
+      "merged while merged",
+    ],
+    [
+      "a working claim",
+      () => after(decisionReversal, isReopen),
+      merge(UPLOAD.atlasClaim, synthCommit(3)),
+      "merged while working",
+    ],
+    ["another generation", () => published(), merge(UPLOAD.atlasClaim, synthCommit(3), 2), ""],
+  ])("halts on a merge of %s", (_name, start, step, message) => {
     const before = start();
     const state = append(before, step);
     expect(state.stream).toEqual({

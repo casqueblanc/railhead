@@ -113,6 +113,7 @@ const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
   "train.main": 1,
   "train.held": 2,
   "check.approved": 2,
+  "claim.merged": 2,
 };
 
 /** The schema version an event of `type` is written at. */
@@ -283,6 +284,12 @@ export type EventPayload =
         decisions: DecisionRef[];
       };
     }
+  | {
+      // The train landed the claim's pin, published as `commit` on main, and the claim closed. A pin
+      // readied again under newer decisions while its batch was published stays ready instead.
+      type: "claim.merged";
+      data: { claimId: ClaimId; generation: number; commit: CommitSha };
+    }
   | { type: "claim.expired"; data: { claimId: ClaimId; generation: number } }
   | {
       type: "claim.reassigned";
@@ -433,6 +440,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "agent.joined",
   "claim.refused",
   "claim.reopened",
+  "claim.merged",
   "claim.expired",
   "claim.reassigned",
   "claim.adapted",
@@ -582,6 +590,11 @@ function validatePayload(event: EventPayload): void {
       requireId("claim", event.data.claimId, "claimId");
       requirePositiveInteger(event.data.generation, "generation");
       requireDecisionRefs(event.data.decisions, "decisions");
+      return;
+    case "claim.merged":
+      requireId("claim", event.data.claimId, "claimId");
+      requirePositiveInteger(event.data.generation, "generation");
+      requireCommit(event.data.commit, "commit");
       return;
     case "claim.expired":
       requireId("claim", event.data.claimId, "claimId");
