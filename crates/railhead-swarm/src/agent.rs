@@ -28,6 +28,9 @@
 //! The agent writes only inside the clone `rh work` made under its own working directory, and
 //! only to a clone whose fork belongs to the scenario's repository. It never follows a symbolic
 //! link the repository planted there (see [`crate::confined`]).
+//!
+//! While the run is paused, an agent claims no new task. A task it already holds goes on to its
+//! landing, a redo included.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -38,6 +41,7 @@ use railhead_protocol::{
     is_commit_sha, is_id,
 };
 use serde::Deserialize;
+use tokio::sync::watch;
 
 use crate::confined;
 use crate::events::{AgentState, Emitter, Event, Step, TaskClass, millis};
@@ -68,6 +72,17 @@ pub struct Shared {
     pub deadline: Instant,
     /// Landings seen so far, to find same-path pairs Git merged.
     pub landings: Mutex<Landings>,
+    /// `true` while the run is paused: no agent claims a new task.
+    pub paused: watch::Receiver<bool>,
+}
+
+/// Resolves once `paused` reads `false`. A pause nobody can lift any more holds for good: the run's
+/// own stop ends it.
+async fn unpaused(paused: &watch::Receiver<bool>) {
+    let mut paused = paused.clone();
+    if paused.wait_for(|paused| !paused).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Where a ready claim's outcome is unverified: the issue that adds the closed reason to the
@@ -361,6 +376,7 @@ impl Run<'_> {
         }
         let mut first = None;
         if task_index(next) < self.agent.edits.len() {
+            unpaused(&self.shared.paused).await;
             let held = self.claim().await?;
             if held.state == ClaimState::Ready {
                 next = self.adopt(held, saved.as_ref(), next).await?;
@@ -456,9 +472,11 @@ impl Run<'_> {
         // Each pass claims once; a pass that lands the scaffold goes round again, which happens
         // at most once per task.
         for _ in 0..2 {
-            let held = match first.take() {
-                Some(held) => held,
-                None => self.claim().await?,
+            let held = if let Some(held) = first.take() {
+                held
+            } else {
+                unpaused(&self.shared.paused).await;
+                self.claim().await?
             };
             if held.state != ClaimState::Working {
                 // Only the first claim of a run may be an earlier run's pin.
@@ -1377,6 +1395,44 @@ mod tests {
             std::fs::read_to_string(dir.path().join(contested))?,
             contested_text
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_paused_run_holds_new_claims_until_it_resumes() -> anyhow::Result<()> {
+        let short = Duration::from_millis(50);
+        let (pause, paused) = watch::channel(false);
+        tokio::time::timeout(short, unpaused(&paused)).await?;
+        pause.send(true)?;
+        assert!(
+            tokio::time::timeout(short, unpaused(&paused))
+                .await
+                .is_err()
+        );
+        let waiting = tokio::spawn({
+            let paused = paused.clone();
+            async move { unpaused(&paused).await }
+        });
+        tokio::time::sleep(short).await;
+        assert!(!waiting.is_finished());
+        pause.send(false)?;
+        tokio::time::timeout(Duration::from_secs(5), waiting).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pause_nobody_can_lift_holds_but_a_closed_resume_does_not() -> anyhow::Result<()> {
+        let short = Duration::from_millis(50);
+        let (pause, paused) = watch::channel(true);
+        drop(pause);
+        assert!(
+            tokio::time::timeout(short, unpaused(&paused))
+                .await
+                .is_err()
+        );
+        let (pause, paused) = watch::channel(false);
+        drop(pause);
+        tokio::time::timeout(short, unpaused(&paused)).await?;
         Ok(())
     }
 }
