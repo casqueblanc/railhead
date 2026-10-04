@@ -23,7 +23,7 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { newWebSocketRpcSession } from "capnweb";
 import { API_PATH } from "../packages/railhead-shared/src/api.ts";
@@ -39,7 +39,8 @@ import {
   remoteProblem,
 } from "./qualify/evidence.ts";
 
-const ROOT = resolve(dirname(new URL(import.meta.url).pathname), "..");
+// Decoded, so a checkout path with a space or other escaped character resolves.
+const ROOT = resolve(import.meta.dirname, "..");
 const PROBE_SOURCE = join(ROOT, "packages/railhead-backend/qualify/probe.ts");
 const BACKEND_CONFIG = join(ROOT, "packages/railhead-backend/wrangler.jsonc");
 
