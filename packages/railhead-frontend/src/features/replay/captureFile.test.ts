@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { MAX_TITLE_LENGTH, type Actor, type RailheadEvent } from "@railhead/shared/events";
+import {
+  MAX_PATH_LENGTH,
+  MAX_TITLE_LENGTH,
+  type Actor,
+  type RailheadEvent,
+} from "@railhead/shared/events";
 import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
@@ -846,11 +851,11 @@ describe("parseCapture", () => {
 
   it("refuses an event from a newer schema before reading its shape", () => {
     const events: unknown[] = issues(3);
-    events[0] = { v: 2, seq: 1 };
+    events[0] = { v: 3, seq: 1 };
     expect(parsedError(fileOf({ events }))).toEqual({
       kind: "invalid_event",
       seq: 1,
-      message: "unsupported schema version 2",
+      message: "unsupported schema version 3",
     });
   });
 
@@ -926,6 +931,147 @@ describe("parseCapture", () => {
     if (!result.ok) throw new Error(`refused: ${result.error.kind}`);
     expect(result.capture.events).toEqual(issues(3));
     expect(JSON.stringify(result.capture)).not.toContain(SECRET);
+  });
+});
+
+describe("held check events", () => {
+  const TRAIN: Actor = { kind: "system", id: "sys_train" };
+  const DIGEST = "d".repeat(64);
+  const held: Extract<RailheadEvent, { type: "train.held" }> = {
+    ...header(4),
+    v: 2,
+    actor: TRAIN,
+    type: "train.held",
+    data: {
+      checkRunId: "chk_synthheld",
+      expectedMain: sha("a"),
+      candidate: sha("b"),
+      claims: ["clm_synthatlas", "clm_synthbeacon"],
+      paths: ["railhead.checks.json", "scripts/check.sh"],
+      digest: DIGEST,
+    },
+  };
+  const approved: Extract<RailheadEvent, { type: "check.approved" }> = {
+    ...header(5),
+    v: 2,
+    actor: SYNTH_OWNER,
+    type: "check.approved",
+    data: { checkRunId: "chk_synthheld", candidate: sha("b"), digest: DIGEST },
+  };
+  const log = (heldData: unknown = held.data, approvedData: unknown = approved.data) =>
+    fileOf({
+      events: [...issues(3), { ...held, data: heldData }, { ...approved, data: approvedData }],
+      head: 5,
+    });
+
+  it("copies both events' fields exactly and drops the ones the schema does not define", () => {
+    const result = parseCapture(
+      log({ ...held.data, note: SECRET }, { ...approved.data, session: SECRET }),
+    );
+    if (!result.ok) throw new Error(`refused: ${JSON.stringify(result.error)}`);
+    expect(result.capture.events.slice(3)).toEqual([held, approved]);
+    expect(JSON.stringify(result.capture)).not.toContain(SECRET);
+  });
+
+  it("keeps a held event's null digest as null", () => {
+    const result = parseCapture(log({ ...held.data, digest: null }));
+    expect(result.ok && result.capture.events[3]).toEqual({
+      ...held,
+      data: { ...held.data, digest: null },
+    });
+  });
+
+  it.each([
+    ["a held event without a digest", { ...held.data, digest: undefined }, "events[3].data.digest"],
+    ["a held digest that is not a string", { ...held.data, digest: 7 }, "events[3].data.digest"],
+    ["held paths that are not a list", { ...held.data, paths: "scripts" }, "events[3].data.paths"],
+    ["a held path that is not a string", { ...held.data, paths: [1] }, "events[3].data.paths[0]"],
+    ["a held event without claims", { ...held.data, claims: undefined }, "events[3].data.claims"],
+  ])("refuses %s by its path", (_label, heldData, path) => {
+    expect(parsedError(log(heldData))).toEqual({ kind: "malformed", path });
+  });
+
+  it.each([
+    ["an approval without a digest", { ...approved.data, digest: undefined }, "digest"],
+    ["an approval whose digest is null", { ...approved.data, digest: null }, "digest"],
+    ["an approval without a candidate", { ...approved.data, candidate: undefined }, "candidate"],
+    ["an approval whose run is a number", { ...approved.data, checkRunId: 3 }, "checkRunId"],
+  ])("refuses %s by its path", (_label, approvedData, field) => {
+    expect(parsedError(log(held.data, approvedData))).toEqual({
+      kind: "malformed",
+      path: `events[4].data.${field}`,
+    });
+  });
+
+  it.each([
+    [
+      "a held path past the length limit",
+      { ...held.data, paths: ["p".repeat(MAX_PATH_LENGTH + 1)] },
+      "paths[0] is not a repository path",
+    ],
+    [
+      "a held path that climbs out of the repository",
+      { ...held.data, paths: ["../secrets"] },
+      "paths[0] is not a repository path",
+    ],
+    [
+      "a held event with no paths",
+      { ...held.data, paths: [] },
+      "paths must name at least one path",
+    ],
+    [
+      "a held digest that is not SHA-256",
+      { ...held.data, digest: "d".repeat(65) },
+      "digest is not a SHA-256 digest",
+    ],
+  ])("refuses %s as an invalid event", (_label, heldData, message) => {
+    expect(parsedError(log(heldData))).toEqual({ kind: "invalid_event", seq: 4, message });
+  });
+
+  it("refuses an approval whose digest is not SHA-256", () => {
+    expect(parsedError(log(held.data, { ...approved.data, digest: DIGEST.toUpperCase() }))).toEqual(
+      {
+        kind: "invalid_event",
+        seq: 5,
+        message: "digest is not a SHA-256 digest",
+      },
+    );
+  });
+
+  it("accepts a held path of exactly the length limit", () => {
+    const path = "p".repeat(MAX_PATH_LENGTH);
+    const result = parseCapture(log({ ...held.data, paths: [path] }));
+    expect(result.ok && result.capture.events[3]).toMatchObject({ data: { paths: [path] } });
+  });
+
+  it("captures both events and redacts a credential in a held path", async () => {
+    const leaky = {
+      ...held,
+      data: { ...held.data, paths: ["src/ok.ts", `ci/${tokenIn("path")}`] },
+    };
+    const result = await capturedEvents([...issues(3), leaky, approved] satisfies RailheadEvent[]);
+    expect(result.redacted).toBe(1);
+    expect(result.capture.events.slice(3)).toEqual([
+      { ...held, data: { ...held.data, paths: ["src/ok.ts", "ci/[redacted]"] } },
+      approved,
+    ]);
+    const written = serializeCapture(result.capture);
+    if (!written.ok) throw new Error(`serialize failed: ${written.error.kind}`);
+    expect(written.text).not.toContain(tokenIn("path"));
+    expect(parseCapture(written.text)).toEqual({ ok: true, capture: result.capture });
+  });
+
+  it("refuses a capture whose redaction lengthens a held path past its bound", async () => {
+    const path = `${"p".repeat(MAX_PATH_LENGTH - " Bearer Q".length)} Bearer Q`;
+    const result = await captureLog(
+      fakeReader([...issues(3), { ...held, data: { ...held.data, paths: [path] } }]).reader,
+      SOURCE,
+      NO_DEADLINE,
+    );
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "invalid_event", seq: 4, message: "paths[0] is not a repository path" },
+    });
   });
 });
 

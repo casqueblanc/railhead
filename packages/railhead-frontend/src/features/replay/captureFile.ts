@@ -37,8 +37,8 @@
 
 import type { BoardErrorCode } from "@railhead/shared/board-api";
 import {
-  EVENT_SCHEMA_VERSION,
   REOPEN_REASON_BEFORE_REASONS,
+  isReadableVersion,
   validateEvent,
   type Actor,
   type DecisionRef,
@@ -671,6 +671,8 @@ const EVENT_TYPES: Readonly<Record<EventType, true>> = {
   "train.conflict": true,
   "train.intent": true,
   "train.main": true,
+  "train.held": true,
+  "check.approved": true,
 };
 
 const isEventType = (value: string): value is EventType => Object.hasOwn(EVENT_TYPES, value);
@@ -882,6 +884,27 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
           main: string(d, "main", p),
         },
       };
+    case "train.held":
+      return {
+        type,
+        data: {
+          checkRunId: string(d, "checkRunId", p),
+          expectedMain: string(d, "expectedMain", p),
+          candidate: string(d, "candidate", p),
+          claims: list(d, "claims", p, stringItem),
+          paths: list(d, "paths", p, stringItem),
+          digest: nullableString(d, "digest", p),
+        },
+      };
+    case "check.approved":
+      return {
+        type,
+        data: {
+          checkRunId: string(d, "checkRunId", p),
+          candidate: string(d, "candidate", p),
+          digest: string(d, "digest", p),
+        },
+      };
     default:
       return unreachable(type);
   }
@@ -896,7 +919,7 @@ const readEvent = (
     const fields = record(value, path);
     const v = integer(fields, "v", path);
     const seq = integer(fields, "seq", path);
-    if (v !== EVENT_SCHEMA_VERSION) {
+    if (!isReadableVersion(v)) {
       return {
         ok: false,
         error: { kind: "invalid_event", seq, message: `unsupported schema version ${v}` },

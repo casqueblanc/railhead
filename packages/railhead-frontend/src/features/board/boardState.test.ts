@@ -172,12 +172,12 @@ describe("foldEvent on events it must not apply", () => {
   it("halts on an unsupported schema version and ignores everything after", () => {
     const newer = {
       ...next(base, { type: "agent.revoked", actor: SYNTH_OWNER, data: { agentId: UPLOAD.birch } }),
-      v: 2,
+      v: 3,
     };
     const halted = foldEvent(base, newer);
     expect(halted.stream).toEqual({
       kind: "halted",
-      fault: { kind: "unsupported_version", seq, version: 2 },
+      fault: { kind: "unsupported_version", seq, version: 3 },
     });
     expect(halted.cursor).toBe(base.cursor);
     expect(halted.agents).toBe(base.agents);
@@ -881,5 +881,44 @@ describe("totals and recent activity", () => {
 
     expect(empty.totals).toEqual({ humanActions: 0, earliestAt: null, lastAt: null });
     expect(empty.recent).toEqual([]);
+  });
+});
+
+describe("schema versions", () => {
+  const held = syntheticLog("Synthetic held check at schema version 2", [
+    ...uploadPrelude(),
+    {
+      type: "train.held",
+      actor: SYNTH_TRAIN,
+      data: {
+        checkRunId: "chk_synthheld",
+        expectedMain: synthCommit(0),
+        candidate: synthCommit(9),
+        claims: [UPLOAD.atlasClaim],
+        paths: [".railhead/check.json"],
+        digest: null,
+      },
+    },
+  ]);
+
+  it("reads a version 1 history followed by a version 2 held check", () => {
+    const board = fold(held.events);
+    expect(held.events.at(-1)?.v).toBe(2);
+    expect(board.stream).toEqual({ kind: "consistent" });
+    expect(board.cursor).toBe(held.events.length);
+  });
+
+  it("halts on a held check stamped at version 1 as an invalid event", () => {
+    const events = held.events.map((event) =>
+      event.type === "train.held" ? { ...event, v: 1 } : event,
+    );
+    expect(fold(events).stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "invalid_event",
+        seq: held.events.length,
+        message: "train.held is written at schema version 2",
+      },
+    });
   });
 });

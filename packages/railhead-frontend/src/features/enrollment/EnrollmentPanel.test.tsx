@@ -134,6 +134,7 @@ const echo = (action: OwnerAction): BoardResult<OwnerActionResult> => {
       return { ok: true, value: { kind: action.kind, agentId: action.agentId } };
     case "issue.file":
     case "decision.record":
+    case "check.approve":
       throw new Error(`unexpected ${action.kind}`);
   }
 };

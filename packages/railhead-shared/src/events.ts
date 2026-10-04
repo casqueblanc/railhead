@@ -27,8 +27,10 @@
 // render it as inert text. No event ever carries a token, key or other secret.
 //
 // Evolution: capnweb-validate refuses a union member it does not know, so adding an event type is
-// a breaking change for older readers. `v` names the schema version; a reader that meets a newer
-// version must stop and say so rather than guess.
+// a breaking change for older readers. `v` names the schema version an event needs: each type is
+// written at the version that introduced it (`eventVersion`), so a log keeps the events an older
+// reader can still read at the version it knows. A reader that meets a newer version must stop and
+// say so rather than guess; the board reloads into newer code when it does.
 
 // =======================================================================================
 // Identifiers
@@ -79,8 +81,49 @@ export type IdKind = keyof typeof ID_PREFIXES;
 // =======================================================================================
 // Limits
 
-/** The schema version this module reads and writes. */
-export const EVENT_SCHEMA_VERSION = 1;
+/** The newest schema version this module reads and writes. It reads every version from 1 to this. */
+export const EVENT_SCHEMA_VERSION = 2;
+
+/**
+ * The schema version each event type is written at: the version that introduced it. An older
+ * reader then refuses a newer type by its version rather than mistaking it for corruption.
+ */
+const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
+  "agent.invited": 1,
+  "agent.joined": 1,
+  "agent.confirmed": 1,
+  "agent.revoked": 1,
+  "issue.filed": 1,
+  "claim.opened": 1,
+  "claim.pushed": 1,
+  "claim.ready": 1,
+  "claim.refused": 1,
+  "claim.reopened": 1,
+  "claim.expired": 1,
+  "claim.reassigned": 1,
+  "claim.adapted": 1,
+  "question.asked": 1,
+  "decision.recorded": 1,
+  "inbox.queued": 1,
+  "inbox.delivered": 1,
+  "inbox.acked": 1,
+  "train.check": 1,
+  "train.conflict": 1,
+  "train.intent": 1,
+  "train.main": 1,
+  "train.held": 2,
+  "check.approved": 2,
+};
+
+/** The schema version an event of `type` is written at. */
+export function eventVersion(type: EventType): number {
+  return EVENT_VERSIONS[type];
+}
+
+/** True when this module reads events of schema version `v`. */
+export function isReadableVersion(v: number): boolean {
+  return Number.isInteger(v) && v >= 1 && v <= EVENT_SCHEMA_VERSION;
+}
 
 /** Maximum length of an issue title, in UTF-16 code units. */
 export const MAX_TITLE_LENGTH = 256;
@@ -319,6 +362,38 @@ export type EventPayload =
   | {
       type: "train.main";
       data: { intentId: IntentId; outcome: MainOutcome; main: CommitSha };
+    }
+  | {
+      /**
+       * A candidate edits the trusted check definition or a path it protects, so its check attempt
+       * is held for a person and nothing runs until one approves it.
+       */
+      type: "train.held";
+      data: {
+        /** The held attempt. */
+        checkRunId: CheckRunId;
+        /** The main commit the candidate was composed on, whose definition the attempt names. */
+        expectedMain: CommitSha;
+        /** The candidate commit. */
+        candidate: CommitSha;
+        /** The claims composed into the candidate. */
+        claims: ClaimId[];
+        /** The protected paths the candidate edits, the definition's own path first when edited. */
+        paths: string[];
+        /**
+         * SHA-256 of the candidate's own definition file: what an approval runs and names. `null`
+         * when the candidate has no valid definition, so there is nothing to approve.
+         */
+        digest: string | null;
+      };
+    }
+  | {
+      /**
+       * A person approved running the candidate's own definition, with exactly this digest, for
+       * this one held attempt.
+       */
+      type: "check.approved";
+      data: { checkRunId: CheckRunId; candidate: CommitSha; digest: string };
     };
 
 /** The name of one event type. */
@@ -326,7 +401,7 @@ export type EventType = EventPayload["type"];
 
 /** One entry in a repository's log. */
 export type RailheadEvent = {
-  /** The schema version, `EVENT_SCHEMA_VERSION` for events this module writes. */
+  /** The schema version, `eventVersion(type)` for events this module writes. */
   v: number;
   /** Position in the repository's log: 1 for the first event, then gapless and increasing. */
   seq: number;
@@ -344,6 +419,7 @@ export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
   "agent.confirmed",
   "agent.revoked",
   "decision.recorded",
+  "check.approved",
 ];
 
 /**
@@ -366,6 +442,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "train.conflict",
   "train.intent",
   "train.main",
+  "train.held",
 ];
 
 // =======================================================================================
@@ -377,6 +454,7 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const AGENT_NAME = /^[a-z][a-z0-9-]*$/;
 const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
 const KEY_FINGERPRINT = /^SHA256:[A-Za-z0-9+/]{43}$/;
+const DIGEST = /^[0-9a-f]{64}$/;
 
 /** True when `value` is an identifier of the given kind. */
 export function isId(kind: IdKind, value: string): boolean {
@@ -397,8 +475,11 @@ export function isCommitSha(value: string): boolean {
  * boundary note at the top of this module.
  */
 export function validateEvent(event: RailheadEvent): void {
-  if (event.v !== EVENT_SCHEMA_VERSION) {
+  if (!isReadableVersion(event.v)) {
     throw new Error(`event schema version is not supported: ${event.v}`);
+  }
+  if (event.v !== eventVersion(event.type)) {
+    throw new Error(`${event.type} is written at schema version ${eventVersion(event.type)}`);
   }
   requirePositiveInteger(event.seq, "seq");
   requirePositiveInteger(event.at, "at");
@@ -587,6 +668,25 @@ function validatePayload(event: EventPayload): void {
       requireId("intent", event.data.intentId, "intentId");
       requireCommit(event.data.main, "main");
       return;
+    case "train.held":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.expectedMain, "expectedMain");
+      requireCommit(event.data.candidate, "candidate");
+      requireList(event.data.claims, "claims");
+      if (event.data.claims.length === 0) throw new Error("claims must name at least one claim");
+      requireUnique(event.data.claims, "claims");
+      event.data.claims.forEach((id, index) => requireId("claim", id, `claims[${index}]`));
+      requireList(event.data.paths, "paths");
+      if (event.data.paths.length === 0) throw new Error("paths must name at least one path");
+      requireUnique(event.data.paths, "paths");
+      event.data.paths.forEach((path, index) => requirePath(path, `paths[${index}]`));
+      if (event.data.digest !== null) requireDigest(event.data.digest, "digest");
+      return;
+    case "check.approved":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.candidate, "candidate");
+      requireDigest(event.data.digest, "digest");
+      return;
     default:
       return unreachable(event);
   }
@@ -657,6 +757,10 @@ function requireId(kind: IdKind, value: string, field: string): void {
 
 function requireCommit(value: string, field: string): void {
   if (!isCommitSha(value)) throw new Error(`${field} is not a commit id`);
+}
+
+function requireDigest(value: string, field: string): void {
+  if (!DIGEST.test(value)) throw new Error(`${field} is not a SHA-256 digest`);
 }
 
 function requireAgentName(name: string): void {
