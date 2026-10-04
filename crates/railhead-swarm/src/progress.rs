@@ -273,6 +273,8 @@ impl HomeLock {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::plan::EditClass;
 
@@ -467,9 +469,18 @@ mod tests {
         // Another agent's home is its own.
         let other = HomeLock::acquire(dir.path(), "swarm-01")?;
         drop(lock);
-        // The file stays, unlocked, and the next run takes it.
+        // The file stays, unlocked, and the next run takes it. A child another test starts in
+        // this process shares the lock file until it execs, so the release can take a moment.
         assert!(path.exists());
-        let again = HomeLock::acquire(dir.path(), "swarm-00")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let again = loop {
+            match HomeLock::acquire(dir.path(), "swarm-00") {
+                Err(LockError::Held { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                acquired => break acquired?,
+            }
+        };
         drop((again, other));
         Ok(())
     }
