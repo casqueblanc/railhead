@@ -2,10 +2,11 @@
 // the binding's observable contract (initial token on fork, token states and expiry, `null` for a
 // missing commit, `ArtifactsError` codes) and adds switches for the failures a real service shows
 // rarely: a lost fork response, a hung or late call, slow revocations, and a fork still in
-// progress. It proves nothing about
-// the deployed service's revocation timing or limits; that evidence is H04's.
+// progress. `listTokens` answers as the binding was measured to (#161): only live tokens, newest
+// first, at most one page of `TOKEN_PAGE_SIZE`, with `total` counting live tokens. It proves
+// nothing about the deployed service's revocation timing or limits; that evidence is H04's.
 
-import type { ArtifactsNamespace, ArtifactsRepoHandle } from "./adapter";
+import { TOKEN_PAGE_SIZE, type ArtifactsNamespace, type ArtifactsRepoHandle } from "./adapter";
 
 /** The error the fake throws, shaped like the binding's `ArtifactsError`. */
 export class FakeArtifactsError extends Error {
@@ -46,13 +47,6 @@ export interface FakeRepo {
   /** The ref `HEAD` names. Only `refs/heads/main` holds `commits`; any other ref is empty. */
   headRef: string;
 }
-
-/** How a paged `listTokens` chooses its tokens. */
-export type TokenPageOrder =
-  /** The first tokens in creation order, whatever their state. */
-  | "creation"
-  /** Live tokens first, then the others, each in creation order. */
-  | "live-first";
 
 /** How the next `fork` call misbehaves. */
 export type ForkFault =
@@ -98,7 +92,7 @@ export class FakeArtifacts implements ArtifactsNamespace {
   #forkFaults: ForkFault[] = [];
   #revokeFails = 0;
   #revokeDelayMs = 0;
-  #tokenPage: { size: number; order: TokenPageOrder } | null = null;
+  #tokenPageSize = TOKEN_PAGE_SIZE;
   readonly #gates = new Map<PausableCall, Gate>();
 
   constructor(now = 1_000_000) {
@@ -141,12 +135,11 @@ export class FakeArtifacts implements ArtifactsNamespace {
   }
 
   /**
-   * Makes `listTokens` return at most `size` tokens, chosen by `order`, with `total` still counting
-   * every token, revoked and expired ones too; `null` lists them all. Which order the binding uses,
-   * and whether it keeps revoked tokens, is not known, so tests cover both.
+   * Makes `listTokens` return at most `size` tokens instead of `TOKEN_PAGE_SIZE`, as if Artifacts
+   * had changed the page it was measured to return.
    */
-  pageTokens(size: number | null, order: TokenPageOrder = "creation"): void {
-    this.#tokenPage = size === null ? null : { size, order };
+  pageTokens(size: number): void {
+    this.#tokenPageSize = size;
   }
 
   /**
@@ -275,23 +268,19 @@ export class FakeArtifacts implements ArtifactsNamespace {
         live();
         this.listTokensCalls += 1;
         await this.#hold("listTokens");
-        const tokens = repo.tokens.map((token) => ({
+        // Newest first; a later token of the same millisecond counts as newer.
+        const active = repo.tokens
+          .filter((token) => tokenState(token, this.#now) === "active")
+          .toReversed()
+          .toSorted((a, b) => b.createdAtMs - a.createdAtMs);
+        const tokens = active.slice(0, this.#tokenPageSize).map((token) => ({
           id: token.id,
           scope: token.scope,
-          state: tokenState(token, this.#now),
+          state: "active" as const,
           createdAt: new Date(token.createdAtMs).toISOString(),
           expiresAt: new Date(token.expiresAtMs).toISOString(),
         }));
-        const page = this.#tokenPage;
-        if (page === null) return { tokens, total: tokens.length };
-        const ordered =
-          page.order === "creation"
-            ? tokens
-            : [
-                ...tokens.filter((token) => token.state === "active"),
-                ...tokens.filter((token) => token.state !== "active"),
-              ];
-        return { tokens: ordered.slice(0, page.size), total: tokens.length };
+        return { tokens, total: active.length };
       },
       revokeToken: async (tokenOrId) => {
         live();

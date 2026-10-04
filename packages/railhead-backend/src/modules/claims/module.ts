@@ -959,8 +959,9 @@ function takeable(row: ClaimRow, now: number): boolean {
 }
 
 /**
- * Whether a revocation is settled: only an explicit `revoked`. A failure is not, and neither is
- * `pending_debt`, which means a partial token listing may still hide a live token.
+ * Whether a revocation is settled: only an explicit `revoked`. A failure is not, such as a partial
+ * token listing that may hide a live token, and neither is `pending_debt`, which means a recent
+ * token could not yet be placed before the cutoff.
  */
 function revocationSettled(result: PortResult<TokenRevocation>): boolean {
   if (!result.ok) return false;

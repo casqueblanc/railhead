@@ -13,15 +13,12 @@
 // passed, so a late token created within that window is revoked by a later sweep. A token Artifacts
 // creates after the final sweep escapes; how late a mint can take effect is not yet measured.
 //
-// A sweep whose token listing cannot cover every token does not count as a revocation: the fork
-// owes a sweep, `revokeTokens` reports `pending_debt` rather than `revoked`, and the fork takes no
-// new token until a later sweep sees every token or every token it may hold has expired. Each
-// debt keeps the cutoff of the sweep that recorded it, and every sweep that settles it uses that
-// cutoff, so a debt a stale attempt records never revokes a newer holder's token. Each partial
-// sweep bumps its debt's generation, and a clean sweep clears only the generations it saw before
-// it listed, so an older clean result never erases a newer partial one. Every token request checks
-// for a debt in the same step that serves a cached token or starts a mint, and again before it
-// returns a minted one.
+// `listTokens` returns one page of at most `TOKEN_PAGE_SIZE` live tokens, newest first, and a
+// `total` of live tokens only; revoked and expired tokens never appear (measured in #161). A fork
+// is kept below a full page: a mint first lists the fork and is refused as busy once it holds
+// `MAX_LIVE_FORK_TOKENS`. Every listing of a fork then shows all its live tokens, so a sweep's
+// listing that covers less than `total` means Artifacts changed that contract, and the sweep
+// fails as an internal error rather than report a revocation it cannot prove.
 //
 // Every fork mint also gets a sequence number in a log kept until its token must have expired, and
 // the token's id once the mint answers, before the token is handed out. Every sweep of a fork,
@@ -114,8 +111,10 @@ export const MAX_TOKEN_TTL_MS = 3_600_000;
 export const MINT_CLOCK_SKEW_MS = 300_000;
 /** How many list-and-revoke rounds one token sweep makes before reporting the repository busy. */
 const MAX_REVOKE_ROUNDS = 5;
-/** How long after one sweep of a fork that owes tokens a token request may sweep it again. */
-export const TOKEN_DEBT_RETRY_MS = 60_000;
+/** How many live tokens one `listTokens` page holds, newest first. Measured in #161, not documented. */
+export const TOKEN_PAGE_SIZE = 30;
+/** How many live tokens a fork may hold before a mint on it is refused, one short of a full page. */
+export const MAX_LIVE_FORK_TOKENS = TOKEN_PAGE_SIZE - 1;
 
 /** The migration owner name of the adapter's tables. */
 const ARTIFACTS_OWNER = "artifacts";
@@ -167,6 +166,9 @@ const MIGRATIONS = [
      owed_until - ${MAX_TOKEN_TTL_MS + MINT_CLOCK_SKEW_MS}, owed_until, retry_at, 1
    FROM artifacts_token_debts`,
   "DROP TABLE artifacts_token_debts",
+  // A partial listing now fails the revocation instead of recording a debt. The claims module keeps
+  // every revocation owed until one reports `revoked`, so a debt earlier code recorded is dropped.
+  "DROP TABLE artifacts_sweep_debts",
 ];
 
 /**
@@ -201,18 +203,6 @@ interface ForkRow {
 }
 
 type Target = { kind: "main" } | { kind: "fork"; claimId: ClaimId };
-
-/** A sweep a fork owes, under the cutoff of the attempt that recorded it. */
-interface Debt {
-  readonly id: number;
-  /** Bumped by every partial sweep the debt absorbs. */
-  readonly generation: number;
-  readonly cutoff: MintCutoff;
-  /** When every token the debt may cover has expired. */
-  readonly owedUntil: number;
-  /** When a token request may sweep for it again. */
-  readonly retryAt: number;
-}
 
 interface CachedToken {
   token: ArtifactsToken;
@@ -325,23 +315,16 @@ class ArtifactsAdapter implements ArtifactsPort {
         // Checked before the sweep: a covered mint that has not answered could create a token after
         // the sweep lists, so success waits for it. The sweep still runs, revoking what exists now.
         const unsettled = this.#mintsInFlight(repo, cutoff.seq).length > 0;
-        // Read before listing: a debt an overlapping sweep records later is newer than this result.
-        const seen = this.#debts(repo);
         using handle = await this.#open(repo);
         const swept = await this.#sweepCovered(repo, handle, cutoff);
-        // A listing that cannot cover every token (#161 qualifies the binding's paging) may hide a
-        // live token, so it is no revocation: the fork owes a sweep under this cutoff and takes no
-        // new token until a later sweep is clean or every token it may hold has expired.
-        if (swept === "partial") this.#oweSweep(repo, cutoff);
-        else if (swept !== "clean" && swept !== "deferred") return swept;
+        // A listing that cannot cover every token may hide a live one, so it is no revocation.
+        if (swept === "partial") return { ...PARTIAL_TOKEN_LISTING };
+        if (swept !== "clean" && swept !== "deferred") return swept;
         if (unsettled)
           return fail("busy", "A token for the repository may still be minted; try again.");
         // A deferred token was never handed out: no logged mint answered with it. The caller's
-        // revocation stays owed instead of a debt, and a later sweep revokes it once it is old enough.
-        if (swept === "deferred") return ok("pending_debt");
-        if (swept === "clean") this.#clearDebts(repo, seen, cutoff);
-        this.#dropExpiredDebts(repo);
-        return ok(this.#debts(repo).length === 0 ? "revoked" : "pending_debt");
+        // revocation stays owed, and a later sweep revokes it once it is old enough.
+        return ok(swept === "clean" ? "revoked" : "pending_debt");
       });
     });
   }
@@ -353,16 +336,10 @@ class ArtifactsAdapter implements ArtifactsPort {
     ttlMs: number,
     key: string,
   ): Promise<PortResult<ArtifactsToken>> {
-    // Settled first: from the fence check below to `#beginMint`, nothing may be awaited, or a
-    // revocation could start and finish in the gap and the mint would outlive its sweep.
-    const owed = await this.#settleDebt(repo);
-    if (!owed.ok) return owed;
+    const epoch = this.#epoch(repo);
     if (this.#revoking.has(repo)) {
       return fail("busy", "The repository's tokens are being revoked; try again.");
     }
-    // Checked again here, in the step that serves or mints: a sweep may have recorded a debt while
-    // `#settleDebt` was awaited.
-    if (this.#debts(repo).length > 0) return owingDebt();
     const claimId = target.kind === "fork" ? target.claimId : null;
     const now = this.#context.clock();
     const cached = this.#cache.get(key);
@@ -370,11 +347,19 @@ class ArtifactsAdapter implements ArtifactsPort {
     if (cached !== undefined && cached.token.expiresAt - now >= ttlMs / 2) {
       return ok({ ...cached.token });
     }
+    if (target.kind === "fork") {
+      const room = await this.#roomToMint(repo);
+      if (!room.ok) return room;
+      // From here to `#beginMint` nothing is awaited. A revocation that ran while the fork was
+      // listed may have ended the requester's access, so this request gets no token.
+      if (this.#revoking.has(repo) || this.#epoch(repo) !== epoch) {
+        return fail("busy", "The repository's tokens were revoked while one was requested.");
+      }
+    }
     // A mint that timed out may still answer; another beside it would let unanswered calls pile up.
     if (this.#unanswered.has(repo) || (target.kind === "fork" && this.#previousMints(repo) > 0)) {
       return fail("busy", "An earlier token for the repository is still being minted; try again.");
     }
-    const epoch = this.#epoch(repo);
     // Recorded in the same step as the fence check above, so a revocation that starts later sees it.
     const ttlSeconds = Math.ceil(ttlMs / 1000);
     const mint = this.#beginMint(repo, target.kind === "fork" ? ttlSeconds * 1000 : null);
@@ -389,9 +374,7 @@ class ArtifactsAdapter implements ArtifactsPort {
       });
       this.#logToken(mint, created.id);
       const expiresAt = Date.parse(created.expiresAt);
-      // A debt recorded while the mint ran means a sweep may have missed a live token, so this one
-      // is not handed out either.
-      const revokedDuring = this.#epoch(repo) !== epoch || this.#debts(repo).length > 0;
+      const revokedDuring = this.#epoch(repo) !== epoch;
       if (revokedDuring || Number.isNaN(expiresAt)) {
         // Revoked while minting, or unusable: this token must not stay live. A fork's tokens up to
         // this mint may be swept if revoking this one fails; main's may not, as that would revoke
@@ -405,8 +388,6 @@ class ArtifactsAdapter implements ArtifactsPort {
           // Its cutoff is this mint, so a later mint of a restarted Repo keeps its token.
           const cutoff = { seq: this.#mintSeq(mint), startedAt: this.#context.clock() };
           const swept = await this.#fenced(repo, () => this.#sweepCovered(repo, handle, cutoff));
-          // The token may be among those a partial listing hid, so the fork owes a sweep.
-          if (swept === "partial") this.#oweSweep(repo, cutoff);
           const result = sweepResult(swept);
           if (!result.ok) return result;
         }
@@ -662,143 +643,21 @@ class ArtifactsAdapter implements ArtifactsPort {
   }
 
   /**
-   * Records that a sweep of `repo` under `cutoff` could not see every token. A debt whose cutoff
-   * already covers this one is bumped to a new generation instead, as its sweep settles this one
-   * too. Debts this cutoff covers are folded into its row, which keeps their earliest deadline:
-   * every token minted before then has expired by `owed_until`, as a fork's tokens live at most
-   * `MAX_TOKEN_TTL_MS` and none is minted while a debt stands.
+   * Refuses a mint on fork `repo` once it holds `MAX_LIVE_FORK_TOKENS` live tokens, so the mint
+   * leaves it below a full page. The caller's lane admits one mint of `repo` at a time, so no other
+   * token of this adapter appears between this listing and the mint.
    */
-  #oweSweep(repo: ArtifactsRepoName, cutoff: MintCutoff): void {
-    const now = this.#context.clock();
-    const { sql } = this.#context.storage;
-    atomically(this.#context.storage, () => {
-      const debts = this.#debts(repo);
-      const covering = debts.find((debt) => covers(debt.cutoff, cutoff));
-      if (covering !== undefined) {
-        sql.exec(
-          "UPDATE artifacts_sweep_debts SET retry_at = ?, generation = generation + 1 WHERE id = ?",
-          now + TOKEN_DEBT_RETRY_MS,
-          covering.id,
-        );
-        return;
-      }
-      const folded = debts.filter((debt) => covers(cutoff, debt.cutoff));
-      const owedUntil = Math.min(
-        now + MAX_TOKEN_TTL_MS + MINT_CLOCK_SKEW_MS,
-        ...folded.map((debt) => debt.owedUntil),
-      );
-      for (const debt of folded)
-        sql.exec("DELETE FROM artifacts_sweep_debts WHERE id = ?", debt.id);
-      sql.exec(
-        `INSERT INTO artifacts_sweep_debts
-           (repo, cutoff_seq, cutoff_started_at, owed_until, retry_at, generation)
-         VALUES (?, ?, ?, ?, ?, 1)`,
-        repo,
-        cutoff.seq,
-        cutoff.startedAt,
-        owedUntil,
-        now + TOKEN_DEBT_RETRY_MS,
-      );
-    });
-  }
-
-  /** `repo`'s outstanding debts, oldest first. */
-  #debts(repo: ArtifactsRepoName): Debt[] {
-    return this.#context.storage.sql
-      .exec<{
-        id: number;
-        generation: number;
-        cutoff_seq: number;
-        cutoff_started_at: number;
-        owed_until: number;
-        retry_at: number;
-      }>(
-        `SELECT id, generation, cutoff_seq, cutoff_started_at, owed_until, retry_at
-         FROM artifacts_sweep_debts WHERE repo = ? ORDER BY id`,
-        repo,
-      )
-      .toArray()
-      .map((row) => ({
-        id: row.id,
-        generation: row.generation,
-        cutoff: { seq: row.cutoff_seq, startedAt: row.cutoff_started_at },
-        owedUntil: row.owed_until,
-        retryAt: row.retry_at,
-      }));
-  }
-
-  /**
-   * Clears the debts of `seen` that a clean sweep under `cutoff` settles: those whose cutoff it
-   * covers, still at the generation the sweep saw before listing. A newer generation was recorded
-   * by a partial sweep that may have listed after it, so it stands.
-   */
-  #clearDebts(repo: ArtifactsRepoName, seen: readonly Debt[], cutoff: MintCutoff): void {
-    const settled = seen.filter((debt) => covers(cutoff, debt.cutoff));
-    if (settled.length === 0) return;
-    atomically(this.#context.storage, () => {
-      for (const debt of settled) {
-        this.#context.storage.sql.exec(
-          "DELETE FROM artifacts_sweep_debts WHERE repo = ? AND id = ? AND generation = ?",
-          repo,
-          debt.id,
-          debt.generation,
-        );
-      }
-    });
-  }
-
-  /** Drops `repo`'s debts once every token each may cover has expired. */
-  #dropExpiredDebts(repo: ArtifactsRepoName): void {
-    atomically(this.#context.storage, () => {
-      this.#context.storage.sql.exec(
-        "DELETE FROM artifacts_sweep_debts WHERE repo = ? AND owed_until <= ?",
-        repo,
-        this.#context.clock(),
-      );
-    });
-  }
-
-  /**
-   * Lets a mint on `repo` proceed only once the fork owes no sweep. A debt ends when its deadline
-   * passes or a sweep under its own cutoff sees every token and no covered live one; a token
-   * request sweeps a debt again at most once per `TOKEN_DEBT_RETRY_MS`, and is refused as busy
-   * meanwhile. Each debt is swept under its own cutoff, never all tokens, so a debt a stale attempt
-   * recorded leaves a newer holder's token alone.
-   */
-  async #settleDebt(repo: ArtifactsRepoName): Promise<PortResult<void>> {
-    this.#dropExpiredDebts(repo);
-    const debts = this.#debts(repo);
-    if (debts.length === 0) return ok(undefined);
-    const now = this.#context.clock();
-    const owing = owingDebt();
-    if (debts.some((debt) => debt.retryAt > now)) return owing;
-    const storage = this.#context.storage;
-    // Pushed back before the sweep, so a sweep that throws is not repeated at once either.
-    atomically(storage, () => {
-      storage.sql.exec(
-        "UPDATE artifacts_sweep_debts SET retry_at = ? WHERE repo = ?",
-        now + TOKEN_DEBT_RETRY_MS,
-        repo,
-      );
-    });
-    for (const debt of debts) {
-      let epoch = 0;
-      const swept = await this.#fenced(repo, async () => {
-        epoch = this.#epoch(repo);
-        using handle = await this.#open(repo);
-        return await this.#sweepCovered(repo, handle, debt.cutoff);
-      });
-      if (swept === "partial" || swept === "deferred") return owing;
-      if (swept !== "clean") return swept;
-      // A release or takeover that revoked during this sweep may have finished already; the request
-      // that began before it gets no token, and that revocation settles the debt by its own result.
-      if (this.#epoch(repo) !== epoch) {
-        return fail("busy", "The repository's tokens were revoked while its debt was settled.");
-      }
-      // A sweep that began before this one may have recorded a newer generation; that one stands.
-      this.#clearDebts(repo, [debt], debt.cutoff);
+  async #roomToMint(repo: ArtifactsRepoName): Promise<PortResult<void>> {
+    using handle = await this.#open(repo);
+    const listed = await this.#bounded(handle.listTokens());
+    if (listed.total >= MAX_LIVE_FORK_TOKENS) {
+      return fail("busy", "The repository holds as many live tokens as allowed; try again later.");
     }
-    return this.#debts(repo).length === 0 ? ok(undefined) : owing;
+    if (listed.total > listed.tokens.length) {
+      logPartialListing(listed);
+      return { ...PARTIAL_TOKEN_LISTING };
+    }
+    return ok(undefined);
   }
 
   async #fork(
@@ -996,8 +855,8 @@ export async function boundedCall<T>(
 }
 
 /**
- * The failure of a sweep whose listing showed no live token but did not cover every token. The
- * listing has no page argument, so the rest cannot be reached and a retry would see the same page.
+ * The failure of a listing that covered less than its `total` and showed no token to revoke. With a
+ * fork kept below a full page, it means Artifacts changed its listing contract.
  */
 export const PARTIAL_TOKEN_LISTING: PortFailure = fail(
   "internal",
@@ -1010,12 +869,11 @@ export const PARTIAL_TOKEN_LISTING: PortFailure = fail(
  * reports busy; a repeat continues where this one stopped. A binding call that fails or times out
  * throws. Every sweep of a claim's fork picks by a `MintCutoff`.
  *
- * `listTokens` returns one page and takes no page argument, so the sweep revokes the tokens it
- * picks and lists again. It is `clean` only from a listing that shows none to pick and whose page
- * covers `total`. A listing that shows none but covers less than `total` is `partial` instead of
- * busy: `total` likely counts revoked and expired tokens too, so if the page keeps those, no repeat
- * would ever see further. Whether the binding's page keeps or drops revoked tokens is not
- * verified; #161 qualifies it against live Artifacts.
+ * `listTokens` takes no page argument and returns the newest live tokens, so the sweep revokes the
+ * tokens it picks and lists again, and each listing shows older ones. It is `clean` only from a
+ * listing that shows none to pick and whose page covers `total`. A listing that shows none to pick
+ * but covers less than `total` is `partial`: it shows the newest tokens and hides older ones, so no
+ * repeat would see further until a shown token expires or is revoked.
  */
 async function sweepTokens(
   handle: Pick<ArtifactsRepo, "listTokens" | "revokeToken">,
@@ -1032,7 +890,9 @@ async function sweepTokens(
     const listed = await boundedCall(handle.listTokens(), remaining());
     const revoke = select(listed.tokens.filter((token) => token.state === "active"));
     if (revoke.length === 0) {
-      return listed.total <= listed.tokens.length ? "clean" : "partial";
+      if (listed.total <= listed.tokens.length) return "clean";
+      logPartialListing(listed);
+      return "partial";
     }
     for (const token of revoke) {
       if (budget === 0 || remaining() <= 0) return unfinished;
@@ -1056,6 +916,17 @@ export async function revokeActiveTokens(
   return sweepResult(await sweepTokens(handle, limits, (active) => active));
 }
 
+/** Records a listing that covered less than its `total`, which a fork's bound should prevent. */
+function logPartialListing(listed: ArtifactsTokenListResult): void {
+  console.error(
+    JSON.stringify({
+      event: "artifacts.partial_token_listing",
+      total: listed.total,
+      listed: listed.tokens.length,
+    }),
+  );
+}
+
 /** The result of a sweep that must cover every picked token, with a partial listing a failure. */
 function sweepResult(swept: "clean" | "deferred" | "partial" | PortFailure): PortResult<void> {
   switch (swept) {
@@ -1068,11 +939,6 @@ function sweepResult(swept: "clean" | "deferred" | "partial" | PortFailure): Por
     default:
       return swept;
   }
-}
-
-/** Whether a sweep under `outer` revokes every token `inner` covers. */
-function covers(outer: MintCutoff, inner: MintCutoff): boolean {
-  return outer.seq >= inner.seq && outer.startedAt >= inner.startedAt;
 }
 
 /**
@@ -1207,10 +1073,6 @@ function failureOf(error: unknown): PortFailure {
     default:
       return code satisfies never;
   }
-}
-
-function owingDebt(): PortFailure {
-  return fail("busy", "The repository's earlier tokens are not all revoked yet; try again.");
 }
 
 function invalid(message: string): PortFailure {

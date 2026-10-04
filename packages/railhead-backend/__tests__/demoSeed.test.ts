@@ -11,7 +11,12 @@ import {
   type PasskeyRegistration,
 } from "@railhead/shared/board-api";
 import { isRepoSegment } from "@railhead/shared/agent-api";
-import { createArtifactsAdapter, mainRepoName, MINT_CLOCK_SKEW_MS } from "../src/artifacts/adapter";
+import {
+  createArtifactsAdapter,
+  mainRepoName,
+  MINT_CLOCK_SKEW_MS,
+  TOKEN_PAGE_SIZE,
+} from "../src/artifacts/adapter";
 import { FakeArtifacts, FakeArtifactsError } from "../src/artifacts/fake";
 import { actionChallenge, relyingParty, type StoredCredential } from "../src/auth/passkeyVerifier";
 import { fail, ok, type PortResult } from "../src/contracts/result";
@@ -1041,13 +1046,13 @@ describe("seed target", () => {
       seed.onNextPush = () => {
         for (let i = 0; i < 10; i += 1) seed.fake.mintFor(main, "write", 300);
       };
-      // The page shows four of the twelve tokens: the sweep revokes those and cannot see the rest.
-      seed.fake.pageTokens(4, "creation");
+      // As if Artifacts stopped listing tokens: the sweep sees none of the twelve.
+      seed.fake.pageTokens(0);
       expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: false, code: "internal" });
-      expect(seed.fake.liveTokens(main)).toHaveLength(12 - 4);
+      expect(seed.fake.liveTokens(main)).toHaveLength(12);
       expect(host.initialized).toBe(false);
 
-      seed.fake.pageTokens(null);
+      seed.fake.pageTokens(TOKEN_PAGE_SIZE);
       expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
       expect(seed.fake.liveTokens(main)).toEqual([]);
       expect(host.initialized).toBe(true);

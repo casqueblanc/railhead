@@ -4,13 +4,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ARTIFACTS_LIMITS,
   createArtifactsAdapter,
+  MAX_LIVE_FORK_TOKENS,
   MINT_CLOCK_SKEW_MS,
   forkRepoName,
   mainRepoName,
   mintCutoff,
   PARTIAL_TOKEN_LISTING,
   recordedForks,
-  TOKEN_DEBT_RETRY_MS,
+  TOKEN_PAGE_SIZE,
   type ArtifactsAdapterLimits,
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
@@ -76,23 +77,6 @@ function forkRows(
       "SELECT claim_id, state, head FROM artifacts_forks ORDER BY claim_id",
     )
     .toArray();
-}
-
-function debtRows(storage: RepoStorage): { repo: string; owed_until: number; retry_at: number }[] {
-  return storage.sql
-    .exec<{ repo: string; owed_until: number; retry_at: number }>(
-      "SELECT repo, owed_until, retry_at FROM artifacts_sweep_debts ORDER BY repo, id",
-    )
-    .toArray();
-}
-
-function cutoffRows(storage: RepoStorage): MintCutoff[] {
-  return storage.sql
-    .exec<{ cutoff_seq: number; cutoff_started_at: number }>(
-      "SELECT cutoff_seq, cutoff_started_at FROM artifacts_sweep_debts ORDER BY id",
-    )
-    .toArray()
-    .map((row) => ({ seq: row.cutoff_seq, startedAt: row.cutoff_started_at }));
 }
 
 function mintRows(storage: RepoStorage): number {
@@ -204,15 +188,15 @@ describe("forkForClaim", () => {
       const repo = await forkRepoName(REPO, CLAIM);
       fake.failNextFork("lose-response");
       expect(await adapter().forkForClaim(CLAIM, HEAD)).toMatchObject({ ok: false });
-      const minted = [fake.mintFor(repo, "write", 600), fake.mintFor(repo, "write", 600)];
+      const live = [...fake.liveTokens(repo), fake.mintFor(repo, "write", 600)];
 
-      // The page shows only the initial token; once it is revoked the other two are out of sight.
-      fake.pageTokens(1, "creation");
+      // As if Artifacts stopped listing tokens: the page shows none of the two.
+      fake.pageTokens(0);
       expect(await adapter().forkForClaim(CLAIM, HEAD)).toEqual(PARTIAL_TOKEN_LISTING);
-      expect(fake.liveTokens(repo)).toEqual(minted);
+      expect(fake.liveTokens(repo)).toEqual(live);
       expect(forkRows(storage)).toEqual([{ claim_id: CLAIM, state: "pending", head: null }]);
 
-      fake.pageTokens(null);
+      fake.pageTokens(TOKEN_PAGE_SIZE);
       expect(await adapter().forkForClaim(CLAIM, HEAD)).toEqual({
         ok: true,
         value: { repo, head: HEAD },
@@ -424,345 +408,118 @@ describe("revokeTokens", () => {
     });
   });
 
+  it("revokes a fork's tokens at the bound from one listing that covers them all", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      const held = Array.from({ length: MAX_LIVE_FORK_TOKENS }, () =>
+        fake.mintFor(repo, "write", 600),
+      );
+      const lists = fake.listTokensCalls;
+
+      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
+      expect(held.some((token) => fake.accepts(token.plaintext))).toBe(false);
+      // The first listing showed every token; the second confirmed none was left.
+      expect(fake.listTokensCalls).toBe(lists + 2);
+    });
+  });
+
+  it("fails loudly when newer tokens beyond the bound hide a covered one", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const port = adapter();
+        const repo = await forkClaim(port);
+        const holder = await tokenValue(port, repo, "write");
+        const cutoff = cutoffNow();
+        // A later mint is unanswered, so tokens of no logged mint created now cannot be placed.
+        const paused = fake.pauseNext("createTokenBeforeMint");
+        const minting = port.token(repo, "read", 10 * MINUTE);
+        await paused.reached;
+        fake.advance(1);
+        for (let i = 0; i < TOKEN_PAGE_SIZE; i += 1) fake.mintFor(repo, "write", 600);
+
+        // The page holds the newest 30, none covered, and hides the holder's: no revocation.
+        expect(await port.revokeTokens(repo, cutoff)).toEqual(PARTIAL_TOKEN_LISTING);
+        expect(fake.accepts(holder)).toBe(true);
+        expect(errors).toHaveBeenCalledWith(
+          JSON.stringify({ event: "artifacts.partial_token_listing", total: 31, listed: 30 }),
+        );
+        paused.release();
+        expect(await minting).toMatchObject({ ok: false, code: "busy" });
+      } finally {
+        errors.mockRestore();
+      }
+    });
+  });
+
+  it("fails loudly, and mints nothing, while a listing covers less than its total", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const port = adapter();
+        const repo = await forkClaim(port);
+        const holder = await tokenValue(port, repo, "write");
+
+        // As if Artifacts stopped listing tokens: the page shows none of the one live token.
+        fake.pageTokens(0);
+        expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PARTIAL_TOKEN_LISTING);
+        expect(fake.accepts(holder)).toBe(true);
+        expect(await port.token(repo, "read", 10 * MINUTE)).toEqual(PARTIAL_TOKEN_LISTING);
+        expect(fake.createTokenCalls).toBe(1);
+        expect(errors).toHaveBeenCalledTimes(2);
+
+        // Nothing was recorded against the fork: once the listing is whole, the release succeeds.
+        fake.pageTokens(TOKEN_PAGE_SIZE);
+        expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
+        expect(fake.accepts(holder)).toBe(false);
+      } finally {
+        errors.mockRestore();
+      }
+    });
+  });
+
+  it("refuses a fork mint as busy at the bound, and mints again once a token expires", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+      for (let i = 0; i < MAX_LIVE_FORK_TOKENS - 1; i += 1) fake.mintFor(repo, "write", 300);
+
+      // One short of the bound, the mint goes ahead and reaches it.
+      const writer = await tokenValue(port, repo, "write");
+      expect(fake.liveTokens(repo)).toHaveLength(MAX_LIVE_FORK_TOKENS);
+      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
+        ok: false,
+        code: "busy",
+      });
+      expect(fake.createTokenCalls).toBe(1);
+      // A cached token is still served, since serving it creates none.
+      expect(await tokenValue(port, repo, "write")).toBe(writer);
+
+      fake.advance(5 * MINUTE);
+      expect(fake.accepts(await tokenValue(port, repo, "read"))).toBe(true);
+      expect(fake.createTokenCalls).toBe(2);
+    });
+  });
+
+  it("mints nothing for a request whose fork listing a release overlapped", async () => {
+    await withArtifacts(async ({ fake, adapter }) => {
+      const port = adapter();
+      const repo = await forkClaim(port);
+
+      const paused = fake.pauseNext("listTokens");
+      const requesting = port.token(repo, "write", 10 * MINUTE);
+      await paused.reached;
+      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
+      paused.release();
+
+      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
+      expect(fake.createTokenCalls).toBe(0);
+      expect(fake.liveTokens(repo)).toEqual([]);
+    });
+  });
+
   // Release and takeover both revoke through `revokeTokens`, so these are their paths.
-  it("reports pending_debt, not revoked, while a partial listing may hide a live token", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const tokens = [1, 2, 3, 4, 5].map(() => fake.mintFor(repo, "write", 600));
-
-      // The page keeps the fork's revoked initial token first, so the sweep sees one live token.
-      fake.pageTokens(2, "creation");
-      const now = fake.clock();
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      // The tokens the page hid are still live, which is why this is not reported as revoked.
-      expect(fake.liveTokens(repo)).toEqual(tokens.slice(1));
-      expect(tokens.slice(1).every((token) => fake.accepts(token.plaintext))).toBe(true);
-      expect(debtRows(storage)).toEqual([
-        {
-          repo,
-          owed_until: now + 60 * MINUTE + MINT_CLOCK_SKEW_MS,
-          retry_at: now + TOKEN_DEBT_RETRY_MS,
-        },
-      ]);
-
-      // A repeat sees the same page and is still pending, keeping the first deadline.
-      fake.advance(MINUTE);
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      expect(debtRows(storage)).toEqual([
-        {
-          repo,
-          owed_until: now + 60 * MINUTE + MINT_CLOCK_SKEW_MS,
-          retry_at: now + MINUTE + TOKEN_DEBT_RETRY_MS,
-        },
-      ]);
-
-      // A full listing revokes the rest and clears the debt.
-      fake.pageTokens(null);
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      expect(fake.liveTokens(repo)).toEqual([]);
-      expect(tokens.some((token) => fake.accepts(token.plaintext))).toBe(false);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("gives a new holder no write token until a release's pending debt is settled", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const former = await tokenValue(port, repo, "write");
-      // The page holds only the fork's revoked initial token, hiding the former holder's.
-      fake.pageTokens(1, "creation");
-
-      // Release: the page shows no live token but cannot cover them all.
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      expect(fake.accepts(former)).toBe(true);
-
-      // The new holder asks for a write token, before and at the retry time: both refused.
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(fake.createTokenCalls).toBe(1);
-      expect(fake.accepts(former)).toBe(true);
-
-      // Once a retry sees every token, the former holder's token is revoked before the new one exists.
-      fake.pageTokens(null);
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      expect(fake.accepts(former)).toBe(false);
-      const successor = await tokenValue(port, repo, "write");
-      expect(fake.liveTokens(repo).map((token) => token.plaintext)).toEqual([successor]);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("reports revoked on a partial listing once every token from before the debt has expired", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-
-      fake.advance(60 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.advance(1);
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("revokes past one page when live tokens come first, and still owes a sweep", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3, 4, 5].forEach(() => fake.mintFor(repo, "write", 600));
-
-      // Every live token is reachable, but a page without one cannot show that none is left.
-      fake.pageTokens(2, "live-first");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      expect(fake.liveTokens(repo)).toEqual([]);
-      expect(debtRows(storage)).toHaveLength(1);
-    });
-  });
-
-  it("refuses tokens on a fork that owes a sweep, sweeping again at most once per retry interval", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const tokens = [1, 2, 3].map(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      const lists = fake.listTokensCalls;
-
-      // Before the retry time: refused at once, with no Artifacts call.
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(fake.listTokensCalls).toBe(lists);
-
-      // At the retry time a request sweeps again; the page is still partial, so it is refused.
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(fake.listTokensCalls).toBe(lists + 1);
-      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(fake.listTokensCalls).toBe(lists + 1);
-      expect(fake.createTokenCalls).toBe(0);
-      expect(fake.liveTokens(repo)).toEqual(tokens.slice(1));
-
-      // Once the listing covers every token, the next retry revokes the rest and mints.
-      fake.pageTokens(null);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      const value = await tokenValue(port, repo, "write");
-      expect(fake.liveTokens(repo).map((token) => token.plaintext)).toEqual([value]);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("mints nothing for a request whose debt sweep a release overlapped", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.pageTokens(null);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-
-      // The request's debt sweep is held while a release revokes the fork and finishes.
-      const paused = fake.pauseNext("listTokens");
-      const requesting = port.token(repo, "write", 10 * MINUTE);
-      await paused.reached;
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      paused.release();
-
-      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
-      expect(fake.createTokenCalls).toBe(0);
-      expect(fake.liveTokens(repo)).toEqual([]);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("refuses a request whose debt sweep a release started during, until the release ends", async () => {
-    await withArtifacts(async ({ fake, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.pageTokens(null);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-
-      // The release is still listing when the request's debt sweep ends.
-      const requestPaused = fake.pauseNext("listTokens");
-      const requesting = port.token(repo, "write", 10 * MINUTE);
-      await requestPaused.reached;
-      const releasePaused = fake.pauseNext("listTokens");
-      const releasing = port.revokeTokens(repo, cutoffNow());
-      await releasePaused.reached;
-      requestPaused.release();
-      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
-      releasePaused.release();
-      expect(await releasing).toEqual(REVOKED);
-
-      expect(fake.createTokenCalls).toBe(0);
-      expect(fake.liveTokens(repo)).toEqual([]);
-      // Once the release has ended, the claim's next holder receives a token.
-      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
-    });
-  });
-
-  it("keeps a debt a release records while a request's debt sweep is listing", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
-      // Every live token is revoked, but the page still cannot show that none is left.
-      fake.pageTokens(2, "live-first");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-
-      // The request's debt sweep holds its final listing while a release lists a partial page.
-      const paused = fake.pauseNext("listTokens");
-      const requesting = port.token(repo, "write", 10 * MINUTE);
-      await paused.reached;
-      fake.pageTokens(1, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.pageTokens(null);
-      paused.release();
-
-      expect(await requesting).toMatchObject({ ok: false, code: "busy" });
-      expect(debtRows(storage)).toHaveLength(1);
-      // The release's debt still refuses the next holder's write token, without a mint.
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(fake.createTokenCalls).toBe(0);
-    });
-  });
-
-  it("keeps a debt an overlapping release records when an earlier clean release ends", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      fake.mintFor(repo, "write", 600);
-
-      // The first release lists after the second has recorded its partial page.
-      const paused = fake.pauseNext("listTokens");
-      const first = port.revokeTokens(repo, cutoffNow());
-      await paused.reached;
-      fake.pageTokens(1, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      fake.pageTokens(null);
-      paused.release();
-
-      // Its clean listing saw no debt before it began, so it cannot settle the newer one.
-      expect(await first).toEqual(PENDING_DEBT);
-      expect(fake.liveTokens(repo)).toEqual([]);
-      expect(debtRows(storage)).toHaveLength(1);
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(fake.createTokenCalls).toBe(0);
-
-      // A clean release that began after the debt clears it, and minting resumes.
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      expect(debtRows(storage)).toEqual([]);
-      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
-    });
-  });
-
-  it("returns no token from a mint during which a release recorded a debt", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const hidden = fake.mintFor(repo, "write", 600);
-
-      const paused = fake.pauseNext("createTokenBeforeMint");
-      const minting = port.token(repo, "write", 10 * MINUTE);
-      await paused.reached;
-      // The page holds only the fork's revoked initial token, hiding the other holder's.
-      fake.pageTokens(1, "creation");
-      // The mint is unanswered, so the release is busy, but its partial page is still a debt.
-      expect(await port.revokeTokens(repo, cutoffNow())).toMatchObject({ ok: false, code: "busy" });
-      expect(debtRows(storage)).toHaveLength(1);
-      paused.release();
-
-      expect(await minting).toMatchObject({ ok: false, code: "busy" });
-      expect(fake.createTokenCalls).toBe(1);
-      // The minted token was revoked; only the one the page hid is still live.
-      expect(fake.liveTokens(repo)).toEqual([hidden]);
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(fake.createTokenCalls).toBe(1);
-    });
-  });
-
-  it("drops the debt once every token the fork may hold has expired", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].map(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-
-      // Just short of the deadline a retry still finds the listing partial.
-      fake.advance(60 * MINUTE + MINT_CLOCK_SKEW_MS - 1);
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      const lists = fake.listTokensCalls;
-
-      // At the deadline the debt ends without another sweep, and minting resumes.
-      fake.advance(1);
-      expect(fake.accepts(await tokenValue(port, repo, "write"))).toBe(true);
-      expect(fake.listTokensCalls).toBe(lists);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("stays busy on a partial listing while a mint is unsettled, still recording the debt", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const before = adapter();
-      const repo = await forkClaim(before);
-      const paused = fake.pauseNext("createTokenBeforeMint");
-      expect(await before.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      [1, 2, 3].map(() => fake.mintFor(repo, "write", 600));
-      fake.pageTokens(2, "creation");
-
-      // After a restart the old mint is unsettled until its bound passes.
-      const after = adapter();
-      expect(await after.revokeTokens(repo, cutoffNow())).toMatchObject({
-        ok: false,
-        code: "busy",
-      });
-      expect(debtRows(storage)).toHaveLength(1);
-      fake.advance(10 * MINUTE + MINT_CLOCK_SKEW_MS);
-      expect(await after.revokeTokens(repo, cutoffNow())).toEqual(PENDING_DEBT);
-      expect(debtRows(storage)).toHaveLength(1);
-
-      paused.release();
-      await vi.waitFor(() => {
-        expect(fake.openHandles).toBe(0);
-      });
-    });
-  });
-
-  it("reports clean from a page that holds exactly the total", async () => {
-    await withArtifacts(async ({ fake, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      [1, 2, 3].forEach(() => fake.mintFor(repo, "write", 600));
-
-      // The initial token and three more: four tokens, all on a page of four.
-      fake.pageTokens(4, "creation");
-      expect(await port.revokeTokens(repo, cutoffNow())).toEqual(REVOKED);
-      expect(fake.liveTokens(repo)).toEqual([]);
-    });
-  });
-
   it("reports busy while a mint that started first runs, and that mint returns no token", async () => {
     await withArtifacts(async ({ fake, adapter }) => {
       const port = adapter();
@@ -795,28 +552,6 @@ describe("revokeTokens", () => {
 
       expect(await minting).toMatchObject({ ok: false, code: "busy" });
       expect(fake.liveTokens(repo)).toEqual([]);
-    });
-  });
-
-  it("owes a sweep under the racing mint's cutoff when its cleanup listing is partial", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-
-      const paused = fake.pauseNext("createTokenBeforeMint");
-      const minting = port.token(repo, "write", 10 * MINUTE);
-      await paused.reached;
-      const seq = cutoffNow().seq;
-      expect(await port.revokeTokens(repo, cutoffNow())).toMatchObject({ ok: false, code: "busy" });
-      fake.failRevocations(1);
-      fake.pageTokens(1, "creation");
-      paused.release();
-
-      expect(await minting).toMatchObject({ ok: false, code: "internal" });
-      // The token stays live behind the page, so the fork owes a sweep covering that mint alone.
-      expect(fake.liveTokens(repo)).toHaveLength(1);
-      expect(cutoffRows(storage).map((cutoff) => cutoff.seq)).toEqual([seq]);
-      expect(await port.token(repo, "read", 10 * MINUTE)).toMatchObject({ code: "busy" });
     });
   });
 
@@ -1323,8 +1058,6 @@ describe("revocation cutoff", () => {
       expect(await port.revokeTokens(repo, cutoff)).toEqual(PENDING_DEBT);
       expect(fake.accepts(old.plaintext)).toBe(false);
       expect(fake.accepts(unlogged.plaintext)).toBe(true);
-      // No adapter debt: the next token request would otherwise sweep the holder's token.
-      expect(debtRows(storage)).toEqual([]);
 
       gate.release();
       const held = await minting;
@@ -1376,112 +1109,8 @@ describe("revocation cutoff", () => {
   });
 });
 
-describe("debt cutoffs", () => {
-  it("settles a debt under its own cutoff on the next token request, keeping a token minted after it", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const before = await tokenValue(port, repo, "write");
-      const cutoff = cutoffNow();
-      const after = await tokenValue(port, repo, "read");
-
-      // A sweep under the earlier cutoff sees only the revoked initial token: it owes a debt.
-      fake.pageTokens(1, "creation");
-      expect(await port.revokeTokens(repo, cutoff)).toEqual(PENDING_DEBT);
-      expect(cutoffRows(storage)).toEqual([cutoff]);
-
-      // The retry a token request makes revokes what the debt's cutoff covers, and nothing later.
-      fake.pageTokens(null);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      const renewed = await tokenValue(port, repo, "read");
-      expect(fake.accepts(before)).toBe(false);
-      expect(fake.accepts(after)).toBe(true);
-      expect(fake.accepts(renewed)).toBe(true);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("keeps a newer token through a retry whose listing is still partial", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const cutoff = cutoffNow();
-      const after = await tokenValue(port, repo, "write");
-
-      // Live tokens come first, so the newer token is listed but not covered.
-      fake.pageTokens(1, "live-first");
-      expect(await port.revokeTokens(repo, cutoff)).toEqual(PENDING_DEBT);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      const lists = fake.listTokensCalls;
-      expect(await port.token(repo, "write", 10 * MINUTE)).toMatchObject({ code: "busy" });
-      expect(fake.listTokensCalls).toBe(lists + 1);
-      expect(fake.accepts(after)).toBe(true);
-      expect(cutoffRows(storage)).toEqual([cutoff]);
-    });
-  });
-
-  it("sweeps each of several debts under its own cutoff", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const old = fake.mintFor(repo, "write", 3600);
-      fake.advance(MINT_CLOCK_SKEW_MS + 1);
-      const early = cutoffNow();
-      const logged = await tokenValue(port, repo, "write");
-      // Neither cutoff covers the other: one reaches the logged mint, the other later unlogged tokens.
-      const wide = { seq: cutoffNow().seq, startedAt: early.startedAt - MINT_CLOCK_SKEW_MS };
-      const late = { seq: early.seq, startedAt: fake.clock() };
-      const newer = await tokenValue(port, repo, "read");
-
-      fake.pageTokens(1, "creation");
-      expect(await port.revokeTokens(repo, wide)).toEqual(PENDING_DEBT);
-      expect(await port.revokeTokens(repo, late)).toEqual(PENDING_DEBT);
-      expect(cutoffRows(storage)).toEqual([wide, late]);
-
-      // The retry sweeps under each debt's cutoff in turn; the token after both stays live.
-      fake.pageTokens(null);
-      fake.advance(TOKEN_DEBT_RETRY_MS);
-      const renewed = await tokenValue(port, repo, "write");
-      expect(fake.accepts(old.plaintext)).toBe(false);
-      expect(fake.accepts(logged)).toBe(false);
-      expect(fake.accepts(newer)).toBe(true);
-      expect(fake.accepts(renewed)).toBe(true);
-      expect(debtRows(storage)).toEqual([]);
-    });
-  });
-
-  it("folds a stale cutoff's debt into a newer one and never clears the newer one from a stale clean sweep", async () => {
-    await withArtifacts(async ({ fake, storage, adapter }) => {
-      const port = adapter();
-      const repo = await forkClaim(port);
-      const stale = cutoffNow();
-      const held = await tokenValue(port, repo, "write");
-      const current = cutoffNow();
-
-      fake.pageTokens(1, "creation");
-      expect(await port.revokeTokens(repo, current)).toEqual(PENDING_DEBT);
-      // The stale attempt's partial result is covered by the newer debt, so no second row exists.
-      expect(await port.revokeTokens(repo, stale)).toEqual(PENDING_DEBT);
-      expect(cutoffRows(storage)).toEqual([current]);
-
-      // A clean sweep under the stale cutoff cannot settle the newer debt.
-      fake.pageTokens(null);
-      expect(await port.revokeTokens(repo, stale)).toEqual(PENDING_DEBT);
-      expect(fake.accepts(held)).toBe(true);
-      expect(cutoffRows(storage)).toEqual([current]);
-
-      // A newer partial cutoff absorbs the older debt, keeping its deadline.
-      const [first] = debtRows(storage);
-      fake.advance(MINUTE);
-      fake.pageTokens(1, "creation");
-      const newest = cutoffNow();
-      expect(await port.revokeTokens(repo, newest)).toEqual(PENDING_DEBT);
-      expect(cutoffRows(storage)).toEqual([newest]);
-      expect(debtRows(storage).map((row) => row.owed_until)).toEqual([first?.owed_until]);
-    });
-  });
-
-  it("gives a debt recorded before debts kept a cutoff every mint logged so far", async () => {
+describe("migrations", () => {
+  it("drops the sweep debts earlier versions recorded and keeps the mint log", async () => {
     const stub = env.REPO.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async (_instance, state) => {
       const storage = state.storage;
@@ -1507,25 +1136,43 @@ describe("debt cutoffs", () => {
       storage.sql.exec(
         "INSERT INTO artifacts_mint_log (mint_id, repo, keep_until) VALUES ('m1', 'f', 1), ('m2', 'f', 1)",
       );
-      const recordedAt = 1_000_000_000;
-      const owedUntil = recordedAt + 60 * MINUTE + MINT_CLOCK_SKEW_MS;
-      storage.sql.exec(
-        "INSERT INTO artifacts_token_debts VALUES ('f', ?, ?, 4)",
-        owedUntil,
-        recordedAt + TOKEN_DEBT_RETRY_MS,
-      );
+      storage.sql.exec("INSERT INTO artifacts_token_debts VALUES ('f', 2000000000, 1000000000, 4)");
 
       const fake = new FakeArtifacts();
       createArtifactsAdapter({ repoId: REPO, storage, clock: fake.clock, namespace: fake }, FAST);
-      expect(cutoffRows(storage)).toEqual([{ seq: 2, startedAt: recordedAt }]);
-      expect(debtRows(storage)).toEqual([
-        { repo: "f", owed_until: owedUntil, retry_at: recordedAt + TOKEN_DEBT_RETRY_MS },
-      ]);
       expect(
         storage.sql
-          .exec("SELECT name FROM sqlite_master WHERE name = 'artifacts_token_debts'")
+          .exec(
+            "SELECT name FROM sqlite_master WHERE name IN ('artifacts_token_debts', 'artifacts_sweep_debts')",
+          )
           .toArray(),
       ).toEqual([]);
+      expect(mintCutoff(storage, fake.clock()).seq).toBe(2);
     });
+  });
+});
+
+describe("FakeArtifacts listTokens", () => {
+  it("lists one page of the newest live tokens, with a total of live tokens only", async () => {
+    const fake = new FakeArtifacts();
+    fake.seed("r", [ROOT]);
+    const tokens = Array.from({ length: TOKEN_PAGE_SIZE + 3 }, () => {
+      fake.advance(1);
+      return fake.mintFor("r", "read", 60);
+    });
+    const [revoked, expiring] = tokens;
+    if (revoked === undefined || expiring === undefined) throw new Error("no tokens");
+    revoked.revoked = true;
+    // Expires first, alone: every later token was created after it.
+    fake.advance(60_000 - TOKEN_PAGE_SIZE - 1);
+    using handle = await fake.get("r");
+    const listed = await handle.listTokens();
+
+    const live = tokens.slice(2).toReversed();
+    expect(listed.total).toBe(live.length);
+    expect(listed.tokens.map((token) => token.id)).toEqual(
+      live.slice(0, TOKEN_PAGE_SIZE).map((token) => token.id),
+    );
+    expect(listed.tokens.every((token) => token.state === "active")).toBe(true);
   });
 });
