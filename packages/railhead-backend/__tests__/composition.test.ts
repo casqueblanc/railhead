@@ -252,7 +252,40 @@ describe("Repo Durable Object", () => {
 });
 
 describe("unavailable modules", () => {
-  it("refuse every port with unavailable and never report success", async () => {
+  it("refuse a check start with unavailable and never report success", async () => {
+    const { stub, repoId } = await freshRepo();
+    const result = await runInDurableObject(stub, async (_instance, state) => {
+      const ports = composeRepo({
+        repoId,
+        storage: state.storage,
+        log: EventLog.open(state.storage, repoId),
+        clock: () => 0,
+        env,
+        wake: async () => true,
+      });
+      return ports.checks.start({
+        attemptId: "chk_attempt1",
+        expectedMain: "a".repeat(40),
+        candidate: "b".repeat(40),
+        pins: [],
+        definition: {
+          name: "test",
+          source: "a".repeat(40),
+          digest: "c".repeat(64),
+          acceptance: null,
+        },
+        decisions: [],
+        createdAt: 0,
+      });
+    });
+
+    expect(result).toMatchObject({ ok: false, code: "unavailable" });
+    expect(await logHead(stub, repoId)).toBe(0);
+  });
+});
+
+describe("installed authorization", () => {
+  it("refuses an attempt the train never recorded, and the main writer an unknown intent", async () => {
     const { stub, repoId } = await freshRepo();
     const results = await runInDurableObject(stub, async (_instance, state) => {
       const ports = composeRepo({
@@ -263,27 +296,20 @@ describe("unavailable modules", () => {
         env,
         wake: async () => true,
       });
-      return Promise.all([
-        ports.checks.start({
-          attemptId: "chk_attempt1",
-          expectedMain: "a".repeat(40),
-          candidate: "b".repeat(40),
-          pins: [],
-          definition: {
-            name: "test",
-            source: "a".repeat(40),
-            digest: "c".repeat(64),
-            acceptance: null,
-          },
-          decisions: [],
-          createdAt: 0,
-        }),
-        ports.authorization.authorize("chk_attempt1"),
-        ports.mainWriter.publish("int_intent01"),
-      ]);
+      return {
+        authorized: await ports.authorization.authorize("chk_attempt1"),
+        malformed: await ports.authorization.authorize("not an attempt"),
+        published: await ports.mainWriter.publish("int_intent01"),
+        intents: state.storage.sql.exec("SELECT COUNT(*) AS n FROM merge_intents").one().n,
+      };
     });
 
-    for (const result of results) expect(result).toMatchObject({ ok: false, code: "unavailable" });
+    expect(results).toMatchObject({
+      authorized: { ok: false, code: "not_found" },
+      malformed: { ok: false, code: "invalid_request" },
+      published: { ok: false, code: "not_found" },
+      intents: 0,
+    });
     expect(await logHead(stub, repoId)).toBe(0);
   });
 });
