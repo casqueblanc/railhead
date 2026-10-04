@@ -280,8 +280,6 @@ describe("unavailable modules", () => {
         }),
         ports.authorization.authorize("chk_attempt1"),
         ports.mainWriter.publish("int_intent01"),
-        // Claims decide Git access themselves now; the Artifacts module behind them is missing.
-        ports.artifacts.revokeTokens("rh-f-missing", { seq: 0, startedAt: 0 }),
       ]);
     });
 
@@ -769,16 +767,18 @@ describe("agent HTTP routes", () => {
 });
 
 describe("Git routes", () => {
-  it("reach the missing Git module for main and for a claim's fork", async () => {
+  it("ask for credentials on main and on a claim's fork before anything else", async () => {
     const { name } = await freshRepo();
 
     for (const path of [
-      `/git/acme/${name}.git/info/refs`,
-      `/git/acme/${name}/claims/${CLAIM}.git/git-receive-pack`,
+      `/git/acme/${name}.git/info/refs?service=git-upload-pack`,
+      `/git/acme/${name}/claims/${CLAIM}.git/info/refs?service=git-receive-pack`,
     ]) {
       const response = await SELF.fetch(`${ORIGIN}${path}`);
-      expect(response.status).toBe(503);
-      expect(await response.text()).toBe("The git module is not available.\n");
+      expect(response.status).toBe(401);
+      expect(response.headers.get("www-authenticate")).toBe(
+        'Basic realm="Railhead", charset="UTF-8"',
+      );
     }
   });
 

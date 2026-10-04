@@ -9,6 +9,7 @@
 // writer's factory receives `MainRefPort`.
 
 import type { RepoId } from "@railhead/shared/events";
+import { createMainRef } from "../artifacts/mainRef";
 import type { ArtifactsPort } from "../contracts/artifacts";
 import type { ClaimsPort } from "../contracts/claims";
 import type { DecisionsPort } from "../contracts/decisions";
@@ -22,7 +23,6 @@ import type {
   MergePort,
   TrainPort,
 } from "../contracts/train";
-import { unavailableMainRef } from "../contracts/unavailable";
 import { adaptation, type AdaptationPort } from "../modules/adaptation/entry";
 import { artifacts } from "../modules/artifacts/entry";
 import { authorization } from "../modules/authorization/entry";
@@ -206,8 +206,17 @@ export function composeRepo(context: RepoContext): RepoPorts {
     checks: checks(context, ports),
     train: train(context, ports),
     authorization: authorization(context, ports),
-    // Main's ref is unavailable until the main writer's task supplies it; no other module gets it.
-    mainWriter: mainWriter(context, ports, unavailableMainRef),
+    // Main's ref goes to the main writer and no other module.
+    mainWriter: mainWriter(
+      context,
+      ports,
+      createMainRef({
+        repoId: context.repoId,
+        namespace: context.env.ARTIFACTS,
+        upstream: (request) => fetch(request),
+        clock: context.clock,
+      }),
+    ),
     conflicts: conflicts(context, ports),
     adaptation: adaptation(context, ports),
     replay: replay(context, ports),

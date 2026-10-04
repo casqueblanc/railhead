@@ -15,6 +15,7 @@ import type { InboxPort, QueuedItem } from "../src/contracts/inbox";
 import type { DecisionsPort } from "../src/contracts/decisions";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { ok, type PortResult } from "../src/contracts/result";
+import { unavailableArtifacts } from "../src/contracts/unavailable";
 import { createClaims } from "../src/modules/claims/module";
 import { createDecisions } from "../src/modules/decisions/decisions";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
@@ -96,7 +97,7 @@ function withReady<T>(
           { ...context, namespace: fake },
           { ...ARTIFACTS_LIMITS, callTimeoutMs: 50 },
         )
-      : base.artifacts;
+      : unavailableArtifacts;
     // The fakes read `world` on every call, so a test can change their answers after ready.
     const decisions =
       world.versions === "real"
