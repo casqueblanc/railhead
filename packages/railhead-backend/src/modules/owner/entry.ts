@@ -16,7 +16,7 @@ import type {
 import type { UserId } from "@railhead/shared/events";
 import { type RelyingParty, relyingParty } from "../../auth/passkeyVerifier";
 import type { HumanGrant } from "../../contracts/principals";
-import { fail, ok, type PortResult } from "../../contracts/result";
+import { ok, type PortResult } from "../../contracts/result";
 import type { ModuleFactory, RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { migrate } from "../../repo/storage";
 import type { OwnerCredential } from "./instance";
@@ -172,8 +172,10 @@ async function act(ports: RepoPorts, grant: HumanGrant): Promise<PortResult<Owne
       const result = await ports.decisions.record({ ...grant, action });
       return result.ok ? ok({ kind: action.kind, ...result.value }) : result;
     }
-    case "check.approve":
-      return fail("unavailable", "Approving a held check is not installed.");
+    case "check.approve": {
+      const result = await ports.checks.approve({ ...grant, action });
+      return result.ok ? ok({ kind: action.kind, ...result.value }) : result;
+    }
     default: {
       const unreachable: never = action;
       return unreachable;

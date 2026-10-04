@@ -31,8 +31,11 @@
 // `merge_attempt` names the merge attempt of a batch's latest compose, recorded before the merge
 // port is called, so its candidate prefix is known whatever the compose did. `train_discards` holds
 // the attempts whose candidate refs the train still has to delete: a batch's attempt when it
-// settles, and an earlier attempt when a new compose of the same batch supersedes it. Each row is
-// due no earlier than `MERGE_PUSH_WINDOW_MS` after it was queued, so its compose can no longer push.
+// settles, and an earlier attempt when a new compose of the same batch supersedes it. A batch that
+// fails holding one pin, parked for a person's approval, keeps its attempt: the approval revives it
+// on the same candidate. Its attempt is queued once the pin can no longer return, superseded by a
+// newer ready episode or generation or dropped, or when the revived batch settles. Each row is due
+// no earlier than `MERGE_PUSH_WINDOW_MS` after it was queued, so its compose can no longer push.
 
 import type { CheckResult, CheckRunId, CommitSha, DecisionRef } from "@railhead/shared/events";
 import type { ClaimPin, EpisodePin } from "../../contracts/claims";
@@ -103,6 +106,7 @@ const MIGRATIONS: readonly string[] = [
   "ALTER TABLE train_queue ADD COLUMN next_episode INTEGER",
   "ALTER TABLE train_queue ADD COLUMN batched_episode INTEGER",
   "UPDATE train_queue SET batched_episode = episode WHERE state = 'batched'",
+  "ALTER TABLE train_queue ADD COLUMN approved_attempt TEXT",
 ];
 
 /** Creates or migrates the train's tables. */
@@ -121,9 +125,9 @@ export type EntryState =
   /** Removed from the train; `reason` says why. */
   | "dropped"
   /**
-   * Out of the queue until something returns it: held with the claim it conflicts with (#118), or
-   * waiting for a person to approve the protected check paths it edits (#174). Neither returns it
-   * yet; a new push enqueues the claim's next generation.
+   * Out of the queue until something returns it: held with the claim it conflicts with (#118), which
+   * nothing returns yet, or waiting for a person to approve the protected check paths it edits, which
+   * an approval of its held attempt returns. A new push enqueues the claim's next generation.
    */
   | "parked";
 
@@ -142,7 +146,9 @@ export type DropReason =
   /** The pin conflicts with another claim in its batch. */
   | "conflict"
   /** Checked alone, the pin's candidate edits protected check paths and waits for a person. */
-  | "check_held";
+  | "check_held"
+  /** Parked for a person's approval, it waited too long or too many others were parked after it. */
+  | "held_expired";
 
 /** One pin in the train's queue. */
 export interface QueueEntry {
@@ -162,6 +168,11 @@ export interface QueueEntry {
   nextCommit: CommitSha | null;
   /** The ready episode its latest batch was formed for, or `null` before it was first batched. */
   batchedEpisode: number | null;
+  /**
+   * The approved held attempt it returns to, or `null`. Its next batch is that attempt's own batch,
+   * revived on the same candidate rather than composed again.
+   */
+  approvedAttempt: CheckRunId | null;
 }
 
 /** Where one batch stands. */
@@ -249,6 +260,7 @@ type QueueRow = {
   episode: number;
   next_commit: string | null;
   batched_episode: number | null;
+  approved_attempt: string | null;
 };
 
 type BatchRow = {
@@ -275,7 +287,7 @@ type BatchRow = {
 };
 
 const QUEUE_COLUMNS =
-  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit, batched_episode";
+  "claim_id, generation, commit_sha, state, isolate, retries, reason, episode, next_commit, batched_episode, approved_attempt";
 const BATCH_COLUMNS =
   "batch_id, state, expected_main, pins, decisions, definition, merge_attempt, candidate, attempt_id, attempt_at, check_started, check_held, check_deadline, check_result, log_digest, finished_at, intent_id, failure, created_at, updated_at";
 
@@ -382,14 +394,14 @@ export function insertEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now
 
 /**
  * Queues ready episode `episode` of a claim whose entry is waiting or settled: the entry takes the
- * commit and episode as fresh work, with its retries, isolation, drop reason and held commit
- * cleared, even when the commit is the one it already held. A waiting entry keeps its place; a
- * settled one goes to the back.
+ * commit and episode as fresh work, with its retries, isolation, drop reason, held commit and
+ * approved attempt cleared, even when the commit is the one it already held. A waiting entry keeps
+ * its place; a settled one goes to the back.
  */
 export function requeueEntry(sql: SqlStorage, pin: ClaimPin, episode: number, now: number): void {
   sql.exec(
     `UPDATE train_queue SET commit_sha = ?, episode = ?, isolate = 0, retries = 0, reason = NULL,
-       next_commit = NULL, next_episode = NULL, updated_at = ?,
+       next_commit = NULL, next_episode = NULL, approved_attempt = NULL, updated_at = ?,
        position = CASE WHEN state = 'queued' THEN position
          ELSE (SELECT COALESCE(MAX(position), 0) + 1 FROM train_queue) END,
        state = 'queued'
@@ -472,7 +484,7 @@ export function requeueFront(
   entries.forEach((entry, index) => {
     sql.exec(
       `UPDATE train_queue SET state = 'queued', position = ?, isolate = ?, retries = ?, reason = NULL,
-         updated_at = ? WHERE claim_id = ? AND generation = ?`,
+         approved_attempt = NULL, updated_at = ? WHERE claim_id = ? AND generation = ?`,
       start + index,
       entry.isolate ? 1 : 0,
       entry.retries,
@@ -481,6 +493,166 @@ export function requeueFront(
       entry.pin.generation,
     );
   });
+}
+
+/**
+ * Puts a pin parked for its held attempt back at the front of the queue, alone, to return to
+ * `attemptId`'s batch. Returns whether the entry was parked for that reason.
+ */
+export function requeueApproved(
+  sql: SqlStorage,
+  pin: ClaimPin,
+  attemptId: CheckRunId,
+  now: number,
+): boolean {
+  const front = sql
+    .exec<{ position: number | null }>("SELECT MIN(position) AS position FROM train_queue")
+    .toArray()[0]?.position;
+  const updated = sql.exec(
+    `UPDATE train_queue SET state = 'queued', position = ?, isolate = 1, reason = NULL,
+       approved_attempt = ?, updated_at = ?
+     WHERE claim_id = ? AND generation = ? AND state = 'parked' AND reason = 'check_held'`,
+    (front ?? 1) - 1,
+    attemptId,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+  return updated.rowsWritten > 0;
+}
+
+/**
+ * Makes the batch of a held attempt that failed for waiting active again, on its same candidate and
+ * attempt, and moves its one entry into it. The attempt starts over with no deadline. Returns
+ * whether the batch was revived; nothing changes when another batch is active.
+ */
+export function reviveHeldBatch(
+  sql: SqlStorage,
+  attemptId: CheckRunId,
+  pin: ClaimPin,
+  now: number,
+): boolean {
+  if (activeBatch(sql) !== null) return false;
+  const revived = sql.exec(
+    `UPDATE train_batches SET active = 1, state = 'checking', failure = NULL, check_held = 0,
+       check_started = 0, check_deadline = NULL, updated_at = ?
+     WHERE attempt_id = ? AND state = 'failed' AND failure = 'check_held'`,
+    now,
+    attemptId,
+  );
+  if (revived.rowsWritten === 0) return false;
+  sql.exec(
+    `UPDATE train_queue SET state = 'batched', batched_episode = episode, approved_attempt = NULL,
+       updated_at = ?
+     WHERE claim_id = ? AND generation = ?`,
+    now,
+    pin.claimId,
+    pin.generation,
+  );
+  return true;
+}
+
+/**
+ * Whether the train may still run `attemptId`, a held attempt: the active batch has it and no
+ * result yet, or the one pin of its batch, failed for waiting, is parked for it or queued to revive
+ * it, at the commit and ready episode the batch pinned, and no later generation of its claim was
+ * queued since, which would leave it stale. So at most one parked attempt per claim counts.
+ */
+export function holdsAttempt(sql: SqlStorage, attemptId: CheckRunId): boolean {
+  const active = sql
+    .exec(
+      `SELECT 1 FROM train_batches
+       WHERE active = 1 AND state = 'checking' AND attempt_id = ? AND check_result IS NULL`,
+      attemptId,
+    )
+    .toArray();
+  if (active.length > 0) return true;
+  const batch = batchByAttempt(sql, attemptId);
+  if (batch?.state !== "failed" || batch.failure !== "check_held" || batch.pins.length !== 1) {
+    return false;
+  }
+  const [pin] = batch.pins;
+  if (pin === undefined) return false;
+  const waiting = sql
+    .exec(
+      `SELECT 1 FROM train_queue AS entry
+       WHERE claim_id = ? AND generation = ? AND commit_sha = ? AND episode = ?
+         AND ((state = 'parked' AND reason = 'check_held')
+           OR (state = 'queued' AND approved_attempt = ?))
+         AND NOT EXISTS (SELECT 1 FROM train_queue AS later
+           WHERE later.claim_id = entry.claim_id AND later.generation > entry.generation)`,
+      pin.claimId,
+      pin.generation,
+      pin.commit,
+      pin.episode,
+      attemptId,
+    )
+    .toArray();
+  return waiting.length > 0;
+}
+
+// A parked held pin that can still return to its batch: no later generation of its claim was queued.
+const RETURNABLE_HELD = `state = 'parked' AND reason = 'check_held'
+  AND NOT EXISTS (SELECT 1 FROM train_queue AS later
+    WHERE later.claim_id = entry.claim_id AND later.generation > entry.generation)`;
+
+/**
+ * Drops the parked held pins that can still return and were parked at or before `parkedBy`, and
+ * beyond the newest `keep` the oldest ones, as `held_expired`, and queues each one's merge attempt
+ * for discard. The train then no longer holds their attempts, so an approval of one is stale and
+ * the checks module may prune it. Returns how many were dropped.
+ */
+export function expireHeldPins(
+  sql: SqlStorage,
+  { parkedBy, keep }: { parkedBy: number; keep: number },
+  now: number,
+): number {
+  const returnable = sql
+    .exec<{
+      claim_id: string;
+      generation: number;
+      commit_sha: string;
+      episode: number;
+      updated_at: number;
+    }>(
+      `SELECT claim_id, generation, commit_sha, episode, updated_at FROM train_queue AS entry
+       WHERE ${RETURNABLE_HELD}
+       ORDER BY updated_at DESC, claim_id DESC`,
+    )
+    .toArray();
+  const expired = returnable.filter((row, index) => index >= keep || row.updated_at <= parkedBy);
+  for (const row of expired) {
+    const pin = { claimId: row.claim_id, generation: row.generation, commit: row.commit_sha };
+    settleEntry(sql, pin, "dropped", "held_expired", now);
+    queueHeldDiscard(sql, { pin, episode: row.episode }, now);
+  }
+  return expired.length;
+}
+
+/** When the longest-parked held pin that can still return was parked, or `null`. */
+export function oldestHeldParkAt(sql: SqlStorage): number | null {
+  return (
+    sql
+      .exec<{ at: number | null }>(
+        `SELECT MIN(updated_at) AS at FROM train_queue AS entry WHERE ${RETURNABLE_HELD}`,
+      )
+      .toArray()[0]?.at ?? null
+  );
+}
+
+/**
+ * Lets the active batch's held attempt be asked for again, with no deadline, once a person approved
+ * it. Returns whether that batch was holding `attemptId`.
+ */
+export function releaseActiveHold(sql: SqlStorage, attemptId: CheckRunId, now: number): boolean {
+  const released = sql.exec(
+    `UPDATE train_batches SET check_held = 0, check_deadline = NULL, updated_at = ?
+     WHERE active = 1 AND state = 'checking' AND attempt_id = ? AND check_held = 1
+       AND check_result IS NULL`,
+    now,
+    attemptId,
+  );
+  return released.rowsWritten > 0;
 }
 
 /** The active batch, or `null`. */
@@ -684,6 +856,46 @@ export function settleBatch(
   );
 }
 
+/**
+ * Settles the active batch of a pin held alone past its deadline, keeping its merge attempt: an
+ * approval may revive the batch on the same candidate. `queueHeldDiscard` queues the attempt once
+ * the pin can no longer return to it.
+ */
+export function settleHeldBatch(sql: SqlStorage, batchId: number, now: number): void {
+  sql.exec(
+    `UPDATE train_batches SET active = NULL, state = 'failed', failure = 'check_held', updated_at = ?
+     WHERE batch_id = ?`,
+    now,
+    batchId,
+  );
+}
+
+/**
+ * Queues for discard the merge attempt of the held batch `entry` was parked for at its commit and
+ * ready episode, once the entry can no longer return to it: a newer episode or generation
+ * superseded it, or it was dropped on its way back.
+ */
+export function queueHeldDiscard(
+  sql: SqlStorage,
+  { pin, episode }: { pin: ClaimPin; episode: number },
+  now: number,
+): void {
+  sql.exec(
+    `INSERT INTO train_discards (attempt, due_at, failures)
+       SELECT merge_attempt, ?, 0 FROM train_batches
+       WHERE state = 'failed' AND failure = 'check_held' AND merge_attempt IS NOT NULL
+         AND json_array_length(pins) = 1
+         AND json_extract(pins, '$[0].claimId') = ? AND json_extract(pins, '$[0].generation') = ?
+         AND json_extract(pins, '$[0].commit') = ? AND json_extract(pins, '$[0].episode') = ?
+     ON CONFLICT (attempt) DO NOTHING`,
+    now + MERGE_PUSH_WINDOW_MS,
+    pin.claimId,
+    pin.generation,
+    pin.commit,
+    episode,
+  );
+}
+
 /** Queues the batch's current merge attempt, if any, for discard once its compose cannot push. */
 function queueDiscard(sql: SqlStorage, batchId: number, now: number): void {
   sql.exec(
@@ -843,6 +1055,7 @@ function toEntry(row: QueueRow): QueueEntry {
     episode: row.episode,
     nextCommit: row.next_commit,
     batchedEpisode: row.batched_episode,
+    approvedAttempt: row.approved_attempt,
   };
 }
 
@@ -888,6 +1101,7 @@ const DROP_REASONS = [
   "retries_exhausted",
   "conflict",
   "check_held",
+  "held_expired",
 ] as const;
 const BATCH_STATES = ["composing", "checking", "passed", "landed", "failed"] as const;
 const BATCH_FAILURES = [
