@@ -11,6 +11,12 @@
 // that still happens surfaces as `stale ref` on the next update, which is reported and returned as
 // `rejected` without a retry.
 //
+// The sandbox Git gateway also mints write tokens on main, for a merge composition's candidate
+// pushes, and revokes each when its exchange ends (`sandbox/sandboxObject.ts`). An update that
+// coincides with one of those pushes is refused as `unavailable`, and the train publishes again on
+// its next drive. That refusal is intended: a write token on main can move main, whatever ref its
+// holder was allowed to push, so the check must not learn to skip such tokens.
+//
 // Monotonic main. An update is sent only when `expected` is on `next`'s first-parent history, which
 // is how the train composes a candidate on main. With the compare-and-swap, Railhead's own writes
 // only move main forward. A rewind by another writer can only be detected, as above.

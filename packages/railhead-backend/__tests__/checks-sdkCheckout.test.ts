@@ -210,8 +210,9 @@ function registeredGateway(fence: SandboxFence | null) {
       get: async (repo: string) => ({
         createToken: async (scope: string, ttl: number) => {
           minted.push(`${scope}:${repo}:${ttl}`);
-          return { plaintext: `minted-${scope}` };
+          return { id: `tok-${scope}`, plaintext: `minted-${scope}` };
         },
+        revokeToken: async () => true,
         [Symbol.dispose]: () => {},
       }),
     },
