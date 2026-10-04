@@ -1,0 +1,178 @@
+{
+  "route": "release",
+  "method": "POST",
+  "path": "/agent/v1/casqueblanc/demo/claims/clm_42abcd/release",
+  "exchanges": [
+    {
+      "name": "releases the working claim",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "closed": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "released"
+              },
+              "closedAt": 1789999940000
+            },
+            "repeated": false
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "a repeat after a lost response returns the same release",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "closed": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "released"
+              },
+              "closedAt": 1789999940000
+            },
+            "repeated": true
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "refuses a stale generation",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "stale_generation",
+            "message": "The claim's ownership generation has changed.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses a ready claim, whose pin is on the train",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "after_ready",
+            "message": "The claim is ready and its pin is on the train; it cannot be released.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "status"
+          }
+        }
+      }
+    },
+    {
+      "name": "refuses a claim whose lease already expired",
+      "request": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": {
+          "generation": 1
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "ok": false,
+          "error": {
+            "code": "claim_closed",
+            "message": "The claim's lease expired.",
+            "retryable": false,
+            "retryAfterMs": null,
+            "next": "work"
+          }
+        }
+      }
+    }
+  ],
+  "rejectedRequests": [
+    {
+      "name": "generation 0",
+      "body": {
+        "generation": 0
+      },
+      "stage": "invariant"
+    },
+    {
+      "name": "generation as a string",
+      "body": {
+        "generation": "1"
+      },
+      "stage": "shape"
+    },
+    {
+      "name": "generation missing",
+      "body": {},
+      "stage": "shape"
+    }
+  ]
+}

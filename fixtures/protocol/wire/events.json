@@ -473,6 +473,21 @@
         "generation": 1,
         "commit": "cccccccccccccccccccccccccccccccccccccccc"
       }
+    },
+    {
+      "v": 2,
+      "seq": 27,
+      "at": 1790000000027,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "agent",
+        "id": "agt_atlas01"
+      },
+      "type": "claim.released",
+      "data": {
+        "claimId": "clm_43abcd",
+        "generation": 1
+      }
     }
   ],
   "largestSafeSeq": {
@@ -951,6 +966,44 @@
         }
       },
       "error": "recorded by the system"
+    },
+    {
+      "name": "release recorded by the system",
+      "value": {
+        "v": 2,
+        "seq": 27,
+        "at": 1790000000027,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "claim.released",
+        "data": {
+          "claimId": "clm_43abcd",
+          "generation": 1
+        }
+      },
+      "error": "by the agent itself"
+    },
+    {
+      "name": "release written at version 1",
+      "value": {
+        "v": 1,
+        "seq": 27,
+        "at": 1790000000027,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "claim.released",
+        "data": {
+          "claimId": "clm_43abcd",
+          "generation": 1
+        }
+      },
+      "error": "schema version"
     }
   ]
 }

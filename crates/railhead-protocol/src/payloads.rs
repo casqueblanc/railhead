@@ -260,6 +260,23 @@ impl ClaimExpired {
     }
 }
 
+/// `claim.released`: the holder gave up its working claim, which is left as an expiry leaves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimReleased {
+    /// The `clm_` claim.
+    pub claim_id: String,
+    /// The generation the holder released.
+    pub generation: SafeInteger,
+}
+
+impl ClaimReleased {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::Claim, &self.claim_id, "claimId")?;
+        require_positive(self.generation, "generation")
+    }
+}
+
 /// `claim.reassigned`: a claim moved to another agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

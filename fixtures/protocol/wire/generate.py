@@ -249,6 +249,7 @@ SPECS = {
     "issue_unavailable": (409, False, "work"),
     "stale_generation": (409, False, "status"),
     "after_ready": (409, False, "status"),
+    "claim_closed": (409, False, "work"),
     "unacked_decision": (409, False, "sync"),
     "commit_not_found": (422, False, None),
     "idempotency_mismatch": (409, False, None),
@@ -288,6 +289,7 @@ BASE = f"/agent/v1/{ORG}/{REPO}"
 JOIN_BODY = {"inviteId": INVITE, "inviteSecret": INVITE_SECRET, "publicKey": KEY, "signature": JOIN_SIGNATURE}
 SESSION_BODY = {"agentId": AGENT, "challengeId": CHALLENGE, "signature": LOGIN_SIGNATURE}
 READY_BODY = {"generation": 1, "commit": SHA_HEAD}
+RELEASE_BODY = {"generation": 1}
 ASK_BODY = {
     "generation": 1,
     "requestId": "req_upload0000000001",
@@ -417,6 +419,11 @@ def agent_fixtures() -> dict:
                     success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "expired"})}, EMPTY_DIGEST, "work"),
                 ),
                 exchange(
+                    "the agent's last claim was released",
+                    request(None, True),
+                    success({"agent": AGENT_VIEW, "claim": None, "closed": closed_view({"kind": "released"})}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
                     "the agent's last claim was taken over, and it holds a new one",
                     request(None, True),
                     success({"agent": AGENT_VIEW, "claim": claim_view(), "closed": closed_view({"kind": "taken_over"}, "clm_41abcd")}, EMPTY_DIGEST, None),
@@ -522,6 +529,42 @@ def agent_fixtures() -> dict:
                 rejected("generation beyond the safe integer range", {**READY_BODY, "generation": 9007199254740992}, "invariant"),
                 rejected("generation as a string", {**READY_BODY, "generation": "1"}, "shape"),
                 rejected("commit missing", {"generation": 1}, "shape"),
+            ],
+        },
+        "release": {
+            "method": "POST",
+            "path": f"{BASE}/claims/clm_42abcd/release",
+            "exchanges": [
+                exchange(
+                    "releases the working claim",
+                    request(RELEASE_BODY, True),
+                    success({"closed": closed_view({"kind": "released"}), "repeated": False}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "a repeat after a lost response returns the same release",
+                    request(RELEASE_BODY, True),
+                    success({"closed": closed_view({"kind": "released"}), "repeated": True}, EMPTY_DIGEST, "work"),
+                ),
+                exchange(
+                    "refuses a stale generation",
+                    request(RELEASE_BODY, True),
+                    failure("stale_generation", "The claim's ownership generation has changed."),
+                ),
+                exchange(
+                    "refuses a ready claim, whose pin is on the train",
+                    request(RELEASE_BODY, True),
+                    failure("after_ready", "The claim is ready and its pin is on the train; it cannot be released."),
+                ),
+                exchange(
+                    "refuses a claim whose lease already expired",
+                    request(RELEASE_BODY, True),
+                    failure("claim_closed", "The claim's lease expired."),
+                ),
+            ],
+            "rejectedRequests": [
+                rejected("generation 0", {"generation": 0}, "invariant"),
+                rejected("generation as a string", {"generation": "1"}, "shape"),
+                rejected("generation missing", {}, "shape"),
             ],
         },
         "pin": {
@@ -708,7 +751,7 @@ CHECK_DIGEST = hashlib.sha256(b'{"name":"test","command":"pnpm test","timeoutMs"
 
 
 # The schema version each type is written at, when later than 1: the version that introduced it.
-EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "train.unreported": 2, "claim.merged": 2}
+EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "train.unreported": 2, "claim.merged": 2, "claim.released": 2}
 
 
 def event(seq: int, type_: str, actor: dict, data: dict) -> dict:
@@ -748,6 +791,7 @@ def events_fixture() -> dict:
         ("check.approved", HUMAN, {"checkRunId": "chk_run0002", "candidate": SHA_OTHER, "digest": CHECK_DIGEST}),
         ("train.unreported", SYSTEM, {"checkRunId": "chk_run0003", "candidate": SHA_OTHER, "outcome": "timed_out"}),
         ("claim.merged", SYSTEM, {"claimId": "clm_42abcd", "generation": 1, "commit": SHA_OTHER}),
+        ("claim.released", AGENT_ACTOR, {"claimId": "clm_43abcd", "generation": 1}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -775,8 +819,10 @@ def events_fixture() -> dict:
         ("check approval with an uppercase digest", {**events[23], "data": {**events[23]["data"], "digest": CHECK_DIGEST.upper()}}, "digest"),
         ("unreported check asserted by an agent", {**events[24], "actor": AGENT_ACTOR}, "by the system"),
         ("unreported check written at version 1", {**events[24], "v": 1}, "schema version"),
-        ("merge naming a branch for its commit", {**events[-1], "data": {**events[-1]["data"], "commit": "main"}}, "commit"),
-        ("merge recorded by an agent", {**events[-1], "actor": AGENT_ACTOR}, "recorded by the system"),
+        ("merge naming a branch for its commit", {**events[25], "data": {**events[25]["data"], "commit": "main"}}, "commit"),
+        ("merge recorded by an agent", {**events[25], "actor": AGENT_ACTOR}, "recorded by the system"),
+        ("release recorded by the system", {**events[26], "actor": SYSTEM}, "by the agent itself"),
+        ("release written at version 1", {**events[26], "v": 1}, "schema version"),
     ]
     return {
         "valid": events,

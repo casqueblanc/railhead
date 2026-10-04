@@ -222,6 +222,9 @@ pub enum EventPayload {
     /// A claim's lease ended.
     #[serde(rename = "claim.expired")]
     ClaimExpired(ClaimExpired),
+    /// A claim's holder gave it up.
+    #[serde(rename = "claim.released")]
+    ClaimReleased(ClaimReleased),
     /// A claim moved to another agent.
     #[serde(rename = "claim.reassigned")]
     ClaimReassigned(ClaimReassigned),
@@ -291,6 +294,7 @@ impl EventPayload {
             Self::ClaimReopened(_) => "claim.reopened",
             Self::ClaimMerged(_) => "claim.merged",
             Self::ClaimExpired(_) => "claim.expired",
+            Self::ClaimReleased(_) => "claim.released",
             Self::ClaimReassigned(_) => "claim.reassigned",
             Self::ClaimAdapted(_) => "claim.adapted",
             Self::QuestionAsked(_) => "question.asked",
@@ -338,7 +342,8 @@ impl EventPayload {
             Self::TrainHeld(_)
             | Self::CheckApproved(_)
             | Self::TrainUnreported(_)
-            | Self::ClaimMerged(_) => 2,
+            | Self::ClaimMerged(_)
+            | Self::ClaimReleased(_) => 2,
         }
     }
 
@@ -349,7 +354,7 @@ impl EventPayload {
             | Self::AgentRevoked(_)
             | Self::DecisionRecorded(_)
             | Self::CheckApproved(_) => Recorder::Person,
-            Self::InboxAcked(_) => Recorder::Agent,
+            Self::InboxAcked(_) | Self::ClaimReleased(_) => Recorder::Agent,
             Self::AgentJoined(_)
             | Self::ClaimRefused(_)
             | Self::ClaimReopened(_)
@@ -390,6 +395,7 @@ impl EventPayload {
             | Self::ClaimReopened(_)
             | Self::ClaimMerged(_)
             | Self::ClaimExpired(_)
+            | Self::ClaimReleased(_)
             | Self::ClaimReassigned(_)
             | Self::ClaimAdapted(_)
             | Self::QuestionAsked(_)
@@ -419,6 +425,7 @@ impl EventPayload {
             Self::ClaimReopened(data) => data.validate(),
             Self::ClaimMerged(data) => data.validate(),
             Self::ClaimExpired(data) => data.validate(),
+            Self::ClaimReleased(data) => data.validate(),
             Self::ClaimReassigned(data) => data.validate(),
             Self::ClaimAdapted(data) => data.validate(),
             Self::QuestionAsked(data) => data.validate(),

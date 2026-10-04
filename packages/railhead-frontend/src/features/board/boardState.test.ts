@@ -531,6 +531,53 @@ describe("a ready claim that loses a redo conflict", () => {
   });
 });
 
+/** `agent` releasing its working claim at `generation`. */
+const release = (claimId: string, agent: string, generation = 1): SyntheticStep => ({
+  type: "claim.released",
+  actor: synthAgent(agent),
+  data: { claimId, generation },
+});
+
+describe("a working claim its holder releases", () => {
+  const before = fold(syntheticLog("Synthetic release of a working claim", uploadPrelude()).events);
+
+  it("leaves the claim expired, then lets another agent take it over", () => {
+    const released = append(before, release(UPLOAD.birchClaim, UPLOAD.birch));
+    expect(released.stream).toEqual({ kind: "consistent" });
+    expect(birch(released)).toMatchObject({ phase: "expired", agentId: UPLOAD.birch });
+
+    const taken = append(released, {
+      type: "claim.reassigned",
+      actor: SYNTH_TRAIN,
+      data: { claimId: UPLOAD.birchClaim, from: UPLOAD.birch, to: UPLOAD.atlas, generation: 2 },
+    });
+    expect(taken.stream).toEqual({ kind: "consistent" });
+    expect(birch(taken)).toMatchObject({ phase: "working", agentId: UPLOAD.atlas, generation: 2 });
+  });
+
+  it("halts on the release of a ready claim", () => {
+    const pinned = append(before, ready(UPLOAD.atlas, UPLOAD.atlasClaim, synthCommit(1), []));
+    const halted = append(pinned, release(UPLOAD.atlasClaim, UPLOAD.atlas));
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: pinned.cursor + 1,
+        message: `claim ${UPLOAD.atlasClaim} released while ready`,
+      },
+    });
+  });
+
+  it("halts on a release at another generation", () => {
+    const halted = append(before, release(UPLOAD.birchClaim, UPLOAD.birch, 2));
+    expect(halted.stream).toMatchObject({
+      kind: "halted",
+      fault: { kind: "inconsistent", seq: before.cursor + 1 },
+    });
+    expect(birch(halted)?.phase).toBe("working");
+  });
+});
+
 describe("a ready claim whose decision is superseded", () => {
   const superseded = syntheticLog("Synthetic reopen of a ready claim", [
     ...uploadPrelude(),

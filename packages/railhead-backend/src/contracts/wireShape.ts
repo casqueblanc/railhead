@@ -30,6 +30,8 @@ import type {
   QuestionResult,
   ReadyRequest,
   ReadyResult,
+  ReleaseRequest,
+  ReleaseResult,
   SessionRequest,
   SessionResult,
   StatusResult,
@@ -44,6 +46,7 @@ interface WireShapes {
   sessionRequest(value: SessionRequest): SessionRequest;
   claimRequest(value: ClaimRequest): ClaimRequest;
   readyRequest(value: ReadyRequest): ReadyRequest;
+  releaseRequest(value: ReleaseRequest): ReleaseRequest;
   ackRequest(value: AckRequest): AckRequest;
   askRequest(value: AskRequest): AskRequest;
   emptyBody(value: null): null;
@@ -53,6 +56,7 @@ interface WireShapes {
   statusResponse(value: AgentResponse<StatusResult>): AgentResponse<StatusResult>;
   claimResponse(value: AgentResponse<ClaimResult>): AgentResponse<ClaimResult>;
   readyResponse(value: AgentResponse<ReadyResult>): AgentResponse<ReadyResult>;
+  releaseResponse(value: AgentResponse<ReleaseResult>): AgentResponse<ReleaseResult>;
   pinResponse(value: AgentResponse<PinResult>): AgentResponse<PinResult>;
   inboxResponse(value: AgentResponse<InboxResult>): AgentResponse<InboxResult>;
   ackResponse(value: AgentResponse<AckResult>): AgentResponse<AckResult>;
@@ -77,6 +81,9 @@ class WireShapeCheck extends RpcTarget implements WireShapes {
     return value;
   }
   readyRequest(value: ReadyRequest): ReadyRequest {
+    return value;
+  }
+  releaseRequest(value: ReleaseRequest): ReleaseRequest {
     return value;
   }
   ackRequest(value: AckRequest): AckRequest {
@@ -104,6 +111,9 @@ class WireShapeCheck extends RpcTarget implements WireShapes {
     return value;
   }
   readyResponse(value: AgentResponse<ReadyResult>): AgentResponse<ReadyResult> {
+    return value;
+  }
+  releaseResponse(value: AgentResponse<ReleaseResult>): AgentResponse<ReleaseResult> {
     return value;
   }
   pinResponse(value: AgentResponse<PinResult>): AgentResponse<PinResult> {
@@ -149,6 +159,8 @@ export function parseAgentRequest(route: AgentRouteName, body: unknown): AgentRe
       return { route, body: shapes.claimRequest(body) };
     case "ready":
       return { route, body: shapes.readyRequest(body) };
+    case "release":
+      return { route, body: shapes.releaseRequest(body) };
     case "ack":
       return { route, body: shapes.ackRequest(body) };
     case "ask":
@@ -172,6 +184,7 @@ export type AgentResponsePair =
   | { route: "status"; response: AgentResponse<StatusResult> }
   | { route: "work" | "claim"; response: AgentResponse<ClaimResult> }
   | { route: "ready"; response: AgentResponse<ReadyResult> }
+  | { route: "release"; response: AgentResponse<ReleaseResult> }
   | { route: "pin"; response: AgentResponse<PinResult> }
   | { route: "inbox"; response: AgentResponse<InboxResult> }
   | { route: "ack"; response: AgentResponse<AckResult> }
@@ -193,6 +206,8 @@ export function parseAgentResponse(route: AgentRouteName, body: unknown): AgentR
       return { route, response: shapes.claimResponse(body) };
     case "ready":
       return { route, response: shapes.readyResponse(body) };
+    case "release":
+      return { route, response: shapes.releaseResponse(body) };
     case "pin":
       return { route, response: shapes.pinResponse(body) };
     case "inbox":

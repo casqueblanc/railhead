@@ -661,6 +661,7 @@ const EVENT_TYPES: Readonly<Record<EventType, true>> = {
   "claim.reopened": true,
   "claim.merged": true,
   "claim.expired": true,
+  "claim.released": true,
   "claim.reassigned": true,
   "claim.adapted": true,
   "question.asked": true,
@@ -770,6 +771,7 @@ const readPayload = (type: EventType, d: Fields, p: string): EventPayload => {
         },
       };
     case "claim.expired":
+    case "claim.released":
       return {
         type,
         data: { claimId: string(d, "claimId", p), generation: integer(d, "generation", p) },

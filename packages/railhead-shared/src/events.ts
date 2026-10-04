@@ -115,6 +115,7 @@ const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
   "check.approved": 2,
   "train.unreported": 2,
   "claim.merged": 2,
+  "claim.released": 2,
 };
 
 /** The schema version an event of `type` is written at. */
@@ -298,6 +299,9 @@ export type EventPayload =
       data: { claimId: ClaimId; generation: number; commit: CommitSha };
     }
   | { type: "claim.expired"; data: { claimId: ClaimId; generation: number } }
+  // The holder gave up the working claim at `generation`. It is left as an expiry leaves it: its
+  // fork's tokens are revoked, then another agent may take it over.
+  | { type: "claim.released"; data: { claimId: ClaimId; generation: number } }
   | {
       type: "claim.reassigned";
       data: { claimId: ClaimId; from: AgentId; to: AgentId; generation: number };
@@ -445,10 +449,10 @@ export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
 ];
 
 /**
- * The event types only the agent named in the event may record. An acknowledgement is what the
- * `ready` gate relies on, so nobody can acknowledge on an agent's behalf (#17).
+ * The event types only an agent may record. An acknowledgement is what the `ready` gate relies on,
+ * so nobody can acknowledge on an agent's behalf (#17), and only a claim's holder gives it up.
  */
-export const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked"];
+export const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked", "claim.released"];
 
 /** The event types only the system records: facts no caller can assert about itself. */
 export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
@@ -613,6 +617,7 @@ function validatePayload(event: EventPayload): void {
       requireCommit(event.data.commit, "commit");
       return;
     case "claim.expired":
+    case "claim.released":
       requireId("claim", event.data.claimId, "claimId");
       requirePositiveInteger(event.data.generation, "generation");
       return;

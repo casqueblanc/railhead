@@ -194,6 +194,8 @@ function toCommand(
       return { route: pair.route };
     case "ready":
       return { route: "ready", claimId: idParam(params, "claimId", "claim"), body: pair.body };
+    case "release":
+      return { route: "release", claimId: idParam(params, "claimId", "claim"), body: pair.body };
     case "ask":
       return { route: "ask", claimId: idParam(params, "claimId", "claim"), body: pair.body };
     case "inbox":

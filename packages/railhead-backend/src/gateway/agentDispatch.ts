@@ -20,6 +20,7 @@ import {
   type InboxDigest,
   type JoinRequest,
   type ReadyRequest,
+  type ReleaseRequest,
   type RepoSegment,
   type SessionRequest,
   claimRemotePath,
@@ -39,6 +40,7 @@ export type AgentCommand =
   | { route: "work" }
   | { route: "claim"; body: ClaimRequest }
   | { route: "ready"; claimId: ClaimId; body: ReadyRequest }
+  | { route: "release"; claimId: ClaimId; body: ReleaseRequest }
   | { route: "pin" }
   | { route: "inbox"; limit: number }
   | { route: "ack"; item: number; body: AckRequest }
@@ -94,6 +96,7 @@ export async function dispatchAgent(
     case "work":
     case "claim":
     case "ready":
+    case "release":
     case "pin":
     case "inbox":
     case "ack":
@@ -155,6 +158,8 @@ async function runSessionCommand(
       return located(remotes, await ports.claims.claim(agent, command.body.issueId));
     case "ready":
       return located(remotes, await ports.claims.ready(agent, command.claimId, command.body));
+    case "release":
+      return ports.claims.release(agent, command.claimId, command.body);
     case "pin": {
       // Only the caller's own ready claim, at its current generation: an older generation's pin
       // may have been another agent's.

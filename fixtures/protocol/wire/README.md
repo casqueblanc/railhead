@@ -50,6 +50,7 @@ can also return `invalid_request`, `unsupported_media_type`, `payload_too_large`
 | `work`      | `POST /work`                          | session | the active claim is returned      | claimed, resumed, `no_work`, `busy`                                                         |
 | `claim`     | `POST /claims`                        | session | the active claim is returned      | claimed, `claim_exists`, `issue_unavailable`                                                |
 | `ready`     | `POST /claims/{claimId}/ready`        | session | same claim, generation and commit | pinned, repeated, `unacked_decision`, `stale_generation`, `after_ready`, `commit_not_found` |
+| `release`   | `POST /claims/{claimId}/release`      | session | same claim and generation         | released, repeated, `stale_generation`, `after_ready`, `claim_closed`                       |
 | `pin`       | `GET /pin`                            | session | read only                         | queued, each batch state, landed, parked, dropped, no pin, `unavailable`                    |
 | `inbox`     | `GET /inbox?limit=`                   | session | same unacknowledged items         | items, empty, `unauthenticated`                                                             |
 | `ack`       | `POST /inbox/{item}/ack`              | session | the first acknowledgement is kept | acknowledged, repeated, `not_found`                                                         |

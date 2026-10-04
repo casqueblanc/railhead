@@ -1361,6 +1361,95 @@ async fn a_ready_rejection_names_sync_and_ack() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn release_gives_up_the_clone_claim_at_its_generation() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "POST",
+        "/work",
+        fixture(&world, "work.json", "claims the next ready issue")?,
+    )
+    .await;
+    assert_eq!(
+        rh(&world, &world.outside(), Some("atlas"), &["work"])?.code,
+        Some(0)
+    );
+    let clone = world.clone_dir();
+
+    world.server.reset().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{PREFIX}/claims/clm_42abcd/release")))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .and(body_json(json!({"generation": 1})))
+        .respond_with(fixture(
+            &world,
+            "release.json",
+            "releases the working claim",
+        )?)
+        .expect(1)
+        .mount(&world.server)
+        .await;
+    let run = rh(&world, &clone, None, &["release"])?;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "released claim \"clm_42abcd\" on issue \"iss_upload1\"; another agent can take it over\nnext: rh work\n"
+    );
+
+    world.server.reset().await;
+    answer(
+        &world,
+        "POST",
+        "/claims/clm_42abcd/release",
+        fixture(
+            &world,
+            "release.json",
+            "a repeat after a lost response returns the same release",
+        )?,
+    )
+    .await;
+    let json = rh(&world, &clone, None, &["--json", "release"])?;
+    let envelope = json.json()?;
+    assert_eq!(envelope.pointer("/data/repeated"), Some(&json!(true)));
+    assert_eq!(
+        envelope.pointer("/data/closed/reason"),
+        Some(&json!({"kind": "released"}))
+    );
+
+    // A ready claim is refused, and the refusal points at status.
+    world.server.reset().await;
+    answer(
+        &world,
+        "POST",
+        "/claims/clm_42abcd/release",
+        fixture(
+            &world,
+            "release.json",
+            "refuses a ready claim, whose pin is on the train",
+        )?,
+    )
+    .await;
+    let ready = rh(&world, &clone, None, &["--json", "release"])?;
+    assert_eq!(ready.error_code()?, json!("after_ready"));
+    assert_eq!(
+        ready.json()?.pointer("/error/next"),
+        Some(&json!("rh status"))
+    );
+
+    // Outside a clone there is no claim to release, and nothing is sent.
+    world.server.reset().await;
+    let outside = rh(
+        &world,
+        &world.outside(),
+        Some("atlas"),
+        &["--json", "release"],
+    )?;
+    assert_eq!(outside.error_code()?, json!("no_clone"));
+    assert_eq!(requests(&world).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_without_a_claim_points_at_work_and_a_revoked_agent_fails() -> anyhow::Result<()> {
     let world = world().await?;
     answer(
