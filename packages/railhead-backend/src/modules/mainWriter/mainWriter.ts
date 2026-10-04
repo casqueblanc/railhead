@@ -76,8 +76,15 @@ export const MAIN_REF_TIMEOUT_MS = 10_000;
 
 /**
  * How long after it is sent an update of main may still apply. `MainRefPort` promises that an
- * update which has not applied by then never will. This is a design value, not a measurement:
- * thirty times the writer's own wait for an answer.
+ * update which has not applied by then never will. This is a design value: thirty times the
+ * writer's own wait for an answer.
+ *
+ * Artifacts itself bounds nothing: on #158 an update whose request body was held open for 330 s
+ * applied when the body completed. The value holds only because the Artifacts adapter
+ * (`artifacts/mainRef.ts`) sends the whole body in one buffered write, uses a token minted for the
+ * one update, aborts the request `MAIN_REF_TIMEOUT_MS` after the call and revokes that token
+ * before main is read again. Under those rules every measured late landing came within about 55 ms
+ * of the revocation returning.
  */
 export const MAIN_UPDATE_LIFETIME_MS = 30 * MAIN_REF_TIMEOUT_MS;
 
