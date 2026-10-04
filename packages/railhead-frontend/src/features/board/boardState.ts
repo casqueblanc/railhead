@@ -816,6 +816,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
       check(claim.phase === "working", `claim ${claimId} released while ${claim.phase}`);
+      check(
+        event.actor.kind === "agent" && event.actor.id === claim.agentId,
+        `claim ${claimId} released by an agent that does not hold it`,
+      );
       return {
         ...endHolds(state, draft, [claimId], "dropped", seq),
         claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }),

@@ -568,6 +568,19 @@ describe("a working claim its holder releases", () => {
     });
   });
 
+  it("halts on a release recorded by an agent that does not hold the claim", () => {
+    const halted = append(before, release(UPLOAD.birchClaim, UPLOAD.atlas));
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: {
+        kind: "inconsistent",
+        seq: before.cursor + 1,
+        message: `claim ${UPLOAD.birchClaim} released by an agent that does not hold it`,
+      },
+    });
+    expect(birch(halted)?.phase).toBe("working");
+  });
+
   it("halts on a release at another generation", () => {
     const halted = append(before, release(UPLOAD.birchClaim, UPLOAD.birch, 2));
     expect(halted.stream).toMatchObject({
