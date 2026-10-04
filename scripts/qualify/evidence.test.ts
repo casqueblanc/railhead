@@ -78,6 +78,11 @@ describe("the live gate's origin and remote rules", () => {
       "https://railhead.invalid",
       "https://box.local",
       "https://[::1]",
+      "https://localhost.:8787",
+      "https://box.local.",
+      "https://railhead.test.",
+      "https://169.254.169.254",
+      "https://0.1.2.3",
       "https://user:pw@railhead.dev",
       "not a url",
     ]) {

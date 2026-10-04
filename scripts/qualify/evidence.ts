@@ -28,7 +28,7 @@ const SHA = /^[0-9a-f]{40}$/;
 
 /** Hosts a deployed instance never has: loopback, private ranges and reserved test names. */
 const NOT_LIVE_HOST =
-  /^(?:localhost|.*\.localhost|.*\.invalid|.*\.test|.*\.example|.*\.local|\[.*\]|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|0\.0\.0\.0)$/;
+  /^(?:localhost|.*\.localhost|.*\.invalid|.*\.test|.*\.example|.*\.local|\[.*\]|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+|0\.\d+\.\d+\.\d+)$/;
 
 function check(id: string, pass: boolean, detail: string): Check {
   return { id, outcome: pass ? "pass" : "fail", detail };
@@ -65,7 +65,8 @@ export function originProblem(origin: string): string | null {
   }
   if (url.protocol !== "https:") return "not HTTPS";
   if (url.username !== "" || url.password !== "") return "carries credentials";
-  if (NOT_LIVE_HOST.test(url.hostname)) return "not a public host";
+  // A trailing dot names the same host (`localhost.` is loopback), so it is judged without it.
+  if (NOT_LIVE_HOST.test(url.hostname.replace(/\.$/, ""))) return "not a public host";
   return null;
 }
 
