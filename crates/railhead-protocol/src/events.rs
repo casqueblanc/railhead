@@ -12,7 +12,7 @@ use crate::rules::{IdKind, require_id, require_positive};
 
 /// The newest event schema version this crate reads. It reads every version from 1 to this; any
 /// other version is refused, never guessed at.
-pub const EVENT_SCHEMA_VERSION: u64 = 2;
+pub const EVENT_SCHEMA_VERSION: u64 = 3;
 
 /// True when this crate reads events of schema version `v`.
 #[must_use]
@@ -141,6 +141,16 @@ pub enum UnreportedOutcome {
     TimedOut,
 }
 
+/// Why the train stopped keeping a held attempt for an approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldExpiryReason {
+    /// It waited longer than the train keeps a held attempt.
+    TimedOut,
+    /// Newer held attempts in the repository filled the train's bound, and it was the oldest.
+    OverLimit,
+}
+
 /// The classification of a conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -267,6 +277,9 @@ pub enum EventPayload {
     /// A check attempt ended without a report.
     #[serde(rename = "train.unreported")]
     TrainUnreported(TrainUnreported),
+    /// The train stopped keeping a held attempt nobody approved.
+    #[serde(rename = "train.held_expired")]
+    TrainHeldExpired(TrainHeldExpired),
 }
 
 /// Who may record an event type: `HUMAN_ONLY_EVENTS`, `AGENT_ONLY_EVENTS`, `SYSTEM_ONLY_EVENTS`.
@@ -309,6 +322,7 @@ impl EventPayload {
             Self::TrainHeld(_) => "train.held",
             Self::CheckApproved(_) => "check.approved",
             Self::TrainUnreported(_) => "train.unreported",
+            Self::TrainHeldExpired(_) => "train.held_expired",
         }
     }
 
@@ -344,6 +358,7 @@ impl EventPayload {
             | Self::TrainUnreported(_)
             | Self::ClaimMerged(_)
             | Self::ClaimReleased(_) => 2,
+            Self::TrainHeldExpired(_) => 3,
         }
     }
 
@@ -369,7 +384,8 @@ impl EventPayload {
             | Self::TrainIntent(_)
             | Self::TrainMain(_)
             | Self::TrainHeld(_)
-            | Self::TrainUnreported(_) => Recorder::System,
+            | Self::TrainUnreported(_)
+            | Self::TrainHeldExpired(_) => Recorder::System,
             Self::IssueFiled(_)
             | Self::ClaimOpened(_)
             | Self::ClaimPushed(_)
@@ -408,7 +424,8 @@ impl EventPayload {
             | Self::TrainMain(_)
             | Self::TrainHeld(_)
             | Self::CheckApproved(_)
-            | Self::TrainUnreported(_) => None,
+            | Self::TrainUnreported(_)
+            | Self::TrainHeldExpired(_) => None,
         }
     }
 
@@ -440,6 +457,7 @@ impl EventPayload {
             Self::TrainHeld(data) => data.validate(),
             Self::CheckApproved(data) => data.validate(),
             Self::TrainUnreported(data) => data.validate(),
+            Self::TrainHeldExpired(data) => data.validate(),
         }
     }
 }

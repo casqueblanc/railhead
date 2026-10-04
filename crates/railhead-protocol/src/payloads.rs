@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::events::{
-    Acceptance, CheckResult, ConflictClass, ConflictRoute, DecisionRef, InboxEntry, MainOutcome,
-    QuestionOption, RefusalReason, ReopenReason, UnreportedOutcome,
+    Acceptance, CheckResult, ConflictClass, ConflictRoute, DecisionRef, HeldExpiryReason,
+    InboxEntry, MainOutcome, QuestionOption, RefusalReason, ReopenReason, UnreportedOutcome,
 };
 use crate::integer::{SafeInteger, nullable, omissible};
 use crate::rules::{
@@ -697,6 +697,26 @@ pub struct TrainUnreported {
 }
 
 impl TrainUnreported {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
+        require_commit(&self.candidate, "candidate")
+    }
+}
+
+/// `train.held_expired`: the train stopped keeping a held attempt nobody approved, so it never
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainHeldExpired {
+    /// The held `chk_` attempt.
+    pub check_run_id: String,
+    /// The candidate commit.
+    pub candidate: String,
+    /// Why the train stopped keeping it.
+    pub reason: HeldExpiryReason,
+}
+
+impl TrainHeldExpired {
     pub(crate) fn validate(&self) -> Result<()> {
         require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
         require_commit(&self.candidate, "candidate")

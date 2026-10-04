@@ -53,6 +53,7 @@ import type {
   CommitSha,
   DecisionId,
   DecisionRef,
+  HeldExpiryReason,
 } from "@railhead/shared/events";
 import type { ClaimPin, EpisodePin } from "../../contracts/claims";
 import { MERGE_PUSH_WINDOW_MS, type CheckDefinition } from "../../contracts/train";
@@ -637,17 +638,24 @@ const RETURNABLE_HELD = `state = 'parked' AND reason = 'check_held'
   AND NOT EXISTS (SELECT 1 FROM train_queue AS later
     WHERE later.claim_id = entry.claim_id AND later.generation > entry.generation)`;
 
+/** A held attempt whose parked pin expired, which the train will no longer run. */
+export interface ExpiredHold {
+  attemptId: CheckRunId;
+  candidate: CommitSha;
+  reason: HeldExpiryReason;
+}
+
 /**
  * Drops the parked held pins that can still return and were parked at or before `parkedBy`, and
  * beyond the newest `keep` the oldest ones, as `held_expired`, and queues each one's merge attempt
  * for discard. The train then no longer holds their attempts, so an approval of one is stale and
- * the checks module may prune it. Returns how many were dropped.
+ * the checks module may prune it. Returns the held attempts they were parked for, oldest last.
  */
 export function expireHeldPins(
   sql: SqlStorage,
   { parkedBy, keep }: { parkedBy: number; keep: number },
   now: number,
-): number {
+): ExpiredHold[] {
   const returnable = sql
     .exec<{
       claim_id: string;
@@ -661,13 +669,38 @@ export function expireHeldPins(
        ORDER BY updated_at DESC, claim_id DESC`,
     )
     .toArray();
-  const expired = returnable.filter((row, index) => index >= keep || row.updated_at <= parkedBy);
-  for (const row of expired) {
+  return returnable.flatMap((row, index): ExpiredHold[] => {
+    const reason = row.updated_at <= parkedBy ? "timed_out" : index >= keep ? "over_limit" : null;
+    if (reason === null) return [];
     const pin = { claimId: row.claim_id, generation: row.generation, commit: row.commit_sha };
+    const held = heldAttemptOf(sql, { pin, episode: row.episode });
     settleEntry(sql, pin, "dropped", "held_expired", now);
     queueHeldDiscard(sql, { pin, episode: row.episode }, now);
-  }
-  return expired.length;
+    return held === null ? [] : [{ ...held, reason }];
+  });
+}
+
+/** The attempt and candidate of the held batch `entry` was parked for, or `null`. */
+function heldAttemptOf(
+  sql: SqlStorage,
+  { pin, episode }: { pin: ClaimPin; episode: number },
+): { attemptId: CheckRunId; candidate: CommitSha } | null {
+  const row = sql
+    .exec<{ attempt_id: string; candidate: string }>(
+      `SELECT attempt_id, candidate FROM train_batches
+       WHERE state = 'failed' AND failure = 'check_held'
+         AND attempt_id IS NOT NULL AND candidate IS NOT NULL
+         AND json_array_length(pins) = 1
+         AND json_extract(pins, '$[0].claimId') = ? AND json_extract(pins, '$[0].generation') = ?
+         AND json_extract(pins, '$[0].commit') = ? AND json_extract(pins, '$[0].episode') = ?
+       ORDER BY batch_id DESC LIMIT 1`,
+      pin.claimId,
+      pin.generation,
+      pin.commit,
+      episode,
+    )
+    .toArray()[0];
+  return row === undefined ? null : { attemptId: row.attempt_id, candidate: row.candidate };
 }
 
 /** When the longest-parked held pin that can still return was parked, or `null`. */

@@ -488,13 +488,20 @@ mod tests {
     fn version_prints_the_crate_and_schema_versions() -> anyhow::Result<()> {
         assert_eq!(
             run_args(&["rh", "version"])?,
-            ("rh 0.1.0 (event schema 2)\n".to_owned(), String::new())
+            (
+                format!(
+                    "rh 0.1.0 (event schema {})\n",
+                    railhead_protocol::EVENT_SCHEMA_VERSION
+                ),
+                String::new()
+            )
         );
         let (json, _) = run_args(&["rh", "version", "--json"])?;
         let envelope: serde_json::Value = serde_json::from_str(&json)?;
         assert_eq!(
             envelope,
-            serde_json::json!({"ok": true, "data": {"version": "0.1.0", "eventSchema": 2},
+            serde_json::json!({"ok": true, "data": {"version": "0.1.0",
+                "eventSchema": railhead_protocol::EVENT_SCHEMA_VERSION},
                 "inbox": null, "next": null})
         );
         Ok(())

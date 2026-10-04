@@ -118,7 +118,7 @@ fn decodes_and_round_trips_one_event_of_every_type() -> TestResult {
         assert_eq!(text(value, "type")?, event.payload.type_name());
         types.insert(event.payload.type_name());
     }
-    assert_eq!(types.len(), 27, "every event type has one fixture");
+    assert_eq!(types.len(), 28, "every event type has one fixture");
     Ok(())
 }
 
@@ -162,8 +162,8 @@ fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestRes
         }
     }
     assert_eq!(
-        newer, 5,
-        "train.held, check.approved, train.unreported, claim.merged and claim.released"
+        newer, 6,
+        "train.held, check.approved, train.unreported, claim.merged, claim.released and train.held_expired"
     );
     Ok(())
 }
