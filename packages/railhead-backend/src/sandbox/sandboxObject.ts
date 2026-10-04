@@ -6,10 +6,10 @@
 // is set that handler refuses everything, and afterwards it is the Git gateway for that policy until
 // the sandbox's deadline or its retirement, whichever comes first: before it mints a token and again
 // before it forwards, the gateway asks this object whether the incarnation is still live. No token is
-// ever placed in the container; the gateway adds one to each request it forwards. Each object serves
-// one incarnation behind a `SandboxFence` (see `fence.ts`), which also enforces each command's
-// timeout. Command output is read as a stream and bounded here, before it crosses RPC (see
-// `output.ts`).
+// ever placed in the container; the gateway adds one to each request it forwards, and the handler
+// revokes it once that exchange ends. Each object serves one incarnation behind a `SandboxFence`
+// (see `fence.ts`), which also enforces each command's timeout. Command output is read as a stream
+// and bounded here, before it crosses RPC (see `output.ts`).
 //
 // `ContainerProxy` is the SDK's entrypoint that carries those requests to the handler; the Worker
 // exports it beside this class.
@@ -315,20 +315,114 @@ RailheadSandbox.outbound = () =>
   new Response("railhead sandbox gateway refused this request: policy\n", { status: 403 });
 
 RailheadSandbox.outboundHandlers = {
-  [GIT_GATEWAY]: (request: Request, env: Env, ctx: { containerId: string; params?: unknown }) =>
-    serveGitGateway(request, parseSandboxGrant(ctx.params), {
-      // The object whose container sent the request: its fence says whether the grant still holds.
-      current: (expiresAt) =>
-        env.SANDBOX.get(env.SANDBOX.idFromString(ctx.containerId)).railheadGrantCurrent(expiresAt),
-      mint: async (repo, scope) => {
-        using handle = await env.ARTIFACTS.get(repo);
-        const token = await handle.createToken(scope, TOKEN_TTL_SECONDS);
-        return token.plaintext;
-      },
-      fetch: (forwarded) => fetch(forwarded),
-      now: Date.now,
-    }),
+  [GIT_GATEWAY]: async (
+    request: Request,
+    env: Env,
+    ctx: { containerId: string; params?: unknown },
+  ) => {
+    // Every token minted for this request, each revoked once its exchange ends, so none outlives
+    // it: main's ref treats a live write token it did not mint as another writer (`mainRef.ts`).
+    const minted: MintedToken[] = [];
+    let forwarded = false;
+    const revoke = () => revokeMinted(env.ARTIFACTS, minted);
+    let response: Response;
+    try {
+      response = await serveGitGateway(request, parseSandboxGrant(ctx.params), {
+        // The object whose container sent the request: its fence says whether the grant still holds.
+        current: (expiresAt) =>
+          env.SANDBOX.get(env.SANDBOX.idFromString(ctx.containerId)).railheadGrantCurrent(
+            expiresAt,
+          ),
+        mint: async (repo, scope) => {
+          using handle = await env.ARTIFACTS.get(repo);
+          const token = await handle.createToken(scope, TOKEN_TTL_SECONDS);
+          minted.push({ repo, id: token.id });
+          return token.plaintext;
+        },
+        fetch: (outgoing) => {
+          forwarded = true;
+          return fetch(outgoing);
+        },
+        now: Date.now,
+      });
+    } catch (error) {
+      await revoke();
+      throw error;
+    }
+    if (minted.length === 0) return response;
+    // Refused after minting, or answered without a body: the exchange is already over.
+    if (!forwarded || response.body === null) {
+      await revoke();
+      return response;
+    }
+    return new Response(afterBody(response.body, revoke), response);
+  },
 };
+
+/** A token the gateway minted for one request. */
+interface MintedToken {
+  readonly repo: string;
+  readonly id: string;
+}
+
+/**
+ * Revokes each of `minted`. A revocation that fails is logged by token id and left to expire with
+ * the token's own lifetime: the request it served has already been answered.
+ */
+async function revokeMinted(
+  artifacts: Pick<Env["ARTIFACTS"], "get">,
+  minted: readonly MintedToken[],
+): Promise<void> {
+  for (const { repo, id } of minted) {
+    let revoked = false;
+    try {
+      using handle = await artifacts.get(repo);
+      revoked = await handle.revokeToken(id);
+    } catch {
+      // Logged below, like a refused revocation.
+    }
+    if (!revoked) console.warn(JSON.stringify({ event: "sandbox.token_revoke_failed", id }));
+  }
+}
+
+/**
+ * Replays `body` and runs `end` once it is over: read to its end, failed, or cancelled by the
+ * sandbox. The end of the stream reaches the sandbox only after `end` has settled. A cancel has no
+ * reader left to hold the request open, so its revocation may not finish; the token then expires.
+ */
+function afterBody(
+  body: ReadableStream<Uint8Array>,
+  end: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let ended: Promise<void> | null = null;
+  const finish = (): Promise<void> => (ended ??= end());
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        await finish();
+        controller.error(error);
+        return;
+      }
+      if (chunk.done) {
+        await finish();
+        controller.close();
+      } else {
+        controller.enqueue(chunk.value);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        await finish();
+      }
+    },
+  });
+}
 
 /** The stored count of failed storage deletions, `0` when none is stored. */
 function disposalFailures(value: unknown): number {
