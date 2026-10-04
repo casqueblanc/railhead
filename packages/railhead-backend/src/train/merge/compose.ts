@@ -8,7 +8,9 @@
 // steps until every pin shares a merge base with main, because a full fetch from a repository
 // imported shallow fails (#13). When a pin conflicts, the runner finds the earlier commit it
 // conflicts with and reports the pair with the conflicted paths if the conflict is one the train can
-// classify: text edits on both sides of every path. Any other conflict is `unsupported`.
+// classify: text edits on both sides of every path. Any other conflict is `unsupported`. A reported
+// conflict carries each region's diff3 text within the classifier's bounds; one past them, or whose
+// text cannot be read, is reported without it.
 //
 // `missing_commit`, `unsupported` and a conflict drop pins for good, so each is returned only for a
 // condition Git or Artifacts proved: a pin Artifacts says its fork does not hold, no merge base
@@ -43,6 +45,12 @@ import {
   type SandboxPolicy,
 } from "../../sandbox/policy";
 import {
+  MAX_PATH_LENGTH,
+  MAX_REGION_LENGTH,
+  MAX_REGIONS,
+  type ConflictRegion,
+} from "../classification/classify";
+import {
   CONFLICT_EXIT,
   FETCH_FAILED_EXIT,
   NO_MERGE_BASE_EXIT,
@@ -56,9 +64,12 @@ import {
   parseCommit,
   parseDiscarded,
   parsePartner,
+  parseRegions,
   partnerCommand,
   pushCommand,
+  regionsCommand,
   remoteUrl,
+  type ConflictBlobs,
   type RemoteLocation,
   type UnmergedEntry,
 } from "./script";
@@ -405,7 +416,35 @@ class Run {
     const flagged = parseBinary(binary.exec.stdout, pairs.length);
     if (flagged === null) return failure("infrastructure");
     if (flagged.size > 0) return failure("unsupported");
-    return { kind: "conflict", pins: [partner, pin], paths: paths.map(({ path }) => path) };
+    return {
+      kind: "conflict",
+      pins: [partner, pin],
+      paths: paths.map(({ path }) => path),
+      regions: await this.#regions(paths),
+    };
+  }
+
+  /**
+   * The diff3 regions of `conflicts`, for the classifier, or none when they exceed its bounds or
+   * cannot be read. The conflict stands either way: without its text, the train asks a person.
+   */
+  async #regions(conflicts: readonly TextConflict[]): Promise<ConflictRegion[]> {
+    // Every path has at least one region.
+    if (conflicts.length > MAX_REGIONS) return [];
+    if (conflicts.some(({ path }) => path.length > MAX_PATH_LENGTH)) return [];
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    const step = await this.#exec((seconds) => regionsCommand(nonce, conflicts, seconds));
+    if (step.kind === "ended" || step.exec.exitCode !== 0 || step.exec.truncated) return [];
+    const printed = parseRegions(step.exec.stdout, nonce, conflicts.length);
+    if (printed === null || printed.length > MAX_REGIONS) return [];
+    const regions: ConflictRegion[] = [];
+    for (const { file, base, ours, theirs } of printed) {
+      const path = conflicts[file]?.path;
+      if (path === undefined) return [];
+      if ([base, ours, theirs].some((side) => side.length > MAX_REGION_LENGTH)) return [];
+      regions.push({ path, base, ours, theirs });
+    }
+    return regions;
   }
 
   /**
@@ -436,10 +475,8 @@ class Run {
   }
 }
 
-interface TextConflict {
+interface TextConflict extends ConflictBlobs {
   path: string;
-  ours: string;
-  theirs: string;
 }
 
 /**
@@ -458,10 +495,11 @@ function textConflicts(entries: readonly UnmergedEntry[]): TextConflict[] | null
   if (byPath.size === 0 || byPath.size > MAX_CONFLICT_PATHS) return null;
   const conflicts: TextConflict[] = [];
   for (const [path, stages] of byPath) {
+    const base = stages.get(1);
     const ours = stages.get(2);
     const theirs = stages.get(3);
-    if (!stages.has(1) || ours === undefined || theirs === undefined) return null;
-    conflicts.push({ path, ours: ours.object, theirs: theirs.object });
+    if (base === undefined || ours === undefined || theirs === undefined) return null;
+    conflicts.push({ path, base: base.object, ours: ours.object, theirs: theirs.object });
   }
   return conflicts;
 }

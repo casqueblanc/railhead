@@ -41,6 +41,7 @@ const HOST =
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const REF = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/[a-z]+$/;
 const PREFIX = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/$/;
+const NONCE = /^[a-z0-9]{16,64}$/;
 
 /** Where a repository's Git remote lives: the Artifacts host and namespace. */
 export interface RemoteLocation {
@@ -188,6 +189,45 @@ export function binaryCommand(
   );
 }
 
+/** The blobs of one conflicted path: its merge base, ours and theirs. */
+export interface ConflictBlobs {
+  base: string;
+  ours: string;
+  theirs: string;
+}
+
+/**
+ * For each conflicted path, prints `<nonce> file <index>`, then either `<nonce> opaque` or each
+ * diff3 region of `git merge-file`: `<<<<<<< <nonce>`, ours, `||||||| <nonce>`, base, `=======`,
+ * theirs, `>>>>>>> <nonce>`. Ends with `<nonce> end`. Repository text cannot hold the nonce, which
+ * is chosen after it was committed, so only the `=======` separator could be forged; a path whose
+ * blobs hold a line starting with it is opaque. Exits 2 when a step fails.
+ */
+export function regionsCommand(
+  nonce: string,
+  files: readonly ConflictBlobs[],
+  seconds: number,
+): string {
+  const mark = checkedNonce(nonce);
+  return script(seconds, [
+    "regions() {",
+    '  step git cat-file blob "$2" > .git/rh-base || fail 2',
+    '  step git cat-file blob "$3" > .git/rh-ours || fail 2',
+    '  step git cat-file blob "$4" > .git/rh-theirs || fail 2',
+    `  echo "${mark} file $1"`,
+    `  if grep -q '^=======' .git/rh-base .git/rh-ours .git/rh-theirs; then echo "${mark} opaque"; return; fi`,
+    `  step git merge-file -p --diff3 -L ${mark} -L ${mark} -L ${mark} .git/rh-ours .git/rh-base .git/rh-theirs > .git/rh-merged`,
+    // Git's exit status is the number of conflicts, or 255 when it failed.
+    '  r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ "$r" -lt 128 ] || exit 2',
+    `  sed -n '/^<<<<<<< ${mark}/,/^>>>>>>> ${mark}/p' .git/rh-merged || exit 2`,
+    "}",
+    ...files.map(
+      (file, index) => `regions ${index} ${sha(file.base)} ${sha(file.ours)} ${sha(file.theirs)}`,
+    ),
+    `echo '${mark} end'`,
+  ]);
+}
+
 /** Pushes `commit` to `ref` under the attempt's candidate prefix of `url`. */
 export function pushCommand(url: string, commit: string, ref: string, seconds: number): string {
   if (!REF.test(ref)) throw new Error("invalid candidate ref");
@@ -236,6 +276,11 @@ function script(seconds: number, lines: readonly string[]): string {
 
 function sha(value: string): string {
   if (!SHA.test(value)) throw new Error("invalid object ID");
+  return value;
+}
+
+function checkedNonce(value: string): string {
+  if (!NONCE.test(value)) throw new Error("invalid region nonce");
   return value;
 }
 
@@ -297,6 +342,55 @@ export function parseBinary(stdout: string, count: number): Set<number> | null {
     if (match[2] === "-" || match[3] === "-") binary.add(index);
   }
   return binary;
+}
+
+/** One diff3 region `regionsCommand` printed. Repository content: untrusted. */
+export interface PrintedRegion {
+  /** The index of the conflicted path it belongs to. */
+  file: number;
+  base: string;
+  ours: string;
+  theirs: string;
+}
+
+/**
+ * Reads `regionsCommand`'s output for `count` paths and `nonce`: every region, in order, or `null`
+ * when a path is opaque or has no region, or the output is not what the command prints.
+ */
+export function parseRegions(stdout: string, nonce: string, count: number): PrintedRegion[] | null {
+  const lines = stdout.split("\n");
+  if (lines.pop() !== "" || lines.pop() !== `${nonce} end`) return null;
+  const regions: PrintedRegion[] = [];
+  let file = -1;
+  let region: PrintedRegion | null = null;
+  let side: "ours" | "base" | "theirs" = "ours";
+  for (const line of lines) {
+    // Git ends a marker line with CRLF in a file that uses CRLF.
+    const marker = line.endsWith("\r") ? line.slice(0, -1) : line;
+    if (region === null) {
+      if (marker === `${nonce} file ${file + 1}`) {
+        // The path before this one had no region.
+        if (file >= 0 && regions.at(-1)?.file !== file) return null;
+        file += 1;
+      } else if (marker === `<<<<<<< ${nonce}` && file >= 0) {
+        region = { file, base: "", ours: "", theirs: "" };
+        side = "ours";
+      } else {
+        return null;
+      }
+    } else if (side === "ours" && marker === `||||||| ${nonce}`) {
+      side = "base";
+    } else if (side === "base" && marker === "=======") {
+      side = "theirs";
+    } else if (side === "theirs" && marker === `>>>>>>> ${nonce}`) {
+      regions.push(region);
+      region = null;
+    } else {
+      region[side] += `${line}\n`;
+    }
+  }
+  if (region !== null || file !== count - 1 || regions.at(-1)?.file !== file) return null;
+  return regions;
 }
 
 /** Reads how many refs `discardCommand` deleted, or `null`. */

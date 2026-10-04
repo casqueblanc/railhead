@@ -157,6 +157,12 @@ export interface ClaimsPort {
    */
   readyPin(claimId: ClaimId): ReadyPin | null;
   /**
+   * The title of the claim's issue, which the conflict classifier reads as what the claim's agent
+   * meant to do, or `null` for an unknown claim or a missing module. Untrusted text: never log it.
+   * It only reads storage.
+   */
+  intent(claimId: ClaimId): string | null;
+  /**
    * Merges the claim of each landed pin that is still ready with that pin in that episode, appends
    * `claim.merged` for it and records `main`, the commit the landing published, as each holder's
    * closed claim. A pin whose claim was reopened, re-pinned or taken over is left as it is. A merged
