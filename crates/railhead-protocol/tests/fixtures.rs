@@ -114,11 +114,11 @@ fn decodes_and_round_trips_one_event_of_every_type() -> TestResult {
         assert_eq!(text(value, "type")?, event.payload.type_name());
         types.insert(event.payload.type_name());
     }
-    assert_eq!(types.len(), 25, "every event type has one fixture");
+    assert_eq!(types.len(), 26, "every event type has one fixture");
     Ok(())
 }
 
-/// The event types a schema version 1 reader, such as `rh` and the board before held checks,
+/// The event types a schema version 1 reader, such as `rh` and the board before held checks and merges,
 /// decodes. It refuses any `v` other than 1 first, then any type outside this list as a shape error.
 const VERSION_1_TYPES: [&str; 22] = [
     "agent.invited",
@@ -157,7 +157,7 @@ fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestRes
             newer += 1;
         }
     }
-    assert_eq!(newer, 3, "train.held, check.approved and train.unreported");
+    assert_eq!(newer, 4, "train.held, check.approved, train.unreported and claim.merged");
     Ok(())
 }
 

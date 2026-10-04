@@ -49,6 +49,9 @@ const SYNC = new Map<string, unknown>([
   ["claims.workingGeneration", null],
   ["claims.workingEpisode", null],
   ["claims.readyPin", null],
+  ["claims.merged", "throws"],
+  // No claim has a current generation while claims is missing, so nothing is reopened.
+  ["claims.reopenMerged", undefined],
   ["claims.holder", null],
   ["decisions.askSystem", unavailable("decisions")],
   ["decisions.withdraw", "throws"],

@@ -572,8 +572,9 @@ impl Fake {
                     .shown(&mut state, agent)
                     .and_then(|index| state.claims.get(index))
                     .map(|claim| self.view(claim));
+                // The fake reports no closed claim; `Status` models what the driver sees instead.
                 Ok(success(
-                    &json!({"agent": Self::agent_view(agent), "claim": claim}),
+                    &json!({"agent": Self::agent_view(agent), "claim": claim, "closed": null}),
                     &Self::digest(&state, agent),
                 ))
             }

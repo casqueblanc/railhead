@@ -14,6 +14,7 @@ import type {
 } from "../../packages/railhead-shared/src/events";
 import {
   SYNTH_ADAPTATION,
+  SYNTH_CLAIMS,
   SYNTH_GATEWAY,
   SYNTH_OWNER,
   SYNTH_TRAIN,
@@ -210,4 +211,11 @@ export const moveMain = (
   type: "train.main",
   actor: SYNTH_TRAIN,
   data: { intentId, outcome, main },
+});
+
+/** The backend closing a claim whose pin landed as `commit` on main. */
+export const merge = (claimId: ClaimId, commit: CommitSha, generation = 1): SyntheticStep => ({
+  type: "claim.merged",
+  actor: SYNTH_CLAIMS,
+  data: { claimId, generation, commit },
 });

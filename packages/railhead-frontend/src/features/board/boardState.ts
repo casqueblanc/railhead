@@ -58,10 +58,12 @@ export type InboxDelivery = "queued" | "delivered" | "acknowledged";
 export type AgentStatus = "awaiting_confirmation" | "confirmed" | "revoked";
 
 /**
- * Where a claim stands. A ready or landed claim returns to `working` when its agent pushes again,
- * as the losing side of a `redo` conflict or a rework does; only an expired claim takes no push.
+ * Where a claim stands. A ready claim returns to `working` when its agent pushes again, as the
+ * losing side of a `redo` conflict or a rework does. A claim whose pin landed is `merged`, and an
+ * expired one waits for a successor; neither takes a push. A newer decision reopens a ready or
+ * merged claim to `working` (`claim.reopened`).
  */
-export type ClaimPhase = "working" | "ready" | "landed" | "expired";
+export type ClaimPhase = "working" | "ready" | "merged" | "expired";
 
 /** An invite, and the agent that joined with it once one has. */
 export interface InviteState {
@@ -120,6 +122,11 @@ export interface ClaimState {
   pushes: readonly ClaimPush[];
   /** The latest refusal, which names the generation the refused caller held. */
   refusal: { generation: number; reason: RefusalReason } | null;
+  /**
+   * The phase a newer decision reopened the claim from, until its next `ready` or takeover, or
+   * `null` when it was not reopened since.
+   */
+  reopened: "ready" | "merged" | null;
   /** Intents that landed this claim on main, oldest first. */
   landings: readonly IntentId[];
   /**
@@ -717,6 +724,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           ready: null,
           pushes: [],
           refusal: null,
+          reopened: null,
           landings: [],
           adaptations: [],
         }),
@@ -726,7 +734,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       const { claimId, generation, ref, from, to } = event.data;
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
-      check(claim.phase !== "expired", `claim ${claimId} cannot take a push while expired`);
+      check(
+        claim.phase !== "expired" && claim.phase !== "merged",
+        `claim ${claimId} cannot take a push while ${claim.phase}`,
+      );
       const pushes = [...claim.pushes, { seq, ref, from, to }].slice(-MAX_LANE_PUSHES);
       return {
         ...state,
@@ -751,6 +762,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           ...claim,
           phase: "ready",
           ready: { commit, decisions },
+          reopened: null,
         }),
       };
     }
@@ -767,12 +779,26 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       const { claimId, generation, decisions } = event.data;
       const claim = known(state.claims, claimId, "claim");
       currentGeneration(claim, generation);
-      check(claim.phase === "ready", `claim ${claimId} cannot reopen while ${claim.phase}`);
+      const from = claim.phase === "ready" || claim.phase === "merged" ? claim.phase : null;
+      if (from === null)
+        throw new LogInconsistency(`claim ${claimId} cannot reopen while ${claim.phase}`);
       for (const ref of decisions) knownDecisionVersion(state, ref);
       return {
         ...endHolds(state, draft, [claimId], "dropped", seq),
-        claims: draft.put(state.claims, claimId, { ...claim, phase: "working", ready: null }),
+        claims: draft.put(state.claims, claimId, {
+          ...claim,
+          phase: "working",
+          ready: null,
+          reopened: from,
+        }),
       };
+    }
+    case "claim.merged": {
+      const { claimId, generation } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      currentGeneration(claim, generation);
+      check(claim.phase === "ready", `claim ${claimId} merged while ${claim.phase}`);
+      return { ...state, claims: draft.put(state.claims, claimId, { ...claim, phase: "merged" }) };
     }
     case "claim.expired": {
       const { claimId, generation } = event.data;
@@ -798,6 +824,7 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
           generation,
           phase: "working",
           ready: null,
+          reopened: null,
         }),
       };
     }
@@ -980,10 +1007,10 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
       if (landing.kind === "landed") {
         for (const claimId of intent.claims) {
           const claim = known(claims, claimId, "claim");
+          // The phase changes only on `claim.merged`: a pin readied again while this landing was
+          // published is sent back to the train, and its claim stays ready.
           claims = draft.put(claims, claimId, {
             ...claim,
-            // A claim that moved on since its ready, such as a reassigned one, keeps its phase.
-            phase: claim.phase === "ready" ? "landed" : claim.phase,
             landings: draft.append(claim.landings, intentId),
           });
         }

@@ -10,6 +10,7 @@ import {
   inbox,
   intend,
   moveMain,
+  merge,
   push,
   ready,
   sizeDecision,
@@ -55,5 +56,7 @@ export const mixedBatch = syntheticLog("Synthetic two-claim batch with mixed dep
     "chk_synth30",
   ),
   moveMain("int_synth30", "updated", synthCommit(3)),
+  merge(UPLOAD.atlasClaim, synthCommit(3)),
+  merge(UPLOAD.birchClaim, synthCommit(3)),
   adapt(UPLOAD.atlasClaim, "int_synth30", sizeDecision(1)),
 ]);

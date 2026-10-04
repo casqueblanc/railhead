@@ -1,4 +1,4 @@
-//! `rh sync`, `rh ack` and `rh ask` end to end.
+//! `rh status`, `rh sync`, `rh ack` and `rh ask` end to end.
 //!
 //! Each test runs the built binary against a temporary identity store and a wiremock server that
 //! answers with the A01 wire fixtures. `rh ask` runs inside a Git repository configured as the
@@ -2466,5 +2466,123 @@ async fn a_wait_that_fails_after_asking_names_the_question_to_resume() -> anyhow
     // Each wait failed at its one poll; nothing was asked again.
     assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 2);
     assert_eq!(acks(&world).await, 0);
+    Ok(())
+}
+
+/// `rh status` and `rh --json status` as `atlas` against the `status` fixture exchange `name`,
+/// with the `closed` value that exchange sends.
+async fn status_from(name: &str) -> anyhow::Result<(Run, Run, Value)> {
+    let world = world().await?;
+    answer(&world, "GET", "/status", fixture("status.json", name)?).await;
+    let closed = exchange("status.json", name)?
+        .pointer("/response/body/data/closed")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{name:?} has no closed field"))?;
+    Ok((
+        rh(&world, &["status"])?,
+        rh(&world, &["--json", "status"])?,
+        closed,
+    ))
+}
+
+#[tokio::test]
+async fn status_shows_a_landed_claim_as_merged_at_its_commit() -> anyhow::Result<()> {
+    let (text, json, closed) =
+        status_from("the agent's last claim merged with the landed main commit").await?;
+    assert_eq!(
+        (text.code, text.stdout.as_str(), text.stderr.as_str()),
+        (
+            Some(0),
+            "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\n\
+             last claim \"clm_42abcd\" on issue \"iss_upload1\", \
+             merged at \"cccccccccccccccccccccccccccccccccccccccc\"\nnext: rh work\n",
+            ""
+        )
+    );
+    assert_eq!(json.code, Some(0), "{}", json.stderr);
+    assert_eq!(json.at("/data/closed")?, closed);
+    assert_eq!(json.at("/data/closed/reason/kind")?, json!("merged"));
+    assert_eq!(
+        json.at("/data/closed/reason/commit")?,
+        json!("cccccccccccccccccccccccccccccccccccccccc")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_shows_an_expired_claim() -> anyhow::Result<()> {
+    let (text, json, closed) = status_from("the agent's last claim expired").await?;
+    assert_eq!(
+        (text.code, text.stdout.as_str()),
+        (
+            Some(0),
+            "agent \"atlas\" (\"agt_atlas01\"), confirmed\nno claim\n\
+             last claim \"clm_42abcd\" on issue \"iss_upload1\", expired\nnext: rh work\n"
+        )
+    );
+    assert_eq!(json.at("/data/closed")?, closed);
+    assert_eq!(json.at("/data/closed/reason")?, json!({"kind": "expired"}));
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_shows_a_claim_taken_over_beside_the_active_one() -> anyhow::Result<()> {
+    let (text, json, closed) =
+        status_from("the agent's last claim was taken over, and it holds a new one").await?;
+    assert_eq!(text.code, Some(0), "{}", text.stderr);
+    let lines: Vec<&str> = text.stdout.lines().collect();
+    assert_eq!(
+        lines.get(..3),
+        Some(
+            &[
+                "agent \"atlas\" (\"agt_atlas01\"), confirmed",
+                "claim \"clm_42abcd\"",
+                "issue \"iss_upload1\", working, generation 1",
+            ][..]
+        )
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&"last claim \"clm_41abcd\" on issue \"iss_upload1\", taken over")
+    );
+    assert_eq!(json.at("/data/closed")?, closed);
+    assert_eq!(
+        json.at("/data/closed/reason")?,
+        json!({"kind": "taken_over"})
+    );
+    assert_eq!(json.at("/data/claim/claimId")?, json!("clm_42abcd"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_without_a_closed_claim_prints_no_last_claim() -> anyhow::Result<()> {
+    let (text, json, closed) = status_from("an agent without a claim").await?;
+    assert_eq!(closed, Value::Null);
+    assert_eq!(text.code, Some(0), "{}", text.stderr);
+    assert!(!text.stdout.contains("last claim"), "{}", text.stdout);
+    assert_eq!(
+        json.json()?.pointer("/data/closed"),
+        Some(&Value::Null),
+        "{}",
+        json.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_refuses_an_unknown_closed_reason() -> anyhow::Result<()> {
+    let world = world().await?;
+    let mut body = exchange("status.json", "the agent's last claim expired")?
+        .pointer("/response/body")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no body"))?;
+    if let Some(reason) = body.pointer_mut("/data/closed/reason") {
+        *reason = json!({"kind": "released\nlast claim forged"});
+    }
+    answer(&world, "GET", "/status", json_response(200, &body)).await;
+    let run = rh(&world, &["--json", "status"])?;
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert_eq!(run.at("/error/code")?, json!("malformed_response"));
+    assert!(!run.stdout.contains("forged"), "{}", run.stdout);
     Ok(())
 }

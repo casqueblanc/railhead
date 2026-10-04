@@ -32,6 +32,8 @@ export const SYNTH_OWNER: Actor = { kind: "human", id: "usr_synthowner" };
 export const SYNTH_TRAIN: Actor = { kind: "system", id: "sys_train" };
 /** The synthetic adaptation recorder. */
 export const SYNTH_ADAPTATION: Actor = { kind: "system", id: "sys_adaptation" };
+/** The synthetic claims module. */
+export const SYNTH_CLAIMS: Actor = { kind: "system", id: "sys_claims" };
 /** The synthetic join service. */
 export const SYNTH_GATEWAY: Actor = { kind: "system", id: "sys_gateway" };
 /** The time of a synthetic log's first event: 1 October 2026, 00:00 UTC. */

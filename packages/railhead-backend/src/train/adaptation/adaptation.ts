@@ -31,7 +31,7 @@
 //
 // Each adaptation recorded is announced to the board as a `claim.adapted` event, because the board
 // cannot derive per-claim dependencies from the intent's combined decisions. The landing runs inside
-// the train's transaction, which appends no events, so a recorded adaptation is only marked
+// the train's log transaction, inside which no other can start, so a recorded adaptation is only marked
 // unannounced there and the Repo's alarm is asked to run at once; `resume` appends the events in its
 // own log transaction, at most `MAX_ANNOUNCE_PER_CALL` per call, and marks them announced in the same
 // transaction. The event states a fact about one decision version, so a later supersession does not

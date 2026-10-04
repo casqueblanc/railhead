@@ -143,8 +143,11 @@ async function runSessionCommand(
       if (!view.ok) return view;
       const claim = await ports.claims.activeClaim(agent);
       if (!claim.ok) return claim;
-      if (claim.value === null) return ok({ agent: view.value, claim: null });
-      return located(remotes, ok({ agent: view.value, claim: claim.value }));
+      // Read after the active claim, whose read may have just expired it.
+      const closed = await ports.claims.lastClosed(agent);
+      if (!closed.ok) return closed;
+      if (claim.value === null) return ok({ agent: view.value, claim: null, closed: closed.value });
+      return located(remotes, ok({ agent: view.value, claim: claim.value, closed: closed.value }));
     }
     case "work":
       return located(remotes, await ports.claims.work(agent));

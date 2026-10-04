@@ -41,9 +41,13 @@ export const unavailableSessions: SessionsPort = {
   authenticate: refuse("sessions"),
 };
 
-/** Claims while its module is missing: no Git request is authorized, and nothing is owed. */
+/**
+ * Claims while its module is missing: no Git request is authorized, nothing is owed, and no landing
+ * can close its claims, so it rolls back.
+ */
 export const unavailableClaims: ClaimsPort = {
   activeClaim: refuse("claims"),
+  lastClosed: refuse("claims"),
   work: refuse("claims"),
   claim: refuse("claims"),
   ready: refuse("claims"),
@@ -52,6 +56,10 @@ export const unavailableClaims: ClaimsPort = {
   workingGeneration: () => null,
   workingEpisode: () => null,
   readyPin: () => null,
+  merged: () => {
+    throw new UnavailableError("claims");
+  },
+  reopenMerged: () => {},
   holder: () => null,
   reopen: () => {
     throw new UnavailableError("claims");

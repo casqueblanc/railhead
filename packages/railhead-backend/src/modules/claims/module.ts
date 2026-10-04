@@ -82,6 +82,17 @@
 // again just before that claim's sweep. `ready` answers from the stored claim after its sweep:
 // a pin a newer decision superseded meanwhile is reopened and refused, never reported as pinned.
 //
+// When the train lands a pin, `merged` closes its claim in the landing's transaction, provided the
+// claim is still ready with that pin in that episode. A merged claim takes no push and no longer
+// counts as its agent's, so the agent's next `work` gets a new issue. It keeps its generation, so a
+// decision version recorded after the landing still queues its holder an inbox item, and the
+// decisions module then calls `reopenMerged` in that transaction. A version that supersedes the
+// merged pin reopens the claim to working, appending `claim.reopened`, if its holder holds no other
+// active claim; otherwise the claim waits, and the transaction that closes the holder's active claim
+// (a merge, an expiry or a takeover of a lapsed allocation) reopens the one that waited longest.
+// Each closing, a merge, an expiry or a takeover, records for the agent that held the claim why it
+// closed, in the same transaction, and `lastClosed` answers it. Only the latest is kept per agent.
+//
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
@@ -113,6 +124,7 @@ import {
   beginRevocation,
   claimById,
   claimOfIssue,
+  closedOf,
   dueRevocations,
   expireClaim,
   insertIntent,
@@ -121,6 +133,8 @@ import {
   issueStatus,
   lapsedClaims,
   lostBarriers,
+  markReworkWaiting,
+  mergeClaim,
   migrateClaims,
   nextClaimsDeadline,
   nextOpenIssue,
@@ -129,14 +143,16 @@ import {
   openClaim,
   pinReady,
   reassignClaim,
+  recordClosed,
   recordForkBase,
   recordRevocation,
   releasePendingBefore,
   renewLease,
-  reopenReady,
+  reopenClaim,
   replaceLostBarrier,
   type ClaimRow,
   type RevocationOutcome,
+  waitingRework,
 } from "./store";
 
 /** Limits a test may tighten. */
@@ -260,12 +276,34 @@ export function createClaims(
     return held;
   };
 
-  /** `hold` on the agent's active claim, in a transaction of its own; `null` without one. */
+  /**
+   * `hold` on the agent's active claim, in a transaction of its own; `null` without one. An expiry
+   * it records may reopen a merged claim of the agent waiting for rework, which is answered instead.
+   */
   const holdActive = (agentId: AgentId): ClaimRow | null =>
     log.transaction((tx) => {
       const row = activeClaimOf(tx.sql, agentId);
-      return row === null ? null : hold(tx, row);
+      if (row === null) return null;
+      const held = hold(tx, row);
+      return held.state === "expired" ? (activeClaimOf(tx.sql, agentId) ?? held) : held;
     }).value;
+
+  /**
+   * Expires a working claim, appends `claim.expired`, records the expiry as its holder's closed
+   * claim and reopens a merged claim of the holder waiting for rework. Runs in the caller's
+   * transaction.
+   */
+  const expire = (tx: EventTransaction, row: ClaimRow, now: number): void => {
+    if (!expireClaim(tx.sql, row.claimId, row.generation, now)) {
+      throw new Error("a working claim read in this transaction could not be expired");
+    }
+    recordClosed(tx.sql, row.agentId, row, { kind: "expired" }, now);
+    tx.append(CLAIMS_ACTOR, {
+      type: "claim.expired",
+      data: { claimId: row.claimId, generation: row.generation },
+    });
+    reopenWaiting(tx, row.agentId);
+  };
 
   /** Expires every claim whose lease lapsed, up to a batch, in one transaction. */
   const expireLapsed = (): void => {
@@ -400,12 +438,15 @@ export function createClaims(
     }
     const generation = row.generation + 1;
     if (row.state === "expired") {
+      recordClosed(tx.sql, row.agentId, row, { kind: "taken_over" }, now);
       tx.append(CLAIMS_ACTOR, {
         type: "claim.reassigned",
         data: { claimId: row.claimId, from: row.agentId, to: agent.agentId, generation },
       });
       ports().decisions.transfer(tx, { agentId: agent.agentId, claimId: row.claimId, generation });
     }
+    // A lapsed allocation still counted as its former holder's until now.
+    reopenWaiting(tx, row.agentId);
     wakeForDeadline(tx.sql);
     const taken = activeClaimOf(tx.sql, agent.agentId);
     if (taken?.claimId !== row.claimId) throw new Error("a reassigned claim cannot be read back");
@@ -484,16 +525,26 @@ export function createClaims(
    */
   const settle = (tx: EventTransaction, row: ClaimRow): ClaimRow => {
     if (row.state !== "ready") return row;
-    const decisions = ports().decisions.currentVersions(row.claimId);
-    if (decisions === null) return row;
-    if (row.readyDecisions !== null && sameVersions(row.readyDecisions, decisions)) return row;
-    return reopenAs(tx, row, "decision_superseded", decisions);
+    const decisions = superseding(row);
+    return decisions === null ? row : reopenAs(tx, row, "decision_superseded", decisions);
   };
 
   /**
-   * Returns `row`, a ready claim read in the caller's transaction, to working for `reason`,
-   * appending `claim.reopened` with `decisions`, its current versions, and answers the claim as it
-   * now stands. Runs in the caller's transaction.
+   * The current decision versions when they supersede the pin of `row`, or `null` when they are
+   * the versions it was pinned under or are unknown. A pin whose stored versions cannot be read is
+   * superseded.
+   */
+  const superseding = (row: ClaimRow): DecisionRef[] | null => {
+    const decisions = ports().decisions.currentVersions(row.claimId);
+    if (decisions === null) return null;
+    if (row.readyDecisions !== null && sameVersions(row.readyDecisions, decisions)) return null;
+    return decisions;
+  };
+
+  /**
+   * Returns `row`, a ready or merged claim read in the caller's transaction, to working for
+   * `reason`, appending `claim.reopened` with `decisions`, its current versions, and answers the
+   * claim as it now stands. Runs in the caller's transaction.
    */
   const reopenAs = (
     tx: EventTransaction,
@@ -501,9 +552,13 @@ export function createClaims(
     reason: ReopenReason,
     decisions: readonly DecisionRef[],
   ): ClaimRow => {
+    const from = row.state === "ready" || row.state === "merged" ? row.state : null;
     const lease = clock() + CLAIM_LEASE_MS;
-    if (!reopenReady(tx.sql, row.claimId, row.generation, row.episode, lease)) {
-      throw new Error("a ready claim read in this transaction could not be reopened");
+    if (
+      from === null ||
+      !reopenClaim(tx.sql, row.claimId, row.generation, row.episode, from, lease)
+    ) {
+      throw new Error("a claim read in this transaction could not be reopened");
     }
     tx.append(CLAIMS_ACTOR, {
       type: "claim.reopened",
@@ -520,6 +575,32 @@ export function createClaims(
     if (reopened === null) throw new Error("a reopened claim cannot be read back");
     return reopened;
   };
+
+  /**
+   * Reopens `row`, a merged claim whose pin the current decision versions superseded, when its
+   * holder holds no active claim, and otherwise marks it waiting until the holder holds none. Any
+   * other claim is left as it is. Runs in the caller's transaction.
+   */
+  const reviveMerged = (tx: EventTransaction, row: ClaimRow): void => {
+    if (row.state !== "merged") return;
+    const decisions = superseding(row);
+    if (decisions === null) return;
+    if (activeClaimOf(tx.sql, row.agentId) === null) {
+      reopenAs(tx, row, "decision_superseded", decisions);
+    } else {
+      markReworkWaiting(tx.sql, row.claimId, row.generation, clock());
+    }
+  };
+
+  /**
+   * Reopens the agent's merged claim that has waited longest for rework, unless the agent holds an
+   * active claim. Runs in the transaction that closed the agent's last one.
+   */
+  function reopenWaiting(tx: EventTransaction, agentId: AgentId): void {
+    if (activeClaimOf(tx.sql, agentId) !== null) return;
+    const waiting = waitingRework(tx.sql, agentId);
+    if (waiting !== null) reviveMerged(tx, waiting);
+  }
 
   /** `settle` on the stored claim, in a transaction of its own; `null` for an unknown claim. */
   const settleNow = (claimId: ClaimId): ClaimRow | null =>
@@ -617,6 +698,12 @@ export function createClaims(
       return finished.ok ? ok(finished.value.claim) : finished;
     },
 
+    async lastClosed(agent) {
+      const foreign = refuseForeign(agent);
+      if (foreign !== null) return foreign;
+      return ok(closedOf(context.storage.sql, agent.agentId));
+    },
+
     async work(agent) {
       const foreign = refuseForeign(agent);
       if (foreign !== null) return foreign;
@@ -628,6 +715,9 @@ export function createClaims(
         const held = active === null ? null : hold(tx, active);
         if (held !== null && lapsedAllocation(held, clock())) return lapsedHold();
         if (held !== null && held.state !== "expired") return ok({ row: held, resumed: true });
+        // The expiry just recorded may have reopened a merged claim that waited for rework.
+        const reopened = activeClaimOf(sql, agent.agentId);
+        if (reopened !== null) return ok({ row: reopened, resumed: true });
         const now = clock();
         const takeover = nextTakeover(sql, agent.agentId, now);
         if (takeover !== null) {
@@ -662,9 +752,12 @@ export function createClaims(
         const active = activeClaimOf(sql, agent.agentId);
         const held = active === null ? null : hold(tx, active);
         if (held !== null && lapsedAllocation(held, clock())) return lapsedHold();
-        if (held !== null && held.state !== "expired") {
-          return held.issueId === issueId
-            ? ok({ row: held, resumed: true })
+        // The expiry just recorded may have reopened a merged claim that waited for rework.
+        const holding =
+          held !== null && held.state !== "expired" ? held : activeClaimOf(sql, agent.agentId);
+        if (holding !== null) {
+          return holding.issueId === issueId
+            ? ok({ row: holding, resumed: true })
             : fail("claim_exists", "This agent already holds a claim on another issue.");
         }
         const existing = claimOfIssue(sql, issueId);
@@ -724,6 +817,10 @@ export function createClaims(
     },
 
     currentGeneration(claimId) {
+      // A merged claim is no longer held, but keeps its holder's generation for the decisions that
+      // may reopen it.
+      const row = claimById(context.storage.sql, claimId);
+      if (row?.state === "merged") return row.generation;
       return heldClaim(claimId)?.generation ?? null;
     },
 
@@ -750,8 +847,14 @@ export function createClaims(
       const invalid = invalidReady(claimId, request);
       if (invalid !== null) return invalid;
 
+      // A repeat of the pin that landed, whose first answer was lost, is answered as done.
+      const stored = claimById(context.storage.sql, claimId);
+      if (stored !== null && landedRepeat(stored, agent, request)) {
+        return ok({ claim: view(stored), repeated: true });
+      }
+
       // Refuse what current state already refuses before any call leaves the Repo.
-      const before = standing(claimById(context.storage.sql, claimId), agent, request);
+      const before = standing(stored, agent, request);
       if (before.kind === "refused") return log.transaction((tx) => refuse(tx, before)).value;
 
       // A ready claim may be reopened in the transaction below, so the commit is looked up for a
@@ -875,6 +978,29 @@ export function createClaims(
       };
     },
 
+    merged(tx, landed, main) {
+      if (!isCommitSha(main)) throw new Error("a landing must name the commit it published");
+      const now = clock();
+      for (const pin of landed) {
+        const row = mergeClaim(tx.sql, pin.claimId, pin.generation, pin.episode, pin.commit);
+        if (row === null) continue;
+        recordClosed(tx.sql, row.agentId, row, { kind: "merged", commit: main }, now);
+        tx.append(CLAIMS_ACTOR, {
+          type: "claim.merged",
+          data: { claimId: row.claimId, generation: row.generation, commit: main },
+        });
+        // A version recorded after the batch was checked may already supersede what landed.
+        reviveMerged(tx, row);
+        reopenWaiting(tx, row.agentId);
+      }
+    },
+
+    reopenMerged(tx, claimId) {
+      if (!isId("claim", claimId)) return;
+      const row = claimById(tx.sql, claimId);
+      if (row !== null) reviveMerged(tx, row);
+    },
+
     reopen(tx, pin, episode, reason) {
       const row = claimById(tx.sql, pin.claimId);
       if (
@@ -910,17 +1036,6 @@ export function createClaims(
   };
 }
 
-/** Expires a working claim and appends `claim.expired`. Runs in the caller's transaction. */
-function expire(tx: EventTransaction, row: ClaimRow, now: number): void {
-  if (!expireClaim(tx.sql, row.claimId, row.generation, now)) {
-    throw new Error("a working claim read in this transaction could not be expired");
-  }
-  tx.append(CLAIMS_ACTOR, {
-    type: "claim.expired",
-    data: { claimId: row.claimId, generation: row.generation },
-  });
-}
-
 /**
  * Whether `row` is a working claim whose lease has not lapsed by `now`. A lapsed lease is no longer
  * held, even before anything records the expiry, so neither fence reader answers it.
@@ -939,6 +1054,19 @@ function lapsedHold(): PortFailure {
   return fail(
     "busy",
     "This agent's claim lapsed before its fork opened; repeat the request later.",
+  );
+}
+
+/**
+ * Whether `request` repeats the pin of `row`, a merged claim the agent held at that generation:
+ * the landing answered the first request's pin, so the repeat is done.
+ */
+function landedRepeat(row: ClaimRow, agent: AgentPrincipal, request: ReadyRequest): boolean {
+  return (
+    row.state === "merged" &&
+    row.agentId === agent.agentId &&
+    row.generation === request.generation &&
+    row.readyCommit === request.commit
   );
 }
 

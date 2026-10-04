@@ -1096,15 +1096,25 @@ export function createTrain(
 
   function landBatch(generation: number, batch: BatchRecord, intentId: IntentId): void {
     const now = clock();
-    fenced(generation, () => {
-      const unchecked = orderAsBatch(batch, batchedEntries(sql)).filter(
+    const main = batch.candidate;
+    if (main === null) throw new Error("a landed batch has no candidate");
+    // A log transaction, since closing the landed claims may reopen one and append its event.
+    log.transaction((tx) => {
+      if (!holds(generation)) throw new DriveSuperseded();
+      const entries = orderAsBatch(batch, batchedEntries(sql));
+      const unchecked = entries.filter(
         (entry) => renewed(entry) && !checkedUnder(batch, entry.pin.claimId),
       );
-      for (const pin of batch.pins) {
-        if (!unchecked.some((entry) => samePin(entry.pin, pin))) {
-          settleEntry(sql, pin, "landed", null, now);
-        }
-      }
+      const landed = batch.pins.filter(
+        (pin) => !unchecked.some((entry) => samePin(entry.pin, pin)),
+      );
+      // Each landed pin closes its claim only in the ready episode the train now holds for it, which
+      // a renewed entry checked under its current versions has raised since the batch formed.
+      const closing = landed.flatMap((pin): EpisodePin[] => {
+        const entry = entries.find((candidate) => samePin(candidate.pin, pin));
+        return entry === undefined ? [] : [{ ...claimPinOf(pin), episode: entry.episode }];
+      });
+      for (const pin of landed) settleEntry(sql, pin, "landed", null, now);
       requeueFront(sql, unchecked.map(asFreshWork), now);
       closeBatch(batch.batchId, { state: "landed" }, now);
       promoteDeferred(sql, now);
@@ -1112,6 +1122,9 @@ export function createTrain(
       // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
       // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
       ports().adaptation.owe(intentId, batch.pins);
+      // The landed claims close once the adaptation has read them as held. A missing claims module
+      // throws, so the landing rolls back rather than leaving its claims ready.
+      ports().claims.merged(tx, closing, main);
       try {
         ports().adaptation.recordLanding(intentId);
       } catch (error) {

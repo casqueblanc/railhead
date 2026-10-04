@@ -26,9 +26,10 @@
 //
 // A decision's dependencies name the claim, and the agent and ownership generation an inbox item
 // goes to. An obligation is queued as an item only when the claims module reports that generation
-// as current, inside the transaction that records it. A dependency whose claim was merged, expired,
-// is unknown or has moved to an owner it was not transferred to keeps a pending obligation and gets
-// no item, so nothing reaches a former owner:
+// as current, inside the transaction that records it. A merged claim keeps its holder, which gets
+// the item, and `record` asks the claims module to reopen the merged work the version superseded. A
+// dependency whose claim expired, is unknown or has moved to an owner it was not transferred to
+// keeps a pending obligation and gets no item, so nothing reaches a former owner:
 //
 // - `transfer`, called inside a takeover's transaction, moves the claim's dependencies to the new
 //   holder and queues it the current version of each decision, delivering what was pending.
@@ -735,6 +736,11 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
                 target.relied !== null && target.relied < version ? "rework" : "decision";
               owe(tx, target, { decisionId, version }, kind);
             }
+            // Merged work this version superseded is reopened for its holder, who has just been
+            // queued the version, or waits until the holder's active claim closes.
+            for (const { claim_id: claimId } of targets) {
+              if (isId("claim", claimId)) ports().claims.reopenMerged(tx, claimId);
+            }
             // The train returns the pair its question parked to the queue in this transaction, so
             // the answer and the drive the train owes for it commit together.
             if (SYSTEM_ID.test(question.agent_id)) ports().train.answered(tx, decisionId);
@@ -856,7 +862,7 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       const invalid = invalidReliance(claimId, generation, refs);
       if (invalid !== null) throw new DecisionsWriteError(invalid);
       // Work lands under the generation that held the claim or an earlier one, never a later one.
-      // A claim that merged or expired has no current generation to compare against.
+      // An expired claim has no current generation to compare against.
       const current = ports().claims.currentGeneration(claimId);
       if (current !== null && generation > current) {
         throw new DecisionsWriteError("the work names a generation newer than the claim's");

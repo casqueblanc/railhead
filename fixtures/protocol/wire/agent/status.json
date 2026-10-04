@@ -36,7 +36,8 @@
                 "title": "Handle large uploads",
                 "body": "Uploads above 10 MB fail. Follow the decision."
               }
-            }
+            },
+            "closed": null
           },
           "inbox": {
             "items": [
@@ -97,13 +98,145 @@
               "ownerId": "usr_lemarier",
               "state": "confirmed"
             },
-            "claim": null
+            "claim": null,
+            "closed": null
           },
           "inbox": {
             "items": [],
             "pending": 0
           },
           "next": "work"
+        }
+      }
+    },
+    {
+      "name": "the agent's last claim merged with the landed main commit",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": null,
+            "closed": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "merged",
+                "commit": "cccccccccccccccccccccccccccccccccccccccc"
+              },
+              "closedAt": 1789999940000
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "the agent's last claim expired",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": null,
+            "closed": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "expired"
+              },
+              "closedAt": 1789999940000
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
+      "name": "the agent's last claim was taken over, and it holds a new one",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "working",
+              "readyCommit": null,
+              "originUrl": "https://railhead.dev/git/casqueblanc/demo/claims/clm_42abcd.git",
+              "upstreamUrl": "https://railhead.dev/git/casqueblanc/demo.git",
+              "task": {
+                "title": "Handle large uploads",
+                "body": "Uploads above 10 MB fail. Follow the decision."
+              }
+            },
+            "closed": {
+              "claimId": "clm_41abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "taken_over"
+              },
+              "closedAt": 1789999940000
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": null
         }
       }
     },
