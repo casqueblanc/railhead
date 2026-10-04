@@ -1,180 +1,65 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  BINDING_CHECK_IDS,
+  SLICE_CHECK_IDS,
   claimOfRemote,
   gatePasses,
+  judgeBinding,
   judgeListing,
   judgeMainRef,
+  judgeReport,
   judgeRestActive,
   judgeSlice,
+  judgeSliceReport,
   landedBatches,
   originProblem,
+  probeProblem,
   remoteProblem,
+  sliceEvents,
   type Check,
-  type MainRefCommits,
-  type MainRefObservations,
-  type SliceObservations,
 } from "./evidence.ts";
-
-const LIVE_REMOTE =
-  "https://0123456789abcdef0123456789abcdef.artifacts.cloudflare.net/git/qual/rh-m-1.git";
-const sha = (digit: string): string => digit.repeat(40);
+import {
+  CLAIMS,
+  COMMITS,
+  JUDGED_AT,
+  LIVE_REMOTE,
+  ORIGIN,
+  REPO,
+  at,
+  event,
+  liveBindingReport,
+  liveListing,
+  liveMainRef,
+  liveSlice,
+  liveSliceReport,
+  sha,
+  sliceLog,
+  updated,
+} from "./reportFixtures.ts";
 
 /** The outcome of each check, by id. */
 function outcomes(checks: readonly Check[]): Record<string, string> {
   return Object.fromEntries(checks.map((item) => [item.id, item.outcome]));
 }
 
-/** A time on the day of the #161 run, `index` seconds past 09:00 UTC. */
-function at(index: number): string {
-  return new Date(Date.UTC(2026, 9, 4, 9, 0, index)).toISOString();
+/** The provenance outcome of the live binding report after `change`. */
+function bindingProvenance(change: (report: ReturnType<typeof liveBindingReport>) => void) {
+  const report = liveBindingReport();
+  change(report);
+  return outcomes(judgeBinding(report, JUDGED_AT))["binding.provenance"];
 }
 
-/** A listing observation as live Artifacts produced it on #161: 31 live tokens, page of 30. */
-function liveListing() {
-  const minted = Array.from({ length: 31 }, (_, index) => `tok_${String(index).padStart(2, "0")}`);
-  const page = (ids: string[]) => ({
-    ids,
-    tokens: ids.map((id) => ({
-      id,
-      scope: "read",
-      state: "active",
-      createdAt: at(minted.indexOf(id)),
-      expiresAt: at(3_600),
-    })),
-  });
-  const full = minted.toReversed().slice(0, 30);
-  const afterRevoke = minted.slice(0, 30).toReversed();
-  return {
-    full: { ...page(full), total: 31 },
-    minted,
-    afterRevoke: { ...page(afterRevoke), total: 30 },
-    revoked: "tok_30",
-    withOptions: [{ ...page(afterRevoke), total: 30 }],
-    shortLived: { id: "tok_short", expiresAt: at(120) },
-    afterExpiry: { ...page(afterRevoke), total: 30 },
-    afterExpiryAt: at(125),
-  };
+/** The provenance outcome of the live slice report after `change`. */
+function sliceProvenance(change: (report: ReturnType<typeof liveSliceReport>) => void) {
+  const report = liveSliceReport();
+  change(report);
+  return outcomes(judgeSliceReport(report, JUDGED_AT))["slice.provenance"];
 }
 
-const COMMITS: MainRefCommits = {
-  c4: sha("4"),
-  c5: sha("5"),
-  n1: sha("6"),
-  n2: sha("7"),
-  unrelated: sha("8"),
-  race: [sha("a"), sha("b"), sha("c")],
-  after: [sha("d"), sha("e"), sha("f")],
-  u2: sha("9"),
-};
-
-const updated = (main: string) => ({
-  result: { ok: true, value: { kind: "updated" } },
-  main,
-  liveWriteTokens: 0,
-});
-
-/** An adapter refusal with main read back. */
-function refused(code: string, main: string) {
-  return { result: { ok: false, code, message: "refused" }, main, liveWriteTokens: 0 };
-}
-
-/** Main-ref observations matching the behaviour #158 measured and its adopted spec. */
-function liveMainRef(): MainRefObservations {
-  return {
-    remote: LIVE_REMOTE,
-    rewind: refused("invalid_request", COMMITS.c5),
-    unrelatedUpdate: refused("invalid_request", COMMITS.c5),
-    forward: updated(COMMITS.n1),
-    stale: {
-      result: { ok: true, value: { kind: "rejected", actual: COMMITS.n1 } },
-      main: COMMITS.n1,
-      liveWriteTokens: 0,
-    },
-    lostResponse: {
-      result: { ok: true, value: { kind: "uncertain" } },
-      main: COMMITS.n2,
-      liveWriteTokens: 0,
-      repeat: { status: 200, line: "ng refs/heads/main stale ref" },
-    },
-    race: {
-      updates: [
-        { status: 200, line: "ng refs/heads/main stale ref" },
-        { status: 200, line: "ok refs/heads/main" },
-        { status: 200, line: "ng refs/heads/main stale ref" },
-      ],
-      main: COMMITS.race[1],
-    },
-    foreignToken: refused("unavailable", COMMITS.race[1] ?? ""),
-    foreignPush: {
-      result: { ok: true, value: { kind: "rejected", actual: COMMITS.unrelated } },
-      main: COMMITS.unrelated,
-      liveWriteTokens: 0,
-    },
-    fence: { revoked: true, answered: { status: 403, line: null }, main: COMMITS.unrelated },
-    eviction: { evicted: true, main: COMMITS.unrelated, liveWriteTokens: 0, waitedMs: 75_000 },
-  };
-}
-
-const ORIGIN = "https://railhead.mashin.workers.dev";
-const CLAIMS = ["clm_aaaa", "clm_bbbb", "clm_cccc"];
-const AGENTS = ["agt_atlas", "agt_birch", "agt_cedar"];
-
-function event(type: string, data: Record<string, unknown>) {
-  return {
-    v: 1,
-    seq: 0,
-    at: 0,
-    repo: "rep_x",
-    actor: { kind: "system", id: "sys_train" },
-    type,
-    data,
-  };
-}
-
-/** A slice log: three agents, atlas lands alone, birch and cedar land together. */
-function sliceLog() {
-  const [atlas, birch, cedar] = CLAIMS;
-  return [
-    ...AGENTS.map((agentId) => event("agent.confirmed", { agentId })),
-    ...CLAIMS.map((claimId, index) => event("claim.opened", { claimId, agentId: AGENTS[index] })),
-    event("train.check", { checkRunId: "chk_1", candidate: sha("c"), result: "pass" }),
-    event("train.intent", {
-      intentId: "int_1",
-      checkRunId: "chk_1",
-      expectedMain: sha("2"),
-      candidate: sha("c"),
-      claims: [atlas],
-    }),
-    event("train.main", { intentId: "int_1", outcome: "updated", main: sha("c") }),
-    event("claim.merged", { claimId: atlas, commit: sha("c") }),
-    event("train.check", { checkRunId: "chk_2", candidate: sha("d"), result: "pass" }),
-    event("train.intent", {
-      intentId: "int_2",
-      checkRunId: "chk_2",
-      expectedMain: sha("c"),
-      candidate: sha("d"),
-      claims: [birch, cedar],
-    }),
-    event("train.main", { intentId: "int_2", outcome: "updated", main: sha("d") }),
-    event("claim.merged", { claimId: birch, commit: sha("d") }),
-    event("claim.merged", { claimId: cedar, commit: sha("d") }),
-  ];
-}
-
-function liveSlice(): SliceObservations {
-  return {
-    origin: ORIGIN,
-    events: sliceLog(),
-    clones: CLAIMS.map((claim, index) => ({
-      originUrl: `${ORIGIN}/git/acme/upload-app/claims/${claim}.git`,
-      identity: AGENTS[index] ?? "",
-      reachable: true,
-      tokensFound: 0,
-    })),
-    remoteMain: sha("d"),
-    denials: { pushToMain: "refused", otherClaim: "refused", anonymousStatus: 401 },
-  };
+/** A report as the harness writes it: its observations and the outcomes judged from them. */
+function written<T extends { kind: string }>(report: T) {
+  return { ...report, checks: judgeReport(report, JUDGED_AT).slice(0, -2) };
 }
 
 describe("the live gate's origin and remote rules", () => {
@@ -349,17 +234,17 @@ describe("judgeSlice", () => {
     assert.ok(gatePasses(checks), JSON.stringify(checks.filter((item) => item.outcome === "fail")));
     assert.match(
       checks.find((item) => item.id === "slice.batch")?.detail ?? "",
-      new RegExp(`check chk_2 passed on ${sha("d")}, main ${sha("c")} → ${sha("d")}`),
+      new RegExp(`check chk_000002 passed on ${sha("d")}, main ${sha("c")} → ${sha("d")}`),
     );
   });
 
   test("finds only batches of two or more claims whose check passed on the landed candidate", () => {
     assert.deepEqual(
       landedBatches(sliceLog()).map((batch) => [batch.intentId, batch.claims.length]),
-      [["int_2", 2]],
+      [["int_000002", 2]],
     );
     const failedCheck = sliceLog().map((logged) =>
-      logged.type === "train.check" && logged.data.checkRunId === "chk_2"
+      logged.type === "train.check" && logged.data.checkRunId === "chk_000002"
         ? { ...logged, data: { ...logged.data, result: "fail" } }
         : logged,
     );
@@ -382,12 +267,17 @@ describe("judgeSlice", () => {
 
   test("fails on any Artifacts token in the log or a clone, and on a proxy that let a request through", () => {
     const observed = liveSlice();
-    observed.events = [
-      ...observed.events,
-      event("issue.filed", { body: "art_v1_0123456789abcdefXYZ" }),
-    ];
-    observed.denials = { pushToMain: "accepted", otherClaim: "refused", anonymousStatus: 401 };
-    const checks = outcomes(judgeSlice(observed));
+    observed.logTokens = 1;
+    observed.denials = { pushToMainStatus: 200, otherClaimStatus: 404, anonymousStatus: 401 };
+    let checks = outcomes(judgeSlice(observed));
+    assert.equal(checks["slice.no-token"], "fail");
+    assert.equal(checks["slice.proxy-denial"], "fail");
+
+    const inClone = liveSlice();
+    const [clone] = inClone.clones;
+    if (clone !== undefined) clone.tokensFound = 1;
+    inClone.denials = { pushToMainStatus: 403, otherClaimStatus: 200, anonymousStatus: 401 };
+    checks = outcomes(judgeSlice(inClone));
     assert.equal(checks["slice.no-token"], "fail");
     assert.equal(checks["slice.proxy-denial"], "fail");
   });
@@ -399,13 +289,291 @@ describe("judgeSlice", () => {
     assert.equal(outcomes(judgeSlice(observed))["slice.batch"], "fail");
   });
 
-  test("reads a claim only from a remote on the instance's own origin", () => {
-    assert.equal(claimOfRemote(ORIGIN, `${ORIGIN}/git/acme/app/claims/clm_ab12.git`), "clm_ab12");
-    assert.equal(
-      claimOfRemote(ORIGIN, "https://evil.example/git/acme/app/claims/clm_ab12.git"),
-      null,
+  test("reads a claim only from a claim remote of the repository on the instance's own origin", () => {
+    const remote = `${ORIGIN}/git/${REPO}/claims/clm_ab12cd.git`;
+    assert.equal(claimOfRemote(ORIGIN, REPO, remote), "clm_ab12cd");
+    for (const url of [
+      "https://evil.example/git/acme/upload-app/claims/clm_ab12cd.git",
+      `${ORIGIN}/git/acme/other/claims/clm_ab12cd.git`,
+      `${ORIGIN}/git/${REPO}.git`,
+      `${ORIGIN.replace("https:", "http:")}/git/${REPO}/claims/clm_ab12cd.git`,
+      `${ORIGIN}/git/${REPO}/claims/clm_ab12cd.git/../../x.git`,
+      `${ORIGIN}/git/${REPO}/claims/clm_a.git`,
+      "not a url",
+    ]) {
+      assert.equal(claimOfRemote(ORIGIN, REPO, url), null, url);
+    }
+  });
+});
+
+describe("sliceEvents", () => {
+  test("keeps the slice's events with their ids, commits, positions and times, and no text", () => {
+    const filed = event(30, "issue.filed", { issueId: "iss_000001", title: "t", body: "b" });
+    const kept = sliceEvents([...sliceLog(), filed]);
+    assert.equal(kept.length, sliceLog().length);
+    assert.deepEqual(kept[0], {
+      seq: 1,
+      at: Date.UTC(2026, 9, 1, 10, 0, 1),
+      repo: "rep_board1",
+      type: "agent.confirmed",
+      data: { agentId: "agt_atlas1" },
+    });
+    const opened = sliceLog()[3];
+    const withExtra = {
+      ...opened,
+      data: { ...opened?.data, issueId: "iss_000001", base: sha("1") },
+    };
+    assert.deepEqual(sliceEvents([withExtra])[0]?.data, {
+      claimId: CLAIMS[0],
+      agentId: "agt_atlas1",
+    });
+  });
+
+  test("drops an event whose id, commit or position is malformed", () => {
+    const [confirmed] = sliceLog();
+    assert.deepEqual(
+      sliceEvents([
+        { ...confirmed, data: { agentId: "usr_000001" } },
+        { ...confirmed, seq: "1" },
+        { ...confirmed, repo: "x" },
+        event(1, "claim.merged", { claimId: CLAIMS[0], commit: "HEAD" }),
+        null,
+      ]),
+      [],
     );
-    assert.equal(claimOfRemote(ORIGIN, `${ORIGIN}/git/acme/app.git`), null);
+  });
+});
+
+describe("judgeBinding and judgeSliceReport", () => {
+  test("pass a live-collected report and judge every required case", () => {
+    const binding = judgeBinding(liveBindingReport(), JUDGED_AT);
+    assert.deepEqual(
+      binding.map((item) => item.id),
+      [...BINDING_CHECK_IDS],
+    );
+    assert.ok(gatePasses(binding), JSON.stringify(binding.filter((c) => c.outcome === "fail")));
+    const slice = judgeSliceReport(liveSliceReport(), JUDGED_AT);
+    assert.deepEqual(
+      slice.map((item) => item.id),
+      [...SLICE_CHECK_IDS],
+    );
+    assert.ok(gatePasses(slice), JSON.stringify(slice.filter((c) => c.outcome === "fail")));
+  });
+
+  test("fail a binding report missing any one case's observation", () => {
+    const keys = Object.keys(liveBindingReport().observations);
+    assert.equal(keys.length, 12);
+    for (const key of keys) {
+      const report = liveBindingReport();
+      const observations: Record<string, unknown> = { ...report.observations };
+      delete observations[key];
+      assert.equal(
+        gatePasses(judgeBinding({ ...report, observations }, JUDGED_AT)),
+        false,
+        `without ${key}`,
+      );
+    }
+    for (const key of ["repositories", "commits", "observations"] as const) {
+      const report: Record<string, unknown> = liveBindingReport();
+      delete report[key];
+      assert.deepEqual(outcomes(judgeBinding(report, JUDGED_AT)), { "binding.shape": "fail" });
+    }
+  });
+
+  test("fail a binding report not collected through the deployed probe in one live run", () => {
+    assert.equal(
+      bindingProvenance(() => undefined),
+      "pass",
+    );
+    assert.equal(
+      bindingProvenance((report) => {
+        report.probe = "localhost:8787";
+      }),
+      "fail",
+    );
+    assert.equal(
+      bindingProvenance((report) => {
+        report.probe = "railhead.mashin.workers.dev";
+      }),
+      "fail",
+    );
+    // Shorter than the 60 s token and the eviction wait the run sits through.
+    assert.equal(
+      bindingProvenance((report) => {
+        report.finishedAt = at(30);
+      }),
+      "fail",
+    );
+    // Collected after the moment it is judged.
+    assert.equal(
+      bindingProvenance((report) => {
+        report.startedAt = "2026-10-03T09:00:00.000Z";
+        report.finishedAt = "2026-10-03T09:05:00.000Z";
+      }),
+      "fail",
+    );
+    // A repository whose Artifacts name is not derived from its id, or a remote on another account.
+    assert.equal(
+      bindingProvenance((report) => {
+        report.repositories = {
+          ...report.repositories,
+          main: { ...report.repositories.main, name: "rh-m-1" },
+        };
+      }),
+      "fail",
+    );
+    assert.equal(
+      bindingProvenance((report) => {
+        report.repositories = {
+          ...report.repositories,
+          main: {
+            ...report.repositories.main,
+            remote: report.repositories.main.remote.replace("0123", "9999"),
+          },
+        };
+      }),
+      "fail",
+    );
+    // Token times Artifacts assigned outside the run, and a token count the probe never mints.
+    assert.equal(
+      bindingProvenance((report) => {
+        const [token] = report.observations.listing.full.tokens;
+        if (token !== undefined) token.createdAt = "2026-09-01T09:00:00.000Z";
+      }),
+      "fail",
+    );
+    assert.equal(
+      bindingProvenance((report) => {
+        report.observations.listing.minted = report.observations.listing.minted.slice(1);
+      }),
+      "fail",
+    );
+    // An eviction wait longer than the whole run.
+    assert.equal(
+      bindingProvenance((report) => {
+        report.observations.eviction = { ...(liveMainRef().eviction as object), waitedMs: 300_000 };
+      }),
+      "fail",
+    );
+  });
+
+  test("fail a slice report whose log positions, times or events are not a live read", () => {
+    assert.equal(
+      sliceProvenance(() => undefined),
+      "pass",
+    );
+    assert.equal(
+      sliceProvenance((report) => {
+        report.observations.events = sliceLog().toReversed();
+      }),
+      "fail",
+    );
+    assert.equal(
+      sliceProvenance((report) => {
+        report.observations.eventCount = 5;
+      }),
+      "fail",
+    );
+    assert.equal(
+      sliceProvenance((report) => {
+        report.readAt = "2026-10-01T09:00:00.000Z";
+      }),
+      "fail",
+    );
+    assert.equal(
+      sliceProvenance((report) => {
+        report.observations.events = [
+          ...sliceLog(),
+          event(30, "issue.filed", { issueId: "iss_000001", title: "t", body: "b" }),
+        ];
+      }),
+      "fail",
+    );
+    assert.equal(
+      sliceProvenance((report) => {
+        report.observations.events = sliceLog().map((logged, index) =>
+          index === 0 ? { ...logged, repo: "rep_other1" } : logged,
+        );
+      }),
+      "fail",
+    );
+    assert.deepEqual(
+      outcomes(judgeSliceReport({ kind: "slice", readAt: at(0), observations: {} }, JUDGED_AT)),
+      { "slice.shape": "fail" },
+    );
+  });
+});
+
+describe("judgeReport", () => {
+  test("passes a complete live-collected report whose recorded outcomes match", () => {
+    for (const report of [written(liveBindingReport()), written(liveSliceReport())]) {
+      const checks = judgeReport(report, JUDGED_AT);
+      assert.ok(gatePasses(checks), JSON.stringify(checks.filter((c) => c.outcome === "fail")));
+      assert.deepEqual(
+        checks.slice(-2).map((item) => item.id),
+        ["report.complete", "report.recorded"],
+      );
+    }
+  });
+
+  test("fails a hand-built report that states passing checks without observations", () => {
+    for (const kind of ["binding", "slice"]) {
+      const required = kind === "binding" ? BINDING_CHECK_IDS : SLICE_CHECK_IDS;
+      const report = {
+        kind,
+        checks: required.map((id) => ({ id, outcome: "pass", detail: "" })),
+      };
+      const checks = outcomes(judgeReport(report, JUDGED_AT));
+      assert.equal(checks[`${kind}.shape`], "fail", kind);
+      assert.equal(checks["report.complete"], "fail", kind);
+      assert.equal(checks["report.recorded"], "fail", kind);
+    }
+    assert.deepEqual(outcomes(judgeReport({ kind: "simulated" }, JUDGED_AT)), {
+      "report.kind": "fail",
+    });
+    assert.deepEqual(outcomes(judgeReport(null, JUDGED_AT)), { "report.kind": "fail" });
+  });
+
+  test("fails a report whose recorded outcomes are not the ones its observations give", () => {
+    const report = written(liveBindingReport());
+    report.observations = { ...report.observations, race: { updates: [], main: COMMITS.n2 } };
+    const checks = outcomes(judgeReport(report, JUDGED_AT));
+    assert.equal(checks["main.race"], "fail");
+    assert.equal(checks["report.recorded"], "fail");
+
+    const reordered = written(liveSliceReport());
+    reordered.checks = reordered.checks.toReversed();
+    assert.equal(outcomes(judgeReport(reordered, JUDGED_AT))["report.recorded"], "fail");
+  });
+
+  test("fails a fake's Artifacts remote and a simulator's origin even with every other part live", () => {
+    const binding = written(liveBindingReport());
+    binding.repositories = {
+      ...binding.repositories,
+      listing: {
+        ...binding.repositories.listing,
+        remote: "https://fake.artifacts.invalid/rh-m-1.git",
+      },
+    };
+    assert.equal(outcomes(judgeReport(binding, JUDGED_AT))["listing.live"], "fail");
+    const slice = written(liveSliceReport());
+    slice.observations = { ...slice.observations, origin: "http://localhost:8787" };
+    assert.equal(outcomes(judgeReport(slice, JUDGED_AT))["slice.live"], "fail");
+  });
+});
+
+describe("probeProblem", () => {
+  test("accepts only the probe Worker probe-config deploys", () => {
+    assert.equal(probeProblem("https://railhead-qual-probe.mashin.workers.dev/"), null);
+    for (const url of [
+      "http://railhead-qual-probe.mashin.workers.dev",
+      "https://railhead-qual-probe.mashin.workers.dev.evil.dev",
+      "https://railhead.mashin.workers.dev",
+      "https://localhost:8787",
+      "nope",
+    ]) {
+      assert.notEqual(probeProblem(url), null, url);
+    }
   });
 });
 

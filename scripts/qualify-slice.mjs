@@ -12,12 +12,16 @@
 // probe, on repositories the probe creates and deletes; it also reads the REST token listing, with
 // the operator's `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the environment. `slice` reads a deployed instance's public
 // event log and three agents' claim clones, and checks the run the agents made there. `gate` exits 0
-// only when a binding report and a slice report are both present and every check in both passed.
+// only when one binding report and one slice report both pass when judged again from the
+// observations and collection record they hold (scripts/qualify/evidence.ts, `judgeReport`).
 //
 // Nothing here talks to a simulator: `slice` refuses a loopback or reserved host and `binding`
 // requires the probe's repositories to sit on a live Artifacts Git host, so a fake cannot pass.
-// Reports hold commit ids, ids and counts; never a token, a session or event text. Exit codes: 0
-// every check passed, 1 a check failed or a call failed, 2 the arguments are invalid.
+// `slice` checks every clone's remotes against the instance's claim and main paths before it reads
+// a credential or sends a request, and sends a session only to that instance, never following a
+// redirect (scripts/qualify/request.ts). Reports hold commit ids, ids, times and counts; never a
+// token, a session or event text. Exit codes: 0 every check passed, 1 a check failed or a call
+// failed, 2 the arguments are invalid.
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -29,15 +33,18 @@ import { newWebSocketRpcSession } from "capnweb";
 import { API_PATH } from "../packages/railhead-shared/src/api.ts";
 import {
   ARTIFACTS_TOKEN,
+  claimOfRemote,
+  eventsWithToken,
   gatePasses,
-  judgeListing,
-  judgeMainRef,
-  judgeRestActive,
-  judgeSlice,
-  landedBatches,
+  judgeBinding,
+  judgeReport,
+  judgeSliceReport,
   originProblem,
+  probeProblem,
   remoteProblem,
+  sliceEvents,
 } from "./qualify/evidence.ts";
+import { RefusedDestination, sendToInstance } from "./qualify/request.ts";
 
 // Decoded, so a checkout path with a space or other escaped character resolves.
 const ROOT = resolve(import.meta.dirname, "..");
@@ -138,11 +145,16 @@ const gitOk = async (args, opts) => {
   return ran.stdout.trim();
 };
 
-/** Git configuration that sends `token` as a bearer header, through the environment only. */
+/**
+ * Git configuration that sends `token` as a bearer header, through the environment only, and never
+ * to a host a redirect names.
+ */
 const bearer = (token) => ({
-  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_COUNT: "2",
   GIT_CONFIG_KEY_0: "http.extraHeader",
   GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+  GIT_CONFIG_KEY_1: "http.followRedirects",
+  GIT_CONFIG_VALUE_1: "false",
 });
 
 // --- probe-config ------------------------------------------------------------------------------
@@ -189,10 +201,13 @@ const probeConfig = (argv) => {
   );
 };
 
+/** A probe repository as the report records it: no token. */
+const repository = ({ repoId, name, remote }) => ({ repoId, name, remote });
+
 // --- binding -----------------------------------------------------------------------------------
 
 const probeClient = (url, secret) => async (name, body) => {
-  const response = await fetch(new URL(name, url), {
+  const response = await sendToInstance(new URL(url).origin, new URL(name, url).href, {
     method: "POST",
     headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -221,6 +236,7 @@ const restActiveCount = async (namespace, name) => {
   url.searchParams.set("per_page", "100");
   const response = await fetch(url, {
     headers: { authorization: `Bearer ${token}` },
+    redirect: "error",
     signal: AbortSignal.timeout(BOARD_TIMEOUT_MS),
   }).catch(() => null);
   const body = await response?.json().catch(() => null);
@@ -284,8 +300,8 @@ const binding = async (argv) => {
   if (typeof secret !== "string" || secret.length < 32) {
     throw new HarnessFailure("--secrets has no PROBE_SECRET of at least 32 characters", 2);
   }
-  if (originProblem(probeUrl) !== null)
-    throw new HarnessFailure("--probe must be a deployed HTTPS URL", 2);
+  const probeHost = probeProblem(probeUrl);
+  if (probeHost !== null) throw new HarnessFailure(`--probe is ${probeHost}`, 2);
   const probe = probeClient(probeUrl, secret);
   const startedAt = new Date().toISOString();
   const created = [];
@@ -300,12 +316,16 @@ const binding = async (argv) => {
     process.stderr.write("binding: main's ref\n");
     const main = await probe("create", {});
     created.push(main.repoId);
+    // The harness sends this repository's write tokens to its remote: only to a live Artifacts host.
+    if (remoteProblem(main.remote) !== null) {
+      throw new HarnessFailure("the probe's repository is not on a live Artifacts Git host");
+    }
     const { commits, refs } = await buildHistory(scratch);
     await gitOk(["push", "-q", main.remote, ...refs], { cwd: scratch, env: bearer(main.token) });
     // Only the adapter's own tokens may be live from here on.
     await probe("revoke", { repoId: main.repoId, token: main.token });
     const update = (expected, next) => probe("update", { repoId: main.repoId, expected, next });
-    const obs = { remote: main.remote };
+    const obs = {};
     obs.rewind = await update(commits.c5, commits.c4);
     obs.unrelatedUpdate = await update(commits.c5, commits.unrelated);
     obs.forward = await update(commits.c5, commits.n1);
@@ -347,27 +367,17 @@ const binding = async (argv) => {
     const after = await probe("main", { repoId: main.repoId });
     obs.eviction = { ...evicted, ...after, waitedMs: Date.now() - evictedAt };
 
-    const remoteCheck = remoteProblem(listingRepo.remote);
-    const checks = [
-      {
-        id: "listing.live",
-        outcome: remoteCheck === null ? "pass" : "fail",
-        detail: remoteCheck ?? "live Artifacts remote",
-      },
-      ...judgeListing(listing),
-      judgeRestActive(listing.afterExpiry?.total, restActive),
-      ...judgeMainRef(commits, obs),
-    ];
-    // Observations go in the report as recorded: ids, commit ids, statuses and counts only.
-    writeReport(out, {
+    // Observations go in the report as recorded: ids, commit ids, times, statuses and counts only.
+    const report = {
       kind: "binding",
       probe: new URL(probeUrl).host,
       startedAt,
       finishedAt: new Date().toISOString(),
-      checks,
+      repositories: { listing: repository(listingRepo), main: repository(main) },
       commits,
-      observations: { listing, ...obs, remote: undefined },
-    });
+      observations: { listing, restActive, ...obs },
+    };
+    writeReport(out, { ...report, checks: judgeBinding(report, Date.now()) });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
     for (const repoId of created) {
@@ -391,7 +401,7 @@ const withTimeout = (promise, what) => {
   return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
 };
 
-/** Reads the repository's whole public event log over the board's session. */
+/** Reads the repository's whole public event log, and its head, over the board's session. */
 const readLog = async (origin, org, name) => {
   const socketUrl = new URL(API_PATH, origin);
   socketUrl.protocol = "wss:";
@@ -414,7 +424,9 @@ const readLog = async (origin, org, name) => {
       if (!page.ok) throw new HarnessFailure("the instance refused a page of the event log");
       history = page.value.history;
       events.push(...page.value.events);
-      if (page.value.events.length === 0 || page.value.cursor >= page.value.head) return events;
+      if (page.value.events.length === 0 || page.value.cursor >= page.value.head) {
+        return { events, head: page.value.head };
+      }
       cursor = page.value.cursor;
     }
     throw new HarnessFailure(`the event log is longer than ${MAX_EVENTS} events`);
@@ -440,10 +452,15 @@ const basic = ({ username, password }) =>
 
 const countTokens = (text) => (text.match(new RegExp(ARTIFACTS_TOKEN.source, "g")) ?? []).length;
 
-const observeClone = async (dir) => {
-  const originUrl = await gitOk(["config", "--get", "remote.origin.url"], { cwd: dir });
+/** The URL Git uses for `remote` in `dir`, after any `insteadOf` rewrite. Sends nothing. */
+const remoteUrl = (dir, remote) => gitOk(["ls-remote", "--get-url", remote], { cwd: dir });
+
+/** Reads a clone whose origin, `originUrl`, was already checked against the instance. */
+const observeClone = async (dir, originUrl) => {
   const identity = await gitOk(["config", "--get", "railhead.identity"], { cwd: dir });
-  const listed = await git(["ls-remote", "origin"], { cwd: dir });
+  const listed = await git(["-c", "http.followRedirects=false", "ls-remote", "origin"], {
+    cwd: dir,
+  });
   const credential = await credentialFor(dir, originUrl);
   const gitDir = await gitOk(["rev-parse", "--absolute-git-dir"], { cwd: dir });
   const files = ["config", "FETCH_HEAD", "packed-refs"]
@@ -460,11 +477,11 @@ const observeClone = async (dir) => {
 };
 
 /** A receive-pack request creating a branch, refused by the instance before it reaches Artifacts. */
-const pushRequest = (url, credential) => {
+const pushRequest = (origin, url, credential) => {
   const zero = "0".repeat(40);
   const line = `${zero} ${"1".repeat(40)} refs/heads/qualify-denied\0report-status\n`;
   const pkt = `${(Buffer.byteLength(line) + 4).toString(16).padStart(4, "0")}${line}0000`;
-  return fetch(`${url}/git-receive-pack`, {
+  return sendToInstance(origin, `${url}/git-receive-pack`, {
     method: "POST",
     headers: {
       authorization: basic(credential),
@@ -502,63 +519,105 @@ const slice = async (argv) => {
   if (problem !== null)
     throw new HarnessFailure(`--origin is not a deployed instance: ${problem}`, 2);
   const base = new URL(origin).origin;
-  const upstreamUrl = `${base}/git/${org}/${name}.git`;
+  const repo = `${org}/${name}`;
+  const upstreamUrl = `${base}/git/${repo}.git`;
+  const dirs = clones.map((dir) => resolve(dir));
 
-  const events = await readLog(base, org, name);
+  // Every destination is checked before a credential is read or a request is sent: a clone whose
+  // remote names another host or path would otherwise be handed the first agent's session.
+  const originUrls = [];
+  for (const [index, dir] of dirs.entries()) {
+    const url = await remoteUrl(dir, "origin");
+    if (claimOfRemote(base, repo, url) === null) {
+      throw new HarnessFailure(
+        `--clone ${index + 1}: origin is not a claim remote of ${repo} on ${base}`,
+        2,
+      );
+    }
+    originUrls.push(url);
+  }
+  const [firstDir] = dirs;
+  if ((await remoteUrl(firstDir, "upstream")) !== upstreamUrl) {
+    throw new HarnessFailure(`--clone 1: upstream is not ${upstreamUrl}`, 2);
+  }
+
+  const { events, head } = await readLog(base, org, name);
   const observed = [];
-  for (const dir of clones) observed.push(await observeClone(resolve(dir)));
+  for (const [index, dir] of dirs.entries()) {
+    observed.push(await observeClone(dir, originUrls[index]));
+  }
   const [first, second] = observed;
-  const pushToMain = await pushRequest(upstreamUrl, first.credential);
-  const otherClaim = await fetch(
+  const pushToMain = await pushRequest(base, upstreamUrl, first.credential);
+  const otherClaim = await sendToInstance(
+    base,
     `${second.observation.originUrl}/info/refs?service=git-upload-pack`,
     {
       headers: { authorization: basic(first.credential) },
       signal: AbortSignal.timeout(BOARD_TIMEOUT_MS),
     },
   );
-  const anonymous = await fetch(
+  const anonymous = await sendToInstance(
+    base,
     `${first.observation.originUrl}/info/refs?service=git-upload-pack`,
     { signal: AbortSignal.timeout(BOARD_TIMEOUT_MS) },
   );
-  const mainLine = await git(["ls-remote", "upstream", "refs/heads/main"], {
-    cwd: resolve(clones[0]),
-  });
+  const mainLine = await git(
+    ["-c", "http.followRedirects=false", "ls-remote", "upstream", "refs/heads/main"],
+    { cwd: firstDir },
+  );
   const remoteMain = /^([0-9a-f]{40})\trefs\/heads\/main$/m.exec(mainLine.stdout)?.[1] ?? null;
-  const checks = judgeSlice({
-    origin: base,
-    events,
-    clones: observed.map((clone) => clone.observation),
-    remoteMain,
-    denials: {
-      pushToMain: pushToMain.status === 403 ? "refused" : "accepted",
-      otherClaim: otherClaim.status === 403 || otherClaim.status === 404 ? "refused" : "accepted",
-      anonymousStatus: anonymous.status,
-    },
-  });
-  writeReport(out, {
+  // The slice's events are kept reduced to ids, commits, positions and times; never event text.
+  const report = {
     kind: "slice",
-    origin: base,
-    repo: `${org}/${name}`,
     readAt: new Date().toISOString(),
-    events: events.length,
-    batches: landedBatches(events),
-    remoteMain,
-    checks,
-  });
+    observations: {
+      origin: base,
+      repo,
+      events: sliceEvents(events),
+      eventCount: head,
+      logTokens: eventsWithToken(events),
+      clones: observed.map((clone) => clone.observation),
+      remoteMain,
+      denials: {
+        pushToMainStatus: pushToMain.status,
+        otherClaimStatus: otherClaim.status,
+        anonymousStatus: anonymous.status,
+      },
+    },
+  };
+  writeReport(out, { ...report, checks: judgeSliceReport(report, Date.now()) });
 };
 
 // --- gate --------------------------------------------------------------------------------------
 
+/**
+ * Judges each report again from what it recorded; the outcomes a report states are compared, never
+ * trusted. Prints check ids only: a report is a file, and its text is not repeated.
+ */
 const gate = (paths) => {
   if (paths.length === 0) throw usage();
-  const reports = paths.map((path) => JSON.parse(readFileSync(path, "utf8")));
-  const kinds = new Set(reports.map((report) => report.kind));
-  let passed = kinds.has("binding") && kinds.has("slice");
-  if (!passed) process.stdout.write("FAIL gate: needs one binding report and one slice report\n");
+  const reports = paths.map((path) => {
+    try {
+      return JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      throw new HarnessFailure(`${path} is not a readable JSON report`, 2);
+    }
+  });
+  const kinds = reports.map((report) => report?.kind);
+  let passed = reports.length === 2 && kinds.includes("binding") && kinds.includes("slice");
+  if (!passed) {
+    process.stdout.write("FAIL gate: needs exactly one binding report and one slice report\n");
+  }
+  const now = Date.now();
   for (const [index, report] of reports.entries()) {
-    const ok = Array.isArray(report.checks) && gatePasses(report.checks);
+    const checks = judgeReport(report, now);
+    const ok = gatePasses(checks);
     passed &&= ok;
-    process.stdout.write(`${ok ? "PASS" : "FAIL"} ${report.kind} ${paths[index]}\n`);
+    const kind = kinds[index] === "binding" || kinds[index] === "slice" ? kinds[index] : "unknown";
+    process.stdout.write(`${ok ? "PASS" : "FAIL"} ${kind} ${paths[index]}\n`);
+    for (const item of checks) {
+      if (item.outcome !== "pass") process.stdout.write(`  FAIL ${item.id}\n`);
+    }
   }
   process.stdout.write(passed ? "the live gate passed\n" : "the live gate did not pass\n");
   if (!passed) process.exitCode = 1;
@@ -587,9 +646,11 @@ try {
   const failure =
     error instanceof HarnessFailure
       ? error
-      : new HarnessFailure(
-          `unexpected failure (${error instanceof Error ? error.name : "unknown"})`,
-        );
+      : error instanceof RefusedDestination
+        ? new HarnessFailure(error.message)
+        : new HarnessFailure(
+            `unexpected failure (${error instanceof Error ? error.name : "unknown"})`,
+          );
   process.stderr.write(`qualify-slice: ${failure.message}\n`);
   process.exitCode = failure.exitCode;
 }
