@@ -1107,6 +1107,14 @@ export function createTrain(
       // other. Settling it never undoes the landing: it runs in its own nested transaction, keeps
       // what it cannot settle pending for the Repo's alarm, and a throw here is logged.
       ports().adaptation.owe(intentId, batch.pins);
+      // Each claim that closes records the versions its pin was readied under, so a later version
+      // reaches its holder as rework. `merged` closes only a pin still ready in its episode, and so
+      // does this; it reads the pin before `merged` ends it.
+      for (const pin of closing) {
+        const ready = ports().claims.readyPin(pin.claimId);
+        if (ready === null || ready.episode !== pin.episode || !samePin(ready.pin, pin)) continue;
+        ports().decisions.relied(tx, pin.claimId, pin.generation, ready.decisions);
+      }
       // The landed claims close once the adaptation has read them as held. A missing claims module
       // throws, so the landing rolls back rather than leaving its claims ready.
       ports().claims.merged(tx, closing, main);

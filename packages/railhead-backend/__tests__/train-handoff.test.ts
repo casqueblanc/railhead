@@ -32,6 +32,7 @@ import {
   MAX_WAKE_FAILURES,
   QUESTION_BASE_MS,
   type Train,
+  WAKE_BASE_MS,
 } from "../src/modules/train/scheduler";
 import { insertEntry, readWake, settleEntry } from "../src/modules/train/store";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/composeRepo";
@@ -77,6 +78,8 @@ interface Setup {
   openFor(n: number, ...commits: string[]): Promise<ClaimView>;
   /** Whether the decisions port the other modules reach can read a claim's current versions. */
   versionsKnown: boolean;
+  /** Whether the decisions port the train reaches throws when a landing records relied versions. */
+  reliedFails: boolean;
   /**
    * While set, the merge port answers a conflict between these two pins on `conflictPath` for any
    * pin list holding both, rather than a clean candidate.
@@ -247,6 +250,10 @@ function withHandoff<T>(
         ...decisions,
         currentVersions: (claimId) =>
           setup.versionsKnown ? decisions.currentVersions(claimId) : null,
+        relied(tx, claimId, generation, refs) {
+          if (setup.reliedFails) throw new Error("relied failed");
+          decisions.relied(tx, claimId, generation, refs);
+        },
       },
       train: install(train),
       authorization,
@@ -372,6 +379,7 @@ function withHandoff<T>(
       },
       push,
       versionsKnown: true,
+      reliedFails: false,
       conflict: null,
       conflictPath: "src/upload.ts",
       holdChecks: false,
@@ -1732,6 +1740,127 @@ describe("a landed claim", () => {
       expect(claimState(setup.sql, claim.claimId)).toBe("merged");
       expect(claimState(setup.sql, other.claimId)).toBe("working");
       expect(eventTypes(setup)).not.toContain("claim.reopened");
+    });
+  });
+});
+
+describe("a landed claim's decision versions", () => {
+  it("make a later version rework for the holder", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      await landNext(setup);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      // Version 1 is still current, so the landing owes nothing new.
+      expect(setup.decisions.obligations(claim.claimId)).toMatchObject([
+        { decision: first, kind: "decision" },
+      ]);
+
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      const pending = await setup.inbox.pending(agent(1), 16);
+      expect(pending).toMatchObject({
+        ok: true,
+        value: { items: [{ claimId: claim.claimId, entry: { kind: "rework", decision: second } }] },
+      });
+      expect(setup.decisions.obligations(claim.claimId)).toMatchObject([
+        { decision: first, kind: "decision" },
+        { decision: second, kind: "rework", delivery: { agentId: agent(1).agentId } },
+      ]);
+    });
+  });
+
+  it("owe rework at once when a version was recorded while the batch published", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const update = setup.holdUpdate();
+      const landing = landNext(setup);
+      await update.reached;
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      update.release();
+      await landing;
+
+      // The landed work followed version 1, so version 2, already queued as a decision, is now
+      // rework as well, and the merged claim reopens for it.
+      expect(eventTypes(setup)).toContain("claim.merged");
+      expect(claimState(setup.sql, claim.claimId)).toBe("working");
+      expect(await setup.inbox.pending(agent(1), 16)).toMatchObject({
+        ok: true,
+        value: {
+          items: [
+            { entry: { kind: "decision", decision: second } },
+            { entry: { kind: "rework", decision: second } },
+          ],
+        },
+      });
+      expect(setup.decisions.obligations(claim.claimId)).toMatchObject([
+        { decision: second, kind: "decision" },
+        { decision: second, kind: "rework" },
+      ]);
+    });
+  });
+
+  it("are not recorded for a claim readied again while its batch publishes", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      const update = setup.holdUpdate();
+      const landing = landNext(setup);
+      await update.reached;
+      await setup.decide(claim.claimId, first.decisionId);
+      await setup.ackAll();
+      const again = await setup.claims.ready(agent(1), claim.claimId, {
+        generation: 1,
+        commit: WORK,
+      });
+      expect(again).toMatchObject({ ok: true, value: { repeated: false } });
+      update.release();
+      await landing;
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+
+      // The landed commit was not this episode's work, so a later version is a plain decision.
+      const third = await setup.decisions.record({
+        kind: "human",
+        userId: OWNER,
+        repoId: REPO,
+        grantId: crypto.randomUUID(),
+        action: {
+          kind: "decision.record",
+          decisionId: first.decisionId,
+          option: "chunk",
+          expectedVersion: 2,
+        },
+      });
+      expect(third).toEqual(ok({ decisionId: first.decisionId, version: 3 }));
+      expect(await setup.inbox.pending(agent(1), 16)).toMatchObject({
+        ok: true,
+        value: { items: [{ entry: { kind: "decision", decision: { version: 3 } } }] },
+      });
+      const kinds = setup.decisions.obligations(claim.claimId)?.map((one) => one.kind);
+      expect(kinds).toEqual(["decision"]);
+    });
+  });
+
+  it("roll the landing back when they cannot be recorded, and land with them on the next drive", async () => {
+    await withHandoff(async (setup) => {
+      const { claim, first } = await readyUnderFirst(setup);
+      setup.reliedFails = true;
+      await landNext(setup);
+      const published = setup.main();
+      expect(published).not.toBe(MAIN);
+      expect(claimState(setup.sql, claim.claimId)).toBe("ready");
+      expect(eventTypes(setup)).not.toContain("claim.merged");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "batched", next: null }]);
+      expect(readWake(setup.sql)).toEqual({ dueAt: setup.now() + WAKE_BASE_MS, failures: 1 });
+
+      setup.reliedFails = false;
+      setup.advance(WAKE_BASE_MS);
+      await setup.train.resume();
+      expect(setup.main()).toBe(published);
+      expect(claimState(setup.sql, claim.claimId)).toBe("merged");
+      expect(setup.entries()).toEqual([{ commit: WORK, state: "landed", next: null }]);
+      const second = await setup.decide(claim.claimId, first.decisionId);
+      expect(await setup.inbox.pending(agent(1), 16)).toMatchObject({
+        ok: true,
+        value: { items: [{ entry: { kind: "rework", decision: second } }] },
+      });
     });
   });
 });
