@@ -86,6 +86,7 @@ impl Render for Status {
             let reason = match &closed.reason {
                 ClosedReason::Merged { commit } => format!("merged at {}", quoted(commit)),
                 ClosedReason::Expired => "expired".to_owned(),
+                ClosedReason::Released => "released".to_owned(),
                 ClosedReason::TakenOver => "taken over".to_owned(),
             };
             writeln!(

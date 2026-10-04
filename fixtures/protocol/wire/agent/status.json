@@ -189,6 +189,45 @@
       }
     },
     {
+      "name": "the agent's last claim was released",
+      "request": {
+        "headers": {
+          "authorization": "Bearer eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhZ3RfYXRsYXMwMSJ9.c2lnbmF0dXJlLW5vdC1yZWFs"
+        },
+        "query": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "data": {
+            "agent": {
+              "agentId": "agt_atlas01",
+              "name": "atlas",
+              "ownerId": "usr_lemarier",
+              "state": "confirmed"
+            },
+            "claim": null,
+            "closed": {
+              "claimId": "clm_42abcd",
+              "issueId": "iss_upload1",
+              "generation": 1,
+              "reason": {
+                "kind": "released"
+              },
+              "closedAt": 1789999940000
+            }
+          },
+          "inbox": {
+            "items": [],
+            "pending": 0
+          },
+          "next": "work"
+        }
+      }
+    },
+    {
       "name": "the agent's last claim was taken over, and it holds a new one",
       "request": {
         "headers": {

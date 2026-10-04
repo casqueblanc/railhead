@@ -5,6 +5,8 @@
     "**/*.gen.ts",
     "pnpm-lock.yaml",
     "fixtures/demo/standalone/pnpm-lock.yaml",
-    "Cargo.lock"
+    "Cargo.lock",
+    "**/snapshots/*.snap",
+    "crates/railhead-swarm/tests/fixtures/run.jsonl"
   ]
 }

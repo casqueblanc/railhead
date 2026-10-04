@@ -236,7 +236,10 @@ function withRepo<R>(
       current.get(claimId)?.generation ?? null;
     const currentVersions = (claimId: string): [] | null => (current.has(claimId) ? [] : null);
     const started: CheckAttempt[] = [];
-    const real = composeRepo(context);
+    // The composition builds its own train, whose startup now reads the installed authorization's
+    // unsettled intents. Kept off the storage alarm, it cannot spend the alarm write failures
+    // meant for the train under test.
+    const real = composeRepo({ ...context, wake: async () => true });
     const readyPin = (claimId: string): ReadyPin | null => {
       const found = current.get(claimId);
       const entry =

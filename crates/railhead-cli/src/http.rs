@@ -12,8 +12,8 @@ use railhead_protocol::{
     AGENT_PATH_PREFIX, AGENT_REQUEST_CONTENT_TYPE, AGENT_REQUEST_TIMEOUT_MS, AckRequest,
     AgentError, AgentResponse, AgentRoute, AgentSuccess, AskRequest, ChallengeRequest,
     ClaimRequest, IdKind, JoinRequest, MAX_AGENT_REQUEST_BYTES, MAX_AGENT_RESPONSE_BYTES,
-    MAX_INBOX_PAGE, MAX_LONG_POLL_MS, Method, ReadyRequest, SafeInteger, SessionRequest,
-    decode_response, is_id,
+    MAX_INBOX_PAGE, MAX_LONG_POLL_MS, Method, ReadyRequest, ReleaseRequest, SafeInteger,
+    SessionRequest, decode_response, is_id,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -108,6 +108,7 @@ wire_requests!(
     SessionRequest,
     ClaimRequest,
     ReadyRequest,
+    ReleaseRequest,
     AckRequest,
     AskRequest,
 );
@@ -129,6 +130,11 @@ pub enum Endpoint<'a> {
     Claim,
     /// `POST /claims/{claimId}/ready`.
     Ready {
+        /// The claim.
+        claim_id: &'a str,
+    },
+    /// `POST /claims/{claimId}/release`.
+    Release {
         /// The claim.
         claim_id: &'a str,
     },
@@ -168,6 +174,7 @@ impl Endpoint<'_> {
             Self::Work => AgentRoute::Work,
             Self::Claim => AgentRoute::Claim,
             Self::Ready { .. } => AgentRoute::Ready,
+            Self::Release { .. } => AgentRoute::Release,
             Self::Inbox { .. } => AgentRoute::Inbox,
             Self::Ack { .. } => AgentRoute::Ack,
             Self::Ask { .. } => AgentRoute::Ask,
@@ -198,7 +205,7 @@ impl Endpoint<'_> {
             | Self::Status
             | Self::Work
             | Self::Claim => (path.to_owned(), None),
-            Self::Ready { claim_id } | Self::Ask { claim_id } => (
+            Self::Ready { claim_id } | Self::Release { claim_id } | Self::Ask { claim_id } => (
                 path.replace("{claimId}", &id(IdKind::Claim, claim_id, "claimId")?),
                 None,
             ),

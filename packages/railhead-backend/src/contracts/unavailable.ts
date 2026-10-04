@@ -51,6 +51,7 @@ export const unavailableClaims: ClaimsPort = {
   work: refuse("claims"),
   claim: refuse("claims"),
   ready: refuse("claims"),
+  release: refuse("claims"),
   pin: refuse("claims"),
   currentGeneration: () => null,
   workingGeneration: () => null,

@@ -49,6 +49,7 @@ import join from "../../../fixtures/protocol/wire/agent/join.json";
 import pinRoute from "../../../fixtures/protocol/wire/agent/pin.json";
 import question from "../../../fixtures/protocol/wire/agent/question.json";
 import ready from "../../../fixtures/protocol/wire/agent/ready.json";
+import release from "../../../fixtures/protocol/wire/agent/release.json";
 import session from "../../../fixtures/protocol/wire/agent/session.json";
 import status from "../../../fixtures/protocol/wire/agent/status.json";
 import work from "../../../fixtures/protocol/wire/agent/work.json";
@@ -77,6 +78,7 @@ const FIXTURES: AgentFixture[] = [
   work,
   claim,
   ready,
+  release,
   pinRoute,
   inbox,
   ack,
@@ -254,6 +256,7 @@ describe("events on the wire", () => {
     "claim.reopened": true,
     "claim.merged": true,
     "claim.expired": true,
+    "claim.released": true,
     "claim.reassigned": true,
     "claim.adapted": true,
     "question.asked": true,

@@ -115,6 +115,20 @@ const MIGRATIONS: readonly string[] = [
   "ALTER TABLE claims_claims ADD COLUMN rework_waiting INTEGER",
   `CREATE INDEX claims_rework_waiting ON claims_claims (agent_id, rework_waiting)
     WHERE state = 'merged' AND rework_waiting IS NOT NULL`,
+  // SQLite cannot change a CHECK constraint, so the table is rebuilt to accept `released`.
+  `CREATE TABLE claims_closed_next (
+    agent_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL REFERENCES claims_claims (claim_id),
+    issue_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    reason TEXT NOT NULL CHECK (reason IN ('merged', 'expired', 'released', 'taken_over')),
+    commit_sha TEXT,
+    closed_at INTEGER NOT NULL,
+    CHECK ((reason = 'merged') = (commit_sha IS NOT NULL))
+  ) STRICT`,
+  "INSERT INTO claims_closed_next SELECT * FROM claims_closed",
+  "DROP TABLE claims_closed",
+  "ALTER TABLE claims_closed_next RENAME TO claims_closed",
 ];
 
 /** The states in which a claim counts against its agent and its owner. */
@@ -790,8 +804,9 @@ export type ClosedReason = ClosedClaimView["reason"];
 
 /**
  * Records `claim`, at the generation `agentId` held it, as that agent's most recently closed claim,
- * replacing the one recorded before. A takeover closes a claim that already expired, possibly
- * before a later claim of the agent closed, so it replaces only that same claim's expiry, or no row.
+ * replacing the one recorded before. A takeover closes a claim that already expired or was released,
+ * possibly before a later claim of the agent closed, so it replaces only that same claim's record,
+ * or no row.
  */
 export function recordClosed(
   sql: SqlStorage,
@@ -854,6 +869,8 @@ function closedReason(reason: string, commit: string | null): ClosedReason {
       return { kind: "merged", commit };
     case "expired":
       return { kind: "expired" };
+    case "released":
+      return { kind: "released" };
     case "taken_over":
       return { kind: "taken_over" };
     default:

@@ -480,13 +480,18 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             "The claim has a newer generation than the one you sent.",
           );
         }
-        const asked = tx.sql
-          .exec<{ n: number }>("SELECT COUNT(*) AS n FROM questions WHERE claim_id = ?", claimId)
+        // A system question adds a dependency to every claim it names but stores its question
+        // under the first, so the quota counts dependencies, as `askSystem` does.
+        const depends = tx.sql
+          .exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM decision_claims WHERE claim_id = ?",
+            claimId,
+          )
           .toArray()[0];
-        if ((asked?.n ?? 0) >= MAX_QUESTIONS_PER_CLAIM) {
+        if ((depends?.n ?? 0) >= MAX_QUESTIONS_PER_CLAIM) {
           return fail(
             "quota_exceeded",
-            `A claim may ask at most ${MAX_QUESTIONS_PER_CLAIM} questions.`,
+            `A claim may depend on at most ${MAX_QUESTIONS_PER_CLAIM} decisions.`,
           );
         }
         const questionId = newId("qst_");

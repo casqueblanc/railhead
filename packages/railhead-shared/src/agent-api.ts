@@ -260,6 +260,7 @@ export type AgentRouteName =
   | "work"
   | "claim"
   | "ready"
+  | "release"
   | "pin"
   | "inbox"
   | "ack"
@@ -364,6 +365,13 @@ export const AGENT_ROUTES = {
       "commit_not_found",
       "claim_closed",
     ],
+  },
+  release: {
+    method: "POST",
+    path: "/claims/{claimId}/release",
+    auth: "session",
+    idempotency: "claim and generation: a repeat returns the recorded release",
+    errors: ["stale_generation", "after_ready", "claim_closed", "busy"],
   },
   pin: {
     method: "GET",
@@ -596,12 +604,15 @@ export type ClosedReason =
   | { kind: "merged"; commit: CommitSha }
   /** The lease lapsed (`claim.expired`): the work is not merged and waits for a successor. */
   | { kind: "expired" }
-  /** The expired claim was given to another agent (`claim.reassigned`), which now holds it. */
+  /** The agent gave the claim up (`claim.released`): the work waits for a successor. */
+  | { kind: "released" }
+  /** The expired or released claim was given to another agent (`claim.reassigned`), which now holds it. */
   | { kind: "taken_over" };
 
 /**
  * The agent's most recently closed claim. Only the latest is kept per agent; a later closing
- * replaces it, and a claim that expired and was then taken over reads as `taken_over`.
+ * replaces it, and a claim that expired or was released and was then taken over reads as
+ * `taken_over`.
  */
 export interface ClosedClaimView {
   /** The claim. */
@@ -760,6 +771,23 @@ export interface ReadyResult {
   repeated: boolean;
 }
 
+/**
+ * `release`: give up a working claim the agent cannot finish. The claim is in the path. A ready
+ * claim's pin is on the train, so it is refused with `after_ready`.
+ */
+export interface ReleaseRequest {
+  /** The ownership generation the agent last saw. */
+  generation: number;
+}
+
+/** `release` result. */
+export interface ReleaseResult {
+  /** The claim as the agent's closed claim, with the reason `released`. */
+  closed: ClosedClaimView;
+  /** `true` when this release was already recorded and the call returned it. */
+  repeated: boolean;
+}
+
 /** Where a batch holding a pin stands. */
 export type PinBatchState =
   /** The batch is being composed on main. */
@@ -899,6 +927,8 @@ export interface AgentRequests {
   claim: ClaimRequest;
   /** See `ReadyRequest`. */
   ready: ReadyRequest;
+  /** See `ReleaseRequest`. */
+  release: ReleaseRequest;
   /** No body. */
   pin: null;
   /** No body. */
@@ -927,6 +957,8 @@ export interface AgentResults {
   claim: ClaimResult;
   /** See `ReadyResult`. */
   ready: ReadyResult;
+  /** See `ReleaseResult`. */
+  release: ReleaseResult;
   /** See `PinResult`. */
   pin: PinResult;
   /** See `InboxResult`. */
@@ -973,6 +1005,9 @@ export function validateAgentRequest(request: AgentRequestPair): void {
     case "ready":
       requirePositiveInteger(request.body.generation, "generation");
       if (!isCommitSha(request.body.commit)) throw new Error("commit is not a commit id");
+      return;
+    case "release":
+      requirePositiveInteger(request.body.generation, "generation");
       return;
     case "ack":
       requireText(request.body.plan, MAX_PLAN_LENGTH, "plan");

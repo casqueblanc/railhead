@@ -90,13 +90,25 @@
 // merged pin reopens the claim to working, appending `claim.reopened`, if its holder holds no other
 // active claim; otherwise the claim waits, and the transaction that closes the holder's active claim
 // (a merge, an expiry or a takeover of a lapsed allocation) reopens the one that waited longest.
-// Each closing, a merge, an expiry or a takeover, records for the agent that held the claim why it
-// closed, in the same transaction, and `lastClosed` answers it. Only the latest is kept per agent.
+// Each closing, a merge, an expiry, a release or a takeover, records for the agent that held the
+// claim why it closed, in the same transaction, and `lastClosed` answers it. Only the latest is kept
+// per agent.
+//
+// `release` lets the holder of a working claim give it up before its lease lapses. It closes the
+// claim exactly as an expiry does, appending `claim.released` instead of `claim.expired`, so the
+// fork's tokens are revoked and the claim is then taken over like any expired one. A ready claim's
+// pin is on the train, so its release is refused.
 //
 // The remote URLs in a `ClaimView` are left empty here: the port knows neither the origin the
 // agent called nor the repository's name. The agent dispatcher fills both from the request.
 
-import type { ClaimResult, ClaimView, ReadyRequest, ReadyResult } from "@railhead/shared/agent-api";
+import type {
+  ClaimResult,
+  ClaimView,
+  ReadyRequest,
+  ReadyResult,
+  ReleaseResult,
+} from "@railhead/shared/agent-api";
 import {
   isCommitSha,
   isId,
@@ -293,15 +305,35 @@ export function createClaims(
    * claim and reopens a merged claim of the holder waiting for rework. Runs in the caller's
    * transaction.
    */
-  const expire = (tx: EventTransaction, row: ClaimRow, now: number): void => {
+  const expire = (tx: EventTransaction, row: ClaimRow, now: number): void =>
+    closeWorking(tx, row, now, "expired");
+
+  /**
+   * Expires a working claim because its lease lapsed or its holder released it, appends the event
+   * of that reason, records it as the holder's closed claim and reopens a merged claim of the holder
+   * waiting for rework. Runs in the caller's transaction.
+   */
+  const closeWorking = (
+    tx: EventTransaction,
+    row: ClaimRow,
+    now: number,
+    reason: "expired" | "released",
+  ): void => {
     if (!expireClaim(tx.sql, row.claimId, row.generation, now)) {
       throw new Error("a working claim read in this transaction could not be expired");
     }
-    recordClosed(tx.sql, row.agentId, row, { kind: "expired" }, now);
-    tx.append(CLAIMS_ACTOR, {
-      type: "claim.expired",
-      data: { claimId: row.claimId, generation: row.generation },
-    });
+    recordClosed(tx.sql, row.agentId, row, { kind: reason }, now);
+    const data = { claimId: row.claimId, generation: row.generation };
+    switch (reason) {
+      case "expired":
+        tx.append(CLAIMS_ACTOR, { type: "claim.expired", data });
+        break;
+      case "released":
+        tx.append({ kind: "agent", id: row.agentId }, { type: "claim.released", data });
+        break;
+      default:
+        return reason satisfies never;
+    }
     reopenWaiting(tx, row.agentId);
   };
 
@@ -937,6 +969,41 @@ export function createClaims(
       ).value;
     },
 
+    async release(agent, claimId, request) {
+      const foreign = refuseForeign(agent);
+      if (foreign !== null) return foreign;
+      if (!isId("claim", claimId)) return fail("invalid_request", "The claim id is malformed.");
+      if (!Number.isSafeInteger(request.generation) || request.generation < 1) {
+        return fail("invalid_request", "The generation must be a whole number from 1.");
+      }
+      return log.transaction((tx): PortResult<ReleaseResult> => {
+        // A repeat whose first answer was lost finds its release as the agent's last closed claim.
+        const last = closedOf(tx.sql, agent.agentId);
+        if (
+          last?.claimId === claimId &&
+          last.generation === request.generation &&
+          last.reason.kind === "released"
+        ) {
+          return ok({ closed: last, repeated: true });
+        }
+        const held = releasable(claimById(tx.sql, claimId), agent, request.generation);
+        if (!held.ok) return held;
+        const row = held.value;
+        const now = clock();
+        if (row.leaseUntil !== null && row.leaseUntil <= now) {
+          expire(tx, row, now);
+          wakeForDeadline(tx.sql);
+          return fail("claim_closed", "The claim's lease expired.");
+        }
+        closeWorking(tx, row, now, "released");
+        // The revocation is due now, and the alarm settles it if no successor's call does first.
+        wakeForDeadline(tx.sql);
+        const closed = closedOf(tx.sql, agent.agentId);
+        if (closed === null) throw new Error("a released claim cannot be read back");
+        return ok({ closed, repeated: false });
+      }).value;
+    },
+
     async pin(claimId) {
       if (!isId("claim", claimId)) return fail("invalid_request", "The claim id is malformed.");
       // Every read below is synchronous, so they see one state of the Repo.
@@ -1164,6 +1231,43 @@ function standing(row: ClaimRow | null, agent: AgentPrincipal, request: ReadyReq
     return { kind: "refused", reason: "stale_generation", row };
   }
   return { kind: "held", row };
+}
+
+/**
+ * `row` when `agent` holds it working at `generation`, so it may release it, or why it may not. The
+ * lease is checked by the caller.
+ */
+function releasable(
+  row: ClaimRow | null,
+  agent: AgentPrincipal,
+  generation: number,
+): PortResult<ClaimRow> {
+  if (row === null) return fail("claim_closed", "The claim does not exist.");
+  switch (row.state) {
+    case "allocating":
+      return fail("busy", "The claim is still being allocated; repeat the request.");
+    case "merged":
+    case "expired":
+      return fail("claim_closed", "The claim is closed.");
+    case "working":
+    case "ready":
+      break;
+    default:
+      return row.state satisfies never;
+  }
+  if (row.agentId !== agent.agentId) {
+    return fail("stale_generation", "This agent does not hold the claim.");
+  }
+  if (row.generation !== generation) {
+    return fail("stale_generation", "The claim's ownership generation has changed.");
+  }
+  if (row.state === "ready") {
+    return fail(
+      "after_ready",
+      "The claim is ready and its pin is on the train; it cannot be released.",
+    );
+  }
+  return ok(row);
 }
 
 function refused(failure: PortFailure): Standing {

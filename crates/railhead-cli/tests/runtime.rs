@@ -17,10 +17,11 @@ const KEY: &str =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n-----END OPENSSH PRIVATE KEY-----\n";
 
 /// Every command that acts as an agent, with arguments Git or a person would pass.
-const AGENT_COMMANDS: [&[&str]; 8] = [
+const AGENT_COMMANDS: [&[&str]; 9] = [
     &["work"],
     &["claim", "iss_upload1"],
     &["ready"],
+    &["release"],
     &["status"],
     &["sync"],
     &["ack", "17", "--plan", "p"],

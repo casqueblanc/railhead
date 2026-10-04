@@ -810,6 +810,21 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }),
       };
     }
+    case "claim.released": {
+      // A release leaves the claim as an expiry does, so the board shows it expired.
+      const { claimId, generation } = event.data;
+      const claim = known(state.claims, claimId, "claim");
+      currentGeneration(claim, generation);
+      check(claim.phase === "working", `claim ${claimId} released while ${claim.phase}`);
+      check(
+        event.actor.kind === "agent" && event.actor.id === claim.agentId,
+        `claim ${claimId} released by an agent that does not hold it`,
+      );
+      return {
+        ...endHolds(state, draft, [claimId], "dropped", seq),
+        claims: draft.put(state.claims, claimId, { ...claim, phase: "expired" }),
+      };
+    }
     case "claim.reassigned": {
       const { claimId, from, to, generation } = event.data;
       const claim = known(state.claims, claimId, "claim");

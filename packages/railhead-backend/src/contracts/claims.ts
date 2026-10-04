@@ -8,6 +8,8 @@ import type {
   ClosedClaimView,
   ReadyRequest,
   ReadyResult,
+  ReleaseRequest,
+  ReleaseResult,
 } from "@railhead/shared/agent-api";
 import type {
   ClaimId,
@@ -108,6 +110,17 @@ export interface ClaimsPort {
     claimId: ClaimId,
     request: ReadyRequest,
   ): Promise<PortResult<ReadyResult>>;
+  /**
+   * Gives up the agent's working claim at its current generation, leaving it as an expiry leaves
+   * it: its fork's tokens owed a revocation, then offered to a successor. Refuses a stale generation,
+   * a ready claim with `after_ready` and a closed or lapsed claim with `claim_closed`. A repeat of the
+   * same release, while it is still the agent's last closed claim, returns it.
+   */
+  release(
+    agent: AgentPrincipal,
+    claimId: ClaimId,
+    request: ReleaseRequest,
+  ): Promise<PortResult<ReleaseResult>>;
   /**
    * The claim's current pin, for the train. Fails unless the claim is ready at its recorded decision
    * versions with a clear inbox gate; a superseded pin reopens the claim and fails with

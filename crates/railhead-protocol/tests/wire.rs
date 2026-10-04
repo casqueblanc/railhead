@@ -610,6 +610,10 @@ fn decodes_each_closed_reason_and_refuses_unknown_or_incomplete_ones() -> TestRe
         Some(ClosedReason::Expired)
     );
     assert_eq!(
+        closed_reason(closed_status(&json!({"kind": "released"})))?,
+        Some(ClosedReason::Released)
+    );
+    assert_eq!(
         closed_reason(closed_status(&json!({"kind": "taken_over"})))?,
         Some(ClosedReason::TakenOver)
     );
@@ -618,7 +622,7 @@ fn decodes_each_closed_reason_and_refuses_unknown_or_incomplete_ones() -> TestRe
     let response: AgentResponse<StatusResult> = serde_json::from_value(body.clone())?;
     assert_eq!(serde_json::to_value(&response)?, body);
     for reason in [
-        json!({"kind": "released"}),
+        json!({"kind": "abandoned"}),
         json!({"kind": "takenOver"}),
         json!({"kind": "merged"}),
         json!({"kind": "merged", "commit": null}),

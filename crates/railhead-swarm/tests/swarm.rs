@@ -1241,6 +1241,30 @@ async fn ctrl_c_stops_the_run_and_removes_its_clones() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn the_terminal_view_without_a_terminal_starts_nothing() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    // Standard error is a pipe here, so the view has no terminal to draw on.
+    let output = world.driver(&scenario)?.arg("--tui").output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "railhead-swarm: starting the terminal view: --tui needs standard error to be a terminal\n"
+    );
+    assert!(
+        world
+            .server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(world.work_is_empty()?, "the refused run left clones behind");
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_invalid_scenario_starts_nothing() -> anyhow::Result<()> {
     let world = world(1, 1, false).await?;
     let path = world.dir.path().join("scenario.json");
