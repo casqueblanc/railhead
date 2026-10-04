@@ -13,10 +13,11 @@
 //! landing still needs the claim read as `merged`, and a failed `rh pin` stops nothing.
 //!
 //! A task lands only when the agent reads its claim as `merged`. A ready claim that leaves the
-//! agent's status without that evidence may have merged or expired: today's agent wire does not say
-//! which (casqueblanc/railhead#237 adds the closed reason). The agent reports such a task as
-//! unverified, never as a landing, and goes on with its plan, which is what an agent whose claim
-//! merged would do. A claim it reads as `expired` stops it.
+//! agent's status without that evidence may have merged or expired. The agent wire names the
+//! closed reason in `StatusResult.closed`, but the wait reads only the status's active claim and
+//! does not use it yet. The agent reports such a task as unverified, never as a landing, and goes
+//! on with its plan, which is what an agent whose claim merged would do. A claim it reads as
+//! `expired` stops it.
 //!
 //! Two edits of the same path count as merged by Git only on evidence Git gives: each was
 //! written on a base that lacked the other's line, and main, read back after the second landed,

@@ -9,10 +9,11 @@
 //! A waiting agent reads its pin after each poll and reports each change as a `pinState` event;
 //! the stream knows a batch only through the pins in it. "Landed" needs positive evidence: the
 //! agent read its claim as `merged`. A ready claim that leaves the agent's status without that
-//! evidence may have merged or expired, and today's agent wire does not say which, so it is
-//! "unverified" until casqueblanc/railhead#237 adds the closed reason: never a landing, and not a
-//! failure. "Auto-merged" needs Git's evidence: two edits of the same path landed, each written on
-//! a base that lacked the other's line, and main read back afterwards holds both.
+//! evidence may have merged or expired. The agent wire's `StatusResult.closed` names the closed
+//! reason, but the driver reads only the active claim and does not use it yet, so such a claim is
+//! "unverified": never a landing, and not a failure. "Auto-merged" needs Git's evidence: two edits
+//! of the same path landed, each written on a base that lacked the other's line, and main read
+//! back afterwards holds both.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
