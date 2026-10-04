@@ -119,6 +119,7 @@ export const unavailableChecks: CheckPort = {
   definitions: refuse("checks"),
   start: refuse("checks"),
   report: refuse("checks"),
+  approve: refuse("checks"),
   detail: refuse("checks"),
 };
 
@@ -135,6 +136,8 @@ export const unavailableTrain: TrainPort = {
   holdsLiveEntry: () => null,
   pinView: refuse("train"),
   armWake: async () => false,
+  release: () => false,
+  holds: () => false,
   resume: async () => {},
   startup: async () => true,
 };

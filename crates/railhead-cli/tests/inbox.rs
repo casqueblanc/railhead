@@ -8,7 +8,7 @@
 use std::fs;
 use std::io::{self, Read, Write as _};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 #[cfg(debug_assertions)]
@@ -187,16 +187,60 @@ const OVERRUN: Duration = Duration::from_secs(30);
 /// A child process, started as the leader of a process group of its own, killed with its
 /// descendants and reaped when the test lets go of it. A stalled `rh`, any Git it started, and any
 /// process left in its group after it exited fail the test instead of hanging the job.
-struct Reaped(Child);
+///
+/// The child is reaped only once its tree has been stopped. Until then an exited child stays a
+/// zombie, which keeps its process id, and the process group id equal to it, from being reused, so
+/// the cleanup cannot signal an unrelated process that took either.
+struct Reaped {
+    child: Child,
+    reaped: bool,
+}
+
+impl Reaped {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        Ok(Self {
+            child: command.spawn()?,
+            reaped: false,
+        })
+    }
+
+    /// Whether the child exited. It is left unreaped.
+    #[cfg(unix)]
+    fn exited(&self) -> io::Result<bool> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = i32::try_from(self.child.id())
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("the child has no valid process id"))?;
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        Ok(waitid(WaitId::Pid(pid), options)?.is_some())
+    }
+
+    /// Whether the child exited. Without a way to leave it unreaped, it is reaped.
+    #[cfg(not(unix))]
+    fn exited(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
+    /// Kills the child's tree, then reaps the child and returns its status.
+    fn reap(&mut self) -> io::Result<ExitStatus> {
+        // A check that failed treats the child as running: stopping a zombie is harmless.
+        #[cfg(unix)]
+        kill_tree(self.child.id(), !matches!(self.exited(), Ok(true)));
+        // A child that already exited is the outcome wanted; the wait reaps it either way.
+        let _ = self.child.kill();
+        let status = self.child.wait();
+        self.reaped = true;
+        status
+    }
+}
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        // Drop cannot report a failure: a child that already exited is the outcome wanted, and the
-        // wait reaps it either way.
-        #[cfg(unix)]
-        kill_tree(self.0.id(), matches!(self.0.try_wait(), Ok(None)));
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Drop cannot report a failure, and a test that let go early has already failed.
+        if !self.reaped {
+            let _ = self.reap();
+        }
     }
 }
 
@@ -324,16 +368,17 @@ impl Gate {
         command.env("RH_TEST_WAIT_GATE", self.dir.path());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut child = Reaped(command.spawn()?);
-        let stdout = drain(child.0.stdout.take());
-        let stderr = drain(child.0.stderr.take());
+        let mut child = Reaped::spawn(&mut command)?;
+        let stdout = drain(child.child.stdout.take());
+        let stderr = drain(child.child.stderr.take());
         let ready = self.dir.path().join("ready");
         let until = Instant::now() + patience;
         while !ready.exists() {
-            if let Some(status) = child.0.try_wait()? {
+            if child.exited()? {
                 let stderr = collected(&stderr, until)?.ok_or_else(|| {
                     anyhow::anyhow!("rh exited before its wait, its output still open {patience:?} after it started")
                 })?;
+                let status = child.reap()?;
                 anyhow::bail!(
                     "rh exited before its wait: {status} {}",
                     String::from_utf8_lossy(&stderr)
@@ -351,23 +396,22 @@ impl Gate {
             .map_err(|_| anyhow::anyhow!("a gate opens once"))?;
         fs::write(self.dir.path().join("go"), b"")?;
         let until = go + limit;
-        let status = loop {
-            if let Some(status) = child.0.try_wait()? {
-                break status;
-            }
+        while !child.exited()? {
             anyhow::ensure!(
                 Instant::now() < until,
                 "rh still ran {limit:?} after its gate opened"
             );
             std::thread::sleep(Duration::from_millis(5));
-        };
+        }
         let exited = Instant::now();
         let still_open =
             || anyhow::anyhow!("rh's output was still open {limit:?} after its gate opened");
+        let stdout = collected(&stdout, until)?.ok_or_else(still_open)?;
+        let stderr = collected(&stderr, until)?.ok_or_else(still_open)?;
         let output = Output {
-            status,
-            stdout: collected(&stdout, until)?.ok_or_else(still_open)?,
-            stderr: collected(&stderr, until)?.ok_or_else(still_open)?,
+            status: child.reap()?,
+            stdout,
+            stderr,
         };
         Ok((finish(&output)?, go, exited))
     }
@@ -582,6 +626,64 @@ fn a_descendant_holding_stdout_after_the_gate_is_stopped_and_fails() -> anyhow::
     Ok(())
 }
 
+/// Whether the process `pid` exists, a zombie included.
+#[cfg(unix)]
+fn exists(pid: u32) -> anyhow::Result<bool> {
+    let status = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
+#[cfg(unix)]
+#[test]
+fn an_exited_child_keeps_its_process_id_until_its_tree_is_killed() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let descendant = dir.path().join("descendant");
+    let mut command = orphaning(&descendant, 1, "");
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = Reaped::spawn(&mut command)?;
+    let pid = child.child.id();
+    let until = Instant::now() + PATIENCE;
+    while !child.exited()? {
+        anyhow::ensure!(Instant::now() < until, "the child did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Seeing the exit neither reaps the child nor forgets it: its process id, which is also its
+    // group's, cannot be reused while the descendant left in the group is found and killed.
+    assert!(child.exited()?);
+    assert!(
+        exists(pid)?,
+        "the exited child was reaped before its tree was killed"
+    );
+    assert!(running(&descendant)?);
+    let status = child.reap()?;
+    assert_eq!(status.code(), Some(3));
+    assert!(gone(&descendant)?, "the descendant outlived the cleanup");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_running_child_is_not_seen_exited_and_is_killed_when_reaped() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pid = dir.path().join("pid");
+    let mut command = stalled(&pid, "");
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = Reaped::spawn(&mut command)?;
+    let until = Instant::now() + PATIENCE;
+    while fs::read_to_string(&pid).map_or(true, |pid| pid.trim().is_empty()) {
+        anyhow::ensure!(Instant::now() < until, "the child did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!child.exited()?);
+    let status = child.reap()?;
+    assert_eq!(status.code(), None, "{status}");
+    assert!(!running(&pid)?);
+    Ok(())
+}
+
 /// The fixture exchange named `name`.
 fn exchange(file: &str, name: &str) -> anyhow::Result<Value> {
     let path = format!(
@@ -636,60 +738,54 @@ const HOLD: Duration = Duration::from_secs(20);
 #[cfg(debug_assertions)]
 const EXIT_SLACK: Duration = Duration::from_secs(10);
 
-/// A response held for [`HOLD`], or until a set time after a [`Gate`] opens, that records when each
-/// request arrived, so a test bounds how long the CLI held it open.
+/// A response held for [`HOLD`], or for a set delay, that records when each request arrived, so a
+/// test bounds how long the CLI held it open.
 #[derive(Clone)]
 #[cfg(debug_assertions)]
 struct Held {
     response: ResponseTemplate,
-    until: Option<(Arc<OnceLock<Instant>>, Duration)>,
+    delay: Duration,
     arrivals: Arc<Mutex<Vec<Instant>>>,
 }
 
 #[cfg(debug_assertions)]
 impl Held {
     fn new(response: ResponseTemplate) -> Self {
+        Self::delayed(response, HOLD)
+    }
+
+    /// A response sent `delay` after each request arrives.
+    fn delayed(response: ResponseTemplate, delay: Duration) -> Self {
         Self {
             response,
-            until: None,
+            delay,
             arrivals: Arc::default(),
         }
     }
 
-    /// A response held until `after` past the moment `gate` opens, or sent at once when a request
-    /// arrives later than that.
-    fn after_go(response: ResponseTemplate, gate: &Gate, after: Duration) -> Self {
-        Self {
-            until: Some((Arc::clone(&gate.go), after)),
-            ..Self::new(response)
-        }
+    /// When the latest held request arrived.
+    fn arrived(&self) -> anyhow::Result<Instant> {
+        let arrivals = self.arrivals.lock().unwrap_or_else(PoisonError::into_inner);
+        arrivals
+            .last()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no request was held"))
     }
 
     /// How long the latest held request stayed open before `rh` exited at `exited`.
     fn open_until(&self, exited: Instant) -> anyhow::Result<Duration> {
-        let arrivals = self.arrivals.lock().unwrap_or_else(PoisonError::into_inner);
-        let arrived = arrivals
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("no request was held"))?;
-        Ok(exited.duration_since(*arrived))
+        Ok(exited.duration_since(self.arrived()?))
     }
 }
 
 #[cfg(debug_assertions)]
 impl Respond for Held {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-        let now = Instant::now();
         self.arrivals
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(now);
-        // A request before the gate opens has no time to be held until, so it is held in full.
-        let delay = self
-            .until
-            .as_ref()
-            .and_then(|(go, after)| go.get().map(|go| *go + *after))
-            .map_or(HOLD, |until| until.saturating_duration_since(now));
-        self.response.clone().set_delay(delay)
+            .push(Instant::now());
+        self.response.clone().set_delay(self.delay)
     }
 }
 
@@ -2180,14 +2276,15 @@ fn lapse_session(world: &World) -> anyhow::Result<(String, ResponseTemplate)> {
 async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> anyhow::Result<()> {
     let world = world().await?;
     let (lapsed, challenge) = lapse_session(&world)?;
-    let wait = Duration::from_secs(6);
-    // The challenge answers two seconds before the deadline, timed from the moment the gate lets
-    // the wait start.
-    let gate = Gate::new()?;
-    let near = Duration::from_secs(4);
+    let wait = Duration::from_secs(10);
+    // The challenge answers `late` after it is asked for, so the session request starts at least
+    // that long into the poll. `wait - late` leaves a loaded machine room to start it before the
+    // deadline.
+    let late = Duration::from_secs(4);
+    let challenged = Held::delayed(challenge, late);
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session/challenge")))
-        .respond_with(Held::after_go(challenge, &gate, near))
+        .respond_with(challenged.clone())
         .mount(&world.server)
         .await;
     // The session request then stalls: it fits one request timeout, but not the time left.
@@ -2199,31 +2296,48 @@ async fn a_login_whose_challenge_ends_near_the_deadline_still_ends_by_it() -> an
     ));
     Mock::given(method("POST"))
         .and(path(format!("{PREFIX}/session")))
-        .respond_with(stall)
+        .respond_with(stall.clone())
         .mount(&world.server)
         .await;
 
+    let gate = Gate::new()?;
     let (run, go, exited) = gate.run(
         command(
             &world,
             world.outside.path(),
             Some("atlas"),
-            &["--json", "ask", "--question", "qst_upload1", "--wait", "6"],
+            &["--json", "ask", "--question", "qst_upload1", "--wait", "10"],
         ),
         wait,
     )?;
+    // The case under test needs the session request sent before the deadline. A run that never
+    // sent it did not exercise it, and fails instead of passing on the deadline alone.
+    assert_eq!(
+        received(&world, "/session").await.len(),
+        1,
+        "the session request did not start before the deadline"
+    );
+    let asked = stall.arrived()?;
+    assert!(asked >= challenged.arrived()? + late);
+    let deadline = go + wait;
+    assert!(
+        asked < deadline,
+        "the session request started after the deadline"
+    );
     // A login that gave its session request the request timeout, which the poll set to what was
-    // left of the wait as it began, would end no sooner than `near + wait` after the gate opened,
-    // however the machine scheduled it. One bounded by the deadline ends a little after `wait`.
+    // left of the wait as the poll began, would hold it open for at least `late` more than what
+    // was left of the wait when it arrived, however the machine scheduled the run. One bounded by
+    // the deadline ends a little after it.
+    let open = stall.open_until(exited)?;
+    let left = deadline.duration_since(asked);
+    assert!(open < left + Duration::from_secs(3), "{open:?} {left:?}");
     let elapsed = exited.duration_since(go);
     assert!(elapsed >= wait, "{elapsed:?}");
     assert!(elapsed < wait + Duration::from_secs(3), "{elapsed:?}");
     assert_eq!(run.code, Some(1), "{}", run.stdout);
     assert_eq!(run.at("/error/code")?, json!("timeout"));
     assert_eq!(run.at("/error/next")?, json!("rh ask"));
-    // The login sent its session request, unless a loaded machine delivered the challenge only
-    // once the deadline had passed. No poll was sent, and the lapsed session is kept.
-    assert!(received(&world, "/session").await.len() <= 1);
+    // No poll was sent, and the lapsed session is kept.
     assert_eq!(received(&world, "/questions/qst_upload1").await.len(), 0);
     let stored = fs::read_to_string(world.home.path().join("agents/atlas/session"))?;
     assert_eq!(stored, lapsed);

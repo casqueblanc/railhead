@@ -4,7 +4,7 @@
 
 // The fixtures sit outside any package, so they reach the shared types by path.
 import {
-  EVENT_SCHEMA_VERSION,
+  eventVersion,
   type Actor,
   type AgentId,
   type CommitSha,
@@ -55,7 +55,7 @@ export const syntheticLog = (
   synthetic: true,
   description,
   events: steps.map((step, index): RailheadEvent => ({
-    v: EVENT_SCHEMA_VERSION,
+    v: eventVersion(step.type),
     seq: index + 1,
     at: SYNTH_START_MS + index * SYNTH_STEP_MS,
     repo: SYNTH_REPO,

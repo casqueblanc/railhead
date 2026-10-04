@@ -337,7 +337,13 @@ fn main() -> ExitCode {
     };
     let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
     let mut out = Output::new(cli.mode(), &mut stdout, &mut stderr);
-    match run(&cli, &mut out) {
+    let result = run(&cli, &mut out);
+    // A signal that stopped a Git step ends `rh` once that step has cleaned up, whatever the
+    // command made of the stopped step.
+    if let Some(signal) = subprocess::interrupted() {
+        subprocess::exit_on(signal);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Nothing is left to report a failure to if printing the failure fails.
@@ -468,13 +474,13 @@ mod tests {
     fn version_prints_the_crate_and_schema_versions() -> anyhow::Result<()> {
         assert_eq!(
             run_args(&["rh", "version"])?,
-            ("rh 0.1.0 (event schema 1)\n".to_owned(), String::new())
+            ("rh 0.1.0 (event schema 2)\n".to_owned(), String::new())
         );
         let (json, _) = run_args(&["rh", "version", "--json"])?;
         let envelope: serde_json::Value = serde_json::from_str(&json)?;
         assert_eq!(
             envelope,
-            serde_json::json!({"ok": true, "data": {"version": "0.1.0", "eventSchema": 1},
+            serde_json::json!({"ok": true, "data": {"version": "0.1.0", "eventSchema": 2},
                 "inbox": null, "next": null})
         );
         Ok(())

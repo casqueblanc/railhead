@@ -38,8 +38,8 @@ fn set(value: &mut Value, pointer: &str, new: Value) -> Result<(), String> {
 
 #[test]
 fn refuses_another_version_before_reading_the_rest() {
-    let newer = json!({"v": 2, "type": "claim.moved", "data": {}});
-    assert!(matches!(decode(&newer), Err(Error::UnsupportedVersion(2))));
+    let newer = json!({"v": 3, "type": "claim.moved", "data": {}});
+    assert!(matches!(decode(&newer), Err(Error::UnsupportedVersion(3))));
     let older = json!({"v": 0});
     assert!(matches!(decode(&older), Err(Error::UnsupportedVersion(0))));
     assert!(matches!(
@@ -47,6 +47,18 @@ fn refuses_another_version_before_reading_the_rest() {
         Err(Error::Json { .. })
     ));
     assert!(matches!(decode(&json!({})), Err(Error::Json { .. })));
+}
+
+#[test]
+fn reads_version_1_types_only_at_version_1() -> TestResult {
+    let mut event = opened();
+    assert_eq!(decode(&event)?.v, 1);
+    set(&mut event, "/v", json!(2))?;
+    assert!(matches!(
+        decode(&event),
+        Err(Error::Invalid { field: "v", .. })
+    ));
+    Ok(())
 }
 
 #[test]
@@ -442,6 +454,73 @@ fn checks_decision_versions_and_conflict_bounds() {
         decode(&conflict(json!(["clm_42abcd"]), json!(0.5))),
         Err(Error::Json { .. })
     ));
+}
+
+#[test]
+fn checks_held_checks_and_their_approval() -> TestResult {
+    let held = json!({
+        "v": 2, "seq": 1, "at": 1, "repo": "rep_demo0001",
+        "actor": {"kind": "system", "id": "sys_checks"},
+        "type": "train.held",
+        "data": {
+            "checkRunId": "chk_run0002", "expectedMain": "a".repeat(40),
+            "candidate": "c".repeat(40), "claims": ["clm_42abcd"],
+            "paths": [".railhead/check.json"], "digest": Value::Null,
+        },
+    });
+    let decoded = decode(&held)?;
+    assert!(matches!(
+        decoded.payload,
+        EventPayload::TrainHeld(ref data) if data.digest.is_none()
+    ));
+    let mut as_version_1 = held.clone();
+    set(&mut as_version_1, "/v", json!(1))?;
+    assert!(matches!(
+        decode(&as_version_1),
+        Err(Error::Invalid { field: "v", .. })
+    ));
+    let mut omitted = held.clone();
+    omitted
+        .pointer_mut("/data")
+        .and_then(Value::as_object_mut)
+        .and_then(|data| data.remove("digest"))
+        .ok_or("no digest")?;
+    assert!(matches!(decode(&omitted), Err(Error::Json { .. })));
+    for (pointer, value, field) in [
+        ("/data/digest", json!("f".repeat(63)), "digest"),
+        ("/data/paths", json!([]), "paths"),
+        (
+            "/data/claims",
+            json!(["clm_42abcd", "clm_42abcd"]),
+            "claims",
+        ),
+    ] {
+        let mut event = held.clone();
+        set(&mut event, pointer, value)?;
+        assert!(
+            matches!(decode(&event), Err(Error::Invalid { field: f, .. }) if f == field),
+            "{pointer}"
+        );
+    }
+
+    let approved = json!({
+        "v": 2, "seq": 2, "at": 2, "repo": "rep_demo0001",
+        "actor": {"kind": "human", "id": "usr_lemarier"},
+        "type": "check.approved",
+        "data": {"checkRunId": "chk_run0002", "candidate": "c".repeat(40), "digest": "f".repeat(64)},
+    });
+    assert!(decode(&approved).is_ok());
+    let mut by_agent = approved.clone();
+    set(
+        &mut by_agent,
+        "/actor",
+        json!({"kind": "agent", "id": "agt_atlas01"}),
+    )?;
+    assert!(matches!(decode(&by_agent), Err(Error::WrongActor { .. })));
+    let mut no_digest = approved;
+    set(&mut no_digest, "/data/digest", Value::Null)?;
+    assert!(matches!(decode(&no_digest), Err(Error::Json { .. })));
+    Ok(())
 }
 
 // =======================================================================================

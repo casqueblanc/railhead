@@ -5,6 +5,7 @@ import {
   MAX_LIST_LENGTH,
   MAX_OPTIONS,
   MAX_TITLE_LENGTH,
+  eventVersion,
   isCommitSha,
   isId,
   validateEvent,
@@ -16,6 +17,7 @@ import {
 
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
+const DIGEST = "c".repeat(64);
 const HUMAN: Actor = { kind: "human", id: "usr_lemarier" };
 const AGENT: Actor = { kind: "agent", id: "agt_atlas01" };
 const SYSTEM: Actor = { kind: "system", id: "sys_train" };
@@ -187,6 +189,21 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: SYSTEM,
     data: { intentId: "int_merge01", outcome: "updated", main: SHA_B },
   },
+  "train.held": {
+    actor: SYSTEM,
+    data: {
+      checkRunId: "chk_run0001",
+      expectedMain: SHA_A,
+      candidate: SHA_B,
+      claims: ["clm_42abcd"],
+      paths: [".railhead/check.json", "acceptance"],
+      digest: DIGEST,
+    },
+  },
+  "check.approved": {
+    actor: HUMAN,
+    data: { checkRunId: "chk_run0001", candidate: SHA_B, digest: DIGEST },
+  },
 };
 
 const EVENT_TYPES = Object.keys(VALID) as EventType[];
@@ -200,7 +217,7 @@ function event<T extends EventType>(
   // here. Each `VALID` entry is still checked against its own event type.
   const payload = { type, data } as EventPayload;
   return {
-    v: EVENT_SCHEMA_VERSION,
+    v: eventVersion(type),
     seq: 1,
     at: 1_790_000_000_000,
     repo: "rep_railhead",
@@ -228,8 +245,23 @@ describe("validateEvent", () => {
   });
 
   describe("envelope", () => {
-    it("rejects an unsupported schema version", () => {
-      expect(() => validateEvent({ ...event("issue.filed"), v: 2 })).toThrow(/schema version/);
+    it.each([0, EVENT_SCHEMA_VERSION + 1, 1.5])("rejects unsupported schema version %s", (v) => {
+      expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
+    });
+
+    it("writes the held check and merge events at version 2 and every older type at version 1", () => {
+      const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
+      expect(later.toSorted()).toEqual(["check.approved", "claim.merged", "train.held"]);
+      expect(EVENT_SCHEMA_VERSION).toBe(2);
+    });
+
+    it.each([
+      ["train.held", 1],
+      ["check.approved", 1],
+      ["claim.merged", 1],
+      ["issue.filed", 2],
+    ] as const)("rejects %s stamped at version %s", (type, v) => {
+      expect(() => validateEvent({ ...event(type), v })).toThrow(/is written at schema version/);
     });
 
     it.each([0, -1, 1.5, Number.NaN])("rejects seq %s", (seq) => {
@@ -247,20 +279,32 @@ describe("validateEvent", () => {
   });
 
   describe("authority", () => {
-    it.each(["agent.invited", "agent.confirmed", "agent.revoked", "decision.recorded"] as const)(
-      "refuses %s recorded by an agent",
-      (type) => {
-        expect(() => validateEvent(event(type, AGENT))).toThrow(/must be recorded by a person/);
-      },
-    );
+    it.each([
+      "agent.invited",
+      "agent.confirmed",
+      "agent.revoked",
+      "decision.recorded",
+      "check.approved",
+    ] as const)("refuses %s recorded by an agent", (type) => {
+      expect(() => validateEvent(event(type, AGENT))).toThrow(/must be recorded by a person/);
+    });
 
     it("refuses a decision recorded by the system", () => {
       expect(() => validateEvent(event("decision.recorded", SYSTEM))).toThrow(/by a person/);
     });
 
+    it("refuses a check approval recorded by the system", () => {
+      expect(() => validateEvent(event("check.approved", SYSTEM))).toThrow(/by a person/);
+    });
+
+    it("refuses a held check asserted by a person", () => {
+      expect(() => validateEvent(event("train.held", HUMAN))).toThrow(/by the system/);
+    });
+
     it.each([
       "train.check",
       "train.main",
+      "train.held",
       "claim.reassigned",
       "claim.reopened",
       "claim.adapted",
@@ -394,6 +438,48 @@ describe("validateEvent", () => {
     it("rejects a merge intent with no claims", () => {
       expect(() => validateEvent(withData("train.intent", (d) => ({ ...d, claims: [] })))).toThrow(
         /claims/,
+      );
+    });
+
+    it("accepts a held check whose candidate has no definition to approve", () => {
+      expect(() =>
+        validateEvent(withData("train.held", (d) => ({ ...d, digest: null }))),
+      ).not.toThrow();
+    });
+
+    it.each(["C".repeat(64), "c".repeat(63), ""])("rejects held digest %j", (digest) => {
+      expect(() => validateEvent(withData("train.held", (d) => ({ ...d, digest })))).toThrow(
+        /digest/,
+      );
+    });
+
+    it("rejects an approval without a SHA-256 digest", () => {
+      const bad = withData("check.approved", (d) => ({ ...d, digest: "c".repeat(65) }));
+      expect(() => validateEvent(bad)).toThrow(/digest/);
+    });
+
+    it("rejects an approval naming a non-check attempt", () => {
+      const bad = withData("check.approved", (d) => ({ ...d, checkRunId: "int_merge01" }));
+      expect(() => validateEvent(bad)).toThrow(/checkRunId/);
+    });
+
+    it("rejects a held check with no paths, no claims or a repeated path", () => {
+      expect(() => validateEvent(withData("train.held", (d) => ({ ...d, paths: [] })))).toThrow(
+        /paths/,
+      );
+      expect(() => validateEvent(withData("train.held", (d) => ({ ...d, claims: [] })))).toThrow(
+        /claims/,
+      );
+      const repeated = withData("train.held", (d) => ({
+        ...d,
+        paths: ["acceptance", "acceptance"],
+      }));
+      expect(() => validateEvent(repeated)).toThrow(/duplicate/);
+    });
+
+    it.each(["/etc/passwd", "acceptance/../x"])("rejects held path %j", (path) => {
+      expect(() => validateEvent(withData("train.held", (d) => ({ ...d, paths: [path] })))).toThrow(
+        /paths\[0\]/,
       );
     });
 

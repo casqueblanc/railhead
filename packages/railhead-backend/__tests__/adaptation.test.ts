@@ -949,6 +949,7 @@ async function land(
         },
         report: unavailableChecks.report,
         detail: unavailableChecks.detail,
+        approve: unavailableChecks.approve,
       },
       authorization: {
         authorize: async (attemptId) => {

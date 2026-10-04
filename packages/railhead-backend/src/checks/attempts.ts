@@ -5,15 +5,21 @@
 // else is a mismatch, never an update. A row only moves forward, from `held` (a protected path was
 // edited, so nothing runs) or `started` (a sandbox slot was admitted and the run was asked for) to
 // `reported` (the run's result, with its output cut to `MAX_CHECK_LOG_BYTES` and the SHA-256 of what
-// was kept). The output is untrusted text: it is stored for a reader, never logged. The table keeps
-// at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones going first. A started attempt counts
-// as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its run cannot still be
-// running, and the train no longer accepts its report. A report for an attempt removed this way
-// finds no row and is refused, so an abandoned run can neither grow the table nor pass late. The
-// command the trusted definition gave the run is kept with the attempt so the board can show what
-// ran; a row written before commands were kept has none.
+// was kept). A held attempt moves to `started` only after a person approved it: the approval names
+// the digest of the candidate's own definition, recorded when the attempt was held, and stays on the
+// row through the run and its report. The output is untrusted text: it is stored for a reader, never logged. The table keeps
+// at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones going first. A held attempt the train
+// may still run is not settled: its approval must find it. Those can keep the table over its bound
+// by at most the attempts the train holds: the active batch's and `MAX_PARKED_HELD` parked pins',
+// each for at most `HELD_PARK_TTL_MS`. A
+// started attempt counts as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its
+// run cannot still be running, and the train no longer accepts its report. A report for an attempt
+// removed this way finds no row and is refused, so an abandoned run can neither grow the table nor
+// pass late. The command the run was given is kept with the attempt so the board can show what
+// ran: the trusted definition's, or for an approved held attempt the approved candidate definition's.
+// A row written before commands were kept has none.
 
-import type { CheckResult, CheckRunId, CommitSha } from "@railhead/shared/events";
+import type { CheckResult, CheckRunId, CommitSha, UserId } from "@railhead/shared/events";
 import { CHECK_DEADLINE_MS } from "../modules/train/scheduler";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
 
@@ -51,6 +57,11 @@ const MIGRATIONS: readonly string[] = [
     updated_at INTEGER NOT NULL
   ) STRICT`,
   "ALTER TABLE check_attempts ADD COLUMN command TEXT",
+  "ALTER TABLE check_attempts ADD COLUMN held_digest TEXT",
+  "ALTER TABLE check_attempts ADD COLUMN approved_by TEXT",
+  "ALTER TABLE check_attempts ADD COLUMN approval_id TEXT",
+  "ALTER TABLE check_attempts ADD COLUMN approved_digest TEXT",
+  "ALTER TABLE check_attempts ADD COLUMN approved_at INTEGER",
 ];
 
 /** What identifies an attempt: fixed when it is first written. */
@@ -67,8 +78,11 @@ export interface AttemptIdentity {
 
 /** Where an attempt stands. */
 export type AttemptState =
-  /** A protected path was edited; no run was started and none will be. */
-  | { kind: "held"; paths: string[] }
+  /**
+   * A protected path was edited; no run starts until a person approves it. `digest` is SHA-256 of
+   * the candidate's own definition, or `null` when it has no valid one and cannot be approved.
+   */
+  | { kind: "held"; paths: string[]; digest: string | null }
   /** A slot was admitted and the run asked for. */
   | { kind: "started"; sandbox: string; deadline: number }
   /** The run reported. `log` is untrusted output. */
@@ -80,6 +94,18 @@ export type AttemptState =
       finishedAt: number;
     };
 
+/** A person's approval to run a held candidate's own definition. */
+export interface AttemptApproval {
+  /** The person who approved. */
+  userId: UserId;
+  /** The consumed passkey challenge the approval was made with. */
+  grantId: string;
+  /** SHA-256 of the candidate's definition the approval covers. */
+  digest: string;
+  /** When it was recorded. */
+  approvedAt: number;
+}
+
 /** One stored attempt. */
 export interface AttemptRecord extends AttemptIdentity {
   /**
@@ -89,6 +115,8 @@ export interface AttemptRecord extends AttemptIdentity {
   command: string | null;
   /** Where it stands. */
   state: AttemptState;
+  /** The approval that let a held attempt run, or `null`. */
+  approval: AttemptApproval | null;
 }
 
 interface AttemptRow extends Record<string, SqlStorageValue> {
@@ -104,16 +132,27 @@ interface AttemptRow extends Record<string, SqlStorageValue> {
   log: string | null;
   log_digest: string | null;
   finished_at: number | null;
+  held_digest: string | null;
+  approved_by: string | null;
+  approval_id: string | null;
+  approved_digest: string | null;
+  approved_at: number | null;
   command: string | null;
 }
 
 /** The attempts of one repository, in its storage. */
 export class AttemptTable {
   readonly #storage: RepoStorage;
+  readonly #trainHolds: (attemptId: CheckRunId) => boolean;
 
-  constructor(storage: RepoStorage) {
+  /**
+   * `trainHolds` says whether the train may still run a held attempt (`TrainPort.holds`); such an
+   * attempt is never pruned.
+   */
+  constructor(storage: RepoStorage, trainHolds: (attemptId: CheckRunId) => boolean) {
     migrate(storage, OWNER, MIGRATIONS);
     this.#storage = storage;
+    this.#trainHolds = trainHolds;
   }
 
   /** The attempt, or `null`. */
@@ -125,11 +164,75 @@ export class AttemptTable {
   }
 
   /**
-   * Records a held attempt, unless the attempt is already stored. Returns the stored attempt, which
-   * may be another state or identity if one was recorded first.
+   * Records a held attempt with the digest of the candidate's own definition, unless the attempt is
+   * already stored. Returns the stored attempt, which may be another state or identity if one was
+   * recorded first.
    */
-  hold(identity: AttemptIdentity, command: string, paths: string[], now: number): AttemptRecord {
-    return this.#insert(identity, command, now, "held", JSON.stringify(paths), null, null);
+  hold(
+    identity: AttemptIdentity,
+    command: string,
+    paths: string[],
+    digest: string | null,
+    now: number,
+  ): AttemptRecord {
+    return this.#insert(
+      identity,
+      command,
+      now,
+      "held",
+      { paths: JSON.stringify(paths), digest },
+      null,
+      null,
+    );
+  }
+
+  /**
+   * Records `approval` on a held attempt whose candidate definition has the approval's digest and
+   * which no one approved yet, and returns the stored attempt; anything else leaves it unchanged.
+   */
+  approve(attemptId: string, approval: AttemptApproval, now: number): AttemptRecord | null {
+    return atomically(this.#storage, () => {
+      this.#storage.sql.exec(
+        `UPDATE check_attempts
+           SET approved_by = ?, approval_id = ?, approved_digest = ?, approved_at = ?, updated_at = ?
+         WHERE attempt_id = ? AND state = 'held' AND held_digest = ? AND approved_by IS NULL`,
+        approval.userId,
+        approval.grantId,
+        approval.digest,
+        approval.approvedAt,
+        now,
+        attemptId,
+        approval.digest,
+      );
+      return this.get(attemptId);
+    });
+  }
+
+  /**
+   * Records an approved held attempt as started in `sandbox` until `deadline` with the `command` of
+   * the approved definition, and returns the stored attempt; an attempt that is not held and
+   * approved is returned unchanged.
+   */
+  startApproved(
+    attemptId: string,
+    command: string,
+    sandbox: string,
+    deadline: number,
+    now: number,
+  ): AttemptRecord | null {
+    return atomically(this.#storage, () => {
+      this.#storage.sql.exec(
+        `UPDATE check_attempts
+           SET state = 'started', command = ?, sandbox = ?, deadline = ?, updated_at = ?
+         WHERE attempt_id = ? AND state = 'held' AND approved_by IS NOT NULL`,
+        command,
+        sandbox,
+        deadline,
+        now,
+        attemptId,
+      );
+      return this.get(attemptId);
+    });
   }
 
   /** Records a started attempt in `sandbox` until `deadline`, unless the attempt is already stored. */
@@ -178,7 +281,7 @@ export class AttemptTable {
     command: string,
     now: number,
     state: "held" | "started",
-    heldPaths: string | null,
+    held: { paths: string; digest: string | null } | null,
     sandbox: string | null,
     deadline: number | null,
   ): AttemptRecord {
@@ -188,15 +291,16 @@ export class AttemptTable {
       this.#prune(now);
       this.#storage.sql.exec(
         `INSERT INTO check_attempts
-           (attempt_id, candidate, expected_main, digest, state, held_paths, sandbox, deadline,
-            created_at, updated_at, command)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (attempt_id, candidate, expected_main, digest, state, held_paths, held_digest, sandbox,
+            deadline, created_at, updated_at, command)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         identity.attemptId,
         identity.candidate,
         identity.expectedMain,
         identity.digest,
         state,
-        heldPaths,
+        held?.paths ?? null,
+        held?.digest ?? null,
         sandbox,
         deadline,
         now,
@@ -210,21 +314,31 @@ export class AttemptTable {
   }
 
   // Makes room for one more row: removes the oldest settled attempts beyond the bound. A started
-  // attempt whose report could still arrive is never removed, so that report finds it.
+  // attempt whose report could still arrive is never removed, so that report finds it, and neither
+  // is a held attempt the train may still run, so its approval finds it.
   #prune(now: number): void {
     const row = this.#storage.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM check_attempts")
       .one();
     const excess = row.n - MAX_STORED_ATTEMPTS + 1;
     if (excess <= 0) return;
-    this.#storage.sql.exec(
-      `DELETE FROM check_attempts WHERE attempt_id IN (
-         SELECT attempt_id FROM check_attempts
-         WHERE state != 'started' OR deadline <= ?
-         ORDER BY updated_at, attempt_id LIMIT ?)`,
-      now - REPORT_GRACE_MS,
-      excess,
-    );
+    const settled = this.#storage.sql
+      .exec<{ attempt_id: string; state: string }>(
+        `SELECT attempt_id, state FROM check_attempts
+       WHERE state != 'started' OR deadline <= ?
+       ORDER BY updated_at, attempt_id`,
+        now - REPORT_GRACE_MS,
+      )
+      .toArray();
+    const removed: string[] = [];
+    for (const { attempt_id: attemptId, state } of settled) {
+      if (removed.length >= excess) break;
+      if (state === "held" && this.#trainHolds(attemptId)) continue;
+      removed.push(attemptId);
+    }
+    for (const attemptId of removed) {
+      this.#storage.sql.exec("DELETE FROM check_attempts WHERE attempt_id = ?", attemptId);
+    }
   }
 }
 
@@ -249,13 +363,27 @@ function toRecord(row: AttemptRow): AttemptRecord {
     digest: row.digest,
     command: row.command,
     state: toState(row),
+    approval: toApproval(row),
+  };
+}
+
+function toApproval(row: AttemptRow): AttemptApproval | null {
+  if (row.approved_by === null) return null;
+  if (row.approval_id === null || row.approved_digest === null || row.approved_at === null) {
+    throw new Error("stored check approval is not valid");
+  }
+  return {
+    userId: row.approved_by,
+    grantId: row.approval_id,
+    digest: row.approved_digest,
+    approvedAt: row.approved_at,
   };
 }
 
 function toState(row: AttemptRow): AttemptState {
   switch (row.state) {
     case "held":
-      return { kind: "held", paths: parsePaths(row.held_paths) };
+      return { kind: "held", paths: parsePaths(row.held_paths), digest: row.held_digest };
     case "started":
       if (row.sandbox === null || row.deadline === null) break;
       return { kind: "started", sandbox: row.sandbox, deadline: row.deadline };

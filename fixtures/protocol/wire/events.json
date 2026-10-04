@@ -408,9 +408,44 @@
       }
     },
     {
-      "v": 1,
+      "v": 2,
       "seq": 23,
       "at": 1790000000023,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.held",
+      "data": {
+        "checkRunId": "chk_run0002",
+        "expectedMain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "claims": ["clm_42abcd"],
+        "paths": [".railhead/check.json"],
+        "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
+      }
+    },
+    {
+      "v": 2,
+      "seq": 24,
+      "at": 1790000000024,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "human",
+        "id": "usr_lemarier"
+      },
+      "type": "check.approved",
+      "data": {
+        "checkRunId": "chk_run0002",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
+      }
+    },
+    {
+      "v": 2,
+      "seq": 25,
+      "at": 1790000000025,
       "repo": "rep_demo0001",
       "actor": {
         "kind": "system",
@@ -717,11 +752,97 @@
       "error": "by a person"
     },
     {
-      "name": "merge naming a branch for its commit",
+      "name": "held check asserted by a person",
       "value": {
-        "v": 1,
+        "v": 2,
         "seq": 23,
         "at": 1790000000023,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "human",
+          "id": "usr_lemarier"
+        },
+        "type": "train.held",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "expectedMain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "claims": ["clm_42abcd"],
+          "paths": [".railhead/check.json"],
+          "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
+        }
+      },
+      "error": "by the system"
+    },
+    {
+      "name": "held path outside the repository",
+      "value": {
+        "v": 2,
+        "seq": 23,
+        "at": 1790000000023,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.held",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "expectedMain": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "claims": ["clm_42abcd"],
+          "paths": ["../check.json"],
+          "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
+        }
+      },
+      "error": "paths"
+    },
+    {
+      "name": "check approval recorded by the system",
+      "value": {
+        "v": 2,
+        "seq": 24,
+        "at": 1790000000024,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "check.approved",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
+        }
+      },
+      "error": "by a person"
+    },
+    {
+      "name": "check approval with an uppercase digest",
+      "value": {
+        "v": 2,
+        "seq": 24,
+        "at": 1790000000024,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "human",
+          "id": "usr_lemarier"
+        },
+        "type": "check.approved",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "digest": "2F41328E380BB61B830C7E9F5B2D2CD708072F059B29C1E6204FE866B3E9A29E"
+        }
+      },
+      "error": "digest"
+    },
+    {
+      "name": "merge naming a branch for its commit",
+      "value": {
+        "v": 2,
+        "seq": 25,
+        "at": 1790000000025,
         "repo": "rep_demo0001",
         "actor": {
           "kind": "system",
@@ -739,9 +860,9 @@
     {
       "name": "merge recorded by an agent",
       "value": {
-        "v": 1,
-        "seq": 23,
-        "at": 1790000000023,
+        "v": 2,
+        "seq": 25,
+        "at": 1790000000025,
         "repo": "rep_demo0001",
         "actor": {
           "kind": "agent",

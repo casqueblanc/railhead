@@ -267,6 +267,7 @@ function withHandoff<T>(
         },
         report: async () => fail("unavailable", "Not used."),
         detail: async () => fail("unavailable", "Not used."),
+        approve: async () => fail("unavailable", "Not used."),
       },
       merge: {
         compose: async (_main, pins) => {

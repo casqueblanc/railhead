@@ -222,6 +222,8 @@ function actionFields(action: ApprovableAction): (string | number | null)[] {
       return [action.kind, action.title, action.body];
     case "decision.record":
       return [action.kind, action.decisionId, action.option, action.expectedVersion];
+    case "check.approve":
+      return [action.kind, action.checkRunId, action.candidate, action.digest];
     case "demo.seed":
       return [action.kind, action.head];
     case "demo.reset":

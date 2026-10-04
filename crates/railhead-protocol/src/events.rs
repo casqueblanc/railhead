@@ -10,8 +10,15 @@ use crate::integer::SafeInteger;
 pub use crate::payloads::*;
 use crate::rules::{IdKind, require_id, require_positive};
 
-/// The event schema version this crate reads. Any other version is refused, never guessed at.
-pub const EVENT_SCHEMA_VERSION: u64 = 1;
+/// The newest event schema version this crate reads. It reads every version from 1 to this; any
+/// other version is refused, never guessed at.
+pub const EVENT_SCHEMA_VERSION: u64 = 2;
+
+/// True when this crate reads events of schema version `v`.
+#[must_use]
+pub const fn is_readable_version(v: u64) -> bool {
+    v >= 1 && v <= EVENT_SCHEMA_VERSION
+}
 
 /// Who recorded an event, as authenticated by the backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +247,12 @@ pub enum EventPayload {
     /// The result of an attempt to move main.
     #[serde(rename = "train.main")]
     TrainMain(TrainMain),
+    /// A candidate edits protected check paths; its attempt waits for a person.
+    #[serde(rename = "train.held")]
+    TrainHeld(TrainHeld),
+    /// A person approved running a held candidate's own definition.
+    #[serde(rename = "check.approved")]
+    CheckApproved(CheckApproved),
 }
 
 /// Who may record an event type: `HUMAN_ONLY_EVENTS`, `AGENT_ONLY_EVENTS`, `SYSTEM_ONLY_EVENTS`.
@@ -278,6 +291,39 @@ impl EventPayload {
             Self::TrainConflict(_) => "train.conflict",
             Self::TrainIntent(_) => "train.intent",
             Self::TrainMain(_) => "train.main",
+            Self::TrainHeld(_) => "train.held",
+            Self::CheckApproved(_) => "check.approved",
+        }
+    }
+
+    /// The schema version an event of this type is written at: the version that introduced the
+    /// type, so an older reader refuses a newer type by its version rather than by its shape.
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        match self {
+            Self::AgentInvited(_)
+            | Self::AgentJoined(_)
+            | Self::AgentConfirmed(_)
+            | Self::AgentRevoked(_)
+            | Self::IssueFiled(_)
+            | Self::ClaimOpened(_)
+            | Self::ClaimPushed(_)
+            | Self::ClaimReady(_)
+            | Self::ClaimRefused(_)
+            | Self::ClaimReopened(_)
+            | Self::ClaimExpired(_)
+            | Self::ClaimReassigned(_)
+            | Self::ClaimAdapted(_)
+            | Self::QuestionAsked(_)
+            | Self::DecisionRecorded(_)
+            | Self::InboxQueued(_)
+            | Self::InboxDelivered(_)
+            | Self::InboxAcked(_)
+            | Self::TrainCheck(_)
+            | Self::TrainConflict(_)
+            | Self::TrainIntent(_)
+            | Self::TrainMain(_) => 1,
+            Self::TrainHeld(_) | Self::CheckApproved(_) | Self::ClaimMerged(_) => 2,
         }
     }
 
@@ -286,7 +332,8 @@ impl EventPayload {
             Self::AgentInvited(_)
             | Self::AgentConfirmed(_)
             | Self::AgentRevoked(_)
-            | Self::DecisionRecorded(_) => Recorder::Person,
+            | Self::DecisionRecorded(_)
+            | Self::CheckApproved(_) => Recorder::Person,
             Self::InboxAcked(_) => Recorder::Agent,
             Self::AgentJoined(_)
             | Self::ClaimRefused(_)
@@ -300,7 +347,8 @@ impl EventPayload {
             | Self::TrainCheck(_)
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
-            | Self::TrainMain(_) => Recorder::System,
+            | Self::TrainMain(_)
+            | Self::TrainHeld(_) => Recorder::System,
             Self::IssueFiled(_)
             | Self::ClaimOpened(_)
             | Self::ClaimPushed(_)
@@ -335,7 +383,9 @@ impl EventPayload {
             | Self::TrainCheck(_)
             | Self::TrainConflict(_)
             | Self::TrainIntent(_)
-            | Self::TrainMain(_) => None,
+            | Self::TrainMain(_)
+            | Self::TrainHeld(_)
+            | Self::CheckApproved(_) => None,
         }
     }
 
@@ -363,6 +413,8 @@ impl EventPayload {
             Self::TrainConflict(data) => data.validate(),
             Self::TrainIntent(data) => data.validate(),
             Self::TrainMain(data) => data.validate(),
+            Self::TrainHeld(data) => data.validate(),
+            Self::CheckApproved(data) => data.validate(),
         }
     }
 }
@@ -370,7 +422,7 @@ impl EventPayload {
 /// One entry in a repository's log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
-    /// The schema version, always [`EVENT_SCHEMA_VERSION`] after decoding.
+    /// The schema version, the payload's [`EventPayload::schema_version`] after decoding.
     pub v: u64,
     /// Position in the repository's log, counting from 1.
     pub seq: SafeInteger,
@@ -400,8 +452,9 @@ struct VersionProbe {
 ///
 /// # Errors
 ///
-/// [`Error::UnsupportedVersion`] for any `v` other than [`EVENT_SCHEMA_VERSION`], checked first;
-/// [`Error::Json`] for a shape error; and the other variants for the first rule the event breaks.
+/// [`Error::UnsupportedVersion`] for a `v` outside 1 to [`EVENT_SCHEMA_VERSION`], checked first;
+/// [`Error::Json`] for a shape error; [`Error::Invalid`] on `v` when it is not the version the
+/// event's type is written at; and the other variants for the first rule the event breaks.
 ///
 /// ```
 /// let json = r#"{"v":1,"seq":1,"at":1700000000000,"repo":"rep_abc123",
@@ -413,7 +466,7 @@ struct VersionProbe {
 /// ```
 pub fn decode_event(json: &str) -> Result<Event> {
     let VersionProbe { v } = serde_json::from_str(json)?;
-    if v != EVENT_SCHEMA_VERSION {
+    if !is_readable_version(v) {
         return Err(Error::UnsupportedVersion(v));
     }
     let event: Event = serde_json::from_str(json)?;
@@ -429,8 +482,14 @@ impl Event {
     ///
     /// The first rule the event breaks; see [`decode_event`].
     pub fn validate(&self) -> Result<()> {
-        if self.v != EVENT_SCHEMA_VERSION {
+        if !is_readable_version(self.v) {
             return Err(Error::UnsupportedVersion(self.v));
+        }
+        if self.v != self.payload.schema_version() {
+            return Err(Error::Invalid {
+                field: "v",
+                expected: "the schema version its type is written at",
+            });
         }
         require_positive(self.seq, "seq")?;
         require_positive(self.at, "at")?;

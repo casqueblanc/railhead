@@ -16,6 +16,7 @@ import {
 } from "../src/auth/passkeyVerifier";
 import type { ClaimsPort } from "../src/contracts/claims";
 import type { DecisionsPort } from "../src/contracts/decisions";
+import type { CheckPort } from "../src/contracts/train";
 import type { IdentityPort } from "../src/contracts/identity";
 import type { GrantFor, HumanGrant } from "../src/contracts/principals";
 import { fail, ok, type PortResult } from "../src/contracts/result";
@@ -831,13 +832,14 @@ describe("owner enrollment", () => {
   });
 });
 
-/** The five ports an owner action may be handed to. */
+/** The six ports an owner action may be handed to. */
 type ActionPort =
   | "identity.createInvite"
   | "identity.confirm"
   | "identity.revoke"
   | "claims.fileIssue"
-  | "decisions.record";
+  | "decisions.record"
+  | "checks.approve";
 
 /** A grant as one port received it. */
 interface Dispatch {
@@ -852,6 +854,7 @@ interface Answers {
   revoke(grant: GrantFor<"agent.revoke">, log: EventLog): ReturnType<IdentityPort["revoke"]>;
   fileIssue(grant: GrantFor<"issue.file">): ReturnType<ClaimsPort["fileIssue"]>;
   record(grant: GrantFor<"decision.record">): ReturnType<DecisionsPort["record"]>;
+  approve(grant: GrantFor<"check.approve">): ReturnType<CheckPort["approve"]>;
 }
 
 const INVITE_RESULT = {
@@ -867,9 +870,10 @@ const DEFAULT_ANSWERS: Answers = {
   fileIssue: async () => ok({ issueId: "iss_issue0001" }),
   record: async (grant) =>
     ok({ decisionId: grant.action.decisionId, version: (grant.action.expectedVersion ?? 0) + 1 }),
+  approve: async (grant) => ok({ checkRunId: grant.action.checkRunId }),
 };
 
-/** `base` with its five action ports replaced by fakes that record each grant they receive. */
+/** `base` with its six action ports replaced by fakes that record each grant they receive. */
 function recordingPorts(
   base: RepoPorts,
   dispatched: Dispatch[],
@@ -907,6 +911,13 @@ function recordingPorts(
         return answers.record(grant);
       },
     },
+    checks: {
+      ...base.checks,
+      async approve(grant) {
+        dispatched.push({ port: "checks.approve", grant });
+        return answers.approve(grant);
+      },
+    },
   };
 }
 
@@ -928,6 +939,12 @@ interface Harness {
 
 const CONFIRM: OwnerAction = { kind: "agent.confirm", agentId: "agt_atlas01", code: "123456" };
 const REVOKE: OwnerAction = { kind: "agent.revoke", agentId: "agt_atlas01" };
+const APPROVE = {
+  kind: "check.approve",
+  checkRunId: "chk_heldrun01",
+  candidate: "c".repeat(40),
+  digest: "d".repeat(64),
+} as const satisfies OwnerAction;
 
 /**
  * Runs `body` inside a fresh repository with its owner module wired to a freshly enrolled `Owner`
@@ -1069,6 +1086,11 @@ describe("owner actions", () => {
         port: "decisions.record",
         result: { kind: "decision.record", decisionId: "dec_decision1", version: 5 },
       },
+      {
+        action: APPROVE,
+        port: "checks.approve",
+        result: { kind: "check.approve", checkRunId: APPROVE.checkRunId },
+      },
     ];
     await withRepoOwner(async ({ owner, auth, userId, userHandle, repoId, grants, state }) => {
       for (const { action, port, result } of cases) {
@@ -1128,6 +1150,7 @@ describe("owner actions", () => {
             port: "decisions.record",
             code: "action_stale",
           },
+          { action: APPROVE, port: "checks.approve", code: "action_stale" },
         ];
         for (const { action, port, code } of refusals) {
           grants.length = 0;
@@ -1175,6 +1198,7 @@ describe("owner actions", () => {
       {
         createInvite: async () => fail("unavailable", "refused by identity.createInvite"),
         fileIssue: async () => fail("invalid_request", "refused by claims.fileIssue"),
+        approve: async () => fail("action_stale", "refused by checks.approve"),
         record: async (grant) => {
           if (grant.action.expectedVersion !== current) {
             return fail("action_stale", "refused by decisions.record");
