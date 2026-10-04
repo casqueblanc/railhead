@@ -337,7 +337,13 @@ fn main() -> ExitCode {
     };
     let (mut stdout, mut stderr) = (io::stdout().lock(), io::stderr().lock());
     let mut out = Output::new(cli.mode(), &mut stdout, &mut stderr);
-    match run(&cli, &mut out) {
+    let result = run(&cli, &mut out);
+    // A signal that stopped a Git step ends `rh` once that step has cleaned up, whatever the
+    // command made of the stopped step.
+    if let Some(signal) = subprocess::interrupted() {
+        subprocess::exit_on(signal);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Nothing is left to report a failure to if printing the failure fails.
