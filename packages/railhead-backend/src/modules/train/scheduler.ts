@@ -977,14 +977,18 @@ export function createTrain(
     const held = failure === "check_held";
     // A pin held alone that stays parked keeps this batch's candidate for an approval that revives
     // the batch on it, until the pin can no longer return (`queueHeldDiscard`). A pin readied again
-    // while batched goes on as fresh work instead, so the candidate is discarded with the batch.
+    // while batched goes on as fresh work instead, and one whose claim queued a newer generation
+    // during the hold can never return, so either way the candidate is discarded with the batch.
     const [lone] = entries;
+    const superseded =
+      lone !== undefined && highestGeneration(sql, lone.pin.claimId) > lone.pin.generation;
     const parks =
       held &&
       entries.length === 1 &&
       lone !== undefined &&
       !renewed(lone) &&
-      lone.nextCommit === null;
+      lone.nextCommit === null &&
+      !superseded;
     closeBatch(batch.batchId, parks ? { state: "held" } : { state: "failed", failure }, now);
     const definitive = isDefinitive(failure);
     const returned: Returned[] = [];
@@ -994,8 +998,10 @@ export function createTrain(
       } else if (held && entries.length === 1) {
         // Held alone, the pin is the one that edits a protected path. It is parked, keeping its
         // pin, so the queue behind it moves. A new push enqueues the claim's next generation as a
-        // new entry; an approval of the held attempt returns this one (`release`).
-        settleEntry(sql, entry.pin, "parked", "check_held", now);
+        // new entry; an approval of the held attempt returns this one (`release`). A pin that new
+        // entry already superseded is dropped instead.
+        if (superseded) settleEntry(sql, entry.pin, "dropped", "pin_changed", now);
+        else settleEntry(sql, entry.pin, "parked", "check_held", now);
       } else if (held) {
         // Waiting for a person is no fault of the pins: no retry is counted and none is dropped.
         returned.push({ pin: entry.pin, isolate: true, retries: entry.retries });

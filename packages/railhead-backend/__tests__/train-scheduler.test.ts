@@ -1738,6 +1738,50 @@ describe("train parked held pins", () => {
     }, fakes);
   });
 
+  it("drops a held pin whose newer generation was queued during the hold and deletes its candidate", async () => {
+    const fakes = new Fakes();
+    const pushed = pin(1, 2, sha("9"));
+    // Only the first generation edits a protected path; the next one runs.
+    fakes.start = (attempt) =>
+      attempt.pins.some((p) => p.generation === 1)
+        ? fail("check_held", "The candidate edits protected check paths.")
+        : ok({ attemptId: attempt.attemptId });
+    await withTrain(async ({ train, sql, now, advance }) => {
+      fakes.ready(pin(1));
+      await train.enqueue(pin(1));
+      const heldBatch = train.batches(1)[0];
+      const [heldAttempt] = fakes.composeAttempts;
+      if (heldBatch?.attemptId == null || heldAttempt === undefined) throw new Error("no hold");
+
+      // The next generation is queued while the first is still the active, held batch.
+      fakes.ready(pushed);
+      expect(await train.enqueue(pushed)).toEqual(ok({ queued: true }));
+      expect(states(train)).toMatchObject({
+        "clm_claim001@1": "batched",
+        "clm_claim001@2": "queued",
+      });
+
+      // At the deadline the held pin can never return, so it is dropped, not parked.
+      advance(owed(sql).dueAt - now());
+      await train.resume();
+      expect(train.entries(8).find((entry) => entry.pin.generation === 1)).toMatchObject({
+        state: "dropped",
+        reason: "pin_changed",
+      });
+      expect(train.holds(heldBatch.attemptId)).toBe(false);
+      expect(pendingDiscards(sql).map((d) => d.attempt)).toContain(heldAttempt);
+
+      // Its candidate refs go once its compose can no longer push, well before a parked pin's day.
+      advance(MERGE_PUSH_WINDOW_MS);
+      await train.resume();
+      expect(fakes.discards).toContain(heldAttempt);
+      expect(fakes.candidateRefs.has(heldAttempt)).toBe(false);
+      advance(HELD_PARK_TTL_MS);
+      await train.resume();
+      expect(fakes.discards.filter((attempt) => attempt === heldAttempt)).toHaveLength(1);
+    }, fakes);
+  });
+
   it("leaves a parked pin a newer generation superseded to that generation's discard", async () => {
     const fakes = new Fakes();
     const pushed = pin(1, 2, sha("9"));
