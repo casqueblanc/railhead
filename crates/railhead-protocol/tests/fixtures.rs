@@ -157,7 +157,10 @@ fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestRes
             newer += 1;
         }
     }
-    assert_eq!(newer, 4, "train.held, check.approved, train.unreported and claim.merged");
+    assert_eq!(
+        newer, 4,
+        "train.held, check.approved, train.unreported and claim.merged"
+    );
     Ok(())
 }
 
