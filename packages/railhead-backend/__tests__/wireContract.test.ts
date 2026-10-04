@@ -266,6 +266,7 @@ describe("events on the wire", () => {
     "train.main": true,
     "train.held": true,
     "check.approved": true,
+    "train.unreported": true,
   };
 
   it("has one valid fixture for every event type", () => {

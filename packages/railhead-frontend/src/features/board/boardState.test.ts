@@ -22,6 +22,7 @@ import {
   UPLOAD,
   adapt,
   checkResult,
+  checkTimedOut,
   decide,
   inbox,
   intend,
@@ -996,6 +997,49 @@ describe("folding a long log", () => {
     expect(halted.checkRuns[run]?.results.map((entry) => entry.check)).toEqual(["first", "second"]);
     expect(Object.keys(halted.issues)).toEqual([issueId(1)]);
     expect({ ...halted, stream: null }).toEqual({ ...fold(log.events.slice(0, 3)), stream: null });
+  });
+});
+
+describe("check runs that end without a report", () => {
+  const run = "chk_synthlate";
+
+  it("folds a timed-out run as its own status, with no result", () => {
+    const state = fold(
+      syntheticLog("a check that times out", [checkTimedOut(run, synthCommit(1))]).events,
+    );
+    expect(state.stream).toEqual({ kind: "consistent" });
+    expect(state.checkRuns[run]).toEqual({
+      checkRunId: run,
+      candidate: synthCommit(1),
+      results: [],
+      unreported: { outcome: "timed_out", seq: 1 },
+    });
+    expect(state.recent).toEqual([]);
+  });
+
+  it.each([
+    [
+      "a report after the run timed out",
+      [checkTimedOut(run, synthCommit(1)), checkResult(run, synthCommit(1), "test", "pass")],
+      `check run ${run} reported after it ended`,
+    ],
+    [
+      "a timeout after the run reported",
+      [checkResult(run, synthCommit(1), "test", "fail"), checkTimedOut(run, synthCommit(1))],
+      `check run ${run} already reported or ended`,
+    ],
+    [
+      "a second timeout of one run",
+      [checkTimedOut(run, synthCommit(1)), checkTimedOut(run, synthCommit(1))],
+      `check run ${run} already reported or ended`,
+    ],
+  ])("halts on %s", (_label, steps, message) => {
+    const halted = fold(syntheticLog("an unreported run out of order", steps).events);
+    expect(halted.stream).toEqual({
+      kind: "halted",
+      fault: { kind: "inconsistent", seq: 2, message },
+    });
+    expect(halted.cursor).toBe(1);
   });
 });
 

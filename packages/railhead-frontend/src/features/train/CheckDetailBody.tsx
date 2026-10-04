@@ -3,7 +3,7 @@ import { MAX_CHECK_DETAIL_LOG_BYTES } from "@railhead/shared/board-api";
 import type { CheckDetailUnavailableReason } from "../board/boardPorts";
 import { ShortSha } from "../claims/ShortSha";
 import { CHECK_RESULT_BADGE } from "./CheckResultBadge";
-import type { CheckDetailLoad, ReportedCheckDetail } from "./useCheckDetail";
+import type { CheckDetailLoad, ListedCheckDetail } from "./useCheckDetail";
 
 const UNAVAILABLE_TEXT: Readonly<Record<CheckDetailUnavailableReason, string>> = {
   offline: "The board is offline. Reconnect to read this run.",
@@ -20,8 +20,8 @@ interface CheckDetailBodyProps {
 
 /**
  * What the backend recorded for one run: the commit checked, the command main's definition gave
- * it and its result with the end of its output. The command, protected paths and output are
- * repository content and run output, shown only as text.
+ * it and its result with the end of its output, or for a run that timed out, its deadline. The
+ * command and output are repository content and run output, shown only as text.
  */
 export const CheckDetailBody = ({ load, onRetry }: CheckDetailBodyProps) => {
   switch (load.kind) {
@@ -40,7 +40,7 @@ export const CheckDetailBody = ({ load, onRetry }: CheckDetailBodyProps) => {
     case "failed":
       return <Failure code={load.code} onRetry={onRetry} />;
     case "loaded":
-      return <Detail detail={load.detail} />;
+      return <Detail detail={load.detail} timedOut={load.timedOut} />;
     default:
       return unreachable(load);
   }
@@ -66,7 +66,7 @@ const Failure = ({
     case "mismatch":
       return (
         <Text variant="secondary">
-          The backend's record does not match this run's reported result, so nothing is shown.
+          The backend's record does not match this run in the log, so nothing is shown.
         </Text>
       );
     case "invalid_request":
@@ -91,7 +91,7 @@ const Failure = ({
   }
 };
 
-const Detail = ({ detail }: { detail: ReportedCheckDetail }) => {
+const Detail = ({ detail, timedOut }: { detail: ListedCheckDetail; timedOut: boolean }) => {
   const { state } = detail;
   return (
     <div className="grid gap-3 text-sm">
@@ -118,23 +118,33 @@ const Detail = ({ detail }: { detail: ReportedCheckDetail }) => {
           <TextBlock text={detail.command} label="Command" />
         )}
       </div>
-      <div className="grid gap-1">
+      {state.kind === "started" ? (
         <Text>
-          {CHECK_RESULT_BADGE[state.result].label} at{" "}
-          <time dateTime={new Date(state.finishedAt).toISOString()}>
-            {timeFormat.format(state.finishedAt)}
+          No report arrived by its deadline,{" "}
+          <time dateTime={new Date(state.deadline).toISOString()}>
+            {timeFormat.format(state.deadline)}
           </time>
           .
         </Text>
-        <Text variant="secondary">
-          {state.logCut ? `Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB` : "Output"}
-        </Text>
-        {state.logTail === "" ? (
-          <Text variant="secondary">No output.</Text>
-        ) : (
-          <TextBlock text={state.logTail} label="Output" />
-        )}
-      </div>
+      ) : (
+        <div className="grid gap-1">
+          <Text>
+            {CHECK_RESULT_BADGE[state.result].label} at{" "}
+            <time dateTime={new Date(state.finishedAt).toISOString()}>
+              {timeFormat.format(state.finishedAt)}
+            </time>
+            {timedOut ? ", after its deadline, so the train did not use this result" : ""}.
+          </Text>
+          <Text variant="secondary">
+            {state.logCut ? `Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB` : "Output"}
+          </Text>
+          {state.logTail === "" ? (
+            <Text variant="secondary">No output.</Text>
+          ) : (
+            <TextBlock text={state.logTail} label="Output" />
+          )}
+        </div>
+      )}
     </div>
   );
 };

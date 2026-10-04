@@ -441,6 +441,22 @@
         "candidate": "cccccccccccccccccccccccccccccccccccccccc",
         "digest": "2f41328e380bb61b830c7e9f5b2d2cd708072f059b29c1e6204fe866b3e9a29e"
       }
+    },
+    {
+      "v": 2,
+      "seq": 25,
+      "at": 1790000000025,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.unreported",
+      "data": {
+        "checkRunId": "chk_run0003",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "outcome": "timed_out"
+      }
     }
   ],
   "largestSafeSeq": {
@@ -573,6 +589,25 @@
         "type": "claim.expired",
         "data": {
           "claimId": "clm_42abcd"
+        }
+      }
+    },
+    {
+      "name": "unknown unreported outcome",
+      "value": {
+        "v": 2,
+        "seq": 25,
+        "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "lost"
         }
       }
     }
@@ -820,6 +855,46 @@
         }
       },
       "error": "digest"
+    },
+    {
+      "name": "unreported check asserted by an agent",
+      "value": {
+        "v": 2,
+        "seq": 25,
+        "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "timed_out"
+        }
+      },
+      "error": "by the system"
+    },
+    {
+      "name": "unreported check written at version 1",
+      "value": {
+        "v": 1,
+        "seq": 25,
+        "at": 1790000000025,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.unreported",
+        "data": {
+          "checkRunId": "chk_run0003",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "outcome": "timed_out"
+        }
+      },
+      "error": "schema version"
     }
   ]
 }

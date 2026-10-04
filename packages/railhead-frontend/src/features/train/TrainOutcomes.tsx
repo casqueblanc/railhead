@@ -19,7 +19,7 @@ interface TrainOutcomesProps {
 
 /**
  * The train's merge intents and what became of each, newest first, then its check runs that reported
- * a result, failed ones included, newest first.
+ * a result or timed out, failed ones included, newest first.
  */
 export const TrainOutcomes = ({ feed, checks, onRetry }: TrainOutcomesProps) => {
   const headingId = useId();
@@ -84,7 +84,7 @@ export const TrainOutcomes = ({ feed, checks, onRetry }: TrainOutcomesProps) => 
           {checked.runs.length > 0 && (
             <section aria-labelledby={checksHeadingId} className="border-t border-kumo-line">
               <Text as="h3" variant="heading" DANGEROUS_className="px-4 pt-3">
-                <span id={checksHeadingId}>Reported check runs</span>
+                <span id={checksHeadingId}>Check runs</span>
               </Text>
               <ul className="grid divide-y divide-kumo-line">
                 {checked.runs.map((run) => (
@@ -93,7 +93,7 @@ export const TrainOutcomes = ({ feed, checks, onRetry }: TrainOutcomesProps) => 
               </ul>
               {checked.omitted > 0 && (
                 <Text variant="secondary" DANGEROUS_className="px-4 pb-3">
-                  {checked.omitted} older reported check runs are not listed; the totals count them.
+                  {checked.omitted} older check runs are not listed; the totals count them.
                 </Text>
               )}
             </section>

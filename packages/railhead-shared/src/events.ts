@@ -113,6 +113,7 @@ const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
   "train.main": 1,
   "train.held": 2,
   "check.approved": 2,
+  "train.unreported": 2,
 };
 
 /** The schema version an event of `type` is written at. */
@@ -209,6 +210,12 @@ export type InboxEntry =
 
 /** The outcome of one check run. `error` means the check could not run, not that the change failed. */
 export type CheckResult = "pass" | "fail" | "error";
+
+/**
+ * Why a check attempt ended without a report. `timed_out`: its deadline passed before the runner
+ * reported, so the train failed its batch.
+ */
+export type UnreportedOutcome = "timed_out";
 
 /** Clef's classification of a conflict. */
 export type ConflictClass = "compatible" | "contradictory";
@@ -394,6 +401,14 @@ export type EventPayload =
        */
       type: "check.approved";
       data: { checkRunId: CheckRunId; candidate: CommitSha; digest: string };
+    }
+  | {
+      /**
+       * A check attempt ended without a report, so it has no `train.check` result. A held attempt
+       * is recorded by `train.held` instead.
+       */
+      type: "train.unreported";
+      data: { checkRunId: CheckRunId; candidate: CommitSha; outcome: UnreportedOutcome };
     };
 
 /** The name of one event type. */
@@ -443,6 +458,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "train.intent",
   "train.main",
   "train.held",
+  "train.unreported",
 ];
 
 // =======================================================================================
@@ -686,6 +702,10 @@ function validatePayload(event: EventPayload): void {
       requireId("checkRun", event.data.checkRunId, "checkRunId");
       requireCommit(event.data.candidate, "candidate");
       requireDigest(event.data.digest, "digest");
+      return;
+    case "train.unreported":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.candidate, "candidate");
       return;
     default:
       return unreachable(event);

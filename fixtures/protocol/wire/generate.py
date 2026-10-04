@@ -690,7 +690,7 @@ CHECK_DIGEST = hashlib.sha256(b'{"name":"test","command":"pnpm test","timeoutMs"
 
 
 # The schema version each type is written at, when later than 1: the version that introduced it.
-EVENT_VERSIONS = {"train.held": 2, "check.approved": 2}
+EVENT_VERSIONS = {"train.held": 2, "check.approved": 2, "train.unreported": 2}
 
 
 def event(seq: int, type_: str, actor: dict, data: dict) -> dict:
@@ -728,6 +728,7 @@ def events_fixture() -> dict:
         ("claim.adapted", SYSTEM, {"claimId": "clm_42abcd", "intentId": "int_merge01", "decision": {"decisionId": "dec_upload1", "version": 1}}),
         ("train.held", SYSTEM, {"checkRunId": "chk_run0002", "expectedMain": SHA_BASE, "candidate": SHA_OTHER, "claims": ["clm_42abcd"], "paths": [".railhead/check.json"], "digest": CHECK_DIGEST}),
         ("check.approved", HUMAN, {"checkRunId": "chk_run0002", "candidate": SHA_OTHER, "digest": CHECK_DIGEST}),
+        ("train.unreported", SYSTEM, {"checkRunId": "chk_run0003", "candidate": SHA_OTHER, "outcome": "timed_out"}),
     ]
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
@@ -739,6 +740,7 @@ def events_fixture() -> dict:
         ("seq as a string", {**opened, "seq": "5"}),
         ("unknown actor kind", {**opened, "actor": {"kind": "robot", "id": AGENT}}),
         ("tag and data of different types", {**opened, "type": "claim.expired", "data": {"claimId": "clm_42abcd"}}),
+        ("unknown unreported outcome", {**events[24], "data": {**events[24]["data"], "outcome": "lost"}}),
     ]
     invariant = [
         ("unsupported schema version", {**opened, "v": 2}, "schema version"),
@@ -752,6 +754,8 @@ def events_fixture() -> dict:
         ("held path outside the repository", {**events[22], "data": {**events[22]["data"], "paths": ["../check.json"]}}, "paths"),
         ("check approval recorded by the system", {**events[23], "actor": SYSTEM}, "by a person"),
         ("check approval with an uppercase digest", {**events[23], "data": {**events[23]["data"], "digest": CHECK_DIGEST.upper()}}, "digest"),
+        ("unreported check asserted by an agent", {**events[24], "actor": AGENT_ACTOR}, "by the system"),
+        ("unreported check written at version 1", {**events[24], "v": 1}, "schema version"),
     ]
     return {
         "valid": events,

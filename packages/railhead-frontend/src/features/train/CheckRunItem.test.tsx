@@ -8,7 +8,7 @@ import {
 } from "@railhead/shared/board-api";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { SYNTH_REPO, synthCommit, syntheticLog } from "../../../../../fixtures/board/syntheticLog";
-import { checkResult } from "../../../../../fixtures/board/uploadSteps";
+import { checkResult, checkTimedOut } from "../../../../../fixtures/board/uploadSteps";
 import type { CheckDetailPort } from "../board/boardPorts";
 import { emptyBoardState, foldEvents } from "../board/boardState";
 import type { BoardFeed } from "../claims/boardFeed";
@@ -104,7 +104,7 @@ describe("check runs in the train section", () => {
 
     const [item] = checkItems();
     expect(checkItems()).toHaveLength(1);
-    expect(container.querySelector("h3")?.textContent).toBe("Reported check runs");
+    expect(container.querySelector("h3")?.textContent).toBe("Check runs");
     expect(item?.textContent).toContain("Failed");
     expect(item?.textContent).toContain("test: Failed");
     expect(item?.querySelector(`[title="${CANDIDATE}"]`)?.textContent).toBe(CANDIDATE.slice(0, 7));
@@ -183,7 +183,7 @@ describe("check runs in the train section", () => {
     ];
     await render(feedOf(failingLog));
     await openDetail();
-    expect(text()).toContain("does not match this run's reported result");
+    expect(text()).toContain("does not match this run in the log");
     expect(text()).not.toContain(".railhead/check.json");
     expect(container.querySelector("pre")).toBeNull();
 
@@ -198,7 +198,7 @@ describe("check runs in the train section", () => {
       ),
     );
     expect(reads).toEqual([RUN, RUN]);
-    expect(text()).toContain("does not match this run's reported result");
+    expect(text()).toContain("does not match this run in the log");
     expect(text()).not.toContain("Running");
     expect(container.querySelector("pre")).toBeNull();
   });
@@ -208,7 +208,7 @@ describe("check runs in the train section", () => {
     await render(feedOf(failingLog));
     await openDetail();
 
-    expect(text()).toContain("does not match this run's reported result");
+    expect(text()).toContain("does not match this run in the log");
     expect(container.querySelector("pre")).toBeNull();
   });
 
@@ -292,6 +292,64 @@ describe("check runs in the train section", () => {
     expectFullCandidate(checkItems()[0]);
   });
 
+  describe("a run that timed out", () => {
+    const DEADLINE = Date.UTC(2026, 9, 1, 12, 30);
+    const timedOutLog = syntheticLog("Synthetic timed-out check run", [
+      checkResult("chk_synthearly", synthCommit(1), "test", "pass"),
+      checkTimedOut(RUN, CANDIDATE),
+    ]).events;
+
+    it("is listed first as timed out, with no result, and reads nothing until opened", async () => {
+      await render(feedOf(timedOutLog));
+
+      const [item, earlier] = checkItems();
+      expect(checkItems()).toHaveLength(2);
+      expect(item?.textContent).toContain("Timed out");
+      expect(item?.textContent).toContain("No report arrived before the deadline");
+      expect(item?.querySelectorAll("ul > li")).toHaveLength(0);
+      expectFullCandidate(item);
+      expect(earlier?.textContent).toContain("Passed");
+      expect(reads).toEqual([]);
+    });
+
+    it("shows its recorded command and the deadline it missed once opened", async () => {
+      answers = [{ ok: true, value: detail({ state: { kind: "started", deadline: DEADLINE } }) }];
+      await render(feedOf(timedOutLog));
+      await openDetail();
+
+      expect(reads).toEqual([RUN]);
+      expect(container.querySelector("pre[aria-label=Command]")?.textContent).toBe(
+        "pnpm install --frozen-lockfile && pnpm test",
+      );
+      expect(text()).toContain("No report arrived by its deadline");
+      expect(container.querySelector("time")?.getAttribute("datetime")).toBe(
+        new Date(DEADLINE).toISOString(),
+      );
+      expect(container.querySelector("pre[aria-label=Output]")).toBeNull();
+    });
+
+    it("says a report that arrived after the deadline was not used", async () => {
+      await render(feedOf(timedOutLog));
+      await openDetail();
+
+      expect(text()).toContain("after its deadline, so the train did not use this result");
+      expect(container.querySelector("pre[aria-label=Output]")?.textContent).toBe(
+        "FAIL upload.test.ts\n1 failed",
+      );
+    });
+
+    it("shows nothing from a held answer", async () => {
+      answers = [
+        { ok: true, value: detail({ state: { kind: "held", paths: [".railhead/check.json"] } }) },
+      ];
+      await render(feedOf(timedOutLog));
+      await openDetail();
+
+      expect(text()).toContain("does not match this run in the log");
+      expect(text()).not.toContain(".railhead/check.json");
+    });
+  });
+
   it(`lists the newest ${MAX_LISTED_CHECK_RUNS} runs and says how many are left out`, async () => {
     const many = syntheticLog(
       "Synthetic many check runs",
@@ -302,6 +360,6 @@ describe("check runs in the train section", () => {
     await render(feedOf(many));
 
     expect(checkItems()).toHaveLength(MAX_LISTED_CHECK_RUNS);
-    expect(text()).toContain("2 older reported check runs are not listed; the totals count them.");
+    expect(text()).toContain("2 older check runs are not listed; the totals count them.");
   });
 });

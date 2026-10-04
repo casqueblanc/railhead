@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::events::{
     Acceptance, CheckResult, ConflictClass, ConflictRoute, DecisionRef, InboxEntry, MainOutcome,
-    QuestionOption, RefusalReason, ReopenReason,
+    QuestionOption, RefusalReason, ReopenReason, UnreportedOutcome,
 };
 use crate::integer::{SafeInteger, nullable};
 use crate::rules::{
@@ -622,6 +622,25 @@ impl CheckApproved {
         require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
         require_commit(&self.candidate, "candidate")?;
         require_digest(&self.digest, "digest")
+    }
+}
+
+/// `train.unreported`: a check attempt ended without a report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainUnreported {
+    /// The `chk_` attempt.
+    pub check_run_id: String,
+    /// The candidate commit.
+    pub candidate: String,
+    /// Why it ended.
+    pub outcome: UnreportedOutcome,
+}
+
+impl TrainUnreported {
+    pub(crate) fn validate(&self) -> Result<()> {
+        require_id(IdKind::CheckRun, &self.check_run_id, "checkRunId")?;
+        require_commit(&self.candidate, "candidate")
     }
 }
 

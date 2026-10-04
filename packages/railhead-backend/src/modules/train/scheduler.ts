@@ -62,14 +62,15 @@
 //
 // The deadline of a check attempt is recorded before the check port is asked to start it. An
 // attempt the runner never reports, whether or not the port acknowledged it, expires at that
-// deadline: the batch fails with `check_timeout`, its pins return to the queue as after a check
-// error, and a report arriving at or after the deadline is refused, so a late pass can never
-// authorize a landing. An attempt the check port holds for a person (`check_held`: the candidate
-// edits protected check paths) is not an outage: the train records it, asks the port nothing more,
-// waits for the deadline without backing off, and then fails the batch with `check_held`, counting
-// no retry, so a held pin is never dropped for waiting. A shared batch goes back split into isolated
-// pins, so the pins that do not edit those paths go on alone; a pin held alone is parked out of the
-// queue, so it cannot hold the pins behind it.
+// deadline: the batch fails with `check_timeout`, recorded as `train.unreported` in the same
+// transaction, its pins return to the queue as after a check error, and a report arriving at or
+// after the deadline is refused, so a late pass can never authorize a landing. An attempt the check
+// port holds for a person (`check_held`: the candidate edits protected check paths) is not an
+// outage: the train records it, asks the port nothing more, waits for the deadline without backing
+// off, and then fails the batch with `check_held`, counting no retry, so a held pin is never
+// dropped for waiting. A shared batch goes back split into isolated pins, so the pins that do not
+// edit those paths go on alone; a pin held alone is parked out of the queue, so it cannot hold the
+// pins behind it.
 //
 // A person's approval of the held attempt (`release`, inside the checks module's transaction) is the
 // way back, on the same candidate and attempt: composing again would make another candidate, held
@@ -992,13 +993,27 @@ export function createTrain(
     return deadline;
   }
 
-  /** Fails an attempt whose runner did not report by its deadline. */
+  /**
+   * Fails an attempt whose runner did not report by its deadline. An attempt that was not held
+   * records `train.unreported` with the failure, so the log shows it ended; `train.held` already
+   * records a held one.
+   */
   function expireCheck(generation: number, batch: BatchRecord): void {
     const now = clock();
-    const expired = fenced(generation, () => {
+    const { value: expired } = log.transaction((tx) => {
+      if (!holds(generation)) throw new DriveSuperseded();
       const current = activeBatch(sql);
       if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
-      failBatchIn(current, current.checkHeld ? "check_held" : "check_timeout", now);
+      if (current.checkHeld) {
+        failBatchIn(current, "check_held", now);
+        return true;
+      }
+      failBatchIn(current, "check_timeout", now);
+      const attempt = attemptOf(current);
+      tx.append(TRAIN_ACTOR, {
+        type: "train.unreported",
+        data: { checkRunId: attempt.attemptId, candidate: attempt.candidate, outcome: "timed_out" },
+      });
       return true;
     });
     if (expired) {

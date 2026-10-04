@@ -1801,6 +1801,12 @@ describe("train check deadline", () => {
 
       advance(10);
       await again.resume();
+      const timedOut = {
+        type: "train.unreported",
+        actor: { kind: "system", id: "sys_train" },
+        data: { checkRunId: silent.attemptId, candidate: silent.candidate, outcome: "timed_out" },
+      };
+      expect(events()).toMatchObject([timedOut]);
       const fresh = lastStarted(fakes);
       expect(fresh.attemptId).not.toBe(silent.attemptId);
       expect(pinsOf(fresh)).toEqual([pin(1)]);
@@ -1817,7 +1823,9 @@ describe("train check deadline", () => {
         code: "check_mismatch",
       });
       expect(again.attemptOutcome(silent.attemptId)).toEqual({ attempt: silent, report: null });
-      expect(events()).toEqual([]);
+      // Neither the refused report nor another drive records the expiry again.
+      await again.resume();
+      expect(events()).toMatchObject([timedOut]);
 
       expect(await again.recordCheck(report(fresh, "pass"))).toEqual(ok(fresh));
       expect(fakes.authorized).toEqual([fresh.attemptId]);
@@ -1844,6 +1852,9 @@ describe("train check deadline", () => {
 
       await train.resume();
       expect(train.batches(2).map((b) => b.failure)).toEqual([null, "check_timeout"]);
+      expect(events()).toMatchObject([
+        { type: "train.unreported", data: { checkRunId: attempt.attemptId, outcome: "timed_out" } },
+      ]);
       expect(fakes.authorized).toEqual([]);
       expect(fakes.main).toBe(MAIN);
     }, fakes);
@@ -1851,14 +1862,20 @@ describe("train check deadline", () => {
 
   it("drops a pin whose attempts keep expiring and moves the next queued pin", async () => {
     const fakes = new Fakes();
-    await withTrain(async ({ train, sql, now, advance }) => {
+    await withTrain(async ({ train, sql, now, advance, events }) => {
       fakes.ready(pin(1), pin(2));
       await train.enqueue(pin(1));
       await train.enqueue(pin(2));
+      const expired: string[] = [];
       for (let expiry = 0; expiry <= MAX_RETRIES; expiry += 1) {
+        expired.push(lastStarted(fakes).attemptId);
         advance(owed(sql).dueAt - now());
         await train.resume();
       }
+      // Each expired attempt is logged once, under its own id.
+      expect(
+        events().map((e) => (e.type === "train.unreported" ? e.data.checkRunId : e.type)),
+      ).toEqual(expired);
       expect(states(train)).toEqual({ "clm_claim001@1": "dropped", "clm_claim002@1": "batched" });
       expect(train.entries(64).find((e) => e.pin.claimId === pin(1).claimId)?.reason).toBe(
         "retries_exhausted",
@@ -1882,7 +1899,7 @@ describe("train held checks", () => {
         ? fail("check_held", "The candidate edits protected check paths.")
         : ok({ attemptId: attempt.attemptId });
     fakes.head = () => fail("unavailable", "Not yet.");
-    await withTrain(async ({ train, sql, now, advance }) => {
+    await withTrain(async ({ train, sql, now, advance, events }) => {
       fakes.ready(offender, pin(2));
       await train.enqueue(offender);
       await train.enqueue(pin(2));
@@ -1925,6 +1942,8 @@ describe("train held checks", () => {
       });
       // Nothing is left to drive: the parked pin owes no wake.
       expect(readWake(sql)).toBeNull();
+      // A held attempt is logged by the check port as `train.held`, never as unreported.
+      expect(events().map((e) => e.type)).toEqual(["train.check", "train.check"]);
     }, fakes);
   });
 
@@ -2461,7 +2480,7 @@ describe("train hung ports", () => {
     const fakes = new Fakes();
     fakes.portTimeoutMs = 20;
     fakes.hang = "checks.start";
-    await withTrain(async ({ train, now, advance }) => {
+    await withTrain(async ({ train, now, advance, events }) => {
       fakes.ready(pin(1));
       await train.enqueue(pin(1));
       const silent = lastStarted(fakes);
@@ -2479,6 +2498,9 @@ describe("train hung ports", () => {
 
       fakes.hang = null;
       await train.resume();
+      expect(events()).toMatchObject([
+        { type: "train.unreported", data: { checkRunId: silent.attemptId, outcome: "timed_out" } },
+      ]);
       const fresh = lastStarted(fakes);
       expect(fresh.attemptId).not.toBe(silent.attemptId);
       expect(train.batches(2).map((b) => [b.state, b.failure, b.checkStarted])).toEqual([
