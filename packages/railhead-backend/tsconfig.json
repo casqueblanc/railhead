@@ -4,5 +4,5 @@
     "lib": ["ES2023", "ESNext.Disposable"],
     "types": ["./worker-configuration.d.ts", "@cloudflare/vitest-plugin/types"]
   },
-  "include": ["src", "__tests__", "vitest.config.ts"]
+  "include": ["src", "__tests__", "qualify", "vitest.config.ts"]
 }
