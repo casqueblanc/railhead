@@ -29,6 +29,7 @@ pub const SUMMARY_LABEL: &str = "measured on a simulated run";
 
 /// What a task delivers: the scaffold or a planned edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub enum TaskClass {
     /// The shared files the two shared edit classes rewrite.
@@ -55,6 +56,7 @@ impl From<EditClass> for TaskClass {
 
 /// Where an agent is in its loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub enum AgentState {
     /// Asking for work with `rh work`.
@@ -77,6 +79,7 @@ pub enum AgentState {
 
 /// The step that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub enum Step {
     /// Checking the agent's identity before the run.
@@ -103,6 +106,7 @@ pub enum Step {
 
 /// One event.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -195,6 +199,7 @@ pub enum Event {
         /// What it delivers.
         class: TaskClass,
         /// The issue that adds the closed reason to the agent wire.
+        #[cfg_attr(test, serde(deserialize_with = "known"))]
         needs: &'static str,
     },
     /// Two claims changed the same path from bases that lacked each other's edit, and main holds
@@ -258,6 +263,7 @@ pub enum Event {
 
 /// Why the run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     /// Every agent finished or stopped.
@@ -270,6 +276,7 @@ pub enum StopReason {
 
 /// Ready→landed latency over the run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub struct Latency {
     /// How many landings were measured.
@@ -282,9 +289,11 @@ pub struct Latency {
 
 /// The run's totals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
     /// Always [`SUMMARY_LABEL`].
+    #[cfg_attr(test, serde(deserialize_with = "known"))]
     pub label: &'static str,
     /// Why the run ended.
     pub stopped_by: StopReason,
@@ -328,30 +337,52 @@ impl Summary {
     }
 }
 
+/// One of the fixed strings the stream carries, read back from a recorded run.
+#[cfg(test)]
+fn known<'de, D: serde::Deserializer<'de>>(from: D) -> Result<&'static str, D::Error> {
+    use serde::Deserialize as _;
+    let text = String::deserialize(from)?;
+    [SUMMARY_LABEL, crate::agent::UNVERIFIED_NEEDS]
+        .into_iter()
+        .find(|known| *known == text)
+        .ok_or_else(|| serde::de::Error::custom("not a string the stream carries"))
+}
+
 /// The `p`th percentile of sorted `samples` by nearest rank.
 fn percentile(sorted: &[u64], p: usize) -> Option<u64> {
     let rank = p.saturating_mul(sorted.len()).div_ceil(100).max(1);
     sorted.get(rank - 1).copied()
 }
 
-/// Counts events as they are written.
+/// Counts events as they are written. The fields are the [`Summary`] totals of the same name.
 #[derive(Debug, Default)]
 pub struct Tally {
-    pushes: u64,
-    readies: u64,
-    landings: u64,
-    unverified: u64,
-    auto_merged: u64,
-    routed: u64,
-    redos: u64,
-    stalls: u64,
-    failures: u64,
-    agents_done: u64,
+    /// Commits pushed.
+    pub pushes: u64,
+    /// Commits pinned.
+    pub readies: u64,
+    /// Commits landed.
+    pub landings: u64,
+    /// Pinned claims that closed without a closed reason.
+    pub unverified: u64,
+    /// Same-path pairs Git merged.
+    pub auto_merged: u64,
+    /// Conflicts the backend routed to an agent.
+    pub routed: u64,
+    /// Edits redone.
+    pub redos: u64,
+    /// Ready claims that never landed.
+    pub stalls: u64,
+    /// Steps that failed for good.
+    pub failures: u64,
+    /// Agents that finished every planned task.
+    pub agents_done: u64,
     latencies: Vec<u64>,
 }
 
 impl Tally {
-    fn count(&mut self, event: &Event) {
+    /// Counts `event` into the totals.
+    pub fn count(&mut self, event: &Event) {
         let counter = match event {
             Event::Pushed { .. } => &mut self.pushes,
             Event::Ready { .. } => &mut self.readies,
@@ -381,10 +412,21 @@ impl Tally {
         *counter = counter.saturating_add(1);
     }
 
+    /// Ready→landed latency over the landings counted so far.
+    #[must_use]
+    pub fn latency(&self) -> Latency {
+        let mut sorted = self.latencies.clone();
+        sorted.sort_unstable();
+        Latency {
+            samples: sorted.len(),
+            p50_ms: percentile(&sorted, 50),
+            p95_ms: percentile(&sorted, 95),
+        }
+    }
+
     /// The summary of what was counted.
     #[must_use]
-    pub fn summary(mut self, stopped_by: StopReason, duration: Duration) -> Summary {
-        self.latencies.sort_unstable();
+    pub fn summary(&self, stopped_by: StopReason, duration: Duration) -> Summary {
         Summary {
             label: SUMMARY_LABEL,
             stopped_by,
@@ -399,11 +441,7 @@ impl Tally {
             stalls: self.stalls,
             failures: self.failures,
             agents_done: self.agents_done,
-            ready_to_landed: Latency {
-                samples: self.latencies.len(),
-                p50_ms: percentile(&self.latencies, 50),
-                p95_ms: percentile(&self.latencies, 95),
-            },
+            ready_to_landed: self.latency(),
         }
     }
 }

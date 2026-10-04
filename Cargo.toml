@@ -17,6 +17,9 @@ railhead-protocol = { path = "crates/railhead-protocol", version = "=0.1.0" }
 
 anyhow = "=1.0.104"
 clap = { version = "=4.6.7", features = ["derive"] }
+# The swarm's `--tui` view. 0.30.2 is the latest stable release and needs Rust 1.88. Only the
+# crossterm backend; its widgets are always built.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 # The per-user config directory that holds the agent key store.
 dirs = "=7.0.0"
 # rustls with the platform verifier: no OpenSSL to link, and the OS trust store is honoured.
@@ -37,6 +40,8 @@ thiserror = "=2.0.21"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 url = "=2.5.8"
 
+# Snapshots of the swarm's `--tui` screens, rendered on ratatui's `TestBackend`.
+insta = "=1.49.0"
 tempfile = "=3.27.0"
 wiremock = "=0.6.5"
 

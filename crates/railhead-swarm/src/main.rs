@@ -19,6 +19,9 @@
 //! was killed leaves nothing to clean up before the next. Ctrl-C is listened for before anything
 //! else, so one pressed during startup still stops the run cleanly.
 //!
+//! With `--tui` the run is shown live on the terminal; see [`tui`]. `q` there stops the run as
+//! Ctrl-C does.
+//!
 //! The exit code is 0 only when every agent finished every planned task; 1 when an agent failed or
 //! stalled, or the run timed out; 130 on Ctrl-C; 2 when the run could not start. A task whose claim
 //! closed without a closed reason is reported as unverified, not as a failure, until
@@ -36,6 +39,7 @@ mod plan;
 mod process;
 mod progress;
 mod scenario;
+mod tui;
 
 use std::future::Future;
 use std::io::{self, Read as _, Write};
@@ -46,15 +50,16 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::agent::{Agent, Landings, Shared};
-use crate::events::{Emitter, Event, StopReason, Writer};
+use crate::events::{Emitter, Event, StopReason, Summary, Writer};
 use crate::plan::Plan;
 use crate::process::{AgentEnv, Reaper, Runner, STOP_GRACE};
 use crate::progress::{HomeLock, Progress, ProgressFile, RunKey};
 use crate::scenario::{MAX_SCENARIO_BYTES, Scenario};
+use crate::tui::Tui;
 
 /// Largest identity record read from an agent home, in bytes.
 const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
@@ -83,6 +88,11 @@ struct Cli {
     /// resuming.
     #[arg(long)]
     discard_progress: bool,
+
+    /// Shows the run live on the terminal, drawn on standard error. The JSON lines still go to
+    /// standard output when it is redirected.
+    #[arg(long)]
+    tui: bool,
 }
 
 /// The name of agent `index`.
@@ -206,7 +216,7 @@ struct Ended {
 }
 
 async fn run(cli: &Cli) -> anyhow::Result<Ended> {
-    let mut interrupt = Interrupt::listen().context("listening for Ctrl-C")?;
+    let interrupt = Interrupt::listen().context("listening for Ctrl-C")?;
     let (scenario, key) = read_scenario(&cli.scenario)?;
     let homes = (0..scenario.agents)
         .map(|index| {
@@ -239,6 +249,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     .context("creating the run's temporary directory")?;
 
     let started = Instant::now();
+    let (tui, stop_asked, paused) = start_view(cli.tui, started)?;
     let (events, mut received) = Emitter::channel();
     let runner = Runner::new(
         cli.rh.clone(),
@@ -255,14 +266,19 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
             .checked_add(scenario.bounds.run_timeout)
             .context("the run timeout is out of range")?,
         landings: Mutex::new(Landings::default()),
+        paused,
     });
-    let mut writer = Writer::new(io::stdout(), started);
-    writer.write(&Event::RunStarted {
+    let mut sink = Sink {
+        writer: Writer::new(output(cli.tui), started),
+        tui,
+    };
+    sink.write(&Event::RunStarted {
         seed: scenario.seed,
         agents: scenario.agents,
         rounds: scenario.rounds,
         repository: scenario.repository.to_string(),
-    })?;
+    })
+    .await?;
 
     // Every agent is prepared before any runs, so a failure here leaves nothing to stop.
     let mut prepared = Vec::with_capacity(homes.len());
@@ -287,26 +303,101 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     // The agents hold the only emitters now, so the stream ends when the last agent does.
     drop(shared);
 
-    let run_timeout = scenario.bounds.run_timeout;
-    let stop = async move {
-        tokio::select! {
-            biased;
-            () = interrupt.recv() => StopReason::Interrupted,
-            () = tokio::time::sleep(run_timeout) => StopReason::TimedOut,
-        }
-    };
-    let stopped_by = supervise(&mut writer, &mut agents, &reaper, &mut received, stop).await?;
+    let stop = stop_on(interrupt, stop_asked, scenario.bounds.run_timeout);
+    let stopped_by = supervise(&mut sink, &mut agents, &reaper, &mut received, stop).await?;
     while let Ok(event) = received.try_recv() {
-        writer.write(&event)?;
+        sink.write(&event).await?;
     }
+    let Sink { writer, tui } = sink;
     let summary = writer.finish(stopped_by)?;
     clones
         .close()
         .context("removing the run's temporary directory")?;
+    if let Some(tui) = tui {
+        finish_view(tui, &summary).await?;
+    }
     Ok(Ended {
         stopped_by,
         succeeded: summary.succeeded(scenario.agents),
     })
+}
+
+/// Resolves with why the run stops: Ctrl-C, `asked` from the terminal view, or the run timeout.
+async fn stop_on(
+    mut interrupt: Interrupt,
+    asked: Option<oneshot::Receiver<()>>,
+    run_timeout: std::time::Duration,
+) -> StopReason {
+    let asked = async move {
+        match asked {
+            // An error means the view is gone, and with it the way to stop the run.
+            Some(asked) => {
+                let _ = asked.await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = interrupt.recv() => StopReason::Interrupted,
+        () = asked => StopReason::Interrupted,
+        () = tokio::time::sleep(run_timeout) => StopReason::TimedOut,
+    }
+}
+
+/// The terminal view when `tui` asks for one, the stop it can ask for, and whether it holds new
+/// claims back.
+type View = (
+    Option<Tui>,
+    Option<oneshot::Receiver<()>>,
+    watch::Receiver<bool>,
+);
+
+fn start_view(tui: bool, started: Instant) -> anyhow::Result<View> {
+    if !tui {
+        return Ok((None, None, watch::channel(false).1));
+    }
+    let (tui, controls) = Tui::start(started).context("starting the terminal view")?;
+    Ok((Some(tui), Some(controls.stop), controls.paused))
+}
+
+/// Shows the summary, waits for the operator to close the view, then prints the totals once the
+/// terminal is back.
+async fn finish_view(tui: Tui, summary: &Summary) -> anyhow::Result<()> {
+    tui.show(&Event::Summary(summary.clone())).await;
+    tui.finish().context("showing the run")?;
+    eprintln!(
+        "railhead-swarm: {} pushes, {} landings, {} unverified, {} failures ({})",
+        summary.pushes, summary.landings, summary.unverified, summary.failures, summary.label
+    );
+    Ok(())
+}
+
+/// Where events go: the JSON lines, and the terminal view when there is one.
+struct Sink<W: Write> {
+    writer: Writer<W>,
+    tui: Option<Tui>,
+}
+
+impl<W: Write> Sink<W> {
+    /// Writes `event`, then shows it.
+    async fn write(&mut self, event: &Event) -> io::Result<()> {
+        self.writer.write(event)?;
+        if let Some(tui) = &self.tui {
+            tui.show(event).await;
+        }
+        Ok(())
+    }
+}
+
+/// Where the JSON lines go: standard output, unless the terminal view draws on that terminal.
+fn output(tui: bool) -> Box<dyn Write> {
+    use std::io::IsTerminal as _;
+    if tui && io::stdout().is_terminal() {
+        Box::new(io::sink())
+    } else {
+        Box::new(io::stdout())
+    }
 }
 
 /// Writes the agents' events until the last agent ends or `stop` resolves, then stops every
@@ -314,7 +405,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
 /// asks its running child to stop; the reaper waits for each such child, killing it after
 /// [`STOP_GRACE`], so none outlives this and writes into a clone the run is about to remove.
 async fn supervise<W: Write>(
-    writer: &mut Writer<W>,
+    sink: &mut Sink<W>,
     agents: &mut JoinSet<()>,
     reaper: &Reaper,
     received: &mut mpsc::Receiver<Event>,
@@ -327,7 +418,7 @@ async fn supervise<W: Write>(
                 biased;
                 reason = &mut stop => break Ok(reason),
                 event = received.recv() => match event {
-                    Some(event) => writer.write(&event)?,
+                    Some(event) => sink.write(&event).await?,
                     None => break Ok(StopReason::Completed),
                 },
             }
@@ -368,6 +459,13 @@ mod tests {
         }
     }
 
+    fn sink<W: Write>(out: W) -> Sink<W> {
+        Sink {
+            writer: Writer::new(out, Instant::now()),
+            tui: None,
+        }
+    }
+
     fn agent_holding(agents: &mut JoinSet<()>) -> Arc<AtomicBool> {
         let killed = Arc::new(AtomicBool::new(false));
         let child = Child(Arc::clone(&killed));
@@ -389,9 +487,9 @@ mod tests {
                 state: AgentState::Claiming,
             })
             .await;
-        let mut writer = Writer::new(Closed, Instant::now());
+        let mut sink = sink(Closed);
         let outcome = supervise(
-            &mut writer,
+            &mut sink,
             &mut agents,
             &Reaper::default(),
             &mut received,
@@ -409,9 +507,9 @@ mod tests {
         let (_events, mut received) = Emitter::channel();
         let mut agents = JoinSet::new();
         let killed = agent_holding(&mut agents);
-        let mut writer = Writer::new(Vec::new(), Instant::now());
+        let mut sink = sink(Vec::new());
         let stopped = supervise(
-            &mut writer,
+            &mut sink,
             &mut agents,
             &Reaper::default(),
             &mut received,
@@ -429,9 +527,9 @@ mod tests {
         let (events, mut received) = Emitter::channel();
         drop(events);
         let mut agents = JoinSet::new();
-        let mut writer = Writer::new(Vec::new(), Instant::now());
+        let mut sink = sink(Vec::new());
         let stopped = supervise(
-            &mut writer,
+            &mut sink,
             &mut agents,
             &Reaper::default(),
             &mut received,
@@ -476,10 +574,10 @@ mod tests {
                 .rh::<serde_json::Value>(&env, &workdir, &["work"])
                 .await;
         });
-        let mut writer = Writer::new(Vec::new(), Instant::now());
+        let mut sink = sink(Vec::new());
         // Stopped once the child is running with its trap set.
         let running = clone.join("x");
-        let stopped = supervise(&mut writer, &mut agents, &reaper, &mut received, async {
+        let stopped = supervise(&mut sink, &mut agents, &reaper, &mut received, async {
             for _ in 0..500 {
                 if running.exists() {
                     break;
@@ -512,7 +610,8 @@ mod tests {
             Cli::try_parse_from(["railhead-swarm", "--scenario", "s.json", "--homes", "homes"]);
         assert!(cli.is_ok_and(|cli| cli.rh == Path::new("rh")
             && cli.workdir.is_none()
-            && !cli.discard_progress));
+            && !cli.discard_progress
+            && !cli.tui));
     }
 
     #[test]
