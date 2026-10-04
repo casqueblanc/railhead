@@ -16,7 +16,7 @@ The other cases cover a check report for another candidate and a ready for a com
 
 What is faked, in `__tests__/sliceWorld.ts`: Artifacts (`FakeArtifacts` for forks, `FakeMainRepo` for main's compare-and-swap as measured on #158), the Git endpoint, the sandbox container (it answers the merge script as Git would for a clean merge) and the check Workflow (the test reports each run through `Repo.reportCheck`, as the Workflow does). The owner's passkey is replaced by grants made inside the Repo; `ownerActions.test.ts` covers the passkey.
 
-The test fails while any module it needs is still the unavailable stub. Until #284 installs the authorization module, the three landing cases fail.
+The test fails while any module it needs is still the unavailable stub, so it cannot pass on a partial composition.
 
 ## Live gate
 
@@ -88,7 +88,5 @@ A failed `listing.*` check means the token bound (`MAX_LIVE_FORK_TOKENS`, `TOKEN
 
 ## Known gaps
 
-- #282: main's ref counts the sandbox's short-lived compose tokens on main as another writer, so a landing within about a minute of a compose push is refused and retried within the train's budget. On a fast check this can delay a landing or report the train drive `unavailable`; it cannot cause a wrong write. Until #282 lands, a `slice.batch` failure with `main_ref_foreign_writer` in the Worker logs is this issue.
-- #284: until the authorization module is installed, no merge is authorized, so the offline landing cases and `slice.batch` fail.
 - The `cf.artifacts.repo.pushed` event is not qualified here. It needs a Queue and an event subscription on the account, and nothing in Railhead relies on it (#158's adopted spec, rule 5).
 - Sandbox outbound denial (a check command reaching Artifacts or the internet directly) is covered by the sandbox gateway's workerd tests, not by this harness.
