@@ -123,8 +123,16 @@ impl Screen {
             let _ = terminal::disable_raw_mode();
             return Err(error);
         }
+        let terminal = match Terminal::new(CrosstermBackend::new(stderr)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = execute!(io::stderr(), terminal::LeaveAlternateScreen);
+                let _ = terminal::disable_raw_mode();
+                return Err(error);
+            }
+        };
         // From here on, dropping the screen restores the terminal.
-        let mut screen = Self(Terminal::new(CrosstermBackend::new(stderr))?);
+        let mut screen = Self(terminal);
         screen.0.hide_cursor()?;
         Ok(screen)
     }
