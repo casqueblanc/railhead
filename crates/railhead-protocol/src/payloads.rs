@@ -7,7 +7,7 @@ use crate::events::{
     Acceptance, CheckResult, ConflictClass, ConflictRoute, DecisionRef, InboxEntry, MainOutcome,
     QuestionOption, RefusalReason, ReopenReason, UnreportedOutcome,
 };
-use crate::integer::{SafeInteger, nullable};
+use crate::integer::{SafeInteger, nullable, omissible};
 use crate::rules::{
     IdKind, MAX_CHECK_NAME_LENGTH, MAX_ISSUE_BODY_LENGTH, MAX_OPTION_LABEL_LENGTH, MAX_OPTIONS,
     MAX_PLAN_LENGTH, MAX_QUESTION_LENGTH, MAX_TITLE_LENGTH, MIN_OPTIONS, require,
@@ -340,6 +340,15 @@ pub struct QuestionAsked {
     pub text: String,
     /// The answers offered.
     pub options: Vec<QuestionOption>,
+    /// Every `clm_` claim the decision depends on, `claim_id` first. A system question sets it, so
+    /// a train conflict question names both claims; `None` means the decision depends on
+    /// `claim_id` alone.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "omissible"
+    )]
+    pub claim_ids: Option<Vec<String>>,
 }
 
 impl QuestionAsked {
@@ -353,7 +362,20 @@ impl QuestionAsked {
             "text",
             "a question of 1 to 2000 characters",
         )?;
-        require_options(&self.options)
+        require_options(&self.options)?;
+        if let Some(claim_ids) = &self.claim_ids {
+            require_list(claim_ids, "claimIds")?;
+            require_unique(claim_ids.iter().map(String::as_str), "claimIds")?;
+            claim_ids
+                .iter()
+                .try_for_each(|id| require_id(IdKind::Claim, id, "claimIds"))?;
+            require(
+                claim_ids.first() == Some(&self.claim_id),
+                "claimIds",
+                "a list starting with the question's claimId",
+            )?;
+        }
+        Ok(())
     }
 }
 

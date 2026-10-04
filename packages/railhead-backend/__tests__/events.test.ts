@@ -242,6 +242,13 @@ function withData<T extends EventType>(
   return event(type, VALID[type].actor, change(structuredClone(VALID[type].data)));
 }
 
+/** `n` distinct claims, led by the question fixture's own claim. */
+function questionClaims(n: number): string[] {
+  return Array.from({ length: n }, (_, i) =>
+    i === 0 ? "clm_42abcd" : `clm_claim${String(i).padStart(4, "0")}`,
+  );
+}
+
 /** `n` distinct, valid question options. */
 function options(n: number): { key: string; label: string }[] {
   return Array.from({ length: n }, (_, i) => ({ key: `option_${i}`, label: `Option ${i}` }));
@@ -427,6 +434,24 @@ describe("validateEvent", () => {
       expect(() => validateEvent(bad)).toThrow(/options/);
     });
 
+    it("accepts a question naming every claim its decision depends on", () => {
+      const both = withData("question.asked", (d) => ({
+        ...d,
+        claimIds: ["clm_42abcd", "clm_43abcd"],
+      }));
+      expect(() => validateEvent(both)).not.toThrow();
+    });
+
+    it.each([
+      ["empty", [], /start with the question's claimId/],
+      ["led by another claim", ["clm_43abcd", "clm_42abcd"], /start with the question's claimId/],
+      ["naming a claim twice", ["clm_42abcd", "clm_42abcd"], /duplicate/],
+      ["naming a decision", ["clm_42abcd", "dec_upload1"], /claimIds\[1\]/],
+    ])("rejects question claims %s", (_name, claimIds, error) => {
+      const bad = withData("question.asked", (d) => ({ ...d, claimIds }));
+      expect(() => validateEvent(bad)).toThrow(error);
+    });
+
     it("rejects a conflict between a claim and itself", () => {
       const bad = withData("train.conflict", (d) => ({
         ...d,
@@ -575,6 +600,19 @@ describe("validateEvent", () => {
       expect(() => validateEvent(withData("train.intent", (d) => ({ ...d, claims })))).toThrow(
         /more than/,
       );
+    });
+
+    it("accepts the maximum number of question claims and rejects one more", () => {
+      const at = withData("question.asked", (d) => ({
+        ...d,
+        claimIds: questionClaims(MAX_LIST_LENGTH),
+      }));
+      const over = withData("question.asked", (d) => ({
+        ...d,
+        claimIds: questionClaims(MAX_LIST_LENGTH + 1),
+      }));
+      expect(() => validateEvent(at)).not.toThrow();
+      expect(() => validateEvent(over)).toThrow(/claimIds has more than/);
     });
 
     it.each([0, 1])("accepts conflict probability %s", (probability) => {

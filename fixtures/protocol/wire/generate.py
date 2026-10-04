@@ -796,6 +796,9 @@ def events_fixture() -> dict:
     events = [event(i + 1, t, a, d) for i, (t, a, d) in enumerate(valid)]
     pushed = events[5]
     opened = events[4]
+    asked = events[6]
+    # A train conflict question names both claims; `claimIds` is omitted from an agent's question.
+    system_asked = {**asked, "actor": SYSTEM, "data": {**asked["data"], "claimIds": ["clm_42abcd", "clm_43abcd"]}}
     shape = [
         ("unknown event type", {**opened, "type": "claim.deleted"}),
         ("data missing", {k: v for k, v in opened.items() if k != "data"}),
@@ -804,6 +807,7 @@ def events_fixture() -> dict:
         ("unknown actor kind", {**opened, "actor": {"kind": "robot", "id": AGENT}}),
         ("tag and data of different types", {**opened, "type": "claim.expired", "data": {"claimId": "clm_42abcd"}}),
         ("unknown unreported outcome", {**events[24], "data": {**events[24]["data"], "outcome": "lost"}}),
+        ("question claims written as null", {**asked, "data": {**asked["data"], "claimIds": None}}),
     ]
     invariant = [
         ("unsupported schema version", {**opened, "v": 2}, "schema version"),
@@ -823,10 +827,14 @@ def events_fixture() -> dict:
         ("merge recorded by an agent", {**events[25], "actor": AGENT_ACTOR}, "recorded by the system"),
         ("release recorded by the system", {**events[26], "actor": SYSTEM}, "by the agent itself"),
         ("release written at version 1", {**events[26], "v": 1}, "schema version"),
+        ("question claims not led by its claim", {**system_asked, "data": {**system_asked["data"], "claimIds": ["clm_43abcd", "clm_42abcd"]}}, "claimIds"),
+        ("question claims naming a claim twice", {**system_asked, "data": {**system_asked["data"], "claimIds": ["clm_42abcd", "clm_42abcd"]}}, "claimIds"),
+        ("question claims left empty", {**system_asked, "data": {**system_asked["data"], "claimIds": []}}, "claimIds"),
     ]
     return {
         "valid": events,
         "largestSafeSeq": {**opened, "seq": 9007199254740991},
+        "systemQuestion": system_asked,
         "rejectedShape": [{"name": n, "value": v} for n, v in shape],
         "rejectedInvariant": [{"name": n, "value": v, "error": e} for n, v, e in invariant],
     }

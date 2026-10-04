@@ -608,6 +608,7 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             decisionId,
             text: request.text,
             options: request.options,
+            claimIds: holders.map((holder) => holder.claimId),
           },
         },
       );

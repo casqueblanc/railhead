@@ -6,6 +6,7 @@ import { checkBeforeLand } from "../../../../../fixtures/board/checkBeforeLand";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { mixedBatch } from "../../../../../fixtures/board/mixedBatch";
 import { optionResults } from "../../../../../fixtures/board/optionResults";
+import { parkedConflict } from "../../../../../fixtures/board/parkedConflict";
 import type { SyntheticLog } from "../../../../../fixtures/board/syntheticLog";
 import { CAPTURE_FORMAT, CAPTURE_VERSION, type Capture } from "./captureFile";
 
@@ -30,4 +31,5 @@ export const SYNTHETIC_REPLAYS: readonly Capture[] = [
   checkBeforeLand,
   optionResults,
   mixedBatch,
+  parkedConflict,
 ].map(syntheticCapture);
