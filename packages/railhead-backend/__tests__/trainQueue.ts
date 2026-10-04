@@ -1,5 +1,6 @@
 // Queues a pin the way `ready` does, for train tests that start from a pin rather than a claim.
 
+import type { CheckRunId } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import type { PortResult } from "../src/contracts/result";
 import type { Train } from "../src/modules/train/scheduler";
@@ -17,6 +18,8 @@ export interface QueueingTrain extends Train {
    * rethrown, as the alarm does.
    */
   enqueue(pin: ClaimPin, episode?: number): Promise<PortResult<{ queued: boolean }>>;
+  /** Calls `release` in a transaction of its own, as the checks module does for an approval. */
+  releaseHeld(attemptId: CheckRunId): boolean;
 }
 
 /** Adds `enqueue` to `train`, queuing through `log`, the Repo's event log. */
@@ -34,6 +37,9 @@ export function queueing(train: Train, log: EventLog): QueueingTrain {
         console.error(JSON.stringify({ event: "train.drive_failed", error: name }));
       }
       return result;
+    },
+    releaseHeld(attemptId) {
+      return log.transaction((tx) => train.release(tx, attemptId)).value;
     },
   };
 }

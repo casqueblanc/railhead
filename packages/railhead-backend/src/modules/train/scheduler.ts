@@ -1006,6 +1006,8 @@ export function createTrain(
       if (current?.batchId !== batch.batchId || current.checkResult !== null) return false;
       if (current.checkHeld) {
         failBatchIn(current, "check_held", now);
+        // Each parked pin keeps a candidate and an attempt: past the bound, the oldest expire.
+        expireHeld(tx, now);
         return true;
       }
       failBatchIn(current, "check_timeout", now);
@@ -1231,8 +1233,6 @@ export function createTrain(
       }
     }
     requeueFront(sql, returned, now);
-    // Each parked pin keeps a candidate and an attempt: past the bound, the oldest expire.
-    if (parks) expireHeld(now);
   }
 
   /**
@@ -1385,8 +1385,8 @@ export function createTrain(
    * due, then discards what was due when the alarm fired.
    */
   async function resume(): Promise<void> {
-    context.storage.transactionSync(() => {
-      expireHeld(clock());
+    log.transaction((tx) => {
+      expireHeld(tx, clock());
       wakeForCleanup();
     });
     const firedAt = await resumeDrive();
@@ -1479,9 +1479,22 @@ export function createTrain(
     if (next !== null) context.wake(next);
   }
 
-  /** Expires the parked held pins past `HELD_PARK_TTL_MS` or beyond `MAX_PARKED_HELD`. */
-  function expireHeld(now: number): void {
-    expireHeldPins(sql, { parkedBy: now - HELD_PARK_TTL_MS, keep: MAX_PARKED_HELD }, now);
+  /**
+   * Expires the parked held pins past `HELD_PARK_TTL_MS` or beyond `MAX_PARKED_HELD`, recording
+   * `train.held_expired` for each attempt in `tx`, so the board stops offering its approval.
+   */
+  function expireHeld(tx: EventTransaction, now: number): void {
+    const parkedBy = now - HELD_PARK_TTL_MS;
+    for (const { attemptId, candidate, reason } of expireHeldPins(
+      sql,
+      { parkedBy, keep: MAX_PARKED_HELD },
+      now,
+    )) {
+      tx.append(TRAIN_ACTOR, {
+        type: "train.held_expired",
+        data: { checkRunId: attemptId, candidate, reason },
+      });
+    }
   }
 
   /** Drives the train if its wake is due. Returns the time it read, or `null` when it read none. */
@@ -1699,10 +1712,10 @@ export function createTrain(
     return value;
   }
 
-  function release(attemptId: CheckRunId): boolean {
+  function release(tx: EventTransaction, attemptId: CheckRunId): boolean {
     const now = clock();
     // A parked pin past its time is expired here rather than revived, even before the alarm fires.
-    expireHeld(now);
+    expireHeld(tx, now);
     wakeForCleanup();
     // The same fence `holds` reads: a parked pin a later generation superseded is stale, so its
     // attempt goes back to nothing even though its entry is still parked.

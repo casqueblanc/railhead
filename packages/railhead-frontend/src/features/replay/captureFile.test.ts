@@ -851,11 +851,11 @@ describe("parseCapture", () => {
 
   it("refuses an event from a newer schema before reading its shape", () => {
     const events: unknown[] = issues(3);
-    events[0] = { v: 3, seq: 1 };
+    events[0] = { v: 4, seq: 1 };
     expect(parsedError(fileOf({ events }))).toEqual({
       kind: "invalid_event",
       seq: 1,
-      message: "unsupported schema version 3",
+      message: "unsupported schema version 4",
     });
   });
 

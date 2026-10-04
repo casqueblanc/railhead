@@ -2206,7 +2206,7 @@ async function parkHeld(setup: Setup): Promise<void> {
 
 /** Approves the held attempt as the checks module does: `release` inside a transaction. */
 function approveHeld(setup: Setup, attemptId: string): boolean {
-  return setup.log.transaction(() => setup.train.release(attemptId)).value;
+  return setup.log.transaction((tx) => setup.train.release(tx, attemptId)).value;
 }
 
 describe("an approval of a held check", () => {

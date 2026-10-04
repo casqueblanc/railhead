@@ -212,6 +212,10 @@ const VALID: { [T in EventType]: { actor: Actor; data: DataOf[T] } } = {
     actor: SYSTEM,
     data: { checkRunId: "chk_run0001", candidate: SHA_B, outcome: "timed_out" },
   },
+  "train.held_expired": {
+    actor: SYSTEM,
+    data: { checkRunId: "chk_run0001", candidate: SHA_B, reason: "over_limit" },
+  },
 };
 
 const EVENT_TYPES = Object.keys(VALID) as EventType[];
@@ -257,8 +261,8 @@ describe("validateEvent", () => {
       expect(() => validateEvent({ ...event("issue.filed"), v })).toThrow(/not supported/);
     });
 
-    it("writes the held check, unreported check, merge and release events at version 2 and every older type at version 1", () => {
-      const later = EVENT_TYPES.filter((type) => eventVersion(type) !== 1);
+    it("writes the held check, unreported check, merge and release events at version 2, the held expiry at version 3 and every older type at version 1", () => {
+      const later = EVENT_TYPES.filter((type) => eventVersion(type) === 2);
       expect(later.toSorted()).toEqual([
         "check.approved",
         "claim.merged",
@@ -266,7 +270,10 @@ describe("validateEvent", () => {
         "train.held",
         "train.unreported",
       ]);
-      expect(EVENT_SCHEMA_VERSION).toBe(2);
+      expect(EVENT_TYPES.filter((type) => eventVersion(type) === 3)).toEqual([
+        "train.held_expired",
+      ]);
+      expect(EVENT_SCHEMA_VERSION).toBe(3);
     });
 
     it.each([
@@ -274,6 +281,7 @@ describe("validateEvent", () => {
       ["check.approved", 1],
       ["train.unreported", 1],
       ["claim.merged", 1],
+      ["train.held_expired", 2],
       ["issue.filed", 2],
     ] as const)("rejects %s stamped at version %s", (type, v) => {
       expect(() => validateEvent({ ...event(type), v })).toThrow(/is written at schema version/);
@@ -320,11 +328,16 @@ describe("validateEvent", () => {
       expect(() => validateEvent(event("train.unreported", HUMAN))).toThrow(/by the system/);
     });
 
+    it("refuses a held check expiry asserted by a person", () => {
+      expect(() => validateEvent(event("train.held_expired", HUMAN))).toThrow(/by the system/);
+    });
+
     it.each([
       "train.check",
       "train.main",
       "train.held",
       "train.unreported",
+      "train.held_expired",
       "claim.reassigned",
       "claim.reopened",
       "claim.adapted",
@@ -493,6 +506,21 @@ describe("validateEvent", () => {
     it("rejects an unreported check with an outcome it does not define", () => {
       const bad = withData("train.unreported", (d) => ({ ...d, outcome: "lost" as "timed_out" }));
       expect(() => validateEvent(bad)).toThrow(/outcome/);
+    });
+
+    it("rejects a held check expiry naming a non-check attempt, a short candidate or another reason", () => {
+      const run = withData("train.held_expired", (d) => ({ ...d, checkRunId: "int_merge01" }));
+      expect(() => validateEvent(run)).toThrow(/checkRunId/);
+      const candidate = withData("train.held_expired", (d) => ({
+        ...d,
+        candidate: "c".repeat(39),
+      }));
+      expect(() => validateEvent(candidate)).toThrow(/candidate/);
+      const reason = withData("train.held_expired", (d) => ({
+        ...d,
+        reason: "approved" as "timed_out",
+      }));
+      expect(() => validateEvent(reason)).toThrow(/reason/);
     });
 
     it("rejects a held check with no paths, no claims or a repeated path", () => {

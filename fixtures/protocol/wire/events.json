@@ -488,6 +488,22 @@
         "claimId": "clm_43abcd",
         "generation": 1
       }
+    },
+    {
+      "v": 3,
+      "seq": 28,
+      "at": 1790000000028,
+      "repo": "rep_demo0001",
+      "actor": {
+        "kind": "system",
+        "id": "sys_train"
+      },
+      "type": "train.held_expired",
+      "data": {
+        "checkRunId": "chk_run0002",
+        "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+        "reason": "timed_out"
+      }
     }
   ],
   "largestSafeSeq": {
@@ -639,6 +655,25 @@
           "checkRunId": "chk_run0003",
           "candidate": "cccccccccccccccccccccccccccccccccccccccc",
           "outcome": "lost"
+        }
+      }
+    },
+    {
+      "name": "unknown held expiry reason",
+      "value": {
+        "v": 3,
+        "seq": 28,
+        "at": 1790000000028,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.held_expired",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "reason": "approved"
         }
       }
     }
@@ -1001,6 +1036,66 @@
         "data": {
           "claimId": "clm_43abcd",
           "generation": 1
+        }
+      },
+      "error": "schema version"
+    },
+    {
+      "name": "held expiry asserted by an agent",
+      "value": {
+        "v": 3,
+        "seq": 28,
+        "at": 1790000000028,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "agent",
+          "id": "agt_atlas01"
+        },
+        "type": "train.held_expired",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "reason": "timed_out"
+        }
+      },
+      "error": "by the system"
+    },
+    {
+      "name": "held expiry asserted by a person",
+      "value": {
+        "v": 3,
+        "seq": 28,
+        "at": 1790000000028,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "human",
+          "id": "usr_lemarier"
+        },
+        "type": "train.held_expired",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "reason": "timed_out"
+        }
+      },
+      "error": "by the system"
+    },
+    {
+      "name": "held expiry written at version 2",
+      "value": {
+        "v": 2,
+        "seq": 28,
+        "at": 1790000000028,
+        "repo": "rep_demo0001",
+        "actor": {
+          "kind": "system",
+          "id": "sys_train"
+        },
+        "type": "train.held_expired",
+        "data": {
+          "checkRunId": "chk_run0002",
+          "candidate": "cccccccccccccccccccccccccccccccccccccccc",
+          "reason": "timed_out"
         }
       },
       "error": "schema version"

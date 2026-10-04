@@ -171,7 +171,15 @@ async fn version_prints_text_or_one_envelope() -> anyhow::Result<()> {
     let text = rh(&world, world.outside.path(), None, &["version"], "")?;
     assert_eq!(
         (text.code, text.stdout.as_str(), text.stderr.as_str()),
-        (Some(0), "rh 0.1.0 (event schema 2)\n", "")
+        (
+            Some(0),
+            format!(
+                "rh 0.1.0 (event schema {})\n",
+                railhead_protocol::EVENT_SCHEMA_VERSION
+            )
+            .as_str(),
+            ""
+        )
     );
     let json = rh(
         &world,
@@ -180,7 +188,10 @@ async fn version_prints_text_or_one_envelope() -> anyhow::Result<()> {
         &["--json", "version"],
         "",
     )?;
-    assert_eq!(json.json()?.pointer("/data/eventSchema"), Some(&json!(2)));
+    assert_eq!(
+        json.json()?.pointer("/data/eventSchema"),
+        Some(&json!(railhead_protocol::EVENT_SCHEMA_VERSION))
+    );
     Ok(())
 }
 

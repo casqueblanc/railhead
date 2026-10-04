@@ -2,9 +2,10 @@
 
 use railhead_protocol::Error;
 use railhead_protocol::{
-    Actor, AgentErrorCode, AgentResponse, AskRequest, ClosedReason, EventPayload, InboxResult,
-    JoinRequest, MAX_SAFE_INTEGER, PinBatchState, PinResult, PinTrainState, QuestionOption,
-    ReadyRequest, ReopenReason, SafeInteger, StatusResult, decode_event, decode_response,
+    Actor, AgentErrorCode, AgentResponse, AskRequest, ClosedReason, EventPayload, HeldExpiryReason,
+    InboxResult, JoinRequest, MAX_SAFE_INTEGER, PinBatchState, PinResult, PinTrainState,
+    QuestionOption, ReadyRequest, ReopenReason, SafeInteger, StatusResult, decode_event,
+    decode_response,
 };
 use serde_json::{Value, json};
 
@@ -38,8 +39,8 @@ fn set(value: &mut Value, pointer: &str, new: Value) -> Result<(), String> {
 
 #[test]
 fn refuses_another_version_before_reading_the_rest() {
-    let newer = json!({"v": 3, "type": "claim.moved", "data": {}});
-    assert!(matches!(decode(&newer), Err(Error::UnsupportedVersion(3))));
+    let newer = json!({"v": 4, "type": "claim.moved", "data": {}});
+    assert!(matches!(decode(&newer), Err(Error::UnsupportedVersion(4))));
     let older = json!({"v": 0});
     assert!(matches!(decode(&older), Err(Error::UnsupportedVersion(0))));
     assert!(matches!(
@@ -520,6 +521,53 @@ fn checks_held_checks_and_their_approval() -> TestResult {
     let mut no_digest = approved;
     set(&mut no_digest, "/data/digest", Value::Null)?;
     assert!(matches!(decode(&no_digest), Err(Error::Json { .. })));
+    Ok(())
+}
+
+#[test]
+fn checks_a_held_check_expiry() -> TestResult {
+    let expired = json!({
+        "v": 3, "seq": 3, "at": 3, "repo": "rep_demo0001",
+        "actor": {"kind": "system", "id": "sys_train"},
+        "type": "train.held_expired",
+        "data": {"checkRunId": "chk_run0002", "candidate": "c".repeat(40), "reason": "over_limit"},
+    });
+    assert!(matches!(
+        decode(&expired)?.payload,
+        EventPayload::TrainHeldExpired(ref data) if data.reason == HeldExpiryReason::OverLimit
+    ));
+    let mut timed_out = expired.clone();
+    set(&mut timed_out, "/data/reason", json!("timed_out"))?;
+    assert!(matches!(
+        decode(&timed_out)?.payload,
+        EventPayload::TrainHeldExpired(ref data) if data.reason == HeldExpiryReason::TimedOut
+    ));
+    let mut unknown = expired.clone();
+    set(&mut unknown, "/data/reason", json!("approved"))?;
+    assert!(matches!(decode(&unknown), Err(Error::Json { .. })));
+    let mut as_version_2 = expired.clone();
+    set(&mut as_version_2, "/v", json!(2))?;
+    assert!(matches!(
+        decode(&as_version_2),
+        Err(Error::Invalid { field: "v", .. })
+    ));
+    for actor in [
+        json!({"kind": "agent", "id": "agt_atlas01"}),
+        json!({"kind": "human", "id": "usr_lemarier"}),
+    ] {
+        let mut asserted = expired.clone();
+        set(&mut asserted, "/actor", actor)?;
+        assert!(matches!(decode(&asserted), Err(Error::WrongActor { .. })));
+    }
+    let mut not_a_check = expired;
+    set(&mut not_a_check, "/data/checkRunId", json!("int_merge01"))?;
+    assert!(matches!(
+        decode(&not_a_check),
+        Err(Error::InvalidId {
+            field: "checkRunId",
+            ..
+        })
+    ));
     Ok(())
 }
 

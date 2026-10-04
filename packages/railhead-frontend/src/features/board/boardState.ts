@@ -29,6 +29,7 @@ import {
   type ConflictRoute,
   type DecisionId,
   type DecisionRef,
+  type HeldExpiryReason,
   type InboxEntry,
   type IntentId,
   type InviteId,
@@ -216,9 +217,10 @@ export interface HeldCheckState {
 /**
  * Why the train can no longer run a held attempt. `superseded`: a later attempt took one of its
  * claims, or a claim moved to a new generation. `dropped`: a claim was reopened or expired, so its
- * pin is gone.
+ * pin is gone. `timed_out` and `over_limit`: the train stopped keeping it unapproved, as its
+ * `train.held_expired` event records.
  */
-export type HeldEndReason = "superseded" | "dropped";
+export type HeldEndReason = "superseded" | "dropped" | HeldExpiryReason;
 
 /** What became of a merge intent. Only `landed` means the candidate is on main. */
 export type IntentLanding =
@@ -1078,6 +1080,20 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
         heldChecks: draft.put(state.heldChecks, checkRunId, {
           ...held,
           approval: { userId: event.actor.id, seq },
+        }),
+      };
+    }
+    case "train.held_expired": {
+      const { checkRunId, candidate, reason } = event.data;
+      const held = known(state.heldChecks, checkRunId, "held check");
+      check(held.candidate === candidate, `expiry of ${checkRunId} names another candidate`);
+      // The board may already have ended it from a claim event; the first end stands.
+      if (held.ended !== null) return state;
+      return {
+        ...state,
+        heldChecks: draft.put(state.heldChecks, checkRunId, {
+          ...held,
+          ended: { reason, seq },
         }),
       };
     }

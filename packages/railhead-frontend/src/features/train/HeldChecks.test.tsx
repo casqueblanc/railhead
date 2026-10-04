@@ -394,6 +394,24 @@ describe("HeldChecks", () => {
       },
       "Dropped",
     ],
+    [
+      "expired by the train after waiting too long",
+      {
+        type: "train.held_expired",
+        actor: SYNTH_TRAIN,
+        data: { checkRunId: RUN, candidate: CANDIDATE, reason: "timed_out" },
+      },
+      "Expired",
+    ],
+    [
+      "expired by the train for newer held checks",
+      {
+        type: "train.held_expired",
+        actor: SYNTH_TRAIN,
+        data: { checkRunId: RUN, candidate: CANDIDATE, reason: "over_limit" },
+      },
+      "Expired",
+    ],
   ] satisfies [string, SyntheticStep, string][])(
     "offers no approval once the held claim is %s",
     async (_name, step, label) => {
@@ -404,6 +422,30 @@ describe("HeldChecks", () => {
       expect(text()).not.toContain("waiting for approval");
     },
   );
+
+  it.each([
+    ["timed_out", "Nobody approved it within the time the train keeps a held check"],
+    ["over_limit", "Newer held checks in this repository filled the number the train keeps"],
+  ] as const)("says why the train expired a held check as %s", async (reason, why) => {
+    const { owner, prepares } = recordingOwner();
+    await render(
+      live(
+        board([
+          held(),
+          {
+            type: "train.held_expired",
+            actor: SYNTH_TRAIN,
+            data: { checkRunId: RUN, candidate: CANDIDATE, reason },
+          },
+        ]),
+      ),
+      owner,
+    );
+    expect(text()).toContain(why);
+    expect(text()).not.toContain("Waiting for approval");
+    expect(approveButton()).toBeNull();
+    expect(prepares).toEqual([]);
+  });
 
   it("keeps a run's result once the claim it landed moves on", async () => {
     const { owner } = recordingOwner();

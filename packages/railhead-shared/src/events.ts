@@ -82,7 +82,7 @@ export type IdKind = keyof typeof ID_PREFIXES;
 // Limits
 
 /** The newest schema version this module reads and writes. It reads every version from 1 to this. */
-export const EVENT_SCHEMA_VERSION = 2;
+export const EVENT_SCHEMA_VERSION = 3;
 
 /**
  * The schema version each event type is written at: the version that introduced it. An older
@@ -116,6 +116,7 @@ const EVENT_VERSIONS: Readonly<Record<EventType, number>> = {
   "train.unreported": 2,
   "claim.merged": 2,
   "claim.released": 2,
+  "train.held_expired": 3,
 };
 
 /** The schema version an event of `type` is written at. */
@@ -218,6 +219,13 @@ export type CheckResult = "pass" | "fail" | "error";
  * reported, so the train failed its batch.
  */
 export type UnreportedOutcome = "timed_out";
+
+/**
+ * Why the train stopped keeping a held attempt for an approval. `timed_out`: it waited longer than
+ * the train keeps a held attempt. `over_limit`: newer held attempts in the repository filled the
+ * train's bound, and it was the oldest.
+ */
+export type HeldExpiryReason = "timed_out" | "over_limit";
 
 /** Clef's classification of a conflict. */
 export type ConflictClass = "compatible" | "contradictory";
@@ -420,6 +428,14 @@ export type EventPayload =
        */
       type: "train.unreported";
       data: { checkRunId: CheckRunId; candidate: CommitSha; outcome: UnreportedOutcome };
+    }
+  | {
+      /**
+       * The train stopped keeping a held attempt nobody approved, so it will never run and an
+       * approval of it is refused.
+       */
+      type: "train.held_expired";
+      data: { checkRunId: CheckRunId; candidate: CommitSha; reason: HeldExpiryReason };
     };
 
 /** The name of one event type. */
@@ -471,6 +487,7 @@ export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "train.main",
   "train.held",
   "train.unreported",
+  "train.held_expired",
 ];
 
 // =======================================================================================
@@ -726,6 +743,13 @@ function validatePayload(event: EventPayload): void {
       requireCommit(event.data.candidate, "candidate");
       if (event.data.outcome !== "timed_out")
         throw new Error("outcome is not an unreported outcome");
+      return;
+    case "train.held_expired":
+      requireId("checkRun", event.data.checkRunId, "checkRunId");
+      requireCommit(event.data.candidate, "candidate");
+      if (event.data.reason !== "timed_out" && event.data.reason !== "over_limit") {
+        throw new Error("reason is not a held expiry reason");
+      }
       return;
     default:
       return unreachable(event);

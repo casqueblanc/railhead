@@ -17,7 +17,12 @@ import {
   type BoardResult,
   type SubscriptionEnd,
 } from "@railhead/shared/board-api";
-import type { Actor, EventPayload, RailheadEvent } from "@railhead/shared/events";
+import {
+  EVENT_SCHEMA_VERSION,
+  type Actor,
+  type EventPayload,
+  type RailheadEvent,
+} from "@railhead/shared/events";
 import {
   DELIVERY_TIMEOUT_MS,
   MAX_SUBSCRIPTIONS,
@@ -1100,7 +1105,7 @@ describe("board subscriptions the Repo ends, over the RPC session", () => {
 // A log the Repo cannot read, through the Worker. Replay refuses an event whose stored schema
 // version it does not support, as it refuses one that is missing.
 
-/** Sets the stored schema version of event `seq`; 1 and 2 are the supported ones. */
+/** Sets the stored schema version of event `seq`; 1 to `EVENT_SCHEMA_VERSION` are supported. */
 async function setSchemaVersion(
   stub: DurableObjectStub<Repo>,
   seq: number,
@@ -1121,7 +1126,8 @@ async function appendUnreadable(stub: DurableObjectStub<Repo>, repoId: string): 
     const { value: seq } = EventLog.open(state.storage, repoId).transaction((tx) => {
       const event = tx.append(HUMAN, issue(0));
       state.storage.sql.exec(
-        "UPDATE events SET body = json_set(body, '$.v', 3) WHERE seq = ?",
+        "UPDATE events SET body = json_set(body, '$.v', ?) WHERE seq = ?",
+        EVENT_SCHEMA_VERSION + 1,
         event.seq,
       );
       return event.seq;
@@ -1134,7 +1140,7 @@ describe("board subscriptions over a log the Repo cannot read", () => {
   it("ends with restart before an unreadable event, releases both sides, and resumes once it reads", async () => {
     const { name, stub, repoId } = await freshRepo();
     await appendIn(stub, repoId, 3);
-    await setSchemaVersion(stub, 3, 3);
+    await setSchemaVersion(stub, 3, EVENT_SCHEMA_VERSION + 1);
     const taken = await takeSlots(stub, repoId, MAX_SUBSCRIPTIONS - 1);
     const { session, api } = await countedSession();
     using board = value(await api.openBoard("acme", name));

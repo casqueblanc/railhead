@@ -8,7 +8,7 @@ import {
   XCircleIcon,
   type Icon,
 } from "@phosphor-icons/react";
-import type { HeldCheckState } from "../board/boardState";
+import type { HeldCheckState, HeldEndReason } from "../board/boardState";
 import { ShortSha } from "../claims/ShortSha";
 import { BlockedNote } from "../enrollment/BlockedNote";
 import type { AvailableOwnerPort } from "../enrollment/ownerActions";
@@ -147,7 +147,18 @@ const ENDED_TEXT = {
     "A newer attempt or a new holder of its claim replaced this one, so the train will not run it and there is nothing to approve.",
   dropped:
     "Its claim was reopened or expired, so the train will not run this attempt and there is nothing to approve.",
-} as const;
+  timed_out:
+    "Nobody approved it within the time the train keeps a held check, so the train dropped it and there is nothing to approve. A new push to the claim is checked again.",
+  over_limit:
+    "Newer held checks in this repository filled the number the train keeps, and this was the oldest, so the train dropped it and there is nothing to approve. A new push to the claim is checked again.",
+} as const satisfies Record<HeldEndReason, string>;
+
+const ENDED_LABEL = {
+  superseded: "Superseded",
+  dropped: "Dropped",
+  timed_out: "Expired",
+  over_limit: "Expired",
+} as const satisfies Record<HeldEndReason, string>;
 
 const Approver = ({ held }: { held: HeldCheckState }) => (
   <>
@@ -301,11 +312,7 @@ const badgeFor = (
           return unreachable(status.result);
       }
     case "ended":
-      return {
-        label: status.reason === "superseded" ? "Superseded" : "Dropped",
-        variant: "neutral",
-        icon: ProhibitIcon,
-      };
+      return { label: ENDED_LABEL[status.reason], variant: "neutral", icon: ProhibitIcon };
     default:
       return unreachable(status);
   }
