@@ -1,0 +1,15 @@
+{
+  "seed": 211,
+  "origin": "http://localhost:8787",
+  "repository": "casqueblanc/demo",
+  "agents": 8,
+  "rounds": 3,
+  "mix": { "disjoint": 5, "sameFileHunks": 3, "overlapping": 2 },
+  "bounds": {
+    "retries": 3,
+    "commandTimeoutSecs": 60,
+    "landTimeoutSecs": 300,
+    "runTimeoutSecs": 900,
+    "pollMs": 1000
+  }
+}

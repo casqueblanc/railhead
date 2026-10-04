@@ -18,6 +18,7 @@ import type {
 } from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
 import type { ArtifactsRepoName } from "./artifacts";
+import type { InboxTarget } from "./inbox";
 import type { AgentPrincipal, GrantFor } from "./principals";
 import type { PortResult } from "./result";
 
@@ -161,6 +162,11 @@ export interface ClaimsPort {
    * item is queued to one.
    */
   reopenMerged(tx: EventTransaction, claimId: ClaimId): void;
+  /**
+   * The agent holding the claim and its current generation, or `null` whenever `currentGeneration`
+   * is `null` or the claim merged. A fence reader like `currentGeneration`: call it inside the caller's transaction.
+   */
+  holder(claimId: ClaimId): InboxTarget | null;
   /**
    * Returns the claim to working because its pinned work must be redone for `reason`, inside the
    * caller's transaction, and appends `claim.reopened` with the claim's current decision versions.

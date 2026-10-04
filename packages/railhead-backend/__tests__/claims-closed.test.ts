@@ -11,6 +11,7 @@ import {
 } from "../src/artifacts/adapter";
 import { FakeArtifacts } from "../src/artifacts/fake";
 import type { ClaimsPort } from "../src/contracts/claims";
+import type { DecisionsPort, SystemQuestion } from "../src/contracts/decisions";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { ok } from "../src/contracts/result";
 import { CLAIM_LEASE_MS, createClaims } from "../src/modules/claims/module";
@@ -30,6 +31,7 @@ function agent(n: number, repoId = REPO): AgentPrincipal {
 interface Setup {
   fake: FakeArtifacts;
   claims: ClaimsPort;
+  decisions: DecisionsPort;
   sql: SqlStorage;
   log: EventLog;
   events: () => RailheadEvent[];
@@ -72,6 +74,7 @@ function withClaims<T>(body: (setup: Setup) => Promise<T>): Promise<T> {
     const setup: Setup = {
       fake,
       claims,
+      decisions: ports.decisions,
       sql: state.storage.sql,
       log,
       events: () => log.replay(0, 256).events,
@@ -243,6 +246,50 @@ describe("an agent's closed claim", () => {
       });
       // Another agent of this repository never sees agent 1's closing.
       expect(await setup.claims.lastClosed(agent(3))).toEqual(ok(null));
+    });
+  });
+});
+
+describe("a merged claim", () => {
+  it("is refused by a system question, which records nothing, though it keeps its generation", async () => {
+    await withClaims(async (setup) => {
+      const claim = await setup.open(agent(1));
+      const commit = "3".repeat(40);
+      await setup.push(claim.claimId, commit);
+      expect(
+        await setup.claims.ready(agent(1), claim.claimId, { generation: 1, commit }),
+      ).toMatchObject({ ok: true });
+      const question: SystemQuestion = {
+        asker: "sys_train",
+        key: "conflict_1",
+        claims: [{ claimId: claim.claimId, generation: 1 }],
+        text: "Which change should main keep?",
+        options: [
+          { key: "keep_first", label: "Keep the first change" },
+          { key: "keep_second", label: "Keep the second change" },
+        ],
+        scope: ["src/upload.ts"],
+      };
+      // While ready, the claim is held, so the same question would be accepted.
+      expect(setup.claims.holder(claim.claimId)).toEqual({
+        agentId: agent(1).agentId,
+        claimId: claim.claimId,
+        generation: 1,
+      });
+
+      setup.log.transaction((tx) => {
+        const ready = setup.claims.readyPin(claim.claimId);
+        if (ready === null) throw new Error("the claim has no pin");
+        setup.claims.merged(tx, [{ ...ready.pin, episode: ready.episode }], HEAD);
+      });
+      expect(setup.claims.currentGeneration(claim.claimId)).toBe(1);
+      expect(setup.claims.holder(claim.claimId)).toBeNull();
+
+      const before = setup.events().length;
+      const asked = setup.log.transaction((tx) => setup.decisions.askSystem(tx, question)).value;
+      expect(asked).toMatchObject({ ok: false, code: "claim_closed" });
+      expect(setup.events()).toHaveLength(before);
+      expect(setup.sql.exec("SELECT 1 FROM questions").toArray()).toHaveLength(0);
     });
   });
 });

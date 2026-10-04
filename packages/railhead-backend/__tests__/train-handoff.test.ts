@@ -22,7 +22,7 @@ import {
   unavailableTrain,
 } from "../src/contracts/unavailable";
 import { CLAIM_LEASE_MS, createClaims } from "../src/modules/claims/module";
-import { createDecisions } from "../src/modules/decisions/decisions";
+import { createDecisions, MAX_QUESTIONS_PER_CLAIM } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { createMainWriter } from "../src/modules/mainWriter/mainWriter";
 import {
@@ -30,6 +30,7 @@ import {
   EXHAUSTED_FAILURES,
   MAX_QUEUE,
   MAX_WAKE_FAILURES,
+  QUESTION_BASE_MS,
   type Train,
 } from "../src/modules/train/scheduler";
 import { insertEntry, readWake, settleEntry } from "../src/modules/train/store";
@@ -77,14 +78,16 @@ interface Setup {
   /** Whether the decisions port the other modules reach can read a claim's current versions. */
   versionsKnown: boolean;
   /**
-   * While set, the merge port answers a conflict between these two pins on `src/upload.ts` for any
+   * While set, the merge port answers a conflict between these two pins on `conflictPath` for any
    * pin list holding both, rather than a clean candidate.
    */
   conflict: [ClaimPin, ClaimPin] | null;
+  /** The path the merge port names for that conflict. */
+  conflictPath: string;
   /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
   decide(claimId: string, decisionId?: string): Promise<DecisionRef>;
-  /** Acknowledges every inbox item agent 1 has pending. */
-  ackAll(): Promise<void>;
+  /** Acknowledges every inbox item agent `n`, 1 unless given, has pending. */
+  ackAll(n?: number): Promise<void>;
   /** Pushes `commit` to the claim's fork. */
   push(claimId: string, commit: string): Promise<void>;
   /**
@@ -274,7 +277,7 @@ function withHandoff<T>(
           composed.push(pins);
           const pair = setup.conflict;
           if (pair !== null && pair.every((one) => pins.some((pin) => samePin(pin, one)))) {
-            return ok({ kind: "conflict", pins: pair, paths: ["src/upload.ts"] });
+            return ok({ kind: "conflict", pins: pair, paths: [setup.conflictPath] });
           }
           return ok({ kind: "clean", candidate: candidateOf(pins) });
         },
@@ -355,17 +358,18 @@ function withHandoff<T>(
         if (!recorded.ok) throw new Error(`record refused: ${recorded.code}`);
         return recorded.value;
       },
-      async ackAll() {
-        const delivered = await inbox.pending(agent(1), 16);
+      async ackAll(n = 1) {
+        const delivered = await inbox.pending(agent(n), 16);
         if (!delivered.ok) throw new Error(`pending refused: ${delivered.code}`);
         for (const { item } of delivered.value.items) {
-          const acked = await inbox.ack(agent(1), item, "Follow the decision.");
+          const acked = await inbox.ack(agent(n), item, "Follow the decision.");
           if (!acked.ok) throw new Error(`ack refused: ${acked.code}`);
         }
       },
       push,
       versionsKnown: true,
       conflict: null,
+      conflictPath: "src/upload.ts",
       fake,
       holdNextPin() {
         const reached = signal();
@@ -845,6 +849,207 @@ async function readyUnderFirst(setup: Setup) {
   expect(ready.ok).toBe(true);
   return { claim, first };
 }
+
+describe("a conflicting pair", () => {
+  const OTHER = "6".repeat(40);
+  const REDONE = "9".repeat(40);
+
+  it("asks the owner once, and the answer returns both claims to their agents and the train", async () => {
+    await withHandoff(async (setup) => {
+      const first = await setup.openFor(1, WORK);
+      const second = await setup.openFor(2, OTHER);
+      setup.conflict = [
+        { claimId: first.claimId, generation: 1, commit: WORK },
+        { claimId: second.claimId, generation: 1, commit: OTHER },
+      ];
+      for (const [n, claim, commit] of [
+        [1, first, WORK],
+        [2, second, OTHER],
+      ] as const) {
+        const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+        expect(ready.ok).toBe(true);
+      }
+      const before = setup.log.head();
+
+      await setup.train.resume();
+
+      const asked = setup.log.replay(before, 64).events;
+      expect(asked.map((event) => event.type)).toEqual(["train.conflict", "question.asked"]);
+      expect(asked[1]).toMatchObject({
+        actor: { kind: "system", id: "sys_train" },
+        data: { claimId: first.claimId },
+      });
+      const [conflict] = setup.train.conflicts(1);
+      expect(conflict).toMatchObject({ state: "asked" });
+      const decisionId = conflict?.decisionId;
+      if (decisionId == null) throw new Error("no question was asked");
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["parked", "parked"]);
+      // Another alarm asks nothing more.
+      await setup.train.resume();
+      expect(setup.log.head()).toBe(before + 2);
+
+      const wakes = setup.wakes.length;
+      const recorded = await setup.decisions.record({
+        kind: "human",
+        userId: OWNER,
+        repoId: REPO,
+        grantId: crypto.randomUUID(),
+        action: {
+          kind: "decision.record",
+          decisionId,
+          option: "keep_first",
+          expectedVersion: null,
+        },
+      });
+      expect(recorded).toEqual(ok({ decisionId, version: 1 }));
+      // The answer asks for the alarm and reaches both agents.
+      expect(setup.wakes.length).toBeGreaterThan(wakes);
+      const queued = setup.log
+        .replay(before + 2, 64)
+        .events.filter((event) => event.type === "inbox.queued");
+      // Delivery follows the claim ids, which are random, so compare in agent order.
+      const delivered = queued
+        .map((event) => event.data)
+        .toSorted((left, right) => left.agentId.localeCompare(right.agentId));
+      expect(delivered).toMatchObject([
+        { agentId: agent(1).agentId, claimId: first.claimId },
+        { agentId: agent(2).agentId, claimId: second.claimId },
+      ]);
+
+      // The alarm returns the pair to the queue; reading the superseded pins reopens both claims.
+      await setup.train.resume();
+      expect(setup.train.conflicts(1)).toMatchObject([{ state: "answered" }]);
+      expect(claimState(setup.sql, first.claimId)).toBe("working");
+      expect(claimState(setup.sql, second.claimId)).toBe("working");
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["dropped", "dropped"]);
+
+      // The first agent keeps its change; the second redoes its own to fit. Both land together.
+      setup.conflict = null;
+      await setup.ackAll(1);
+      await setup.ackAll(2);
+      await setup.push(second.claimId, REDONE);
+      expect(
+        (await setup.claims.ready(agent(1), first.claimId, { generation: 1, commit: WORK })).ok,
+      ).toBe(true);
+      expect(
+        (await setup.claims.ready(agent(2), second.claimId, { generation: 1, commit: REDONE })).ok,
+      ).toBe(true);
+      await setup.train.resume();
+
+      const answer = { decisionId, version: 1 };
+      expect(setup.composed.at(-1)).toEqual([
+        { claimId: first.claimId, generation: 1, commit: WORK },
+        { claimId: second.claimId, generation: 1, commit: REDONE },
+      ]);
+      expect(setup.started.at(-1)).toMatchObject({ decisions: [answer] });
+    });
+  });
+
+  it.each([
+    ["a newline", "src/up\nload.ts"],
+    ["a tab", "src/up\tload.ts"],
+  ])(
+    "merges the pair one at a time, unparked and unasked, when the conflicted path holds %s",
+    async (_name, path) => {
+      await withHandoff(async (setup) => {
+        const first = await setup.openFor(1, WORK);
+        const second = await setup.openFor(2, OTHER);
+        const pins: [ClaimPin, ClaimPin] = [
+          { claimId: first.claimId, generation: 1, commit: WORK },
+          { claimId: second.claimId, generation: 1, commit: OTHER },
+        ];
+        setup.conflict = pins;
+        setup.conflictPath = path;
+        for (const [n, pin] of [
+          [1, pins[0]],
+          [2, pins[1]],
+        ] as const) {
+          const ready = await setup.claims.ready(agent(n), pin.claimId, {
+            generation: 1,
+            commit: pin.commit,
+          });
+          expect(ready.ok).toBe(true);
+        }
+        const before = setup.log.head();
+
+        await setup.train.resume();
+
+        // No question can name the path, so nothing is parked, asked or recorded about it, and the
+        // batch fails as a compose the train cannot use: each pin is merged alone instead.
+        const types = setup.log.replay(before, 64).events.map((event) => event.type);
+        expect(types).not.toContain("train.conflict");
+        expect(types).not.toContain("question.asked");
+        expect(setup.train.conflicts(8)).toEqual([]);
+        expect(setup.train.batches(2).at(-1)).toMatchObject({
+          state: "failed",
+          failure: "compose_unsupported",
+        });
+        expect(setup.composed).toEqual([pins, [pins[0]]]);
+        expect(sortedEntries(setup).map((entry) => entry.state)).toEqual(["batched", "queued"]);
+
+        // Each lands in turn.
+        await pass(setup);
+        expect(setup.composed.at(-1)).toEqual([pins[1]]);
+        await pass(setup);
+        expect(sortedEntries(setup).map((entry) => entry.state)).toEqual(["landed", "landed"]);
+        expect(setup.published).toHaveLength(2);
+      });
+    },
+  );
+
+  it("keeps the question owed with the wake armed when a claim's decision quota is spent", async () => {
+    await withHandoff(async (setup) => {
+      const first = await setup.openFor(1, WORK);
+      const second = await setup.openFor(2, OTHER);
+      setup.conflict = [
+        { claimId: first.claimId, generation: 1, commit: WORK },
+        { claimId: second.claimId, generation: 1, commit: OTHER },
+      ];
+      for (const [n, claim, commit] of [
+        [1, first, WORK],
+        [2, second, OTHER],
+      ] as const) {
+        const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+        expect(ready.ok).toBe(true);
+      }
+      // Unanswered dependencies stand in for the decisions that spent the first claim's quota.
+      for (let n = 0; n < MAX_QUESTIONS_PER_CLAIM; n += 1) {
+        setup.sql.exec(
+          `INSERT INTO decision_claims (decision_id, claim_id, agent_id, generation)
+           VALUES (?, ?, ?, 1)`,
+          `dec_spent${String(n).padStart(6, "0")}`,
+          first.claimId,
+          agent(1).agentId,
+        );
+      }
+      const before = setup.log.head();
+
+      await setup.train.resume();
+
+      // The pair is parked without a question, and the question stays owed with its wake armed.
+      const types = setup.log.replay(before, 64).events.map((event) => event.type);
+      expect(types).toEqual(["train.conflict"]);
+      const [owing] = setup.train.conflicts(1);
+      expect(owing).toMatchObject({ state: "asking", decisionId: null, failures: 1 });
+      if (owing === undefined) throw new Error("no pair was parked");
+      expect(owing.retryAt - owing.updatedAt).toBe(QUESTION_BASE_MS);
+      expect(readWake(setup.sql)).toEqual({ dueAt: owing.retryAt, failures: 0 });
+      expect(setup.wakes).toContain(owing.retryAt);
+      expect(setup.entries().map((entry) => entry.state)).toEqual(["parked", "parked"]);
+
+      // Once the claim can take another decision, the alarm at the retry time asks the question.
+      setup.sql.exec("DELETE FROM decision_claims WHERE decision_id LIKE 'dec_spent%'");
+      setup.advance(owing.retryAt - setup.now());
+      await setup.train.resume();
+
+      const asked = setup.log.replay(before + 1, 64).events;
+      expect(asked.map((event) => event.type)).toEqual(["question.asked"]);
+      expect(asked[0]).toMatchObject({ actor: { kind: "system", id: "sys_train" } });
+      expect(setup.train.conflicts(1)).toMatchObject([{ state: "asked", failures: 1 }]);
+      expect(readWake(setup.sql)).toBeNull();
+    });
+  });
+});
 
 describe("a re-ready after a superseded decision", () => {
   it("queues the same commit again after the train dropped the superseded pin", async () => {
@@ -1587,7 +1792,7 @@ async function pass(setup: Setup): Promise<CheckAttempt> {
 describe("a ready claim reopened for rework", () => {
   it("lets the loser of a conflict push, ready again and land", async () => {
     await withHandoff(async (setup) => {
-      const { loser } = await losePair(setup);
+      const { winner, loser } = await losePair(setup);
       const episode = episodeOf(setup, loser);
       const pushTo = {
         principal: agent(2),
@@ -1624,21 +1829,72 @@ describe("a ready claim reopened for rework", () => {
         commit: REDO,
       });
       expect(ready).toMatchObject({ ok: true, value: { repeated: false } });
-      // The parked entry is queued again for the new episode; the winner stays parked.
+      // The parked entry is queued again for the new episode, and the redo returns the winner to
+      // the queue with it, so the two are merged together again without the owner's answer.
       expect(sortedEntries(setup)).toEqual([
-        { commit: WORK, state: "parked", next: null },
+        { commit: WORK, state: "queued", next: null },
         { commit: REDO, state: "queued", next: null },
       ]);
 
       await setup.train.resume();
       const redone: ClaimPin = { ...loser, commit: REDO };
-      expect(setup.composed.at(-1)).toEqual([redone]);
+      expect(setup.composed.at(-1)).toEqual(expect.arrayContaining([winner, redone]));
+      expect(setup.composed.at(-1)).toHaveLength(2);
       const attempt = await pass(setup);
 
       expect(setup.published).toHaveLength(1);
       expect(setup.main()).toBe(attempt.candidate);
       expect(sortedEntries(setup)).toEqual([
-        { commit: WORK, state: "parked", next: null },
+        { commit: WORK, state: "landed", next: null },
+        { commit: REDO, state: "landed", next: null },
+      ]);
+    });
+  });
+
+  it("refuses the owner's answer to the pair's question once the loser redid its change", async () => {
+    await withHandoff(async (setup) => {
+      const { winner, loser } = await losePair(setup);
+      const [conflict] = setup.train.conflicts(1);
+      const decisionId = conflict?.decisionId;
+      if (decisionId == null) throw new Error("no question was asked");
+      expect(reopenLost(setup, loser, episodeOf(setup, loser))).toBe(true);
+      await setup.push(loser.claimId, REDO);
+      const ready = await setup.claims.ready(agent(2), loser.claimId, {
+        generation: 1,
+        commit: REDO,
+      });
+      expect(ready.ok).toBe(true);
+      expect(setup.train.conflicts(1)).toMatchObject([{ state: "redone", decisionId }]);
+      const before = setup.log.head();
+
+      const recorded = await setup.decisions.record({
+        kind: "human",
+        userId: OWNER,
+        repoId: REPO,
+        grantId: crypto.randomUUID(),
+        action: {
+          kind: "decision.record",
+          decisionId,
+          option: "keep_first",
+          expectedVersion: null,
+        },
+      });
+
+      // The question was withdrawn with the redo: nothing is recorded or delivered, and neither
+      // claim's pin is superseded by it.
+      expect(recorded).toMatchObject({ ok: false, code: "action_stale" });
+      expect(setup.log.head()).toBe(before);
+      expect(setup.decisions.currentVersions(winner.claimId)).toEqual([]);
+      expect(setup.decisions.currentVersions(loser.claimId)).toEqual([]);
+      expect(claimState(setup.sql, winner.claimId)).toBe("ready");
+
+      // The pair is merged together again and lands.
+      await setup.train.resume();
+      const redone: ClaimPin = { ...loser, commit: REDO };
+      expect(setup.composed.at(-1)).toEqual(expect.arrayContaining([winner, redone]));
+      await pass(setup);
+      expect(sortedEntries(setup)).toEqual([
+        { commit: WORK, state: "landed", next: null },
         { commit: REDO, state: "landed", next: null },
       ]);
     });

@@ -14,6 +14,16 @@
 //   of the same grant returns the version it recorded; a stale `expectedVersion` records nothing,
 //   so a person who answered against an older version never overwrites a newer one.
 //
+// - `askSystem` records a question a system module raises on its own authority, such as the train
+//   when two claims conflict, inside the caller's transaction. Its asker is stored in place of an
+//   agent, so no agent can read it with `question`, and every claim it names is a dependency of its
+//   decision, so the answer reaches each holder and supersedes each ready pin. Recording a version
+//   of a system question calls the train's `answered` in the same transaction, then awaits the
+//   train's wake once it commits.
+// - `withdraw` is called by the asker, inside its own transaction, when the work an open system
+//   question asked about was replaced. The question keeps its row but loses its dependencies, and
+//   `record` refuses any answer to it, so no version supersedes the replaced work.
+//
 // A decision's dependencies name the claim, and the agent and ownership generation an inbox item
 // goes to. An obligation is queued as an item only when the claims module reports that generation
 // as current, inside the transaction that records it. A merged claim keeps its holder, which gets
@@ -58,7 +68,12 @@ import {
   type QuestionId,
   type QuestionOption,
 } from "@railhead/shared/events";
-import type { DecisionObligation, DecisionsPort } from "../../contracts/decisions";
+import {
+  MAX_SYSTEM_QUESTION_KEY_LENGTH,
+  type DecisionObligation,
+  type DecisionsPort,
+  type SystemQuestion,
+} from "../../contracts/decisions";
 import type { InboxTarget } from "../../contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../../contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../../contracts/result";
@@ -122,6 +137,9 @@ const MIGRATIONS: readonly string[] = [
     CHECK ((agent_id IS NULL) = (item IS NULL)),
     PRIMARY KEY (claim_id, decision_id, version, kind)
   ) STRICT`,
+  // When the asker withdrew a system question before any answer, or `NULL`. A withdrawn question
+  // takes no answer, and its decision has no dependencies.
+  "ALTER TABLE questions ADD COLUMN withdrawn_at INTEGER",
 ];
 
 /**
@@ -135,6 +153,12 @@ export const MAX_WAITERS = 256;
 
 /** Longest option key a question may offer, as the event log's option key format allows. */
 const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * A system module's actor id. No agent id has this form, so a system question is never an agent's
+ * question, whose rows are keyed by the agent that asked.
+ */
+const SYSTEM_ID = /^sys_[a-z0-9_]{1,32}$/;
 
 /**
  * The decisions port, with the fence reader the train's authorization calls inside its own
@@ -223,6 +247,17 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         decisionId,
       )
       .toArray()[0];
+  }
+
+  /** Whether the asker withdrew the question that opened `decisionId`. */
+  function withdrawn(decisionId: DecisionId): boolean {
+    const row = sql
+      .exec<{ withdrawn_at: number | null }>(
+        "SELECT withdrawn_at FROM questions WHERE decision_id = ?",
+        decisionId,
+      )
+      .toArray()[0];
+    return row !== undefined && row.withdrawn_at !== null;
   }
 
   function versionOf(decisionId: DecisionId, version: number): VersionRow | undefined {
@@ -490,6 +525,110 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
       }).value;
     },
 
+    askSystem(tx, sent) {
+      const invalid = invalidSystemQuestion(sent);
+      if (invalid !== null) return fail("invalid_request", invalid);
+      const request = ownedSystemQuestion(sent);
+      const { asker, key } = request;
+      const existing = tx.sql
+        .exec<QuestionRow>(
+          `SELECT question_id, decision_id, agent_id, claim_id, generation, text, options, scope
+           FROM questions WHERE agent_id = ? AND request_id = ?`,
+          asker,
+          key,
+        )
+        .toArray()[0];
+      if (existing !== undefined) {
+        if (!sameSystemQuestion(tx.sql, existing, request)) {
+          return fail("invalid_request", "That key was used for another question.");
+        }
+        return ok({ questionId: existing.question_id, decisionId: existing.decision_id });
+      }
+      const holders: InboxTarget[] = [];
+      for (const { claimId, generation } of request.claims) {
+        const holder = ports().claims.holder(claimId);
+        if (holder === null || holder.generation !== generation) {
+          return fail("claim_closed", "A claim is not held at the generation the question names.");
+        }
+        const depends = tx.sql
+          .exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM decision_claims WHERE claim_id = ?",
+            claimId,
+          )
+          .toArray()[0];
+        if ((depends?.n ?? 0) >= MAX_QUESTIONS_PER_CLAIM) {
+          return fail(
+            "quota_exceeded",
+            `A claim may depend on at most ${MAX_QUESTIONS_PER_CLAIM} decisions.`,
+          );
+        }
+        holders.push(holder);
+      }
+      const [first] = holders;
+      if (first === undefined) throw new Error("a validated system question names no claim");
+      const questionId = newId("qst_");
+      const decisionId = newId("dec_");
+      tx.sql.exec(
+        `INSERT INTO questions (question_id, decision_id, agent_id, request_id, claim_id,
+           generation, text, options, scope, asked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        questionId,
+        decisionId,
+        asker,
+        key,
+        first.claimId,
+        first.generation,
+        request.text,
+        JSON.stringify(request.options),
+        JSON.stringify(request.scope),
+        clock(),
+      );
+      for (const holder of holders) {
+        tx.sql.exec(
+          `INSERT INTO decision_claims (decision_id, claim_id, agent_id, generation)
+           VALUES (?, ?, ?, ?)`,
+          decisionId,
+          holder.claimId,
+          holder.agentId,
+          holder.generation,
+        );
+      }
+      tx.append(
+        { kind: "system", id: asker },
+        {
+          type: "question.asked",
+          data: {
+            questionId,
+            claimId: first.claimId,
+            decisionId,
+            text: request.text,
+            options: request.options,
+          },
+        },
+      );
+      return ok({ questionId, decisionId });
+    },
+
+    withdraw(tx, asker, decisionId) {
+      const question = tx.sql
+        .exec<{ withdrawn_at: number | null }>(
+          "SELECT withdrawn_at FROM questions WHERE decision_id = ? AND agent_id = ?",
+          decisionId,
+          asker,
+        )
+        .toArray()[0];
+      if (question === undefined || question.withdrawn_at !== null) return false;
+      // An answered decision is part of the work that relied on it, so only an open one goes.
+      if (currentVersion(decisionId) !== 0) return false;
+      tx.sql.exec(
+        "UPDATE questions SET withdrawn_at = ? WHERE decision_id = ?",
+        clock(),
+        decisionId,
+      );
+      tx.sql.exec("DELETE FROM decision_claims WHERE decision_id = ?", decisionId);
+      return true;
+    },
+
     async question(agent, questionId, waitMs): Promise<PortResult<QuestionResult>> {
       if (foreign(agent)) return notForThisRepo();
       if (!isId("question", questionId)) {
@@ -536,6 +675,12 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             const question = questionOfDecision(decisionId);
             if (question === undefined)
               return fail("not_found", "No question opened that decision.");
+            if (withdrawn(decisionId)) {
+              return fail(
+                "action_stale",
+                "The question was withdrawn because the work it asked about changed.",
+              );
+            }
             const options = readOptions(question.options);
             if (!options.some((offered) => offered.key === option)) {
               return fail("invalid_request", "The question does not offer that option.");
@@ -596,6 +741,9 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
             for (const { claim_id: claimId } of targets) {
               if (isId("claim", claimId)) ports().claims.reopenMerged(tx, claimId);
             }
+            // The train returns the pair its question parked to the queue in this transaction, so
+            // the answer and the drive the train owes for it commit together.
+            if (SYSTEM_ID.test(question.agent_id)) ports().train.answered(tx, decisionId);
             return ok({ decisionId, version });
           },
         );
@@ -604,6 +752,14 @@ export function createDecisions(context: RepoContext, ports: () => RepoPorts): D
         throw error;
       }
       if (committed.value.ok && committed.events.length > 0) wake(decisionId);
+      // The answer is committed, so the train's wake is asked for. Its alarm write in the
+      // transaction may have failed, and an answer reported as recorded must leave the drive it
+      // owes scheduled, so a failed write refuses it, as `ready` does. A repeat of the same grant
+      // finds the version it recorded and asks again; until then the stored wake is asked for by
+      // the train's startup and by the next call that queues work.
+      if (committed.value.ok && SYSTEM_ID.test(questionOfDecision(decisionId)?.agent_id ?? "")) {
+        if (!(await ports().train.armWake())) return unavailable("train");
+      }
       return committed.value;
     },
 
@@ -816,6 +972,32 @@ function invalidAsk(request: AskRequest): string | null {
     return "The generation must be a whole number from 1.";
   }
   if (!isRequestId(request.requestId)) return "The requestId is not an idempotency key.";
+  return invalidContent(request);
+}
+
+function invalidSystemQuestion(question: SystemQuestion): string | null {
+  if (!SYSTEM_ID.test(question.asker)) return "The asker is not a system module.";
+  if (question.key === "" || question.key.length > MAX_SYSTEM_QUESTION_KEY_LENGTH) {
+    return `The key must be non-empty and at most ${MAX_SYSTEM_QUESTION_KEY_LENGTH} characters.`;
+  }
+  const { claims } = question;
+  if (claims.length === 0 || claims.length > MAX_OPTIONS) {
+    return `A system question names from 1 to ${MAX_OPTIONS} claims.`;
+  }
+  const seen = new Set<string>();
+  for (const { claimId, generation } of claims) {
+    if (!isId("claim", claimId)) return "A claim is not a claim identifier.";
+    if (!Number.isSafeInteger(generation) || generation < 1) {
+      return "A generation is not a whole number from 1.";
+    }
+    if (seen.has(claimId)) return "A claim is named twice.";
+    seen.add(claimId);
+  }
+  return invalidContent(question);
+}
+
+/** Checks the text, options and scope every question shares. */
+function invalidContent(request: Pick<AskRequest, "text" | "options" | "scope">): string | null {
   if (request.text.trim() === "" || request.text.length > MAX_QUESTION_LENGTH) {
     return `The question must be non-blank and at most ${MAX_QUESTION_LENGTH} characters.`;
   }
@@ -855,6 +1037,43 @@ function ownedAsk(request: AskRequest): AskRequest {
     options: request.options.map(({ key, label }) => ({ key, label })),
     scope: [...request.scope],
   };
+}
+
+/** `ownedAsk` for a system question. */
+function ownedSystemQuestion(question: SystemQuestion): SystemQuestion {
+  return {
+    asker: question.asker,
+    key: question.key,
+    claims: question.claims.map(({ claimId, generation }) => ({ claimId, generation })),
+    text: question.text,
+    options: question.options.map(({ key, label }) => ({ key, label })),
+    scope: [...question.scope],
+  };
+}
+
+/** Whether a stored system question was asked with exactly `request`'s content and claims. */
+function sameSystemQuestion(sql: SqlStorage, row: QuestionRow, request: SystemQuestion): boolean {
+  const [first] = request.claims;
+  if (
+    first === undefined ||
+    row.claim_id !== first.claimId ||
+    row.generation !== first.generation ||
+    row.text !== request.text ||
+    row.options !== JSON.stringify(request.options) ||
+    row.scope !== JSON.stringify(request.scope)
+  ) {
+    return false;
+  }
+  // A takeover may have moved a dependency since, so only the claims are compared.
+  const claims = sql
+    .exec<{ claim_id: string }>(
+      "SELECT claim_id FROM decision_claims WHERE decision_id = ? ORDER BY claim_id",
+      row.decision_id,
+    )
+    .toArray()
+    .map((dependency) => dependency.claim_id);
+  const asked = request.claims.map(({ claimId }) => claimId).toSorted();
+  return claims.length === asked.length && claims.every((claimId, i) => claimId === asked[i]);
 }
 
 function sameAsk(row: QuestionRow, claimId: ClaimId, request: AskRequest): boolean {
