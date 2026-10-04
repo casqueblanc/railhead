@@ -166,6 +166,7 @@ describe("unavailable ports", () => {
     });
     expect(appended).toBe(0);
     expect(head).toBe(0);
-    expect(authorized).toEqual(unavailable("authorization"));
+    // The installed authorization finds no attempt to rest an intent on.
+    expect(authorized).toMatchObject({ ok: false, code: "not_found" });
   });
 });
