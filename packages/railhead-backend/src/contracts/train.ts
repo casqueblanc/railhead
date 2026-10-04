@@ -269,7 +269,8 @@ export interface TrainPort {
    * the check port to start it again under a fresh deadline, and a pin parked alone for it goes to
    * the front of the queue to revive its batch on the same candidate. Returns `false`, changing
    * nothing, when the train holds no such attempt (`holds` is false), such as a shared batch that
-   * already expired or a parked pin a later generation of its claim superseded. A fence method
+   * already expired or a parked pin a later generation of its claim superseded, or when a pin's
+   * claim is no longer ready at the generation and episode it was batched in. A fence method
    * like `attemptOutcome`: call it inside the caller's `log.transaction`, then `resume` once that
    * transaction committed.
    */
