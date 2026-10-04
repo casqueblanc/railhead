@@ -292,6 +292,8 @@ describe("ask", () => {
           options: ASK.options,
         },
       });
+      // An agent's question depends on its own claim alone, which the event leaves implicit.
+      expect(events[0]?.type === "question.asked" && "claimIds" in events[0].data).toBe(false);
       expect(h.count("decision_claims")).toBe(1);
       // Unanswered, so the claim has nothing to satisfy yet.
       expect(await h.decisions.requirements(CLAIM)).toEqual(ok([]));
@@ -774,6 +776,7 @@ describe("askSystem", () => {
         data: {
           questionId,
           claimId: CLAIM,
+          claimIds: [CLAIM, OTHER_CLAIM],
           decisionId,
           text: SYSTEM.text,
           options: SYSTEM.options,

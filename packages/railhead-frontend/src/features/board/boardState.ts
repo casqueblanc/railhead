@@ -140,6 +140,8 @@ export interface ClaimState {
 export interface QuestionState {
   questionId: QuestionId;
   claimId: ClaimId;
+  /** Every claim the question's decision depends on, `claimId` first. */
+  claimIds: readonly ClaimId[];
   decisionId: DecisionId;
   text: string;
   options: readonly QuestionOption[];
@@ -864,13 +866,15 @@ const applyEvent = (state: BoardState, event: RailheadEvent, draft: FoldDraft): 
     }
     case "question.asked": {
       const { questionId, claimId, decisionId, text, options } = event.data;
+      const claimIds = event.data.claimIds ?? [claimId];
       fresh(state.questions, questionId, "question");
-      known(state.claims, claimId, "claim");
+      for (const id of claimIds) known(state.claims, id, "claim");
       return {
         ...state,
         questions: draft.put(state.questions, questionId, {
           questionId,
           claimId,
+          claimIds,
           decisionId,
           text,
           options,

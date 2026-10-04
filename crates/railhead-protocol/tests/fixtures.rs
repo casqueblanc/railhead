@@ -5,9 +5,9 @@ use std::collections::HashSet;
 
 use railhead_protocol::{
     AckRequest, AckResult, AgentResponse, AgentRoute, AskRequest, ChallengeRequest,
-    ChallengeResult, ClaimRequest, ClaimResult, Error, InboxResult, JoinRequest, JoinResult,
-    MAX_SAFE_INTEGER, Method, PinResult, QuestionResult, ReadyRequest, ReadyResult, ReleaseRequest,
-    ReleaseResult, SessionRequest, SessionResult, StatusResult, decode_event,
+    ChallengeResult, ClaimRequest, ClaimResult, Error, EventPayload, InboxResult, JoinRequest,
+    JoinResult, MAX_SAFE_INTEGER, Method, PinResult, QuestionResult, ReadyRequest, ReadyResult,
+    ReleaseRequest, ReleaseResult, SessionRequest, SessionResult, StatusResult, decode_event,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -165,6 +165,39 @@ fn a_version_1_reader_refuses_newer_types_by_version_not_as_corrupt() -> TestRes
         newer, 5,
         "train.held, check.approved, train.unreported, claim.merged and claim.released"
     );
+    Ok(())
+}
+
+#[test]
+fn decodes_a_question_naming_every_claim_its_decision_depends_on() -> TestResult {
+    let fixture: Value = serde_json::from_str(EVENTS)?;
+    let value = field(&fixture, "systemQuestion")?;
+    let event = decode_event(&value.to_string())?;
+    let EventPayload::QuestionAsked(asked) = &event.payload else {
+        return Err(format!("decoded {}", event.payload.type_name()).into());
+    };
+    assert_eq!(
+        asked.claim_ids.as_deref(),
+        Some(["clm_42abcd".to_owned(), "clm_43abcd".to_owned()].as_slice())
+    );
+    assert_eq!(&serde_json::to_value(&event)?, value);
+    Ok(())
+}
+
+#[test]
+fn decodes_a_question_without_claim_ids_as_depending_on_its_claim_alone() -> TestResult {
+    let fixture: Value = serde_json::from_str(EVENTS)?;
+    let value = list(&fixture, "valid")?
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("question.asked"))
+        .ok_or("no question.asked fixture")?;
+    let event = decode_event(&value.to_string())?;
+    let EventPayload::QuestionAsked(asked) = &event.payload else {
+        return Err(format!("decoded {}", event.payload.type_name()).into());
+    };
+    assert_eq!(asked.claim_ids, None);
+    let encoded = serde_json::to_value(&event)?;
+    assert_eq!(encoded.pointer("/data/claimIds"), None);
     Ok(())
 }
 

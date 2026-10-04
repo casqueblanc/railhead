@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RailheadEvent } from "@railhead/shared/events";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
+import { CONFLICT, parkedConflict } from "../../../../../fixtures/board/parkedConflict";
 import {
   SYNTH_REPO,
   seqWhere,
@@ -261,6 +262,15 @@ describe("DecisionsPanel", () => {
       expect(second.requests).toHaveLength(1);
       expect(text()).toContain("Recorded as version 3.");
     });
+  });
+
+  it("counts both claims of a parked train conflict before the answer", async () => {
+    await render(fold(parkedConflict.events), { kind: "unavailable", reason: "offline" });
+    const waiting = container.querySelector('section[aria-label="Waiting for an answer"]');
+    // The conflict holds up both claims, so it leads the queue ahead of atlas's own question.
+    expect(waiting?.textContent).toMatch(
+      new RegExp(`${CONFLICT.decision}Affects 2 claims.*${UPLOAD.decision}Affects 1 claim`),
+    );
   });
 
   it("renders question and option text inertly", async () => {

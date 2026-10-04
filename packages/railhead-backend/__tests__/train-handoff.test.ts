@@ -890,7 +890,7 @@ describe("a conflicting pair", () => {
       expect(asked.map((event) => event.type)).toEqual(["train.conflict", "question.asked"]);
       expect(asked[1]).toMatchObject({
         actor: { kind: "system", id: "sys_train" },
-        data: { claimId: first.claimId },
+        data: { claimId: first.claimId, claimIds: [first.claimId, second.claimId] },
       });
       const [conflict] = setup.train.conflicts(1);
       expect(conflict).toMatchObject({ state: "asked" });
