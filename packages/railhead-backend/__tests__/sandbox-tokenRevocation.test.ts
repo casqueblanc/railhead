@@ -26,6 +26,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -80,8 +81,22 @@ async function setup() {
   const handler = RailheadSandbox.outboundHandlers?.["gitGateway"];
   if (handler === undefined) throw new Error("no git gateway handler");
   let current = alwaysCurrent;
+  // Revocations answer only once released, when `holdRevocations` is set.
+  let revocations: Promise<void> | null = null;
   const bindings = {
-    ARTIFACTS: fake,
+    ARTIFACTS: {
+      get: async (name: string) => {
+        const handle = await fake.get(name);
+        const pending = revocations;
+        if (pending === null) return handle;
+        return Object.assign(handle, {
+          revokeToken: async (id: string) => {
+            await pending;
+            return false;
+          },
+        });
+      },
+    },
     SANDBOX: {
       idFromString: (id: string) => id,
       get: () => ({ railheadGrantCurrent: () => current() }),
@@ -93,6 +108,9 @@ async function setup() {
   );
   return {
     fake,
+    holdRevocations() {
+      revocations = new Promise<void>(() => undefined);
+    },
     held,
     ref,
     setUpstream(next: (request: Request) => Promise<Response>) {
@@ -263,5 +281,21 @@ describe("the registered Git gateway's tokens", () => {
     expect(JSON.stringify(warn.mock.calls)).not.toContain(token.plaintext);
     // Left to expire with its own one-minute lifetime.
     expect(token.expiresAtMs - token.createdAtMs).toBe(60_000);
+  });
+
+  it("ends the answer once a revocation that never answers has had its time", async () => {
+    const { fake, held, serve, holdRevocations } = await setup();
+    holdRevocations();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+    const response = await serve(composePush(fake.name));
+    only(held).controller.enqueue(encoder.encode("report"));
+    only(held).controller.close();
+    const reading = response.text();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(await reading).toBe("report");
+    expect(logged()).toEqual([{ event: "sandbox.token_revoke_failed", id: "tok_1" }]);
+    expect(fake.liveWriteTokens().map((token) => token.id)).toEqual(["tok_1"]);
   });
 });

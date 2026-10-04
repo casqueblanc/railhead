@@ -27,6 +27,7 @@ import {
   type ProcessOptions,
   type RestoreBackupResult,
 } from "@cloudflare/sandbox";
+import { boundedCall } from "../artifacts/adapter";
 import { MAX_OUTPUT_BYTES, type SandboxCommand, type SandboxDriver } from "./entry";
 import { MAX_TEARDOWN_ATTEMPTS, SandboxFence, teardownRetryDelay } from "./fence";
 import { serveGitGateway } from "./gateway";
@@ -37,6 +38,9 @@ export { ContainerProxy };
 
 /** The lifetime of each minted Artifacts token, in seconds: the minimum Artifacts accepts. */
 const TOKEN_TTL_SECONDS = 60;
+
+/** How long revoking one minted token may take before it is logged as failed and left to expire. */
+const REVOKE_TIMEOUT_MS = 10_000;
 
 /** The SDK's idle stop: longer than `MAX_SANDBOX_LIFETIME_MS`, so it never ends a live attempt. */
 const IDLE_BACKSTOP = "45m";
@@ -374,13 +378,12 @@ async function revokeMinted(
   minted: readonly MintedToken[],
 ): Promise<void> {
   for (const { repo, id } of minted) {
-    let revoked = false;
-    try {
+    const revoke = async (): Promise<boolean> => {
       using handle = await artifacts.get(repo);
-      revoked = await handle.revokeToken(id);
-    } catch {
-      // Logged below, like a refused revocation.
-    }
+      return handle.revokeToken(id);
+    };
+    // A failed, refused or late revocation is logged alike.
+    const revoked = await boundedCall(revoke(), REVOKE_TIMEOUT_MS).catch(() => false);
     if (!revoked) console.warn(JSON.stringify({ event: "sandbox.token_revoke_failed", id }));
   }
 }
