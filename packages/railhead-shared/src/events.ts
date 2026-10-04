@@ -706,6 +706,8 @@ function validatePayload(event: EventPayload): void {
     case "train.unreported":
       requireId("checkRun", event.data.checkRunId, "checkRunId");
       requireCommit(event.data.candidate, "candidate");
+      if (event.data.outcome !== "timed_out")
+        throw new Error("outcome is not an unreported outcome");
       return;
     default:
       return unreachable(event);

@@ -133,7 +133,10 @@ const Detail = ({ detail, timedOut }: { detail: ListedCheckDetail; timedOut: boo
             <time dateTime={new Date(state.finishedAt).toISOString()}>
               {timeFormat.format(state.finishedAt)}
             </time>
-            {timedOut ? ", after its deadline, so the train did not use this result" : ""}.
+            .
+            {timedOut
+              ? " The train did not receive this report before the deadline, so it did not use this result."
+              : ""}
           </Text>
           <Text variant="secondary">
             {state.logCut ? `Output, last ${MAX_CHECK_DETAIL_LOG_BYTES / 1024} KiB` : "Output"}

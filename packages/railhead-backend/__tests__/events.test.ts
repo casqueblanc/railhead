@@ -475,6 +475,11 @@ describe("validateEvent", () => {
       expect(() => validateEvent(candidate)).toThrow(/candidate/);
     });
 
+    it("rejects an unreported check with an outcome it does not define", () => {
+      const bad = withData("train.unreported", (d) => ({ ...d, outcome: "lost" as "timed_out" }));
+      expect(() => validateEvent(bad)).toThrow(/outcome/);
+    });
+
     it("rejects a held check with no paths, no claims or a repeated path", () => {
       expect(() => validateEvent(withData("train.held", (d) => ({ ...d, paths: [] })))).toThrow(
         /paths/,

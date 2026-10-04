@@ -332,7 +332,9 @@ describe("check runs in the train section", () => {
       await render(feedOf(timedOutLog));
       await openDetail();
 
-      expect(text()).toContain("after its deadline, so the train did not use this result");
+      expect(text()).toContain(
+        "The train did not receive this report before the deadline, so it did not use this result.",
+      );
       expect(container.querySelector("pre[aria-label=Output]")?.textContent).toBe(
         "FAIL upload.test.ts\n1 failed",
       );
