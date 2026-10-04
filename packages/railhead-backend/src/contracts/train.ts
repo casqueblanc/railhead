@@ -17,6 +17,7 @@ import type {
   IntentId,
 } from "@railhead/shared/events";
 import type { EventTransaction } from "../repo/eventLog";
+import type { ConflictRegion } from "../train/classification/classify";
 import type { ClaimPin, EpisodePin } from "./claims";
 import type { GrantFor } from "./principals";
 import type { PortResult } from "./result";
@@ -95,8 +96,12 @@ export interface CheckRunReport {
 export type MergeOutcome =
   /** Git merged every pin; `candidate` is the composed commit, published only for checking. */
   | { kind: "clean"; candidate: CommitSha }
-  /** Two pins conflict on these paths. */
-  | { kind: "conflict"; pins: [ClaimPin, ClaimPin]; paths: string[] }
+  /**
+   * Two pins conflict on these paths. `regions` holds each conflicted region's text for the
+   * classifier, or is empty when the conflict exceeds the classifier's bounds or its text could
+   * not be read; the train then asks a person.
+   */
+  | { kind: "conflict"; pins: [ClaimPin, ClaimPin]; paths: string[]; regions: ConflictRegion[] }
   /** The merge could not run, such as a missing commit or a timeout. Not the agents' failure. */
   | { kind: "error"; reason: "missing_commit" | "timeout" | "unsupported" | "infrastructure" };
 

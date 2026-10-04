@@ -61,12 +61,32 @@ import {
   unavailableClaims,
 } from "../src/contracts/unavailable";
 import { composeRepo, type RepoContext, type RepoPorts } from "../src/repo/composeRepo";
+import type { ConflictInput, ConflictVerdict } from "../src/train/classification/classify";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
 import { EarliestAlarm } from "../src/repo/storage";
 import { queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_train0001";
+
+/** A compatible verdict at the gate. */
+const REDO: ConflictVerdict = { route: "redo", class: "compatible", probability: 0.95 };
+
+/** One conflicted region of `src/upload.ts`. */
+const REGION = {
+  path: "src/upload.ts",
+  base: "export const limit = 10;\n",
+  ours: "export const limit = 10;\nexport const chunk = 1;\n",
+  theirs: "export const limit = 10;\nexport const retries = 3;\n",
+};
+
+/** The verdict on a conflict no model judged. */
+const UNJUDGED: ConflictVerdict = {
+  route: "question",
+  class: "contradictory",
+  probability: 0,
+  reason: "unavailable",
+};
 const MAIN = sha("1");
 
 function sha(digit: string): CommitSha {
@@ -94,7 +114,8 @@ type PortCall =
   | "merge.compose"
   | "checks.start"
   | "authorization.authorize"
-  | "mainWriter.publish";
+  | "mainWriter.publish"
+  | "conflicts.classify";
 
 /**
  * Fakes of the published ports. Merge composes deterministically from main and the pins; the
@@ -122,6 +143,12 @@ class Fakes {
   discards: string[] = [];
   discard: (attempt: string) => PortResult<{ removed: number }> = (attempt) =>
     ok({ removed: this.candidateRefs.delete(attempt) ? 1 : 0 });
+  /** Each claim's issue title, as the claims module answers it for the conflict's intents. */
+  readonly titles = new Map<string, string>();
+  /** Every conflict the conflicts port was asked to classify, oldest first. */
+  classified: ConflictInput[] = [];
+  /** How the conflicts port answers. */
+  verdict: (conflict: ConflictInput) => ConflictVerdict = () => UNJUDGED;
   /** Every system question the train asked, oldest first, including refused ones. */
   asked: SystemQuestion[] = [];
   /** How the decisions module answers a system question. */
@@ -198,6 +225,7 @@ class Fakes {
           return current === undefined ? fail("not_found", "No such claim.") : ok(current);
         },
         currentGeneration: (claimId) => this.pins.get(claimId)?.generation ?? null,
+        intent: (claimId) => this.titles.get(claimId) ?? null,
         readyPin: (claimId) => {
           const current = this.pins.get(claimId);
           if (current === undefined) return null;
@@ -230,6 +258,13 @@ class Fakes {
           return this.pins.has(claimId) && !this.unknownVersions
             ? (this.requirements.get(claimId) ?? [])
             : null;
+        },
+      },
+      conflicts: {
+        classify: async (conflict) => {
+          this.classified.push(conflict);
+          await this.answer("conflicts.classify");
+          return this.verdict(conflict);
         },
       },
       merge: {
@@ -813,7 +848,12 @@ describe("train failures", () => {
     fakes.head = () => fail("unavailable", "Not yet.");
     fakes.compose = (main, pins) =>
       pins.length === 3
-        ? ok({ kind: "conflict", pins: [pin(1), pin(3)], paths: ["../escape", "src/upload.ts"] })
+        ? ok({
+            kind: "conflict",
+            pins: [pin(1), pin(3)],
+            paths: ["../escape", "src/upload.ts"],
+            regions: [],
+          })
         : ok({ kind: "clean", candidate: candidateOf(main, pins) });
     await withTrain(async ({ train, events }) => {
       fakes.ready(pin(1), pin(2), pin(3));
@@ -847,7 +887,7 @@ describe("train failures", () => {
   it("fails the batch when a conflict names a pin outside it", async () => {
     const fakes = new Fakes();
     fakes.compose = () =>
-      ok({ kind: "conflict", pins: [pin(1), pin(9)], paths: ["src/upload.ts"] });
+      ok({ kind: "conflict", pins: [pin(1), pin(9)], paths: ["src/upload.ts"], regions: [] });
     await withTrain(async ({ train, events }) => {
       fakes.ready(pin(1));
       await train.enqueue(pin(1));
@@ -862,13 +902,167 @@ describe("train failures", () => {
   });
 });
 
+/** Fakes whose merge finds pins 1 and 3 conflicting on one region, with both issue titles. */
+function classifying(verdict: ConflictVerdict): Fakes {
+  const fakes = new Fakes();
+  fakes.compose = (main, pins) => {
+    const has = (n: number) => pins.some((p) => p.claimId === pin(n).claimId);
+    return has(1) && has(3)
+      ? ok({
+          kind: "conflict",
+          pins: [pin(1), pin(3)],
+          paths: ["src/upload.ts"],
+          regions: [REGION],
+        })
+      : ok({ kind: "clean", candidate: candidateOf(main, pins) });
+  };
+  fakes.titles.set(pin(1).claimId, "Add uploads");
+  fakes.titles.set(pin(3).claimId, "Add downloads");
+  fakes.verdict = () => verdict;
+  return fakes;
+}
+
+/** Queues pins 1, 2 and 3 before the first batch forms, so all three are composed together. */
+async function queueThree(train: QueueingTrain, fakes: Fakes): Promise<void> {
+  fakes.head = () => fail("unavailable", "Not yet.");
+  fakes.ready(pin(1), pin(2), pin(3));
+  for (const p of [pin(1), pin(2), pin(3)]) await train.enqueue(p);
+  fakes.head = () => ok(fakes.main);
+}
+
+describe("a classified conflict", () => {
+  it("drops the losing pin of a redo and composes its partner with the rest, asking nothing", async () => {
+    const fakes = classifying(REDO);
+    await withTrain(async ({ train, events }) => {
+      await queueThree(train, fakes);
+      await train.drive();
+
+      expect(fakes.classified).toEqual([
+        { regions: [REGION], oursIntent: "Add uploads", theirsIntent: "Add downloads" },
+      ]);
+      expect(events()).toMatchObject([
+        {
+          type: "train.conflict",
+          data: {
+            claims: [pin(1).claimId, pin(3).claimId],
+            path: "src/upload.ts",
+            class: "compatible",
+            probability: 0.95,
+            route: "redo",
+          },
+        },
+      ]);
+      expect(states(train)).toEqual({
+        "clm_claim001@1": "batched",
+        "clm_claim002@1": "batched",
+        "clm_claim003@1": "dropped",
+      });
+      expect(train.entries(64).find((e) => e.state === "dropped")).toMatchObject({
+        reason: "conflict",
+      });
+      expect(pinsOf(lastStarted(fakes))).toEqual([pin(1), pin(2)]);
+      expect(train.conflicts(8)).toEqual([]);
+      expect(fakes.asked).toEqual([]);
+    }, fakes);
+  });
+
+  it("parks and asks with the verdict a question carries", async () => {
+    const fakes = classifying({
+      route: "question",
+      class: "compatible",
+      probability: 0.82,
+      reason: "below_gate",
+    });
+    await withTrain(async ({ train, events }) => {
+      await queueThree(train, fakes);
+      await train.drive();
+
+      expect(events().map((e) => e.type)).toEqual(["train.conflict"]);
+      expect(events()[0]).toMatchObject({
+        data: { class: "compatible", probability: 0.82, route: "question" },
+      });
+      expect(states(train)).toMatchObject({
+        "clm_claim001@1": "parked",
+        "clm_claim003@1": "parked",
+      });
+      expect(train.conflicts(8)).toMatchObject([{ state: "asked" }]);
+      expect(fakes.asked).toHaveLength(1);
+    }, fakes);
+  });
+
+  it("parks and asks when the conflicts port does not answer in time", async () => {
+    const fakes = classifying(REDO);
+    fakes.portTimeoutMs = 20;
+    fakes.hang = "conflicts.classify";
+    await withTrain(async ({ train, events }) => {
+      await queueThree(train, fakes);
+      await train.drive();
+
+      expect(events()[0]).toMatchObject({
+        type: "train.conflict",
+        data: { class: "contradictory", probability: 0, route: "question" },
+      });
+      expect(train.conflicts(8)).toMatchObject([{ state: "asked" }]);
+    }, fakes);
+  });
+
+  it("classifies a conflict without text or intents as a question would be", async () => {
+    const fakes = classifying(UNJUDGED);
+    fakes.compose = () =>
+      ok({ kind: "conflict", pins: [pin(1), pin(3)], paths: ["src/upload.ts"], regions: [] });
+    fakes.titles.clear();
+    await withTrain(async ({ train }) => {
+      fakes.ready(pin(1), pin(3));
+      fakes.head = () => fail("unavailable", "Not yet.");
+      await train.enqueue(pin(1));
+      await train.enqueue(pin(3));
+      fakes.head = () => ok(fakes.main);
+      await train.drive();
+
+      expect(fakes.classified).toEqual([{ regions: [], oursIntent: "", theirsIntent: "" }]);
+      expect(train.conflicts(8)).toMatchObject([{ state: "asked" }]);
+    }, fakes);
+  });
+
+  it("records nothing from a classification that a later drive's compose overtook", async () => {
+    const fakes = classifying(UNJUDGED);
+    await withTrain(async ({ train, restart, advance, events }) => {
+      fakes.head = () => fail("unavailable", "Not yet.");
+      fakes.ready(pin(1), pin(3));
+      await train.enqueue(pin(1));
+      await train.enqueue(pin(3));
+      fakes.head = () => ok(fakes.main);
+      const release = fakes.hold("conflicts.classify");
+      const stale = train.drive();
+      await vi.waitFor(() => expect(fakes.classified).toHaveLength(1));
+
+      // The object stops mid-classification; the lease alarm composes and classifies again.
+      const again = restart();
+      fakes.holds.delete("conflicts.classify");
+      advance(DRIVE_LEASE_MS);
+      await again.resume();
+      expect(fakes.composeAttempts).toHaveLength(2);
+      expect(events().map((e) => e.type)).toEqual(["train.conflict"]);
+      expect(again.conflicts(8)).toMatchObject([{ state: "asked" }]);
+
+      // The stale drive's late redo is not recorded: nothing is dropped and nothing reopened.
+      fakes.verdict = () => REDO;
+      release();
+      expect(await stale).toEqual({ kind: "superseded" });
+      expect(events().map((e) => e.type)).toEqual(["train.conflict"]);
+      expect(events()[0]).toMatchObject({ data: { route: "question" } });
+      expect(states(again)).toEqual({ "clm_claim001@1": "parked", "clm_claim003@1": "parked" });
+    }, fakes);
+  });
+});
+
 /** Fakes whose merge finds pins 1 and 3 conflicting whenever both are in a batch. */
 function conflicting(): Fakes {
   const fakes = new Fakes();
   fakes.compose = (main, pins) => {
     const has = (n: number) => pins.some((p) => p.claimId === pin(n).claimId);
     return has(1) && has(3)
-      ? ok({ kind: "conflict", pins: [pin(1), pin(3)], paths: ["src/upload.ts"] })
+      ? ok({ kind: "conflict", pins: [pin(1), pin(3)], paths: ["src/upload.ts"], regions: [] })
       : ok({ kind: "clean", candidate: candidateOf(main, pins) });
   };
   return fakes;
@@ -2802,7 +2996,7 @@ describe("train ready episodes", () => {
     // Only the merge of the older episode conflicts; the newer one composes cleanly.
     fakes.compose = (main, pins) =>
       fakes.composeCalls.length === 1
-        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"], regions: [] })
         : ok({ kind: "clean", candidate: candidateOf(main, pins) });
     await withTrain(async ({ train, events }) => {
       fakes.ready(pin(1), pin(2));
@@ -2839,7 +3033,7 @@ describe("train ready episodes", () => {
     fakes.compose = (main, pins) =>
       pins.some((p) => p.claimId === pin(1).claimId && p.commit === pin(1).commit) &&
       pins.length === 2
-        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"], regions: [] })
         : ok({ kind: "clean", candidate: candidateOf(main, pins) });
     await withTrain(async ({ train, events }) => {
       fakes.ready(pin(1), pin(2));
@@ -2869,7 +3063,7 @@ describe("train ready episodes", () => {
     fakes.head = () => fail("unavailable", "Not yet.");
     fakes.compose = (main, pins) =>
       pins.length === 2
-        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"] })
+        ? ok({ kind: "conflict", pins: [pin(1), pin(2)], paths: ["src/upload.ts"], regions: [] })
         : ok({ kind: "clean", candidate: candidateOf(main, pins) });
     await withTrain(async ({ train }) => {
       fakes.ready(pin(1), pin(2));

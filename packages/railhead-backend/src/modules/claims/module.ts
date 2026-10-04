@@ -1045,6 +1045,10 @@ export function createClaims(
       };
     },
 
+    intent(claimId) {
+      return claimById(context.storage.sql, claimId)?.title ?? null;
+    },
+
     merged(tx, landed, main) {
       if (!isCommitSha(main)) throw new Error("a landing must name the commit it published");
       const now = clock();

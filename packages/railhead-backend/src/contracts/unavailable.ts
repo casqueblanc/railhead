@@ -57,6 +57,7 @@ export const unavailableClaims: ClaimsPort = {
   workingGeneration: () => null,
   workingEpisode: () => null,
   readyPin: () => null,
+  intent: () => null,
   merged: () => {
     throw new UnavailableError("claims");
   },

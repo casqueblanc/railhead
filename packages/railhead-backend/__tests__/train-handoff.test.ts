@@ -1,6 +1,7 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { WorkersAi } from "@railhead/ai/clef";
 import type { ClaimView } from "@railhead/shared/agent-api";
 import type { CommitSha, DecisionRef } from "@railhead/shared/events";
 import {
@@ -22,6 +23,7 @@ import {
   unavailableTrain,
 } from "../src/contracts/unavailable";
 import { CLAIM_LEASE_MS, createClaims } from "../src/modules/claims/module";
+import { createConflicts } from "../src/modules/conflicts/entry";
 import { createDecisions, MAX_QUESTIONS_PER_CLAIM } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { createMainWriter } from "../src/modules/mainWriter/mainWriter";
@@ -39,6 +41,7 @@ import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/
 import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm, type AlarmStorage } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
+import type { ConflictRegion } from "../src/train/classification/classify";
 
 const REPO = "rep_handoff0001";
 const ROOT = "1".repeat(40);
@@ -46,6 +49,9 @@ const MAIN = "2".repeat(40);
 const WORK = "4".repeat(40);
 const LATER = "5".repeat(40);
 const OWNER = "usr_owner0001";
+
+/** How long the conflicts port waits for Workers AI in these tests. */
+const CLASSIFY_TIMEOUT_MS = 50;
 
 function agent(n: number): AgentPrincipal {
   return { kind: "agent", agentId: `agt_agent000${n}`, ownerId: OWNER, repoId: REPO };
@@ -87,6 +93,12 @@ interface Setup {
   conflict: [ClaimPin, ClaimPin] | null;
   /** The path the merge port names for that conflict. */
   conflictPath: string;
+  /** The regions the merge port reports with that conflict. */
+  conflictRegions: ConflictRegion[];
+  /** How Workers AI answers each classification call, in order; with none left, a call fails. */
+  clef: (() => Promise<unknown>)[];
+  /** Whether the claims port the train reaches answers intents; while false, it has none. */
+  intentsKnown: boolean;
   /** While set, the check port holds every attempt for a person's approval (`check_held`). */
   holdChecks: boolean;
   /** Records the next version of `decisionId`, asking the question first when it is `undefined`. */
@@ -215,6 +227,15 @@ function withHandoff<T>(
       }),
       mainRef,
     );
+    let calls = 0;
+    const ai: WorkersAi = {
+      run() {
+        const next = setup.clef[calls];
+        calls += 1;
+        if (next === undefined) return Promise.reject(new Error("no recorded answer left"));
+        return next();
+      },
+    };
     const claims = createClaims(context, () => ports);
     const inbox = createInbox(context);
     const decisions = createDecisions(context, () => ports);
@@ -234,6 +255,7 @@ function withHandoff<T>(
       ),
       claims: {
         ...claims,
+        intent: (claimId) => (setup.intentsKnown ? claims.intent(claimId) : null),
         async pin(claimId) {
           const answer = await claims.pin(claimId);
           const hold = held;
@@ -256,6 +278,7 @@ function withHandoff<T>(
         },
       },
       train: install(train),
+      conflicts: createConflicts(REPO, ai, fake.clock, CLASSIFY_TIMEOUT_MS),
       authorization,
       mainWriter: {
         head: async () => {
@@ -288,7 +311,12 @@ function withHandoff<T>(
           composed.push(pins);
           const pair = setup.conflict;
           if (pair !== null && pair.every((one) => pins.some((pin) => samePin(pin, one)))) {
-            return ok({ kind: "conflict", pins: pair, paths: [setup.conflictPath] });
+            return ok({
+              kind: "conflict",
+              pins: pair,
+              paths: [setup.conflictPath],
+              regions: setup.conflictRegions,
+            });
           }
           return ok({ kind: "clean", candidate: candidateOf(pins) });
         },
@@ -382,6 +410,9 @@ function withHandoff<T>(
       reliedFails: false,
       conflict: null,
       conflictPath: "src/upload.ts",
+      conflictRegions: [],
+      clef: [],
+      intentsKnown: true,
       holdChecks: false,
       fake,
       holdNextPin() {
@@ -2258,6 +2289,169 @@ describe("an approval of a held check", () => {
 
       expect(approveHeld(setup, attemptId)).toBe(false);
       expect(setup.train.batches(1)[0]).toMatchObject({ attemptId, checkHeld: true });
+    });
+  });
+});
+
+/** One conflicted region of `src/upload.ts`. */
+const REGION: ConflictRegion = {
+  path: "src/upload.ts",
+  base: "export const limit = 10;\n",
+  ours: "export const limit = 10;\nexport const chunk = 1;\n",
+  theirs: "export const limit = 10;\nexport const retries = 3;\n",
+};
+
+/** A Clef response choosing `choice` at probability `p`, in Workers AI's output shape. */
+function clefAnswer(choice: "compatible" | "contradictory", p: number): () => Promise<unknown> {
+  const other = Math.round((1 - p) * 10_000) / 10_000;
+  const probabilities =
+    choice === "compatible"
+      ? { compatible: p, contradictory: other }
+      : { compatible: other, contradictory: p };
+  return async () => ({
+    model: "clef",
+    answers: {
+      relation: { type: "choice", choice, probabilities, confidence: Math.abs(p - other) },
+    },
+    usage: { input_tokens: 400, output_tokens: 0 },
+  });
+}
+
+/**
+ * Claims for agents 1 and 2, readied with `WORK` and `LATER`, that conflict in one batch, driven
+ * once. Returns both pins, the log head before the drive and each fork's commits before it.
+ */
+async function classifyPair(setup: Setup): Promise<{
+  winner: ClaimPin;
+  loser: ClaimPin;
+  before: number;
+  forks: () => Promise<string[][]>;
+}> {
+  const first = await setup.openFor(1, WORK);
+  const second = await setup.openFor(2, LATER);
+  for (const [n, claim, commit] of [
+    [1, first, WORK],
+    [2, second, LATER],
+  ] as const) {
+    const ready = await setup.claims.ready(agent(n), claim.claimId, { generation: 1, commit });
+    expect(ready.ok).toBe(true);
+  }
+  const winner: ClaimPin = { claimId: first.claimId, generation: 1, commit: WORK };
+  const loser: ClaimPin = { claimId: second.claimId, generation: 1, commit: LATER };
+  setup.conflict = [winner, loser];
+  const forks = async () =>
+    Promise.all(
+      [winner, loser].map(async (pin) => [
+        ...(setup.fake.repos.get(await forkRepoName(REPO, pin.claimId))?.commits ?? []),
+      ]),
+    );
+  const pushed = await forks();
+  const before = setup.log.head();
+  await setup.train.resume();
+  expect(await forks()).toEqual(pushed);
+  return { winner, loser, before, forks };
+}
+
+describe("a classified conflict", () => {
+  it("reopens the loser of a compatible answer at the gate and lands its partner alone", async () => {
+    await withHandoff(async (setup) => {
+      setup.conflictRegions = [REGION];
+      setup.clef = [clefAnswer("compatible", 0.95)];
+      const { winner, loser, before } = await classifyPair(setup);
+
+      const events = setup.log.replay(before, 64).events;
+      expect(events.map((event) => event.type)).toEqual(["train.conflict", "claim.reopened"]);
+      expect(events[0]).toMatchObject({
+        actor: { kind: "system", id: "sys_train" },
+        data: {
+          claims: [winner.claimId, loser.claimId],
+          path: "src/upload.ts",
+          class: "compatible",
+          probability: 0.95,
+          route: "redo",
+        },
+      });
+      expect(events[1]).toMatchObject({
+        data: { claimId: loser.claimId, generation: 1, reason: "lost_conflict" },
+      });
+      expect(claimState(setup.sql, loser.claimId)).toBe("working");
+      expect(setup.train.conflicts(8)).toEqual([]);
+      // Nothing moved main: the partner is composed again alone and must pass its own check.
+      expect(setup.main()).toBe(MAIN);
+      expect(setup.composed).toEqual([[winner, loser], [winner]]);
+
+      const attempt = await pass(setup);
+      expect(attempt.pins).toMatchObject([winner]);
+      expect(setup.main()).toBe(attempt.candidate);
+      expect(sortedEntries(setup)).toEqual([
+        { commit: WORK, state: "landed", next: null },
+        { commit: LATER, state: "dropped", next: null },
+      ]);
+    });
+  });
+
+  it.each([
+    {
+      name: "a contradictory answer",
+      arrange: (setup: Setup) => {
+        setup.clef = [clefAnswer("contradictory", 0.97)];
+      },
+      recorded: { class: "contradictory", probability: 0.97 },
+    },
+    {
+      name: "a compatible answer below the gate",
+      arrange: (setup: Setup) => {
+        setup.clef = [clefAnswer("compatible", 0.85)];
+      },
+      recorded: { class: "compatible", probability: 0.85 },
+    },
+    {
+      name: "an empty intent",
+      arrange: (setup: Setup) => {
+        setup.clef = [clefAnswer("compatible", 0.99)];
+        setup.intentsKnown = false;
+      },
+      recorded: { class: "contradictory", probability: 0 },
+    },
+    {
+      name: "a timeout",
+      arrange: (setup: Setup) => {
+        setup.clef = [() => new Promise<never>(() => {})];
+      },
+      recorded: { class: "contradictory", probability: 0 },
+    },
+    {
+      name: "a classifier failure",
+      arrange: (setup: Setup) => {
+        setup.clef = [() => Promise.reject(new Error("Workers AI is down"))];
+      },
+      recorded: { class: "contradictory", probability: 0 },
+    },
+    {
+      name: "a conflict reported without its text",
+      arrange: (setup: Setup) => {
+        setup.clef = [clefAnswer("compatible", 0.99)];
+        setup.conflictRegions = [];
+      },
+      recorded: { class: "contradictory", probability: 0 },
+    },
+  ])("parks the pair and asks after $name", async ({ arrange, recorded }) => {
+    await withHandoff(async (setup) => {
+      setup.conflictRegions = [REGION];
+      arrange(setup);
+      const { winner, loser, before } = await classifyPair(setup);
+
+      const events = setup.log.replay(before, 64).events;
+      expect(events.map((event) => event.type)).toEqual(["train.conflict", "question.asked"]);
+      expect(events[0]).toMatchObject({
+        data: { claims: [winner.claimId, loser.claimId], ...recorded, route: "question" },
+      });
+      expect(setup.train.conflicts(8)).toMatchObject([{ state: "asked" }]);
+      expect(sortedEntries(setup).map((entry) => entry.state)).toEqual(["parked", "parked"]);
+      expect(claimState(setup.sql, winner.claimId)).toBe("ready");
+      expect(claimState(setup.sql, loser.claimId)).toBe("ready");
+      expect(setup.started).toEqual([]);
+      expect(setup.main()).toBe(MAIN);
     });
   });
 });
