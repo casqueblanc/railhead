@@ -4,7 +4,7 @@
 //   node scripts/qualify-slice.mjs probe-config --namespace <qualification namespace> --dir <new dir>
 //   node scripts/qualify-slice.mjs binding --probe <probe URL> --secrets <dir>/probe-secrets.json --namespace <qualification namespace> --out <file>
 //   node scripts/qualify-slice.mjs slice --origin <instance> --repo <org>/<name> --clone <dir> --clone <dir> --clone <dir> --out <file>
-//   node scripts/qualify-slice.mjs gate <report> <report>
+//   node scripts/qualify-slice.mjs gate --origin <instance> <report> <report>
 //
 // `probe-config` writes a Wrangler config and a secrets file for the throwaway probe Worker
 // (packages/railhead-backend/qualify/probe.ts) and prints the commands that deploy and delete it.
@@ -13,7 +13,8 @@
 // the operator's `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the environment. `slice` reads a deployed instance's public
 // event log and three agents' claim clones, and checks the run the agents made there. `gate` exits 0
 // only when one binding report and one slice report both pass when judged again from the
-// observations and collection record they hold (scripts/qualify/evidence.ts, `judgeReport`).
+// observations and collection record they hold (scripts/qualify/evidence.ts, `judgeReport`), and
+// the instance still holds the slice's recorded events and check runs (scripts/qualify/live.ts).
 //
 // Nothing here talks to a simulator: `slice` refuses a loopback or reserved host and `binding`
 // requires the probe's repositories to sit on a live Artifacts Git host, so a fake cannot pass.
@@ -44,6 +45,13 @@ import {
   remoteProblem,
   sliceEvents,
 } from "./qualify/evidence.ts";
+import {
+  BOARD_TIMEOUT_MS,
+  LiveReadFailure,
+  confirmSlice,
+  readLog,
+  withBoard,
+} from "./qualify/live.ts";
 import { RefusedDestination, sendToInstance } from "./qualify/request.ts";
 
 // Decoded, so a checkout path with a space or other escaped character resolves.
@@ -55,12 +63,8 @@ const BACKEND_CONFIG = join(ROOT, "packages/railhead-backend/wrangler.jsonc");
 const PROBE_TIMEOUT_MS = 180_000;
 /** How long one Git command may take. */
 const GIT_TIMEOUT_MS = 120_000;
-/** How long one board call may take. */
-const BOARD_TIMEOUT_MS = 30_000;
 /** How long after an evicted update main is read: past the update token's 60 s lifetime. */
 const EVICTION_WAIT_MS = 75_000;
-/** The longest event log read. */
-const MAX_EVENTS = 20_000;
 
 const REPO_SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const NAMESPACE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
@@ -390,50 +394,11 @@ const binding = async (argv) => {
 
 // --- slice -------------------------------------------------------------------------------------
 
-const withTimeout = (promise, what) => {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new HarnessFailure(`${what} did not answer within ${BOARD_TIMEOUT_MS} ms`)),
-      BOARD_TIMEOUT_MS,
-    );
-  });
-  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
-};
-
-/** Reads the repository's whole public event log, and its head, over the board's session. */
-const readLog = async (origin, org, name) => {
+/** Opens the instance's API session over a WebSocket on `origin`. */
+const openSession = (origin) => {
   const socketUrl = new URL(API_PATH, origin);
   socketUrl.protocol = "wss:";
-  const api = newWebSocketRpcSession(socketUrl.href);
-  let board = null;
-  try {
-    const opened = await withTimeout(api.openBoard(org, name), "openBoard");
-    if (!opened.ok) throw new HarnessFailure(`the instance refused to open ${org}/${name}`);
-    board = opened.value;
-    const events = [];
-    let cursor = 0;
-    let history;
-    while (events.length < MAX_EVENTS) {
-      const page = await withTimeout(
-        history === undefined
-          ? board.readEvents(cursor, 256)
-          : board.readEvents(cursor, 256, history),
-        "readEvents",
-      );
-      if (!page.ok) throw new HarnessFailure("the instance refused a page of the event log");
-      history = page.value.history;
-      events.push(...page.value.events);
-      if (page.value.events.length === 0 || page.value.cursor >= page.value.head) {
-        return { events, head: page.value.head };
-      }
-      cursor = page.value.cursor;
-    }
-    throw new HarnessFailure(`the event log is longer than ${MAX_EVENTS} events`);
-  } finally {
-    board?.[Symbol.dispose]();
-    api[Symbol.dispose]();
-  }
+  return newWebSocketRpcSession(socketUrl.href);
 };
 
 /** The credential the clone's own helper gives Git for `url`, kept in memory only. */
@@ -541,7 +506,14 @@ const slice = async (argv) => {
     throw new HarnessFailure(`--clone 1: upstream is not ${upstreamUrl}`, 2);
   }
 
-  const { events, head } = await readLog(base, org, name);
+  const api = openSession(base);
+  let log;
+  try {
+    log = await withBoard(api, org, name, (board) => readLog(board));
+  } finally {
+    api[Symbol.dispose]();
+  }
+  const { events, head, history } = log;
   const observed = [];
   for (const [index, dir] of dirs.entries()) {
     observed.push(await observeClone(dir, originUrls[index]));
@@ -575,6 +547,7 @@ const slice = async (argv) => {
       repo,
       events: sliceEvents(events),
       eventCount: head,
+      history,
       logTokens: eventsWithToken(events),
       clones: observed.map((clone) => clone.observation),
       remoteMain,
@@ -591,11 +564,18 @@ const slice = async (argv) => {
 // --- gate --------------------------------------------------------------------------------------
 
 /**
- * Judges each report again from what it recorded; the outcomes a report states are compared, never
- * trusted. Prints check ids only: a report is a file, and its text is not repeated.
+ * Judges each report again from what it recorded, then confirms the slice report against the live
+ * instance at `--origin` (scripts/qualify/live.ts, `confirmSlice`); the outcomes a report states are
+ * compared, never trusted. Prints check ids only: a report is a file, and its text is not repeated.
  */
-const gate = (paths) => {
+const gate = async (argv) => {
+  const { values, positionals: paths } = options(argv, { origin: { type: "string" } });
+  const origin = required(values, "origin");
+  const problem = originProblem(origin);
+  if (problem !== null)
+    throw new HarnessFailure(`--origin is not a deployed instance: ${problem}`, 2);
   if (paths.length === 0) throw usage();
+  const base = new URL(origin).origin;
   const reports = paths.map((path) => {
     try {
       return JSON.parse(readFileSync(path, "utf8"));
@@ -611,6 +591,22 @@ const gate = (paths) => {
   const now = Date.now();
   for (const [index, report] of reports.entries()) {
     const checks = judgeReport(report, now);
+    if (kinds[index] === "slice") {
+      // Read again from the instance the operator names, never from the origin a report claims.
+      if (report?.observations?.origin === base) {
+        let api = null;
+        try {
+          api = openSession(base);
+          checks.push(...(await confirmSlice(report, api)));
+        } catch {
+          checks.push({ id: "slice.live-log", outcome: "fail", detail: "no session" });
+        } finally {
+          api?.[Symbol.dispose]();
+        }
+      } else {
+        checks.push({ id: "slice.live-origin", outcome: "fail", detail: "another origin" });
+      }
+    }
     const ok = gatePasses(checks);
     passed &&= ok;
     const kind = kinds[index] === "binding" || kinds[index] === "slice" ? kinds[index] : "unknown";
@@ -636,7 +632,7 @@ try {
       await slice(argv);
       break;
     case "gate":
-      gate(argv);
+      await gate(argv);
       break;
     default:
       throw usage();
@@ -646,7 +642,7 @@ try {
   const failure =
     error instanceof HarnessFailure
       ? error
-      : error instanceof RefusedDestination
+      : error instanceof RefusedDestination || error instanceof LiveReadFailure
         ? new HarnessFailure(error.message)
         : new HarnessFailure(
             `unexpected failure (${error instanceof Error ? error.name : "unknown"})`,

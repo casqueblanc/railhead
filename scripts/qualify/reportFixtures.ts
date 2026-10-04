@@ -134,6 +134,8 @@ export const ORIGIN = "https://railhead.mashin.workers.dev";
 export const REPO = "acme/upload-app";
 export const CLAIMS = ["clm_aaaaaa", "clm_bbbbbb", "clm_cccccc"];
 export const AGENTS = ["agt_atlas1", "agt_birch1", "agt_cedar1"];
+/** The history the slice log was read under. */
+export const HISTORY = "hist_board1";
 
 /** One event as the board's `readEvents` returns it. */
 export function event(seq: number, type: string, data: Record<string, unknown>) {
@@ -194,6 +196,7 @@ export function liveSlice(): SliceObservations {
     repo: REPO,
     events: sliceLog(),
     eventCount: 20,
+    history: HISTORY,
     logTokens: 0,
     clones: CLAIMS.map((claim, index) => ({
       originUrl: `${ORIGIN}/git/${REPO}/claims/${claim}.git`,

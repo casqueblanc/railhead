@@ -30,21 +30,25 @@ const SHA = /^[0-9a-f]{40}$/;
 const NOT_LIVE_HOST =
   /^(?:localhost|.*\.localhost|.*\.invalid|.*\.test|.*\.example|.*\.local|\[.*\]|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+|0\.\d+\.\d+\.\d+)$/;
 
-function check(id: string, pass: boolean, detail: string): Check {
+/** A check with `pass` turned into its outcome. */
+export function check(id: string, pass: boolean, detail: string): Check {
   return { id, outcome: pass ? "pass" : "fail", detail };
 }
 
-function record(value: unknown): Record<string, unknown> | null {
+/** `value` as a plain object, or `null`. */
+export function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value))
     : null;
 }
 
-function text(value: unknown): string | null {
+/** `value` when it is a string, or `null`. */
+export function text(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
-function sha(value: unknown): string | null {
+/** `value` when it is a full commit id, or `null`. */
+export function sha(value: unknown): string | null {
   return typeof value === "string" && SHA.test(value) ? value : null;
 }
 
@@ -434,6 +438,8 @@ export interface SliceObservations {
   events: unknown[];
   /** How many events the whole log held. */
   eventCount: number;
+  /** The log's history when it was read; a reset of the repository starts a new one. */
+  history: string;
   /** How many events of the whole log held an Artifacts token. */
   logTokens: number;
   clones: CloneObservation[];
@@ -629,6 +635,16 @@ export function claimOfRemote(origin: string, repo: string, url: string): string
   return ID_FIELD.claim.test(claim) ? claim : null;
 }
 
+/** The landed batches of `obs`'s log that include a claim one of its clones holds. */
+export function sliceBatches(obs: SliceObservations): LandedBatch[] {
+  const claims = new Set(
+    obs.clones.map((clone) => claimOfRemote(obs.origin, obs.repo, clone.originUrl)),
+  );
+  return landedBatches(obs.events).filter((batch) =>
+    batch.claims.some((claim) => claims.has(claim)),
+  );
+}
+
 /** Judges a slice run on a deployed instance. */
 export function judgeSlice(obs: SliceObservations): Check[] {
   const checks: Check[] = [];
@@ -671,10 +687,7 @@ export function judgeSlice(obs: SliceObservations): Check[] {
     ),
   );
 
-  const batches = landedBatches(obs.events).filter((batch) =>
-    batch.claims.some((claim) => distinctClaims.has(claim)),
-  );
-  const batch = batches.at(-1);
+  const batch = sliceBatches(obs).at(-1);
   checks.push(
     check(
       "slice.batch",
@@ -984,8 +997,10 @@ function count(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-function sliceObservations(value: unknown): SliceObservations | null {
+/** A slice report's observations, or `null` when one is missing or malformed. */
+export function sliceObservations(value: unknown): SliceObservations | null {
   const obs = record(value);
+  const history = text(obs?.history);
   const origin = text(obs?.origin);
   const repo = text(obs?.repo);
   const events = Array.isArray(obs?.events) ? obs.events : null;
@@ -1013,6 +1028,8 @@ function sliceObservations(value: unknown): SliceObservations | null {
     repo === null ||
     events === null ||
     eventCount === null ||
+    history === null ||
+    history === "" ||
     logTokens === null ||
     pushToMainStatus == null ||
     otherClaimStatus == null ||
@@ -1028,6 +1045,7 @@ function sliceObservations(value: unknown): SliceObservations | null {
     repo,
     events,
     eventCount,
+    history,
     logTokens,
     clones: clones.flatMap((clone) => (clone === null ? [] : [clone])),
     remoteMain: sha(obs?.remoteMain),

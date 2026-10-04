@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { judgeReport } from "./qualify/evidence.ts";
-import { liveBindingReport, liveSliceReport } from "./qualify/reportFixtures.ts";
+import { ORIGIN, liveBindingReport, liveSliceReport } from "./qualify/reportFixtures.ts";
 
 const script = join(import.meta.dirname, "qualify-slice.mjs");
 
@@ -77,6 +77,16 @@ function networkRecorder(log: string): string {
     ].join("\n"),
   );
   return path;
+}
+
+/**
+ * Runs `gate` on `reports` against `origin`, with the network recorder in place so no test reaches
+ * the instance.
+ */
+function gateRun(reports: string[], log = join(scratch, "gate-unused.log"), origin = ORIGIN) {
+  return run(["gate", "--origin", origin, ...reports], {
+    execArgv: ["--import", networkRecorder(log)],
+  });
 }
 
 /** A Git repository in `dir` with `config` set, standing for an agent's claim clone. */
@@ -261,12 +271,37 @@ describe("qualify-slice.mjs", () => {
     assert.equal(existsSync(network), false);
   });
 
-  test("gate passes a complete live-collected binding report and slice report", async () => {
+  test("gate reads the slice again from the named instance and fails when it cannot", async () => {
     const binding = written("binding.json", liveBindingReport());
     const slice = written("slice.json", liveSliceReport());
-    const passed = await run(["gate", binding, slice]);
-    assert.equal(passed.code, 0, passed.stdout);
-    assert.match(passed.stdout, /PASS binding .*\nPASS slice .*\nthe live gate passed/);
+    const network = join(scratch, "gate-network.log");
+    const ran = await gateRun([binding, slice], network);
+    assert.equal(ran.code, 1, ran.stdout);
+    assert.match(
+      ran.stdout,
+      /PASS binding .*\nFAIL slice .*\n  FAIL slice\.live-log\nthe live gate did not pass/,
+    );
+    assert.equal(
+      readFileSync(network, "utf8"),
+      "websocket wss://railhead.mashin.workers.dev/api\n",
+    );
+  });
+
+  test("gate refuses a missing or local origin and never reads a report's own origin", async () => {
+    const binding = written("binding-o.json", liveBindingReport());
+    const slice = written("slice-o.json", liveSliceReport());
+    const network = join(scratch, "origin-network.log");
+    const missing = await run(["gate", binding, slice]);
+    assert.equal(missing.code, 2);
+    assert.match(missing.stderr, /--origin is required/);
+    const local = await run(["gate", "--origin", "https://localhost:8787", binding, slice]);
+    assert.equal(local.code, 2);
+    assert.match(local.stderr, /--origin is not a deployed instance: not a public host/);
+
+    const other = await gateRun([binding, slice], network, "https://railhead.dev");
+    assert.equal(other.code, 1);
+    assert.match(other.stdout, /FAIL slice .*\n  FAIL slice\.live-origin/);
+    assert.equal(existsSync(network), false);
   });
 
   test("gate fails reports that state passing checks without live observations", async () => {
@@ -278,7 +313,7 @@ describe("qualify-slice.mjs", () => {
       kind: "slice",
       checks: [{ id: "slice.x", outcome: "pass", detail: "" }],
     });
-    const ran = await run(["gate", binding, slice]);
+    const ran = await gateRun([binding, slice]);
     assert.equal(ran.code, 1);
     assert.match(ran.stdout, /FAIL binding .*\n  FAIL binding\.shape\n  FAIL report\.complete/);
     assert.match(ran.stdout, /FAIL slice .*\n  FAIL slice\.shape/);
@@ -289,8 +324,7 @@ describe("qualify-slice.mjs", () => {
     const slice = written("slice-ok.json", liveSliceReport());
     const partial = liveBindingReport();
     const { lostResponse: _lost, ...withoutLost } = partial.observations;
-    const incomplete = await run([
-      "gate",
+    const incomplete = await gateRun([
       written("binding-partial.json", { ...partial, observations: withoutLost }),
       slice,
     ]);
@@ -302,19 +336,19 @@ describe("qualify-slice.mjs", () => {
       readFileSync(written("binding-edited.json", liveBindingReport()), "utf8"),
     );
     edited.observations.restActive = 31;
-    const editedRun = await run(["gate", raw("binding-edited-2.json", edited), slice]);
+    const editedRun = await gateRun([raw("binding-edited-2.json", edited), slice]);
     assert.equal(editedRun.code, 1);
     assert.match(editedRun.stdout, /  FAIL listing\.rest-active\n  FAIL report\.recorded/);
 
     const binding = written("binding-ok.json", liveBindingReport());
-    const onlyBinding = await run(["gate", binding]);
+    const onlyBinding = await gateRun([binding]);
     assert.equal(onlyBinding.code, 1);
     assert.match(onlyBinding.stdout, /needs exactly one binding report and one slice report/);
-    const doubled = await run(["gate", binding, binding, slice]);
+    const doubled = await gateRun([binding, binding, slice]);
     assert.equal(doubled.code, 1);
     assert.match(doubled.stdout, /needs exactly one binding report and one slice report/);
 
-    const unreadable = await run(["gate", binding, join(scratch, "missing.json")]);
+    const unreadable = await gateRun([binding, join(scratch, "missing.json")]);
     assert.equal(unreadable.code, 2);
     assert.match(unreadable.stderr, /not a readable JSON report/);
   });
