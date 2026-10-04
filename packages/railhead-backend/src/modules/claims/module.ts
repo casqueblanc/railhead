@@ -579,6 +579,27 @@ export function createClaims(
     }
   };
 
+  /**
+   * The stored claim while it is held. An allocating claim has no fork yet, a merged or expired one
+   * has no owner, and a working claim whose lease lapsed is no longer held, so each reads as `null`.
+   */
+  const heldClaim = (claimId: ClaimId): ClaimRow | null => {
+    const row = claimById(context.storage.sql, claimId);
+    if (row === null) return null;
+    switch (row.state) {
+      case "working":
+        return heldWorking(row, clock()) ? row : null;
+      case "ready":
+        return row;
+      case "allocating":
+      case "merged":
+      case "expired":
+        return null;
+      default:
+        return row.state satisfies never;
+    }
+  };
+
   const current = (row: ClaimRow): ClaimRow | null => {
     const now = activeClaimOf(context.storage.sql, row.agentId);
     return now?.claimId === row.claimId ? now : null;
@@ -703,22 +724,14 @@ export function createClaims(
     },
 
     currentGeneration(claimId) {
-      // Only an opened claim that is still held has a current generation. An allocating claim has
-      // no fork yet, and a merged or expired one has no owner, so each reads as unknown.
-      const row = claimById(context.storage.sql, claimId);
-      if (row === null) return null;
-      switch (row.state) {
-        case "working":
-          return heldWorking(row, clock()) ? row.generation : null;
-        case "ready":
-          return row.generation;
-        case "allocating":
-        case "merged":
-        case "expired":
-          return null;
-        default:
-          return row.state satisfies never;
-      }
+      return heldClaim(claimId)?.generation ?? null;
+    },
+
+    holder(claimId) {
+      const row = heldClaim(claimId);
+      return row === null
+        ? null
+        : { agentId: row.agentId, claimId: row.claimId, generation: row.generation };
     },
 
     workingGeneration(claimId) {

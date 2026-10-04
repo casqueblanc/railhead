@@ -52,6 +52,7 @@ export const unavailableClaims: ClaimsPort = {
   workingGeneration: () => null,
   workingEpisode: () => null,
   readyPin: () => null,
+  holder: () => null,
   reopen: () => {
     throw new UnavailableError("claims");
   },
@@ -74,10 +75,14 @@ export const unavailableInbox: InboxPort = {
 
 /**
  * Decisions while its module is missing: no requirement list, so nothing is authorized, and no
- * dependency is moved or relied on, so its caller's transaction rolls back.
+ * question is asked, and no dependency is moved or relied on, so its caller's transaction rolls back.
  */
 export const unavailableDecisions: DecisionsPort = {
   ask: refuse("decisions"),
+  askSystem: () => unavailable("decisions"),
+  withdraw: () => {
+    throw new UnavailableError("decisions");
+  },
   question: refuse("decisions"),
   record: refuse("decisions"),
   requirements: refuse("decisions"),
@@ -126,6 +131,9 @@ export const unavailableTrain: TrainPort = {
   recordCheck: refuse("train"),
   attemptOutcome: () => null,
   holdsLiveEntry: () => null,
+  answered: () => {
+    throw new UnavailableError("train");
+  },
   pinView: refuse("train"),
   armWake: async () => false,
   release: () => false,
