@@ -7,7 +7,10 @@
 //! decision or a rework request stops it unacknowledged: its edits are scripted, so it cannot
 //! follow a decision, and acknowledging one would claim it had. An `rh ready` whose answer was lost
 //! may have pinned the commit, so the agent reads its claim before repeating it. A ready claim that does not land within the
-//! land timeout stops the agent: it still holds the claim, so it cannot take other work.
+//! land timeout stops the agent: it still holds the claim, so it cannot take other work. While
+//! it waits, it reads its pin with `rh pin` after each poll that finds the claim still ready, and
+//! reports where the train holds it whenever that changes. The pin only describes the wait: a
+//! landing still needs the claim read as `merged`, and a failed `rh pin` stops nothing.
 //!
 //! A task lands only when the agent reads its claim as `merged`. A ready claim that leaves the
 //! agent's status without that evidence may have merged or expired: today's agent wire does not say
@@ -38,13 +41,13 @@ use std::time::{Duration, Instant};
 
 use railhead_protocol::{
     AgentErrorCode, ClaimState, ClaimView, IdKind, InboxDigest, InboxEntry, InboxItem, InboxResult,
-    is_commit_sha, is_id,
+    PinResult, PinView, is_commit_sha, is_id,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::confined;
-use crate::events::{AgentState, Emitter, Event, Step, TaskClass, millis};
+use crate::events::{AgentState, Emitter, Event, Step, TaskClass, TrainState, millis};
 use crate::plan::{ApplyError, Edit, scaffold};
 use crate::process::{self, AgentEnv, Envelope, Runner};
 use crate::progress::{Progress, ProgressFile, RunKey};
@@ -179,6 +182,51 @@ fn judge(state: Option<ClaimState>) -> Polled {
         // The agent wire does not yet say which (casqueblanc/railhead#237 adds the closed reason);
         // without positive evidence it is not a landing, and not a failure either.
         None => Polled::Unverified,
+    }
+}
+
+/// What a waiting agent last read of its pin.
+#[derive(Debug, Default)]
+struct PinWatch {
+    /// The state last reported, `None` before the first read.
+    last: Option<TrainState>,
+    /// No read before this: the backend asked for a delay.
+    not_before: Option<Instant>,
+    /// A refusal that repeating cannot fix ended the reads for this wait.
+    stopped: bool,
+}
+
+impl PinWatch {
+    /// Whether to read the pin at `now`.
+    fn due(&self, now: Instant) -> bool {
+        !self.stopped && self.not_before.is_none_or(|at| now >= at)
+    }
+
+    /// Takes in what one `rh pin` read at `now`, and returns the state to report when it changed.
+    fn read(
+        &mut self,
+        result: Result<Option<&PinView>, &process::Error>,
+        claim_id: &str,
+        now: Instant,
+    ) -> Option<TrainState> {
+        let state = match result {
+            Ok(pin) => {
+                self.not_before = None;
+                TrainState::of(pin, claim_id)
+            }
+            Err(error) => {
+                match error.retry() {
+                    Some(after) => self.not_before = now.checked_add(after),
+                    None => self.stopped = true,
+                }
+                TrainState::Unreadable { code: error.code() }
+            }
+        };
+        if self.last.as_ref() == Some(&state) {
+            return None;
+        }
+        self.last = Some(state.clone());
+        Some(state)
     }
 }
 
@@ -844,6 +892,7 @@ impl Run<'_> {
         let bounds = &self.shared.bounds;
         let since = ready_at.unwrap_or_else(Instant::now);
         let mut failures = 0;
+        let mut pin = PinWatch::default();
         loop {
             tokio::time::sleep(bounds.poll).await;
             if since.elapsed() > bounds.land_timeout {
@@ -898,11 +947,33 @@ impl Run<'_> {
                     return Ok(Waited::Unverified);
                 }
                 Polled::Redo => return Ok(Waited::Redo),
-                Polled::Pending => {}
+                Polled::Pending => self.read_pin(held, &mut pin).await,
                 Polled::Closed(code) => {
                     return Err(self.fail(Step::Status, code.to_owned()).await);
                 }
             }
+        }
+    }
+
+    /// Reads the held claim's pin with `rh pin`, once, and reports where the train holds it when
+    /// that changed since the last read.
+    async fn read_pin(&self, held: &Held, watch: &mut PinWatch) {
+        if !watch.due(Instant::now()) {
+            return;
+        }
+        let read: Result<Envelope<PinResult>, _> = self
+            .shared
+            .runner
+            .rh(&self.agent.env, &held.dir, &["pin"])
+            .await;
+        let result = read.as_ref().map(|envelope| envelope.data.pin.as_ref());
+        if let Some(train) = watch.read(result, &held.claim_id, Instant::now()) {
+            self.emit(Event::PinState {
+                agent: self.name(),
+                claim_id: held.claim_id.clone(),
+                train,
+            })
+            .await;
         }
     }
 
@@ -1338,6 +1409,103 @@ mod tests {
             needs_operator(&entry(serde_json::json!({"kind": "conflict",
                 "otherClaimId": "clm_bcdefg", "path": "swarm/contested.txt"}))?),
             None
+        );
+        Ok(())
+    }
+
+    fn pin_view(state: &serde_json::Value) -> anyhow::Result<PinView> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "claimId": "clm_abcdef", "generation": 1, "commit": "a".repeat(40),
+            "nextCommit": null, "state": state
+        }))?)
+    }
+
+    fn refused(code: AgentErrorCode, retryable: bool, after: Option<u64>) -> process::Error {
+        process::Error::Rejected(process::Rejection {
+            code: process::Code::Agent(code),
+            retryable,
+            retry_after_ms: after,
+            next: None,
+        })
+    }
+
+    #[test]
+    fn a_pin_is_reported_only_when_it_changes() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut watch = PinWatch::default();
+        let queued = pin_view(&serde_json::json!({"kind": "queued", "position": 2}))?;
+        let first = watch.read(Ok(Some(&queued)), "clm_abcdef", now);
+        assert_eq!(first, Some(TrainState::Queued { position: 2 }));
+        assert_eq!(watch.read(Ok(Some(&queued)), "clm_abcdef", now), None);
+        let checking = pin_view(&serde_json::json!({"kind": "batched", "batchId": 7,
+            "batch": "checking", "checkRunId": "chk_run0001"}))?;
+        assert_eq!(
+            watch.read(Ok(Some(&checking)), "clm_abcdef", now),
+            Some(TrainState::Batched {
+                batch_id: 7,
+                batch: railhead_protocol::PinBatchState::Checking,
+                check_run_id: Some("chk_run0001".to_owned()),
+            })
+        );
+        // No pin, or another claim's, is the train holding none for this one.
+        assert_eq!(
+            watch.read(Ok(None), "clm_abcdef", now),
+            Some(TrainState::Absent)
+        );
+        assert_eq!(watch.read(Ok(Some(&queued)), "clm_bcdefg", now), None);
+        assert!(watch.due(now));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_pin_read_waits_as_asked_or_stops_for_the_wait() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut watch = PinWatch::default();
+        let limited = refused(AgentErrorCode::RateLimited, true, Some(5_000));
+        assert_eq!(
+            watch.read(Err(&limited), "clm_abcdef", now),
+            Some(TrainState::Unreadable {
+                code: "rate_limited".to_owned()
+            })
+        );
+        assert!(!watch.due(now + Duration::from_millis(4_999)));
+        assert!(watch.due(now + Duration::from_secs(5)));
+        // The same failure again is no change; a read that works clears the delay.
+        assert_eq!(watch.read(Err(&limited), "clm_abcdef", now), None);
+        let landed = pin_view(&serde_json::json!({"kind": "landed"}))?;
+        assert_eq!(
+            watch.read(Ok(Some(&landed)), "clm_abcdef", now),
+            Some(TrainState::Landed)
+        );
+        assert!(watch.due(now));
+        // A refusal repeating cannot fix ends the reads for this wait.
+        let missing = refused(AgentErrorCode::Unavailable, false, None);
+        assert_eq!(
+            watch.read(Err(&missing), "clm_abcdef", now),
+            Some(TrainState::Unreadable {
+                code: "unavailable".to_owned()
+            })
+        );
+        assert!(!watch.due(now + Duration::from_secs(3600)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_run_that_breaks_the_identifier_rule_is_not_reported() -> anyhow::Result<()> {
+        let forged = pin_view(&serde_json::json!({"kind": "batched", "batchId": 7,
+            "batch": "held", "checkRunId": "chk_x\u{1b}[2J"}))?;
+        assert_eq!(
+            TrainState::of(Some(&forged), "clm_abcdef"),
+            TrainState::Batched {
+                batch_id: 7,
+                batch: railhead_protocol::PinBatchState::Held,
+                check_run_id: None,
+            }
+        );
+        let parked = pin_view(&serde_json::json!({"kind": "parked", "reason": "conflict"}))?;
+        assert_eq!(
+            serde_json::to_value(TrainState::of(Some(&parked), "clm_abcdef"))?,
+            serde_json::json!({"kind": "parked", "reason": "conflict"})
         );
         Ok(())
     }

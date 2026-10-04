@@ -5,17 +5,19 @@
 //! passed the protocol's identifier rules, commit ids, paths from the plan and error codes. Task
 //! text and backend messages are untrusted and never written.
 //!
-//! The agent wire shows an agent its own claim and inbox, not the train, so batches and parked
-//! pairs are not events here. "Landed" needs positive evidence: the agent read its claim as
-//! `merged`. A ready claim that leaves the agent's status without that evidence may have merged or
-//! expired, and today's agent wire does not say which, so it is "unverified" until
-//! casqueblanc/railhead#237 adds the closed reason: never a landing, and not a failure. "Auto-merged"
-//! needs Git's evidence: two edits of the same path landed, each written on a base that lacked the
-//! other's line, and main read back afterwards holds both.
+//! The agent wire shows an agent its own claim, its inbox and where the train holds its own pin.
+//! A waiting agent reads its pin after each poll and reports each change as a `pinState` event;
+//! the stream knows a batch only through the pins in it. "Landed" needs positive evidence: the
+//! agent read its claim as `merged`. A ready claim that leaves the agent's status without that
+//! evidence may have merged or expired, and today's agent wire does not say which, so it is
+//! "unverified" until casqueblanc/railhead#237 adds the closed reason: never a landing, and not a
+//! failure. "Auto-merged" needs Git's evidence: two edits of the same path landed, each written on
+//! a base that lacked the other's line, and main read back afterwards holds both.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use railhead_protocol::{IdKind, PinBatchState, PinLeaveReason, PinTrainState, PinView, is_id};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -104,6 +106,79 @@ pub enum Step {
     Progress,
 }
 
+/// Where the train holds a waiting agent's pin, as `rh pin` read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum TrainState {
+    /// Waiting for a batch.
+    Queued {
+        /// The place in the queue, counting from 1.
+        position: u64,
+    },
+    /// In the active batch.
+    Batched {
+        /// The batch.
+        batch_id: u64,
+        /// Where the batch stands.
+        batch: PinBatchState,
+        /// The `chk_` check run, once the train recorded one that passes the identifier rule.
+        check_run_id: Option<String>,
+    },
+    /// The train merged it. Not a landing: that needs the agent to read its claim as merged.
+    Landed,
+    /// Taken off the train; a new `rh ready` queues it again.
+    Dropped {
+        /// Why.
+        reason: PinLeaveReason,
+    },
+    /// Out of the queue until a person or a new push returns it.
+    Parked {
+        /// Why.
+        reason: PinLeaveReason,
+    },
+    /// The train holds no pin for the claim.
+    Absent,
+    /// `rh pin` failed; the agent goes on waiting on its claim's status.
+    Unreadable {
+        /// The error code `rh` reported, or the driver's own.
+        code: String,
+    },
+}
+
+impl TrainState {
+    /// The train's view of `claim_id`, from the pin `rh pin` returned.
+    #[must_use]
+    pub fn of(pin: Option<&PinView>, claim_id: &str) -> Self {
+        let Some(pin) = pin.filter(|pin| pin.claim_id == claim_id) else {
+            return Self::Absent;
+        };
+        match &pin.state {
+            PinTrainState::Queued { position } => Self::Queued {
+                position: position.get(),
+            },
+            PinTrainState::Batched {
+                batch_id,
+                batch,
+                check_run_id,
+            } => Self::Batched {
+                batch_id: batch_id.get(),
+                batch: *batch,
+                check_run_id: check_run_id
+                    .clone()
+                    .filter(|id| is_id(IdKind::CheckRun, id)),
+            },
+            PinTrainState::Landed => Self::Landed,
+            PinTrainState::Dropped { reason } => Self::Dropped { reason: *reason },
+            PinTrainState::Parked { reason } => Self::Parked { reason: *reason },
+        }
+    }
+}
+
 /// One event.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(test, derive(serde::Deserialize))]
@@ -176,6 +251,15 @@ pub enum Event {
         /// The planned round it carries, from the agent's progress record, or `None` when no
         /// record names it.
         round: Option<u32>,
+    },
+    /// Where the train holds a waiting agent's pin changed.
+    PinState {
+        /// The agent.
+        agent: String,
+        /// The claim.
+        claim_id: String,
+        /// Where the train holds it now.
+        train: TrainState,
     },
     /// A pinned commit landed: the agent read its claim as `merged`.
     Landed {
@@ -406,6 +490,7 @@ impl Tally {
             | Event::AgentState { .. }
             | Event::Claimed { .. }
             | Event::Adopted { .. }
+            | Event::PinState { .. }
             | Event::Acknowledged { .. }
             | Event::Summary(_) => return,
         };

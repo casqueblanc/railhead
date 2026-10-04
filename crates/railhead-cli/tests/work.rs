@@ -1,4 +1,4 @@
-//! `rh work`, `rh claim`, `rh ready` and `rh status` end to end.
+//! `rh work`, `rh claim`, `rh ready`, `rh release`, `rh status` and `rh pin` end to end.
 //!
 //! Each test runs the built binary against a temporary identity store, a wiremock server that
 //! answers with the A01 wire fixtures, and a real bare Git repository standing in for the claim's
@@ -1486,5 +1486,139 @@ async fn status_without_a_claim_points_at_work_and_a_revoked_agent_fails() -> an
     )?;
     assert_eq!(revoked.code, Some(1));
     assert_eq!(revoked.error_code()?, json!("identity_revoked"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pin_prints_where_the_train_holds_the_agents_pin() -> anyhow::Result<()> {
+    let world = world().await?;
+    let commit = "b".repeat(40);
+    let cases = [
+        ("a pin waiting second in the queue", "queued at position 2"),
+        (
+            "a pin in a batch being formed, before any check run",
+            "in batch 7, forming; no check run yet",
+        ),
+        (
+            "a pin in a batch being checked",
+            "in batch 7, checking; check run \"chk_run0001\"",
+        ),
+        (
+            "a pin in a passed batch moving main",
+            "in batch 7, landing; check run \"chk_run0001\"",
+        ),
+        ("a landed pin", "landed on main"),
+        (
+            "a pin parked with the claim it conflicts with",
+            "parked: it conflicts with another claim; a person or a new push returns it",
+        ),
+        (
+            "a pin dropped after its check failed",
+            "dropped: its check failed; rh ready queues it again",
+        ),
+    ];
+    for (name, line) in cases {
+        world.server.reset().await;
+        answer(&world, "GET", "/pin", fixture(&world, "pin.json", name)?).await;
+        let run = rh(&world, &world.outside(), Some("atlas"), &["pin"])?;
+        assert_eq!(run.code, Some(0), "{name}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            format!("claim \"clm_42abcd\" gen 1, commit \"{commit}\"\n{line}\n"),
+            "{name}"
+        );
+        assert_eq!(routes(&world).await, [format!("GET {PREFIX}/pin")]);
+    }
+
+    // JSON carries the pin as the backend sent it, and the inbox the response carried.
+    world.server.reset().await;
+    answer(
+        &world,
+        "GET",
+        "/pin",
+        fixture(
+            &world,
+            "pin.json",
+            "a pin in a batch held for a person, with a newer commit waiting",
+        )?,
+    )
+    .await;
+    let held = rh(&world, &world.outside(), Some("atlas"), &["--json", "pin"])?;
+    let envelope = held.json()?;
+    assert_eq!(
+        envelope.pointer("/data/pin"),
+        Some(
+            &json!({"claimId": "clm_42abcd", "generation": 1, "commit": commit,
+            "nextCommit": "c".repeat(40), "state": {"kind": "batched", "batchId": 7,
+            "batch": "held", "checkRunId": "chk_run0001"}})
+        )
+    );
+    assert_eq!(envelope.pointer("/inbox/pending"), Some(&json!(1)));
+    assert_eq!(envelope.pointer("/next"), Some(&json!("rh sync")));
+
+    // No ready claim: nothing on the train, in text and JSON.
+    world.server.reset().await;
+    answer(
+        &world,
+        "GET",
+        "/pin",
+        fixture(&world, "pin.json", "an agent without a ready claim")?,
+    )
+    .await;
+    let none = rh(&world, &world.outside(), Some("atlas"), &["pin"])?;
+    assert_eq!(
+        (none.code, none.stdout.as_str()),
+        (Some(0), "no pin on the train\n")
+    );
+    let none = rh(&world, &world.outside(), Some("atlas"), &["--json", "pin"])?;
+    assert_eq!(none.json()?.pointer("/data"), Some(&json!({"pin": null})));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pin_reports_a_missing_train_and_sends_nothing_without_a_session() -> anyhow::Result<()> {
+    let world = world().await?;
+    answer(
+        &world,
+        "GET",
+        "/pin",
+        fixture(&world, "pin.json", "the train module is not installed")?,
+    )
+    .await;
+    let missing = rh(&world, &world.outside(), Some("atlas"), &["--json", "pin"])?;
+    assert_eq!(missing.code, Some(1));
+    assert_eq!(missing.error_code()?, json!("unavailable"));
+    assert_eq!(
+        missing.json()?.pointer("/error/retryable"),
+        Some(&json!(false))
+    );
+
+    // A body the protocol does not know is refused rather than printed.
+    world.server.reset().await;
+    answer(
+        &world,
+        "GET",
+        "/pin",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": true,
+            "data": {"pin": {"claimId": "clm_42abcd", "generation": 1, "commit": "b".repeat(40),
+                "nextCommit": null, "state": {"kind": "teleported"}}},
+            "inbox": null, "next": null})),
+    )
+    .await;
+    let malformed = rh(&world, &world.outside(), Some("atlas"), &["--json", "pin"])?;
+    assert_eq!(malformed.error_code()?, json!("malformed_response"));
+
+    // An argument `rh pin` does not take, and an agent without a session, send nothing.
+    world.server.reset().await;
+    let extra = rh(
+        &world,
+        &world.outside(),
+        Some("atlas"),
+        &["--json", "pin", "clm_42abcd"],
+    )?;
+    assert_eq!(extra.error_code()?, json!("invalid_input"));
+    let sessionless = rh(&world, &world.outside(), Some("boreas"), &["--json", "pin"])?;
+    assert_eq!(sessionless.error_code()?, json!("no_session"));
+    assert_eq!(requests(&world).await, 0);
     Ok(())
 }

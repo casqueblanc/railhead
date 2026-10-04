@@ -8,7 +8,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::events::{AgentState, Event, Step as FailedStep, StopReason, Tally, TaskClass};
+use railhead_protocol::{PinBatchState, PinLeaveReason};
+
+use crate::events::{
+    AgentState, Event, Step as FailedStep, StopReason, Tally, TaskClass, TrainState,
+};
 
 /// Recent events kept per agent for its detail view.
 pub const RECENT_EVENTS: usize = 32;
@@ -102,6 +106,30 @@ pub struct Pin {
     pub claim_id: String,
     /// When it was pinned, or adopted from an earlier run.
     pub since: Duration,
+    /// Where the train holds it, once the agent read that.
+    pub train: Option<TrainState>,
+}
+
+/// A batch on the train and the waiting pins it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch<'a> {
+    /// The batch.
+    pub id: u64,
+    /// Where it stands, as its first pin reported it.
+    pub state: PinBatchState,
+    /// Its check run, once one is recorded.
+    pub check_run_id: Option<&'a str>,
+    /// Its pins, longest waiting first.
+    pub pins: Vec<(&'a Lane, &'a Pin)>,
+}
+
+/// The waiting pins, as the train panel shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Train<'a> {
+    /// The batches, by batch id.
+    pub batches: Vec<Batch<'a>>,
+    /// Every other pin: queued ones by position, then the rest longest waiting first.
+    pub others: Vec<(&'a Lane, &'a Pin)>,
 }
 
 /// One agent's row.
@@ -358,6 +386,51 @@ const fn step_label(step: FailedStep) -> &'static str {
     }
 }
 
+/// Where a batch stands, in a word.
+#[must_use]
+pub const fn batch_label(batch: PinBatchState) -> &'static str {
+    match batch {
+        PinBatchState::Forming => "forming",
+        PinBatchState::Checking => "checking",
+        PinBatchState::Held => "held",
+        PinBatchState::Landing => "landing",
+    }
+}
+
+/// Why the train took a pin off its queue, in a few words.
+#[must_use]
+pub const fn leave_label(reason: PinLeaveReason) -> &'static str {
+    match reason {
+        PinLeaveReason::PinChanged => "pin changed",
+        PinLeaveReason::RequirementsRefused => "requirements refused",
+        PinLeaveReason::CheckFailed => "check failed",
+        PinLeaveReason::ComposeFailed => "compose failed",
+        PinLeaveReason::RetriesExhausted => "retries exhausted",
+        PinLeaveReason::Conflict => "conflict",
+        PinLeaveReason::CheckHeld => "check held",
+    }
+}
+
+/// Where the train holds a pin, as a lane's event line says it.
+fn train_text(train: &TrainState) -> String {
+    match train {
+        TrainState::Queued { position } => format!("train: queued #{position}"),
+        TrainState::Batched {
+            batch_id,
+            batch,
+            check_run_id,
+        } => match check_run_id {
+            Some(check) => format!("train: batch {batch_id} {} {check}", batch_label(*batch)),
+            None => format!("train: batch {batch_id} {}", batch_label(*batch)),
+        },
+        TrainState::Landed => "train: merged".to_owned(),
+        TrainState::Dropped { reason } => format!("train: dropped, {}", leave_label(*reason)),
+        TrainState::Parked { reason } => format!("train: parked, {}", leave_label(*reason)),
+        TrainState::Absent => "train: no pin".to_owned(),
+        TrainState::Unreadable { code } => format!("train: unreadable, {code}"),
+    }
+}
+
 /// The agent an event is about, and how its lane describes it; `None` for run-wide events and
 /// state changes, which the lane's stage shows.
 fn describe(event: &Event) -> Option<(&str, String)> {
@@ -386,6 +459,7 @@ fn describe(event: &Event) -> Option<(&str, String)> {
             format!("pushed {} {} {path}", short(commit), class_label(*class)),
         ),
         Event::Ready { agent, commit, .. } => (agent, format!("ready {}", short(commit))),
+        Event::PinState { agent, train, .. } => (agent, train_text(train)),
         Event::Adopted {
             agent, claim_id, ..
         } => (agent, format!("adopted {claim_id}")),
@@ -543,12 +617,12 @@ impl View {
                 class,
                 ready_to_landed_ms,
             } => self.landed(agent, claim_id, *class, *ready_to_landed_ms),
-            Event::Unverified { agent, .. } => {
-                if let Some(lane) = self.lane(agent) {
-                    lane.stage = Stage::Unverified;
-                    lane.pin = None;
-                }
-            }
+            Event::PinState {
+                agent,
+                claim_id,
+                train,
+            } => self.train(agent, claim_id, train),
+            Event::Unverified { agent, .. } => self.unpin(agent, Some(Stage::Unverified)),
             Event::ConflictAutoMerged { path, claims } => {
                 let claims = claims.clone().map(|claim| printable(&claim));
                 self.conflict(path, Overlap::AutoMerged { claims });
@@ -560,9 +634,7 @@ impl View {
                 path,
                 ..
             } => {
-                if let Some(lane) = self.lane(agent) {
-                    lane.pin = None;
-                }
+                self.unpin(agent, None);
                 let overlap = Overlap::Routed {
                     agent: printable(agent),
                     claim_id: printable(claim_id),
@@ -576,13 +648,17 @@ impl View {
                 claim_id,
                 generation,
             } => self.redo(agent, claim_id, *generation),
-            Event::Stalled { agent, .. } | Event::Failed { agent, .. } => {
-                if let Some(lane) = self.lane(agent) {
-                    lane.pin = None;
-                }
-            }
+            Event::Stalled { agent, .. } | Event::Failed { agent, .. } => self.unpin(agent, None),
             Event::Summary(summary) => self.phase = Phase::Ended(summary.stopped_by),
             Event::Acknowledged { .. } => {}
+        }
+    }
+
+    /// The train no longer holds the agent's pin; `stage` is where its lane moves, if anywhere.
+    fn unpin(&mut self, agent: &str, stage: Option<Stage>) {
+        if let Some(lane) = self.lane(agent) {
+            lane.pin = None;
+            lane.stage = stage.unwrap_or(lane.stage);
         }
     }
 
@@ -610,7 +686,39 @@ impl View {
             lane.pin = Some(Pin {
                 claim_id: printable(claim_id),
                 since,
+                train: None,
             });
+        }
+    }
+
+    /// Records where the train holds the lane's pin, when the pin is still the one waiting.
+    fn train(&mut self, agent: &str, claim_id: &str, train: &TrainState) {
+        let claim_id = printable(claim_id);
+        let train = match train {
+            TrainState::Batched {
+                batch_id,
+                batch,
+                check_run_id,
+            } => TrainState::Batched {
+                batch_id: *batch_id,
+                batch: *batch,
+                check_run_id: check_run_id.as_deref().map(printable),
+            },
+            TrainState::Unreadable { code } => TrainState::Unreadable {
+                code: printable(code),
+            },
+            TrainState::Queued { .. }
+            | TrainState::Landed
+            | TrainState::Dropped { .. }
+            | TrainState::Parked { .. }
+            | TrainState::Absent => train.clone(),
+        };
+        if let Some(pin) = self
+            .lane(agent)
+            .and_then(|lane| lane.pin.as_mut())
+            .filter(|pin| pin.claim_id == claim_id)
+        {
+            pin.train = Some(train);
         }
     }
 
@@ -672,6 +780,46 @@ impl View {
             .collect();
         waiting.sort_by_key(|(lane, pin)| (pin.since, lane.name.as_str()));
         waiting
+    }
+
+    /// The waiting pins grouped as the train holds them: each batch with its pins, then the
+    /// queue, then pins the train has not placed, dropped or parked.
+    #[must_use]
+    pub fn train_panel(&self) -> Train<'_> {
+        let mut train = Train::default();
+        let mut queued = Vec::new();
+        for (lane, pin) in self.waiting() {
+            match &pin.train {
+                Some(TrainState::Batched {
+                    batch_id,
+                    batch,
+                    check_run_id,
+                }) => match train.batches.iter_mut().find(|known| known.id == *batch_id) {
+                    Some(known) => known.pins.push((lane, pin)),
+                    None => train.batches.push(Batch {
+                        id: *batch_id,
+                        state: *batch,
+                        check_run_id: check_run_id.as_deref(),
+                        pins: vec![(lane, pin)],
+                    }),
+                },
+                Some(TrainState::Queued { position }) => queued.push((*position, (lane, pin))),
+                Some(
+                    TrainState::Landed
+                    | TrainState::Dropped { .. }
+                    | TrainState::Parked { .. }
+                    | TrainState::Absent
+                    | TrainState::Unreadable { .. },
+                )
+                | None => train.others.push((lane, pin)),
+            }
+        }
+        train.batches.sort_by_key(|batch| batch.id);
+        // A stable sort keeps the longest waiting first among equal positions.
+        queued.sort_by_key(|(position, _)| *position);
+        let rest = std::mem::take(&mut train.others);
+        train.others = queued.into_iter().map(|(_, pin)| pin).chain(rest).collect();
+        train
     }
 
     /// Handles a key, and says what it asks of the run.
@@ -739,6 +887,69 @@ pub mod tests {
                 Ok((event, Duration::from_millis(elapsed)))
             })
             .collect()
+    }
+
+    fn pin_state(agent: &str, claim_id: &str, train: TrainState) -> Event {
+        Event::PinState {
+            agent: agent.to_owned(),
+            claim_id: claim_id.to_owned(),
+            train,
+        }
+    }
+
+    fn checking(batch_id: u64) -> TrainState {
+        TrainState::Batched {
+            batch_id,
+            batch: PinBatchState::Checking,
+            check_run_id: Some(format!("chk_wave{batch_id:04}")),
+        }
+    }
+
+    /// Six agents waiting on the train: two in batch 3, two queued out of order, one parked and
+    /// one whose pin was not read yet.
+    pub fn waiting_on_the_train() -> View {
+        let mut view = View::new();
+        view.apply(
+            &Event::RunStarted {
+                seed: 211,
+                agents: 6,
+                rounds: 1,
+                repository: "casqueblanc/demo".to_owned(),
+            },
+            at(0),
+        );
+        for index in 0..6_u64 {
+            let agent = crate::agent_name(u32::try_from(index).unwrap_or(0));
+            view.apply(
+                &Event::Ready {
+                    agent: agent.clone(),
+                    claim_id: format!("clm_swarm{index:04}"),
+                    commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                },
+                at(100 * (index + 1)),
+            );
+            view.apply(&state(&agent, AgentState::Waiting), at(100 * (index + 1)));
+        }
+        let trains = [
+            ("swarm-00", checking(3)),
+            ("swarm-01", checking(3)),
+            ("swarm-02", TrainState::Queued { position: 2 }),
+            ("swarm-03", TrainState::Queued { position: 1 }),
+            (
+                "swarm-04",
+                TrainState::Parked {
+                    reason: PinLeaveReason::Conflict,
+                },
+            ),
+        ];
+        for (index, (agent, train)) in trains.into_iter().enumerate() {
+            view.apply(
+                &pin_state(agent, &format!("clm_swarm{index:04}"), train),
+                at(900),
+            );
+        }
+        view.tick(at(2000));
+        view
     }
 
     fn state(agent: &str, state: AgentState) -> Event {
@@ -837,6 +1048,115 @@ pub mod tests {
         assert_eq!(view.waiting().len(), 0);
         // One landing in the first 10 seconds.
         assert_eq!(view.landings_per_minute(), 60);
+    }
+
+    #[test]
+    fn the_train_panel_groups_pins_by_batch_then_queue_position() {
+        let view = waiting_on_the_train();
+        let train = view.train_panel();
+        let batches: Vec<_> = train
+            .batches
+            .iter()
+            .map(|batch| {
+                let agents: Vec<&str> = batch
+                    .pins
+                    .iter()
+                    .map(|(lane, _)| lane.name.as_str())
+                    .collect();
+                (batch.id, batch.state, batch.check_run_id, agents)
+            })
+            .collect();
+        assert_eq!(
+            batches,
+            [(
+                3,
+                PinBatchState::Checking,
+                Some("chk_wave0003"),
+                vec!["swarm-00", "swarm-01"]
+            )]
+        );
+        let others: Vec<&str> = train
+            .others
+            .iter()
+            .map(|(lane, _)| lane.name.as_str())
+            .collect();
+        assert_eq!(others, ["swarm-03", "swarm-02", "swarm-04", "swarm-05"]);
+        let texts: Vec<_> = view
+            .lanes
+            .iter()
+            .filter_map(|lane| lane.last().map(|entry| entry.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "train: batch 3 checking chk_wave0003",
+                "train: batch 3 checking chk_wave0003",
+                "train: queued #2",
+                "train: queued #1",
+                "train: parked, conflict",
+                "ready 0123456",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pin_state_applies_only_to_the_pin_still_waiting() {
+        let mut view = waiting_on_the_train();
+        // Another claim's pin, or one read after the claim landed, changes no lane.
+        view.apply(
+            &pin_state("swarm-05", "clm_swarm0099", checking(4)),
+            at(2100),
+        );
+        view.apply(
+            &Event::Landed {
+                agent: "swarm-00".to_owned(),
+                claim_id: "clm_swarm0000".to_owned(),
+                class: TaskClass::Disjoint,
+                ready_to_landed_ms: Some(2000),
+            },
+            at(2100),
+        );
+        view.apply(
+            &pin_state("swarm-00", "clm_swarm0000", checking(3)),
+            at(2200),
+        );
+        let train = view.train_panel();
+        let batched: Vec<&str> = train
+            .batches
+            .iter()
+            .flat_map(|batch| batch.pins.iter().map(|(lane, _)| lane.name.as_str()))
+            .collect();
+        assert_eq!(batched, ["swarm-01"]);
+        assert_eq!(train.others.len(), 4);
+        // An empty train has neither batches nor pins.
+        assert_eq!(View::new().train_panel(), Train::default());
+    }
+
+    #[test]
+    fn an_unreadable_pin_and_its_code_reach_the_screen_inert() {
+        let mut view = waiting_on_the_train();
+        view.apply(
+            &pin_state(
+                "swarm-05",
+                "clm_swarm0005",
+                TrainState::Unreadable {
+                    code: "unavailable\u{1b}[2J".to_owned(),
+                },
+            ),
+            at(2100),
+        );
+        let lane = view.lanes.iter().find(|lane| lane.name == "swarm-05");
+        assert_eq!(
+            lane.and_then(Lane::last).map(|entry| entry.text.as_str()),
+            Some("train: unreadable, unavailable\u{fffd}[2J")
+        );
+        assert_eq!(
+            lane.and_then(|lane| lane.pin.as_ref())
+                .and_then(|pin| pin.train.clone()),
+            Some(TrainState::Unreadable {
+                code: "unavailable\u{fffd}[2J".to_owned()
+            })
+        );
     }
 
     #[test]
