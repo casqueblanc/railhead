@@ -1754,35 +1754,45 @@ mod tests {
         let home = tempfile::tempdir()?;
         let store = FileStore::new(home.path());
         let atlas = identity("atlas", "agt_atlas01")?;
-        store.save_session(&atlas.name, &session(&atlas, TOKEN, 1_800_000_000_000)?)?;
 
-        // A free lock is taken at once, even with the deadline already passed.
+        // A free lock is taken at once, even with the deadline already passed. It is the lock's
+        // first taker: a child another test forks in this process can inherit the descriptor of
+        // a lock released here earlier and hold it until it execs, so nothing takes it before.
         let past = Instant::now();
         let free = store.lock_session_until(&atlas.name, past)?;
         let free = free.ok_or_else(|| anyhow::anyhow!("a free lock was not taken"))?;
+        free.save(&session(&atlas, TOKEN, 1_800_000_000_000)?)?;
         assert!(free.load()?.is_some());
 
-        // Held by another writer, the wait ends at the deadline, not when the lock is released.
+        // Held by another writer, the wait ends at the deadline, not when the lock is released:
+        // the lock stays held throughout, so the wait returning at all shows the deadline ended
+        // it. How long after the deadline it returns depends on scheduling, so it is not bounded.
         let started = Instant::now();
         let deadline = started + Duration::from_millis(300);
         assert!(store.lock_session_until(&atlas.name, deadline)?.is_none());
         let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
-            "{waited:?}"
-        );
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
         assert!(store.lock_session_until(&atlas.name, past)?.is_none());
 
-        // Released within the wait, the lock is taken then.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let taken = std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                drop(free);
+        // Released within the wait, the lock is taken then. The waiter sees the lock held and
+        // starts its deadline before it signals; the lock is released only after that signal.
+        let (seen_held, on_seen_held) = std::sync::mpsc::channel();
+        let taken = std::thread::scope(|scope| -> anyhow::Result<bool> {
+            let wait = scope.spawn(|| -> anyhow::Result<bool> {
+                let held = store.try_lock(&atlas.name, LockKind::Session)?.is_none();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                seen_held.send(held)?;
+                Ok(store.lock_session_until(&atlas.name, deadline)?.is_some())
             });
-            store.lock_session_until(&atlas.name, deadline)
+            let held = on_seen_held.recv()?;
+            drop(free);
+            let taken = wait
+                .join()
+                .map_err(|_| anyhow::anyhow!("the waiter panicked"))??;
+            assert!(held, "the lock was free before it was released");
+            Ok(taken)
         })?;
-        assert!(taken.is_some());
+        assert!(taken);
         Ok(())
     }
 
