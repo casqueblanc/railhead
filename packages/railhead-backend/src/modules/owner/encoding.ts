@@ -1,4 +1,4 @@
-// Byte helpers shared by the owner module's enrollment and action challenges.
+// Byte helpers shared across backend modules: encodings, random tokens, digests and comparison.
 
 /** Decodes canonical base64url without padding, refusing more than `maxBytes` decoded bytes. */
 export function decodeBase64Url(
@@ -20,11 +20,14 @@ export function encodeBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
+/** Encodes `bytes` as lowercase hex, two digits per byte. */
+export function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** `count` random bytes as lowercase hex. */
 export function randomHex(count: number): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(count)), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
+  return hex(crypto.getRandomValues(new Uint8Array(count)));
 }
 
 /** `count` random bytes as base64url without padding. */

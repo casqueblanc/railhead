@@ -19,6 +19,7 @@
 
 import { isCommitSha, isId, MAX_CHECK_NAME_LENGTH, type CommitSha } from "@railhead/shared/events";
 import type { CheckDefinition } from "../contracts/train";
+import { hex } from "../modules/owner/encoding";
 
 /** Where the definition lives in the repository. */
 export const CHECK_DEFINITION_PATH = ".railhead/check.json";
@@ -112,7 +113,7 @@ export async function parseTrustedCheck(
 /** SHA-256 of `bytes`, as 64 lowercase hexadecimal characters. */
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex(digest);
 }
 
 function parseProtected(value: unknown): string[] | null {
