@@ -59,7 +59,7 @@ export const OwnerPasskeySetup = ({ enrollment, authenticator }: OwnerPasskeySet
   };
 
   return (
-    <section aria-labelledby={headingId} className="grid gap-3 border-t border-kumo-line px-4 py-3">
+    <section aria-labelledby={headingId} className="grid gap-3 px-4 py-3">
       <div className="grid gap-1">
         <Text as="h3" variant="heading">
           <span id={headingId}>Owner passkey</span>
