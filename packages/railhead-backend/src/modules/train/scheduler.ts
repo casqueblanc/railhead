@@ -229,7 +229,7 @@ import { readPinView } from "./pinView";
 export const MAX_QUEUE = 256;
 
 /** Most pins one batch composes. */
-export const MAX_BATCH = 8;
+const MAX_BATCH = 8;
 
 /** How many batches may fail for reasons outside a pin before the pin is dropped. */
 export const MAX_RETRIES = 3;
@@ -251,8 +251,8 @@ export const PORT_TIMEOUT_MS = 20_000;
 
 /**
  * How long a check attempt waits for its runner's report, from when its start is first requested,
- * before it expires. The trusted check definition carries no limit yet, so every attempt gets this
- * one.
+ * before it expires. Every attempt gets this one wait; a check's own `timeoutMs` bounds its sandbox
+ * (`checks/port.ts`), not this wait.
  */
 export const CHECK_DEADLINE_MS = 60 * 60_000;
 
@@ -281,7 +281,7 @@ export const EXHAUSTED_FAILURES = MAX_WAKE_FAILURES + 1;
 export const STARTUP_WAKE_ATTEMPTS = 5;
 
 /** The delay before the second of those attempts; each later delay doubles, about 3 seconds in all. */
-export const STARTUP_WAKE_BASE_MS = 200;
+const STARTUP_WAKE_BASE_MS = 200;
 
 /**
  * Most state transitions one call drives. Every transition that does not stop the drive settles or
@@ -328,7 +328,7 @@ export const HELD_PARK_TTL_MS = 24 * 60 * 60_000;
 export const MAX_PARKED_HELD = 16;
 
 /** Most rows a diagnostic read returns. */
-export const MAX_DIAGNOSTIC_ROWS = 64;
+const MAX_DIAGNOSTIC_ROWS = 64;
 
 const TRAIN_ACTOR: Actor = { kind: "system", id: "sys_train" };
 
