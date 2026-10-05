@@ -39,6 +39,7 @@ import {
   wakeTime,
   type FencedSandboxCalls,
 } from "../src/sandbox/sandboxObject";
+import { deferred } from "./sliceWorld";
 
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
 const HOST = `${ACCOUNT}.artifacts.cloudflare.net`;
@@ -1063,15 +1064,6 @@ function clientMembers(client: object): string[] {
 }
 
 function noop(): void {}
-
-/** A promise the test settles by hand. */
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve: () => void = noop;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
 
 /** The SDK's result for a command that ran with `scripted`'s outcome. */
 function execResult(command: string, scripted: Scripted): ExecResult {

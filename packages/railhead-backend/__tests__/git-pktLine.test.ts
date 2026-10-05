@@ -10,6 +10,7 @@ import {
   type HeadParse,
   type ReceivePackHead,
 } from "../src/git/pktLine";
+import { pkt } from "./sliceWorld";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -21,11 +22,6 @@ const ZERO = "0".repeat(40);
 const CAPS = "report-status side-band-64k agent=git/2.47.0";
 const FLUSH = "0000";
 const PACK = "PACK\u0000\u0000\u0000\u0002not inspected";
-
-/** One pkt-line holding `payload`, written by hand so the tests do not reuse the subject's encoder. */
-function pkt(payload: string): string {
-  return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
-}
 
 function bytes(text: string): Uint8Array {
   return encoder.encode(text);

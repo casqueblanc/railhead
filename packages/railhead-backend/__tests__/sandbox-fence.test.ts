@@ -15,6 +15,7 @@ import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import { readBoundedExec } from "../src/sandbox/output";
 import { CANDIDATE_REF_PREFIX, type SandboxGrant, type SandboxPolicy } from "../src/sandbox/policy";
 import { wakeTime } from "../src/sandbox/sandboxObject";
+import { deferred } from "./sliceWorld";
 
 const POLICY: SandboxPolicy = {
   host: "acct.artifacts.cloudflare.net",
@@ -31,15 +32,6 @@ const DEADLINE = START + 60_000;
 const SETTLE_MS = 60;
 
 function noop(): void {}
-
-/** A promise the test settles by hand. */
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve: () => void = noop;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
 
 /**
  * A container that, like the SDK's, starts on any command and stops on destroy. Each operation can
