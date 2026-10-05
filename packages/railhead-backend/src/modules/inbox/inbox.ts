@@ -50,7 +50,7 @@ import type { EventTransaction } from "../../repo/eventLog";
 import { migrate } from "../../repo/storage";
 
 /** The migration owner name of the inbox's tables. */
-export const INBOX_OWNER = "inbox";
+const INBOX_OWNER = "inbox";
 
 /** Released schema steps of the inbox. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [

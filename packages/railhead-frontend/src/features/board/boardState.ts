@@ -375,7 +375,7 @@ export const foldEvents = (state: BoardState, events: Iterable<RailheadEvent>): 
 };
 
 /** The latest recorded version of a decision, or `undefined` for an unknown decision. */
-export const currentDecisionVersion = (
+const currentDecisionVersion = (
   state: BoardState,
   decisionId: DecisionId,
 ): DecisionVersionState | undefined => own(state.decisions, decisionId)?.versions.at(-1);
