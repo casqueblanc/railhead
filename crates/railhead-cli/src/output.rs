@@ -67,8 +67,6 @@ pub enum LocalCode {
     Unreachable,
     /// The backend's answer was not a valid response.
     MalformedResponse,
-    /// The command exists but is not built yet.
-    CommandUnavailable,
     /// Output could not be written.
     Output,
     /// The agent has no session token.
@@ -342,6 +340,16 @@ pub fn quoted(text: &str) -> String {
     inert(&escaped).into_owned()
 }
 
+/// `bytes` in lowercase hex, two digits per byte.
+#[must_use]
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -563,6 +571,12 @@ mod tests {
             out.credential(&[("username", "a")]),
             Err(CredentialError::Io(io::ErrorKind::BrokenPipe))
         );
+    }
+
+    #[test]
+    fn hex_keeps_leading_zeros() {
+        assert_eq!(hex(&[0x00, 0x0a, 0xff]), "000aff");
+        assert_eq!(hex(&[]), "");
     }
 
     #[test]

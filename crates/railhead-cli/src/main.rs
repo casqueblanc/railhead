@@ -26,7 +26,6 @@ mod commands {
 }
 
 use std::ffi::OsString;
-use std::fmt;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -93,51 +92,6 @@ impl Cli {
     }
 }
 
-/// A command, by the name `rh` gives it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandName {
-    /// `rh join`.
-    Join,
-    /// `rh credential`.
-    Credential,
-    /// `rh work`.
-    Work,
-    /// `rh claim`.
-    Claim,
-    /// `rh ready`.
-    Ready,
-    /// `rh release`.
-    Release,
-    /// `rh pin`.
-    Pin,
-    /// `rh status`.
-    Status,
-    /// `rh sync`.
-    Sync,
-    /// `rh ack`.
-    Ack,
-    /// `rh ask`.
-    Ask,
-}
-
-impl fmt::Display for CommandName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Join => "join",
-            Self::Credential => "credential",
-            Self::Work => "work",
-            Self::Claim => "claim",
-            Self::Ready => "ready",
-            Self::Release => "release",
-            Self::Pin => "pin",
-            Self::Status => "status",
-            Self::Sync => "sync",
-            Self::Ack => "ack",
-            Self::Ask => "ask",
-        })
-    }
-}
-
 /// Every way a command fails. No variant carries a token, a key or response text other than the
 /// backend's own error message: text mode renders it inert, and JSON mode carries it escaped and
 /// whole, bounded by the response limit, for the agent to treat as untrusted.
@@ -155,9 +109,6 @@ pub enum Error {
     /// A credential could not be printed for Git.
     #[error(transparent)]
     Credential(#[from] output::CredentialError),
-    /// The command is part of `rh` but not built yet.
-    #[error("rh {0} is not available in this build yet")]
-    Unavailable(CommandName),
     /// The working directory could not be read.
     #[error("reading the working directory: {0}")]
     WorkingDirectory(#[source] io::Error),
@@ -235,7 +186,6 @@ impl Error {
                 },
             },
             Self::Credential(_) | Self::Output(_) => local(LocalCode::Output, false, None),
-            Self::Unavailable(_) => local(LocalCode::CommandUnavailable, false, None),
             Self::WorkingDirectory(_) | Self::Runtime(_) => {
                 local(LocalCode::InvalidInput, false, None)
             }
@@ -620,13 +570,6 @@ mod tests {
         assert_eq!(rejected.code, Code::Agent(AgentErrorCode::UnackedDecision));
         assert_eq!(rejected.message, "ready: Acknowledge item 17 first.");
         assert_eq!(rejected.next, Some(NextCommand::Sync));
-
-        let unavailable = Error::Unavailable(CommandName::Work).failure();
-        assert_eq!(unavailable.code, Code::Local(LocalCode::CommandUnavailable));
-        assert_eq!(
-            unavailable.message,
-            "rh work is not available in this build yet"
-        );
         Ok(())
     }
 
