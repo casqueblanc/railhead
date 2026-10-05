@@ -38,7 +38,7 @@ export const MAX_PATH_LENGTH = 1024;
 /** `MAX_SCOPE_BYTES` in `@railhead/shared/agent-api`. */
 export const MAX_SCOPE_BYTES = 8 * 1024;
 /** The demo has exactly this many agent tasks: one per seeded agent. */
-export const ISSUE_COUNT = 3;
+const ISSUE_COUNT = 3;
 
 const SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 /** `OPTION_KEY` in `@railhead/shared/events` and `agent-api`: lowercase only. */

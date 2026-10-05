@@ -84,7 +84,7 @@ export interface FencedContainer {
  * teardown unconfirmed. Shorter than the repository's `DESTROY_TIMEOUT_MS`, so the fence answers
  * first.
  */
-export const RETIRE_SETTLE_MS = 20_000;
+const RETIRE_SETTLE_MS = 20_000;
 
 /** How many destroys the fence attempts on its own before leaving teardown to the repository. */
 export const MAX_TEARDOWN_ATTEMPTS = 8;
