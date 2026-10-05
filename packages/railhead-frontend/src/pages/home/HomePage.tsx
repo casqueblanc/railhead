@@ -53,15 +53,17 @@ export const HomePage = ({ ports }: HomePageProps) => {
         <div aria-live="polite">
           <BoardUnavailable connection={connection} onReconnect={onReconnect} />
         </div>
-        {/* Seeding the first board needs the owner's passkey, so a new instance enrolls it here. */}
-        {connection === "connected" && (
+        {/* Seeding the first board needs the owner's passkey, so a new instance enrolls it here.
+            The form stays mounted while the connection is down, so a passkey sent before the loss
+            still says its enrollment was not confirmed once the board reconnects. */}
+        <div hidden={connection !== "connected"}>
           <FeatureSlot
             entry={ownerSetupEntry}
             props={{ enrollment }}
             title="Set up this Railhead"
             unavailable="This board cannot enroll the owner's passkey yet."
           />
-        )}
+        </div>
       </div>
     );
   }

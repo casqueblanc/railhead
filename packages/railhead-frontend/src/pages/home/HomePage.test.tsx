@@ -94,6 +94,11 @@ const installOwnerSetup = () => {
   };
 };
 
+const enrolledResult: BoardResult<{ ownerId: string }> = {
+  ok: true,
+  value: { ownerId: "usr_synthowner" },
+};
+
 /** An enrollment port that records each token and completed challenge. */
 const enrollmentPort = (completed: () => Promise<BoardResult<{ ownerId: string }>>) => {
   const tokens: string[] = [];
@@ -313,14 +318,12 @@ describe("HomePage", () => {
     expect(text()).toContain(title);
     expect(container.querySelector("nav")).toBeNull();
     expect(text()).not.toContain("Not available.");
+    expect(tokenInput()?.closest("[hidden]") !== null).toBe(connection !== "connected");
   });
 
   describe("owner passkey on an instance with no board", () => {
     it("enrolls the owner with the bootstrap token and then shows no form", async () => {
-      const { port, tokens, completions } = enrollmentPort(async () => ({
-        ok: true,
-        value: { ownerId: "usr_synthowner" },
-      }));
+      const { port, tokens, completions } = enrollmentPort(async () => enrolledResult);
       installOwnerSetup();
       await render(ports({ board: { kind: "unavailable" }, enrollment: port }));
 
@@ -354,6 +357,29 @@ describe("HomePage", () => {
       );
       expect(text()).not.toContain("Owner passkey enrolled");
       expect(tokenInput()).not.toBeNull();
+    });
+
+    it("still says a sent passkey was not confirmed after the connection drops and returns", async () => {
+      const { port, completions } = enrollmentPort(() => new Promise(() => {}));
+      installOwnerSetup();
+      const empty = { board: { kind: "unavailable" } } as const;
+      await render(ports({ ...empty, enrollment: port }));
+
+      await typeToken("deploy-token");
+      await act(async () => button("Enroll owner passkey").click());
+      expect(completions).toEqual(["enr_1"]);
+
+      await render(ports({ ...empty, connection: "lost", enrollment: port }));
+      expect(tokenInput()?.closest("[hidden]")).not.toBeNull();
+      await render(
+        ports({ ...empty, enrollment: enrollmentPort(async () => enrolledResult).port }),
+      );
+
+      expect(tokenInput()?.closest("[hidden]")).toBeNull();
+      expect(text()).toContain(
+        "The board lost its connection. Enrollment was not confirmed after the passkey was sent.",
+      );
+      expect(text()).not.toContain("Owner passkey enrolled");
     });
 
     it("shows no form when the backend serves no enrollment", async () => {

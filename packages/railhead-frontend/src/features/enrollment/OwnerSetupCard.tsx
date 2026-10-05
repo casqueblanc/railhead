@@ -22,6 +22,7 @@ interface OwnerSetupCardProps extends OwnerSetupSlotProps {
  * The board cannot read whether enrollment is still open: the backend answers `bootstrap_closed`
  * for a wrong token and for an existing owner alike. The form therefore stays until this page
  * enrolls the owner, and a refusal leaves it in place so a mistyped token can be entered again.
+ * An offline port keeps the form mounted, so an attempt the lost session withdrew keeps its outcome.
  */
 export const OwnerSetupCard = ({ enrollment, authenticator }: OwnerSetupCardProps) => {
   const headingId = useId();
@@ -34,12 +35,12 @@ export const OwnerSetupCard = ({ enrollment, authenticator }: OwnerSetupCardProp
           </Text>
         </LayerCard.Secondary>
         <LayerCard.Primary className="p-0">
-          {enrollment.kind === "available" ? (
-            <OwnerPasskeySetup enrollment={enrollment} authenticator={authenticator} />
-          ) : (
+          {enrollment.kind === "unavailable" && enrollment.reason === "module_unavailable" ? (
             <div className="px-4 py-3">
               <BlockedNote block={{ kind: "unavailable", reason: enrollment.reason }} />
             </div>
+          ) : (
+            <OwnerPasskeySetup enrollment={enrollment} authenticator={authenticator} />
           )}
         </LayerCard.Primary>
       </LayerCard>
