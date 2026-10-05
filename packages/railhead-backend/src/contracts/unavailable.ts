@@ -1,8 +1,9 @@
 // The implementation of each port while its module is not installed. Every asynchronous method
 // refuses with `unavailable`, and each synchronous fence reader returns `null`; neither does
-// anything else. Each port holds no state and receives no storage, so it cannot record an effect.
-// In particular the ready gate is never `clear` and no check ever passes by default; a missing
-// security module blocks the action it guards.
+// anything else. The exceptions: alarm resumers resolve with nothing, `armWake` reports the wake
+// unconfirmed and `startup` reports nothing owed. Each port holds no state and receives no
+// storage, so it cannot record an effect. In particular the ready gate is never `clear` and no
+// check ever passes by default; a missing security module blocks the action it guards.
 //
 // The fence readers cannot return a `PortFailure`, so their `null` is what each contract defines
 // as unknown: no attempt, no current generation and no decision list, never an empty one. A

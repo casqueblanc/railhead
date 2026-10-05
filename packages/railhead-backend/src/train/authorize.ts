@@ -383,8 +383,9 @@ function readIntent(
 }
 
 /**
- * Reads one stored row. Rows are written only by `authorize`, so a row is trusted as the record it
- * was written as; these checks catch a row this code cannot read rather than validate input.
+ * Reads one stored row. Rows are written only by `authorize` and `recordWrite`, so a row is trusted
+ * as the record it was written as; these checks catch a row this code cannot read rather than
+ * validate input.
  */
 function toRecord(row: IntentRow): MergeIntentRecord {
   return {
