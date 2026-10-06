@@ -19,7 +19,7 @@ import {
   type OwnerSession,
   openApiSession,
 } from "../../rpc/apiSession";
-import { BoardStream, type StreamPhase, type StreamSink } from "../../rpc/boardStream";
+import { BoardStream, type StreamPhase, type StreamSink, stopFor } from "../../rpc/boardStream";
 import { withDeadline } from "../../rpc/deadline";
 import { type CurrentSession, useApiConnection } from "../../rpc/useApiConnection";
 import type {
@@ -175,7 +175,7 @@ export const useLiveBoardPorts = (
         return;
       }
       if (!opened.ok) {
-        update({ board: openFailure(opened.code) });
+        update({ board: stopFor(opened.code) });
         return;
       }
       const board = opened.value;
@@ -283,26 +283,6 @@ const boardRead = (
       recovered: current === "live" && folded.recovered,
     },
   };
-};
-
-const openFailure = (code: BoardErrorCode): SessionView["board"] => {
-  switch (code) {
-    case "not_found":
-    case "unavailable":
-      return "unavailable";
-    case "invalid_request":
-    case "cursor_ahead":
-    case "proof_invalid":
-    case "proof_expired":
-    case "action_stale":
-    case "bootstrap_closed":
-    case "quota_exceeded":
-    case "busy":
-    case "internal":
-      return "failed";
-    default:
-      return unreachable(code);
-  }
 };
 
 const LOST_CALL: BoardFailure = {
