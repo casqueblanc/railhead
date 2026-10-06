@@ -38,7 +38,26 @@ pnpm exec wrangler delete --config ~/railhead-qual-probe/wrangler.json
 
 ### 2. The slice on the deployed instance
 
-Deploy the qualification instance (docs/deploy.md), enrol the owner and three agents (H03), and file at least three issues. Each agent runs `rh work`, commits and pushes. Ready one agent first; while its check is running, ready the other two, so the train composes them into one batch. When both batches have landed, give the harness each agent's claim clone:
+Deploy the qualification instance (docs/deploy.md), build `rh` and `railhead-swarm` (`cargo build --release`), and run the slice with one command:
+
+```sh
+RAILHEAD_OWNER_BOOTSTRAP_TOKEN=<bootstrap token> pnpm live-run --origin https://railhead.mashin.workers.dev \
+  --owner-key ~/railhead-qual/owner-key.json --agents 3 --binding binding.json \
+  --rh target/release/rh --swarm target/release/railhead-swarm
+```
+
+`scripts/liveRun/` signs every owner step with the software owner key (`scripts/ownerKey/`) and stops at the first failure, naming the step:
+
+1. `enroll`: enrolls the key as the instance owner with the bootstrap token (`--bootstrap-token FILE` or `RAILHEAD_OWNER_BOOTSTRAP_TOKEN`). When the key file exists it enrolls nothing and checks that the instance lists the key's credential.
+2. `seed`: seeds demo/upload-app at `--revision` (default `HEAD`) through the demo seed with `--owner-key`. A seed that finds main in place pushes nothing.
+3. `issues`: files each issue in the seed manifest, skipping a title already on the board.
+4. `invite`: creates one invite per agent, `swarm-00` to `swarm-NN`, for each agent that has not joined.
+5. `join`: runs `rh join` for each agent in its own `RAILHEAD_HOME`, reads its pending join by the agent id that home stored, and confirms it only when the name, the invite and the key fingerprint match.
+6. `swarm`, `slice` and `gate`: runs `railhead-swarm` on those homes with a scenario of one task per agent, keeping its clones (`--clones-dir`), then `qualify-slice.mjs slice` on the clones and `gate` with the binding report. The harness's credential helper reads every agent from one `RAILHEAD_HOME`, so `slice` runs with a copy of the agents' store entries in the run directory. A slice report with a failed check still goes to the gate. `slice.batch` needs two claims landed as one batch; the swarm readies each claim as soon as it is pushed, so whether two land together depends on the run's timing.
+
+It prints the gate verdict and both report paths, and exits 0 only when the gate passes. It refuses `railhead.dev` and prints no token, key, invite URL or join code. The run directory (`--run-dir`, default `~/railhead-live-run/<host>`, refused inside a Git checkout) holds the homes, the clones, the scenario and `reports/` (`swarm.jsonl`, `slice.json`, `gate.txt`); a rerun with the same directory files, invites and confirms nothing twice. The binding report comes from step 1 against a probe deployed separately; the driver does not deploy it.
+
+The same harness also runs on its own, for agents enrolled by hand (H03), with each agent's claim clone:
 
 ```sh
 node scripts/qualify-slice.mjs slice --origin https://railhead.mashin.workers.dev --repo <org>/<name> \
