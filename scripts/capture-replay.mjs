@@ -25,6 +25,7 @@
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { newWebSocketRpcSession } from "capnweb";
+import { isRepoSegment } from "../packages/railhead-shared/src/agent-api.ts";
 import { API_PATH } from "../packages/railhead-shared/src/api.ts";
 import {
   captureErrorText,
@@ -43,10 +44,6 @@ const CALL_TIMEOUT_MS = 30_000;
  * A full 2,000-event log is 8 pages of 256.
  */
 const CAPTURE_DEADLINE_MS = 120_000;
-
-// `isRepoSegment` in `@railhead/shared/agent-api`, which `node` cannot load directly (its imports
-// omit file extensions). The backend checks the names again in `openBoard`.
-const REPO_SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
 const USAGE =
   "usage: node scripts/capture-replay.mjs --origin <https://host> --repo <org>/<name> --out <file.json>";
@@ -91,12 +88,13 @@ const parseOptions = (argv) => {
     throw new CaptureFailure("--origin must be an http or https URL");
   }
   const [org, name, ...rest] = repo.split("/");
+  // The backend checks the names again in `openBoard`.
   if (
     org === undefined ||
     name === undefined ||
     rest.length > 0 ||
-    !REPO_SEGMENT.test(org) ||
-    !REPO_SEGMENT.test(name)
+    !isRepoSegment(org) ||
+    !isRepoSegment(name)
   ) {
     throw new CaptureFailure("--repo must be <org>/<name>");
   }
