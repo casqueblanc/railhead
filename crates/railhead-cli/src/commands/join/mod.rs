@@ -21,7 +21,6 @@
 pub mod invite;
 pub mod key;
 
-use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -38,7 +37,7 @@ use crate::identity::{
     self, AgentId, AgentName, AgentSelector, FileStore, Identity, LockKind, PendingEnrollment,
     SecretKind, SecretStore as _, Session, SessionToken,
 };
-use crate::output::{LocalCode, Output, Render, inert};
+use crate::output::{LocalCode, Output, Render, hex, inert};
 use crate::{Agent, Error, Invocation, Result};
 
 use invite::{INVITE_ENV, Invite, InviteArg};
@@ -449,11 +448,8 @@ fn default_name(invite_id: &str) -> Result<AgentName> {
         return Ok(name);
     }
     let digest = Sha256::digest(invite_id.as_bytes());
-    let mut name = String::from("inv-");
-    for byte in digest.iter().take(6) {
-        let _ = write!(name, "{byte:02x}");
-    }
-    Ok(AgentName::new(&name)?)
+    let prefix: Vec<u8> = digest.iter().take(6).copied().collect();
+    Ok(AgentName::new(&format!("inv-{}", hex(&prefix)))?)
 }
 
 /// The unfinished enrollment stored under `name`, which must be the invite's own: an enrollment of
@@ -689,7 +685,8 @@ mod tests {
         assert_eq!(default_name("inv_abc123")?.as_str(), "inv-abc123");
         // Upper case or a long invite would not make a name, so it is hashed.
         let mixed = default_name("inv_AbC123")?;
-        assert!(mixed.as_str().starts_with("inv-") && mixed.as_str().len() == 16);
+        // The first six bytes of SHA-256("inv_AbC123").
+        assert_eq!(mixed.as_str(), "inv-200e568ffae7");
         assert_ne!(mixed, default_name("inv_abc123")?);
         assert_eq!(mixed, default_name("inv_AbC123")?);
         let long = default_name(&format!("inv_{}", "a".repeat(64)))?;

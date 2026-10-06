@@ -1,9 +1,9 @@
 //! `rh status`, `rh sync`, `rh ack` and `rh ask` end to end.
 //!
 //! Each test runs the built binary against a temporary identity store and a wiremock server that
-//! answers with the A01 wire fixtures. `rh ask` runs inside a Git repository configured as the
-//! claim's clone. "Sends nothing" and "acknowledges nothing" are asserted on the server's request
-//! log, never inferred from the output.
+//! answers with the wire fixtures in `fixtures/protocol/wire`. `rh ask` runs inside a Git
+//! repository configured as the claim's clone. "Sends nothing" and "acknowledges nothing" are
+//! asserted on the server's request log, never inferred from the output.
 
 use std::fs;
 use std::io::{self, Read, Write as _};

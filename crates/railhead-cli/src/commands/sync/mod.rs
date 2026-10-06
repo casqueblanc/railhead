@@ -7,7 +7,6 @@
 //! from the backend is quoted as a JSON string, so a question, label or path cannot break out of
 //! its line or pass for an instruction from `rh`.
 
-use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use railhead_protocol::{
@@ -87,12 +86,11 @@ impl Synced {
                 "the inbox returned more items than its page of {limit}"
             )));
         }
-        let mut seen = BTreeSet::new();
         let mut last = 0;
         let mut items = Vec::with_capacity(page.items.len());
         for item in page.items {
             let number = item.item.get();
-            if number == 0 || number <= last || !seen.insert(number) {
+            if number == 0 || number <= last {
                 return Err(inconsistent(&format!(
                     "inbox item {number} is repeated or out of order"
                 )));

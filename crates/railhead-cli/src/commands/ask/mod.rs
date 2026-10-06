@@ -9,7 +9,6 @@
 //! `rh ask --question <id>` reads, or waits on, a question asked earlier, so a wait that timed out
 //! or was interrupted resumes without asking again.
 
-use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -24,7 +23,7 @@ use crate::commands::claim::{session, workspace};
 use crate::commands::join;
 use crate::commands::sync::render_decision;
 use crate::http::{self, Endpoint};
-use crate::output::{LocalCode, Output, Render, quoted};
+use crate::output::{LocalCode, Output, Render, hex, quoted};
 use crate::{Agent, Error, Result};
 
 /// Longest `--wait`, in seconds.
@@ -308,7 +307,6 @@ fn resumable(error: Error, question_id: &str, request_id: &str, seconds: u64) ->
         other @ (Error::Context(_)
         | Error::Identity(_)
         | Error::Credential(_)
-        | Error::Unavailable(_)
         | Error::WorkingDirectory(_)
         | Error::Runtime(_)
         | Error::Output(_)) => other,
@@ -547,11 +545,7 @@ fn new_request_id() -> Result<String> {
         retryable: true,
         next: None,
     })?;
-    Ok(bytes.iter().fold(String::from("req_"), |mut id, byte| {
-        // Writing to a String cannot fail.
-        let _ = write!(id, "{byte:02x}");
-        id
-    }))
+    Ok(format!("req_{}", hex(&bytes)))
 }
 
 /// The result of `rh ask`.

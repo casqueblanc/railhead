@@ -1,10 +1,10 @@
 //! `rh work`, `rh claim`, `rh ready`, `rh release`, `rh status` and `rh pin` end to end.
 //!
 //! Each test runs the built binary against a temporary identity store, a wiremock server that
-//! answers with the A01 wire fixtures, and a real bare Git repository standing in for the claim's
-//! fork. Git reaches the fork through a `url.<fork>.insteadOf` rewrite of the Railhead fork URL, so
-//! the clone's `origin` remote keeps the address the backend named. "Sends nothing" is asserted on
-//! the server's request log.
+//! answers with the wire fixtures in `fixtures/protocol/wire`, and a real bare Git repository
+//! standing in for the claim's fork. Git reaches the fork through a `url.<fork>.insteadOf` rewrite
+//! of the Railhead fork URL, so the clone's `origin` remote keeps the address the backend named.
+//! "Sends nothing" is asserted on the server's request log.
 
 use std::fs;
 use std::io::Write as _;
