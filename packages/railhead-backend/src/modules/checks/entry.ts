@@ -42,7 +42,7 @@ export const checks: ModuleFactory<CheckPort> = (context, ports) =>
   });
 
 /** Reads one Artifacts repository's objects through the Worker's binding. */
-export function artifactsReader(artifacts: Artifacts, name: string): MainReader {
+function artifactsReader(artifacts: Artifacts, name: string): MainReader {
   return {
     async readFile(commit: CommitSha, path: string, maxBytes: number) {
       using repo = await artifacts.get(name);

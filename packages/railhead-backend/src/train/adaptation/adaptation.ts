@@ -53,7 +53,7 @@ import type { EventLog } from "../../repo/eventLog";
 import { atomically, migrate, type RepoStorage } from "../../repo/storage";
 
 /** The migration owner name of the adaptation tables. */
-export const ADAPTATION_OWNER = "adaptation";
+const ADAPTATION_OWNER = "adaptation";
 
 /** Who records `claim.adapted`. */
 export const ADAPTATION_ACTOR: Actor = { kind: "system", id: "sys_adaptation" };

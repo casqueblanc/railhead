@@ -83,7 +83,7 @@ import type { EventTransaction } from "../../repo/eventLog";
 import { migrate } from "../../repo/storage";
 
 /** The migration owner name of the decisions' tables. */
-export const DECISIONS_OWNER = "decisions";
+const DECISIONS_OWNER = "decisions";
 
 /** Released schema steps of the decisions. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [
