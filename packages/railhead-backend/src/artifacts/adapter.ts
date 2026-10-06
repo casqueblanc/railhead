@@ -103,7 +103,7 @@ export const ARTIFACTS_LIMITS: ArtifactsAdapterLimits = {
 /** The shortest token lifetime Artifacts accepts. */
 export const MIN_TOKEN_TTL_MS = 60_000;
 /** The longest token lifetime this adapter mints. Artifacts allows a year; Railhead never needs it. */
-export const MAX_TOKEN_TTL_MS = 3_600_000;
+const MAX_TOKEN_TTL_MS = 3_600_000;
 /**
  * How long after a previous incarnation's mint started, beyond its requested lifetime, revocation
  * keeps sweeping for a token it may still create. A design margin, not a measured bound.
