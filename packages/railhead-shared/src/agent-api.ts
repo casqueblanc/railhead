@@ -139,7 +139,7 @@ const SSH_SIGNATURE =
 const SESSION_TOKEN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 /** True when `value` is a login challenge identifier. */
-export function isChallengeId(value: string): boolean {
+function isChallengeId(value: string): boolean {
   return CHALLENGE_ID.test(value);
 }
 

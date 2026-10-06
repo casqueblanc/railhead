@@ -11,13 +11,19 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { failureReport, run } from "./cli.ts";
-import { FakeBackend, issueEvent, otherEvent, sessionWith, signedFor } from "./fakeBackend.ts";
+import {
+  closedPort,
+  FakeBackend,
+  issueEvent,
+  otherEvent,
+  sessionWith,
+  signedFor,
+} from "./fakeBackend.ts";
 import { MAX_BUNDLE_BYTES } from "./history.ts";
 import {
   ApprovalNeeded,
@@ -707,13 +713,7 @@ test("a targeted reset dry run reads the instance first and names what it report
 });
 
 test("a targeted reset dry run against an instance that refuses the connection prints no plan and exits 1", async () => {
-  // A port that was just free: nothing listens on it.
-  const server = createServer();
-  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
-  const address = server.address();
-  assert.ok(address !== null && typeof address === "object");
-  await new Promise((done) => server.close(done));
-
+  const port = await closedPort();
   const result = spawnSync(
     process.execPath,
     [
@@ -721,8 +721,20 @@ test("a targeted reset dry run against an instance that refuses the connection p
       "reset",
       "--dry-run",
       "--target",
-      `http://127.0.0.1:${address.port}`,
+      `http://127.0.0.1:${port}`,
     ],
+    { encoding: "utf8", timeout: 60_000 },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "demoSeed failed: WebSocket connection failed.\n");
+});
+
+test("the CLI reports a backend it cannot reach in one line and exits 1", async () => {
+  const port = await closedPort();
+  const result = spawnSync(
+    process.execPath,
+    [join(import.meta.dirname, "cli.ts"), "reset", "--target", `http://127.0.0.1:${port}`],
     { encoding: "utf8", timeout: 60_000 },
   );
   assert.equal(result.status, 1);
