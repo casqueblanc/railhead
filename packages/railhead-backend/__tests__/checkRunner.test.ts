@@ -1245,7 +1245,7 @@ function identity(i: number) {
   };
 }
 
-/** How many rows the attempt table holds. */
+/** How many of the given IDs the attempt table still holds. */
 function rowCount(attempts: AttemptTable, ids: readonly string[]): number {
   return ids.filter((id) => attempts.get(id) !== null).length;
 }

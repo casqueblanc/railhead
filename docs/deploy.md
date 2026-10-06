@@ -44,7 +44,7 @@ Only one deploy runs at a time, and a running one is never cancelled. GitHub kee
 
 ## Rolling back
 
-To return to an earlier commit of main, run the workflow again with that commit's SHA as the ref. Commits from before this workflow landed lack `scripts/write-worker-secrets.mjs`; the run refuses them before deploying, so use a version rollback for those. This rebuilds and redeploys it through the same checks.
+To return to an earlier commit of main, run the workflow again with that commit's SHA as the ref. This rebuilds and redeploys it through the same checks. Commits from before this workflow landed lack `scripts/write-worker-secrets.mjs`; the run refuses them before deploying, so use a version rollback for those.
 
 To return to an earlier Worker version without rebuilding, use **Workers & Pages → railhead → Deployments** in the dashboard, or, logged in to the account, from `packages/railhead-backend`:
 

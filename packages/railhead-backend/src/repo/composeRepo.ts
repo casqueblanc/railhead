@@ -1,7 +1,7 @@
 // The fixed composition of a `Repo`: which feature modules exist, what each one receives, and the
 // order they are built in. The list is closed. There is no runtime discovery, no import named by
 // repository text and no registry a module can write to; a feature takes over its slot by replacing
-// the factory its own `modules/<name>/entry.ts` exports, never by editing this file.
+// the factory its own `entry.ts` exports, never by editing this file.
 //
 // Each factory receives the `RepoContext` and a `ports` function. `ports()` returns the other
 // modules' ports once every factory has run, so a factory keeps the function and calls it when it
@@ -125,7 +125,7 @@ export type MainWriterFactory = (
 ) => MainWriterPort;
 
 /** Thrown when a factory calls `ports()` while the composition is still being built. */
-export class CompositionError extends Error {
+class CompositionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CompositionError";
