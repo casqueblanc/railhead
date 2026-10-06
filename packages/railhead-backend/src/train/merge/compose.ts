@@ -81,7 +81,7 @@ export const MERGE_TIMEOUT_MS = 15_000;
 export const MERGE_SANDBOX_LIFETIME_MS = 60_000;
 
 /** How long a compose waits for its sandbox's teardown before it returns anyway. */
-export const RELEASE_WAIT_MS = 2_000;
+const RELEASE_WAIT_MS = 2_000;
 
 /** The depths a fetch tries, in order, until every pin shares a merge base with main. */
 export const FETCH_DEPTHS: readonly number[] = [16, 128, 1024];
@@ -120,7 +120,7 @@ export interface MergeDeps {
 }
 
 /** Whether `value` is a merge attempt ID `compose` and `discard` accept. */
-export function isMergeAttempt(value: string): boolean {
+function isMergeAttempt(value: string): boolean {
   return MERGE_ATTEMPT.test(value);
 }
 
