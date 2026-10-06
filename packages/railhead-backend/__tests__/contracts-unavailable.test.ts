@@ -136,9 +136,9 @@ describe("unavailable ports", () => {
           env,
           wake: async () => true,
         });
-        // A30's fence reads these in the transaction that would write the intent. Each must say
-        // unknown (`null`), never a generation or an empty decision list a record could match,
-        // including for an empty claim id.
+        // The merge fence (`checkFence` in `src/train/authorize.ts`) reads these in the transaction
+        // that would write the intent. Each must say unknown (`null`), never a generation or an
+        // empty decision list a record could match, including for an empty claim id.
         const committed = log.transaction(() => ({
           attempt: ports.train.attemptOutcome("chk_attempt1"),
           generations: [

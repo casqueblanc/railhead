@@ -886,8 +886,7 @@ describe("the train's settle wake", () => {
     });
   });
 
-  // This runs the Repo alarm handler's steps over the modules built here: the Repo's own
-  // composition has no authorization module or main ref yet, so it never owes a settlement.
+  // This runs the Repo alarm handler's steps over the modules built here.
   // casqueblanc/railhead#242 tracks the test through `Repo.alarm` itself.
   it("settles an owed intent from the stored alarm after the object restarts, with no call", async () => {
     const target: RepoTarget = { stub: env.REPO.getByName(crypto.randomUUID()), realAlarm: true };
