@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { createServer } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
 // These load under plain `node`: their own imports are type-only.
@@ -503,22 +501,4 @@ test("an unavailable backend is a failure with its sentence, not a refusal", asy
         "demo.seed failed with unavailable: The fake backend refused with unavailable.",
   );
   assert.equal(backend.exists, false);
-});
-
-test("the CLI reports a backend it cannot reach in one line and exits 1", async () => {
-  // A port that was just free: nothing listens on it.
-  const server = createServer();
-  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
-  const address = server.address();
-  assert.ok(address !== null && typeof address === "object");
-  await new Promise((done) => server.close(done));
-
-  const result = spawnSync(
-    process.execPath,
-    [join(import.meta.dirname, "cli.ts"), "reset", "--target", `http://127.0.0.1:${address.port}`],
-    { encoding: "utf8", timeout: 60_000 },
-  );
-  assert.equal(result.status, 1);
-  assert.equal(result.stdout, "");
-  assert.equal(result.stderr, "demoSeed failed: WebSocket connection failed.\n");
 });

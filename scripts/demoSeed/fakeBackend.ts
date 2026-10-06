@@ -2,6 +2,7 @@
 // channel, for the live target's tests. It follows the backend's `demo.seed` and `demo.reset` rules
 // (#149) closely enough to tell a correct client from a wrong one; it is not the backend.
 
+import { createServer } from "node:net";
 import { newMessagePortRpcSession, RpcTarget } from "capnweb";
 import type { RailheadApi } from "../../packages/railhead-shared/src/api.ts";
 import type {
@@ -18,7 +19,7 @@ import type { RailheadEvent } from "../../packages/railhead-shared/src/events.ts
 import type { LiveSession } from "./liveTarget.ts";
 
 /** The demo repository's identifier on the fake backend. */
-export const REPO_ID = "rep_demo";
+const REPO_ID = "rep_demo";
 
 /** What the owner's authenticator would return for challenge `id`; the fake accepts only this. */
 export function signedFor(id: string): PasskeyAssertion {
@@ -240,4 +241,14 @@ export function sessionWith(backend: FakeBackend): LiveSession {
       channel.port2.close();
     },
   };
+}
+
+/** A port that was just free: nothing listens on it, so a connection to it is refused. */
+export async function closedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  await new Promise((done) => server.close(done));
+  if (address === null || typeof address !== "object") throw new Error("The server has no port.");
+  return address.port;
 }

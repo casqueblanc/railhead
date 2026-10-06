@@ -52,11 +52,7 @@ function uploadId(body: Record<string, unknown>, what: string): string {
  * Reads upload `id` back after a restart and compares it with `expected` byte for byte, so a pass
  * means the file was stored durably and intact.
  */
-export async function verifyStored(
-  target: UploadTarget,
-  id: string,
-  expected: Uint8Array,
-): Promise<void> {
+async function verifyStored(target: UploadTarget, id: string, expected: Uint8Array): Promise<void> {
   await target.restart();
   const response = await target.fetch(`/api/uploads/${encodeURIComponent(id)}`);
   if (response.status !== 200) fail(`Reading upload ${id} back returned ${response.status}.`);
