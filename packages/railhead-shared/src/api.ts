@@ -13,8 +13,6 @@ export interface PublicApi extends RpcTarget {
 
 /**
  * The complete public surface of the RPC session: `PublicApi` plus the entry points to the board.
- * The session's root object implements it once the Repo composition is installed; until a module
- * exists, its methods fail with `unavailable`.
  */
 export interface RailheadApi extends PublicApi {
   /**
