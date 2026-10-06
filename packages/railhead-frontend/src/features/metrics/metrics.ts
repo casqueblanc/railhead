@@ -4,7 +4,7 @@
 // never shown as if it were measured.
 
 import type { CheckResult } from "@railhead/shared/events";
-import { ACTIVITY_WINDOW_MINUTES, type BoardState } from "../board/boardState";
+import { ACTIVITY_WINDOW_MINUTES, type BoardState, MINUTE_MS } from "../board/boardState";
 
 /** Activity in the recent window of the log. */
 export interface RecentActivity {
@@ -59,8 +59,6 @@ export const boardMetrics = (state: BoardState): BoardMetrics => {
     recent: recentActivity(state),
   };
 };
-
-const MINUTE_MS = 60_000;
 
 const recentActivity = (state: BoardState): RecentActivity | null => {
   const { earliestAt, lastAt } = state.totals;
