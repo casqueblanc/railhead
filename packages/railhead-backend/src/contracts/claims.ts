@@ -66,7 +66,9 @@ export interface GitAccess {
   principal: AgentPrincipal | null;
   /** The remote: a claim's fork, or main. */
   target: { kind: "fork"; claimId: ClaimId } | { kind: "main" };
-  /** `fetch` for upload-pack and its advertisement, `push` for receive-pack and its advertisement. */
+  /**
+   * `fetch` for upload-pack and its advertisement, `push` for receive-pack and its advertisement.
+   */
   operation: "fetch" | "push";
 }
 
@@ -87,9 +89,10 @@ export interface GitGrant {
 /**
  * Issues and claims.
  *
- * `currentGeneration`, `workingGeneration`, `workingEpisode` and `readyPin` are fence readers: each is synchronous and reads only
- * the Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body,
- * and what it returns holds until that transaction commits. Read outside a transaction, the result may already be stale.
+ * `currentGeneration`, `workingGeneration`, `workingEpisode` and `readyPin` are fence readers: each
+ * is synchronous and reads only the Repo's storage, so a caller calls it inside its own
+ * `log.transaction` or `atomically` body, and what it returns holds until that transaction commits.
+ * Read outside a transaction, the result may already be stale.
  */
 export interface ClaimsPort {
   /** The agent's active claim, or `null`. */
@@ -112,9 +115,9 @@ export interface ClaimsPort {
   ): Promise<PortResult<ReadyResult>>;
   /**
    * Gives up the agent's working claim at its current generation, leaving it as an expiry leaves
-   * it: its fork's tokens owed a revocation, then offered to a successor. Refuses a stale generation,
-   * a ready claim with `after_ready` and a closed or lapsed claim with `claim_closed`. A repeat of the
-   * same release, while it is still the agent's last closed claim, returns it.
+   * it: its fork's tokens owed a revocation, then offered to a successor. Refuses a stale
+   * generation, a ready claim with `after_ready` and a closed or lapsed claim with `claim_closed`.
+   * A repeat of the same release, while it is still the agent's last closed claim, returns it.
    */
   release(
     agent: AgentPrincipal,
@@ -122,24 +125,24 @@ export interface ClaimsPort {
     request: ReleaseRequest,
   ): Promise<PortResult<ReleaseResult>>;
   /**
-   * The claim's current pin, for the train. Fails unless the claim is ready at its recorded decision
-   * versions with a clear inbox gate; a superseded pin reopens the claim and fails with
+   * The claim's current pin, for the train. Fails unless the claim is ready at its recorded
+   * decision versions with a clear inbox gate; a superseded pin reopens the claim and fails with
    * `decision_superseded`.
    */
   pin(claimId: ClaimId): Promise<PortResult<ClaimPin>>;
   /**
    * The claim's current ownership generation, or `null` when it is unknown, such as for an unknown
    * or expired claim, a lapsed lease or a missing module. A merged claim keeps its generation, so a
-   * later decision version still reaches its holder; it has no pin, so `readyPin` refuses it. Call it
-   * only inside the caller's transaction; a pin is current only if its generation equals this one,
-   * and `null` is a refusal.
+   * later decision version still reaches its holder; it has no pin, so `readyPin` refuses it. Call
+   * it only inside the caller's transaction; a pin is current only if its generation equals this
+   * one, and `null` is a refusal.
    */
   currentGeneration(claimId: ClaimId): number | null;
   /**
    * The claim's ownership generation while it is working, or `null` once it is anything else, such
-   * as ready, expired or unknown, or once its lease lapsed. A fence reader like `currentGeneration`:
-   * call it inside the caller's transaction. A push is recorded only while this equals the push's
-   * fence generation.
+   * as ready, expired or unknown, or once its lease lapsed. A fence reader like
+   * `currentGeneration`: call it inside the caller's transaction. A push is recorded only while
+   * this equals the push's fence generation.
    */
   workingGeneration(claimId: ClaimId): number | null;
   /**
@@ -152,8 +155,8 @@ export interface ClaimsPort {
    * The ready claim's pin, episode and recorded decision versions, or `null` once the claim is
    * anything but ready, such as working, closed or unknown, or for a missing module. A fence reader
    * like `currentGeneration`: call it inside the caller's transaction. It only reads, so it never
-   * reopens a superseded pin; the caller compares `decisions` with the current versions, and a pin is
-   * mergeable only while they are equal.
+   * reopens a superseded pin; the caller compares `decisions` with the current versions, and a pin
+   * is mergeable only while they are equal.
    */
   readyPin(claimId: ClaimId): ReadyPin | null;
   /**
@@ -165,25 +168,26 @@ export interface ClaimsPort {
   /**
    * Merges the claim of each landed pin that is still ready with that pin in that episode, appends
    * `claim.merged` for it and records `main`, the commit the landing published, as each holder's
-   * closed claim. A pin whose claim was reopened, re-pinned or taken over is left as it is. A merged
-   * claim no longer counts as its holder's, so the holder may reopen a merged claim waiting for
-   * rework, as `reopenMerged` does. Writes inside `tx`, the transaction that settles the landing, after
-   * anything that reads the claims as held. Throws when the module is missing, so the landing rolls
-   * back rather than leaving its claims ready.
+   * closed claim. A pin whose claim was reopened, re-pinned or taken over is left as it is. A
+   * merged claim no longer counts as its holder's, so the holder may reopen a merged claim waiting
+   * for rework, as `reopenMerged` does. Writes inside `tx`, the transaction that settles the
+   * landing, after anything that reads the claims as held. Throws when the module is missing, so
+   * the landing rolls back rather than leaving its claims ready.
    */
   merged(tx: EventTransaction, landed: readonly EpisodePin[], main: CommitSha): void;
   /**
    * Called inside `tx`, the transaction that queued a decision item to the holder of the claim.
-   * When a newer decision version superseded the pin of a merged claim, the claim reopens to working
-   * and `claim.reopened` is appended, provided its holder holds no other active claim; otherwise it
-   * waits, and reopens in the transaction that closes that claim. Any other claim is left as it is.
-   * A missing module does nothing: with no claims module, no claim has a current generation, so no
-   * item is queued to one.
+   * When a newer decision version superseded the pin of a merged claim, the claim reopens to
+   * working and `claim.reopened` is appended, provided its holder holds no other active claim;
+   * otherwise it waits, and reopens in the transaction that closes that claim. Any other claim is
+   * left as it is. A missing module does nothing: with no claims module, no claim has a current
+   * generation, so no item is queued to one.
    */
   reopenMerged(tx: EventTransaction, claimId: ClaimId): void;
   /**
    * The agent holding the claim and its current generation, or `null` whenever `currentGeneration`
-   * is `null` or the claim merged. A fence reader like `currentGeneration`: call it inside the caller's transaction.
+   * is `null` or the claim merged. A fence reader like `currentGeneration`: call it inside the
+   * caller's transaction.
    */
   holder(claimId: ClaimId): InboxTarget | null;
   /**
