@@ -329,7 +329,7 @@ test("a run enrolls, seeds, files, invites, joins, runs the swarm and prints the
   const [slice, gate] = w.calls.qualify;
   assert.ok(slice !== undefined && gate !== undefined);
   const clones = ["swarm-00", "swarm-01", "swarm-02"].map((name, index) =>
-    join(w.options.runDir, "clones", name, `upload-app-clm_${index}`),
+    join(w.options.runDir, "clones", "run-1", name, `upload-app-clm_${index}`),
   );
   assert.deepEqual(slice.args, [
     QUALIFY,
@@ -393,8 +393,17 @@ test("a rerun after a failed step goes on from where it stopped", async () => {
 
   assert.equal(verdict.passed, true);
   assert.deepEqual(w.instance.performed, performed);
-  assert.equal(w.calls.swarm.length, 2);
-  assert.equal(w.calls.qualify.length, 2);
+  // Each swarm run keeps its clones apart, and the slice reads the latest run's.
+  const [first, second] = w.calls.swarm;
+  assert.ok(first !== undefined && second !== undefined);
+  assert.equal(arg(first, "--clones-dir"), join(w.options.runDir, "clones", "run-1"));
+  assert.equal(arg(second, "--clones-dir"), join(w.options.runDir, "clones", "run-2"));
+  const slice = w.calls.qualify.at(-2);
+  assert.ok(slice !== undefined);
+  assert.equal(
+    arg(slice, "--clone"),
+    join(w.options.runDir, "clones", "run-2", "swarm-00", "upload-app-clm_0"),
+  );
 });
 
 test("a join whose key fingerprint differs from the home's key is refused, not confirmed", async () => {
@@ -446,7 +455,11 @@ test("a pending join the driver did not start is never confirmed", async () => {
 });
 
 test("railhead.dev and its subdomains are refused before anything is sent", async () => {
-  for (const origin of ["https://railhead.dev", "https://board.railhead.dev"]) {
+  for (const origin of [
+    "https://railhead.dev",
+    "https://board.railhead.dev",
+    "https://railhead.dev.",
+  ]) {
     const w = world();
     let opened = 0;
     const deps = w.deps();
@@ -464,7 +477,7 @@ test("railhead.dev and its subdomains are refused before anything is sent", asyn
       (error: unknown) => error,
     );
     assert.ok(failure instanceof DriverRefusal);
-    assert.match(failure.message, /never acts on .*railhead\.dev/);
+    assert.match(failure.message, /never acts on .*railhead\.dev|must not end its host with a dot/);
     assert.equal(opened, 0);
     assert.ok(!existsSync(w.options.ownerKey));
   }

@@ -1066,8 +1066,30 @@ async fn clones_dir_keeps_each_agents_clone_after_the_run() -> anyhow::Result<()
         )?;
         assert_eq!(pushed.split(' ').next(), Some(agent));
     }
-    // Nothing went to the temporary directory.
+    // Nothing went to the temporary directory, and the kept one is the owner's alone.
     assert!(world.work_is_empty()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [kept.clone(), kept.join("swarm-00")] {
+            assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clones_dir_others_can_read_starts_nothing() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let open = world.dir.path().join("open");
+    fs::create_dir(&open)?;
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755))?;
+    let run = run(&mut world.driver_with(&scenario, "--clones-dir", &open)?)?;
+    assert_eq!(run.code, Some(2));
+    assert_eq!(fs::read_dir(&open)?.count(), 0);
     Ok(())
 }
 

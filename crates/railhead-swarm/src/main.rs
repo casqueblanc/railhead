@@ -225,7 +225,7 @@ enum Clones {
 impl Clones {
     fn new(cli: &Cli) -> anyhow::Result<Self> {
         if let Some(dir) = &cli.clones_dir {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            private_dir(dir)?;
             return Ok(Self::Kept(dir.clone()));
         }
         let mut builder = tempfile::Builder::new();
@@ -247,7 +247,7 @@ impl Clones {
             }
             Self::Kept(dir) => {
                 let path = dir.join(name);
-                std::fs::create_dir_all(&path).map(|()| path)
+                return private_dir(&path).map(|()| path);
             }
         };
         created.with_context(|| format!("creating the clone directory of {name}"))
@@ -262,6 +262,33 @@ impl Clones {
             Self::Kept(_) => Ok(()),
         }
     }
+}
+
+/// Creates `dir` and any missing parent readable by its owner alone, and refuses an existing `dir`
+/// that others may read: a kept clone outlives the run, and the temporary one is owner-only too.
+fn private_dir(dir: &Path) -> anyhow::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let others = std::fs::metadata(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .permissions()
+            .mode()
+            & 0o077;
+        anyhow::ensure!(
+            others == 0,
+            "{} is open to other users; run chmod 700 on it or choose another --clones-dir",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// How a run ended.

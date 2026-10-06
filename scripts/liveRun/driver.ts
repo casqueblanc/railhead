@@ -224,6 +224,12 @@ export function assertQualificationOrigin(origin: string): string {
   } catch (error) {
     throw new DriverRefusal(`${JSON.stringify(origin)} is not a URL.`, { cause: error });
   }
+  // DNS reads `railhead.dev.` as `railhead.dev`, so a trailing dot would slip past the check below.
+  if (url.hostname.endsWith(".")) {
+    throw new DriverRefusal(
+      `--origin must not end its host with a dot; refusing ${JSON.stringify(origin)}.`,
+    );
+  }
   if (url.hostname === DEMO_HOST || url.hostname.endsWith(`.${DEMO_HOST}`)) {
     throw new DriverRefusal(
       `The live run never acts on ${url.hostname}; use a qualification instance.`,
@@ -637,7 +643,8 @@ async function runSwarm(
       mix: { disjoint: 1, sameFileHunks: 0, overlapping: 0 },
     })}\n`,
   );
-  const clonesDir = join(options.runDir, "clones");
+  // A directory of its own per run: a rerun may claim again, and the slice takes one clone each.
+  const clonesDir = freshDir(join(options.runDir, "clones"));
   const events = join(options.runDir, "reports", "swarm.jsonl");
   mkdirSync(join(options.runDir, "reports"), { recursive: true });
   const child = deps.start({
@@ -692,6 +699,15 @@ async function runSlice(
   }
   deps.log(`slice: report in ${report}${exited.code === 0 ? "" : " (a check failed)"}`);
   return report;
+}
+
+/** `parent/run-N` for the first N not taken yet; the swarm creates it. */
+function freshDir(parent: string): string {
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const taken = new Set(readdirSync(parent));
+  let index = 1;
+  while (taken.has(`run-${index}`)) index += 1;
+  return join(parent, `run-${index}`);
 }
 
 /**
