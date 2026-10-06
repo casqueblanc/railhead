@@ -3,9 +3,9 @@
 // `authorize` runs one Repo transaction. Inside it, it reads the persisted check attempt and its
 // report, every pin's current claim generation, ready pin and inbox ready gate, and the current
 // version of every decision the pins must satisfy, through synchronous readers the train, claims,
-// inbox and decisions modules supply. If all still hold, it writes the `MergeIntentRecord` and appends `train.intent`
-// in the same transaction, before anything tries to move main. If any reader's answer has moved,
-// nothing is written.
+// inbox and decisions modules supply. If all still hold, it writes the `MergeIntentRecord` and
+// appends `train.intent` in the same transaction, before anything tries to move main. If any
+// reader's answer has moved, nothing is written.
 //
 // A repeat for the same attempt returns the record already written, without checking again: the
 // authorization happened, and a caller that lost the first response must see the same intent rather
@@ -37,7 +37,7 @@ import type { EventLog } from "../repo/eventLog";
 import { migrate, type RepoStorage } from "../repo/storage";
 
 /** The migration owner name of the merge intent table. */
-export const AUTHORIZATION_OWNER = "authorization";
+const AUTHORIZATION_OWNER = "authorization";
 
 /** Released schema steps of the merge intent table. Append a step to change it; never edit one. */
 const MIGRATIONS: readonly string[] = [

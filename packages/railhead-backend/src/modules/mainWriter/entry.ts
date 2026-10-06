@@ -2,22 +2,15 @@
 // module that receives main's ref. The implementation is `createMainWriter` in `mainWriter.ts`.
 
 import type { MainWriterFactory } from "../../repo/composeRepo";
+import { authorizationReaders } from "../authorization/entry";
 import { createMainWriter } from "./mainWriter";
 
 /** Builds the main writer of one repository. */
-export const mainWriter: MainWriterFactory = (context, ports, mainRef) =>
-  createMainWriter(
+export const mainWriter: MainWriterFactory = (context, ports, mainRef) => {
+  const readers = authorizationReaders(ports);
+  return createMainWriter(
     context,
-    () => {
-      const { authorization, claims, decisions, inbox, train } = ports();
-      return {
-        authorization,
-        attemptOutcome: (attemptId) => train.attemptOutcome(attemptId),
-        currentGeneration: (claimId) => claims.currentGeneration(claimId),
-        currentVersions: (claimId) => decisions.currentVersions(claimId),
-        readyPin: (claimId) => claims.readyPin(claimId),
-        readyGateNow: (claimId, generation) => inbox.readyGateNow(claimId, generation),
-      };
-    },
+    () => ({ authorization: ports().authorization, ...readers }),
     mainRef,
   );
+};
