@@ -3,10 +3,10 @@
 // Allocation has two steps. The first is synchronous, inside one Repo transaction: it chooses the
 // issue, checks the agent's and the owner's limits and records the claim as a fork intent. Nothing
 // can run between the choice and the record, so two requests never get the same issue. The second
-// step awaits other ports: it reads main through the main writer, records that commit as the fork's requested base, forks,
-// and opens the claim with the fork's head as its immutable base. If a response is lost, the
-// intent stays; the agent's next `work`, `claim` or status call finishes the same claim, and the
-// Artifacts adapter reconciles a fork that was created without its response.
+// step awaits other ports: it reads main through the main writer, records that commit as the fork's
+// requested base, forks, and opens the claim with the fork's head as its immutable base. If a
+// response is lost, the intent stays; the agent's next `work`, `claim` or status call finishes the
+// same claim, and the Artifacts adapter reconciles a fork that was created without its response.
 //
 // `ready` pins an exact commit. The commit's existence in the fork is checked first, since that
 // awaits Artifacts; then one transaction checks that the agent still holds the claim at the
@@ -39,22 +39,23 @@
 //
 // An allocating or working claim is a lease of `CLAIM_LEASE_MS`, renewed by every call of its
 // holder that reaches this module: status, `work`, `claim`, `ready`, an `ask` (which reads the
-// active claim) and Git authorization. `work` and `claim` renew it before they await another
-// fork's revocation, so a slow revocation never lapses a lease its holder called inside. Each awaits
-// at most one due revocation, the oldest issue's; the Repo's alarm revokes the rest a few at a time
+// active claim) and Git authorization. `work` and `claim` renew it before they await another fork's
+// revocation, so a slow revocation never lapses a lease its holder called inside. Each awaits at
+// most one due revocation, the oldest issue's; the Repo's alarm revokes the rest a few at a time
 // and fires again at once while more are due, so a backlog delays neither a request nor the alarm's
 // later modules. A thrown revocation is retried like a failed one. A ready claim does not lapse,
 // since the train holds its pin; a reopened claim starts a new lease. The lapse is checked at the
-// time of use: a holder call after it, the Repo's alarm or another agent's `work` or
-// `claim` expires the claim and appends `claim.expired`. Both fence readers, `currentGeneration`
-// and `workingGeneration`, read a lapsed working claim as unknown even before that, so no push is
-// recorded past the deadline. From the expiry on, the former holder is refused and the fork's tokens
-// are owed a revocation. A lease is renewed only before it lapses: a lapsed allocation is no longer
-// its holder's, which sees no active claim and is answered `busy` by `work` and `claim` until
-// another agent takes the allocation over. It no longer counts toward its owner's limit, and a fork
-// whose response arrives after the lapse opens nothing and answers `busy`. The claim stays expired until that revocation is
-// settled; a failed revocation, or one Artifacts reports as `pending_debt`, is retried by the
-// Repo's alarm, and meanwhile nobody gets a write grant on the fork.
+// time of use: a holder call after it, the Repo's alarm or another agent's `work` or `claim`
+// expires the claim and appends `claim.expired`. Both fence readers, `currentGeneration` and
+// `workingGeneration`, read a lapsed working claim as unknown even before that, so no push is
+// recorded past the deadline. From the expiry on, the former holder is refused and the fork's
+// tokens are owed a revocation. A lease is renewed only before it lapses: a lapsed allocation is no
+// longer its holder's, which sees no active claim and is answered `busy` by `work` and `claim`
+// until another agent takes the allocation over. It no longer counts toward its owner's limit, and
+// a fork whose response arrives after the lapse opens nothing and answers `busy`. The claim stays
+// expired until that revocation is settled; a failed revocation, or one Artifacts reports as
+// `pending_debt`, is retried by the Repo's alarm, and meanwhile nobody gets a write grant on the
+// fork.
 //
 // Takeover gives a settled expired claim, before any new issue, to the next agent other than its
 // former holder that asks for work or names its issue. It keeps the claim, its issue's text and

@@ -352,10 +352,11 @@ export function dueRevocations(sql: SqlStorage, now: number, limit: number): Cla
 
 /**
  * Starts a revocation sweep of the claim's fork tokens and returns its attempt, which
- * `recordRevocation` needs to settle it, only while the stored generation, state and due
- * revocation still equal `expected`. In the same step it raises the fork's revocation barrier for
- * that attempt until `barrierUntil`, recording the attempt's `cutoff`. Returns `"stale"`, and writes nothing, when the claim changed
- * since the caller read it: a reopened claim owes nothing, and its holder's new tokens must live.
+ * `recordRevocation` needs to settle it, only while the stored generation, state and due revocation
+ * still equal `expected`. In the same step it raises the fork's revocation barrier for that attempt
+ * until `barrierUntil`, recording the attempt's `cutoff`. Returns `"stale"`, and writes nothing,
+ * when the claim changed since the caller read it: a reopened claim owes nothing, and its holder's
+ * new tokens must live.
  */
 export function beginRevocation(
   sql: SqlStorage,
