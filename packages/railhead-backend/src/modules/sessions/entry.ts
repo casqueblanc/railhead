@@ -37,7 +37,7 @@ import type { AgentPrincipal, SessionClaims } from "../../contracts/principals";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import type { ModuleFactory, RepoContext, RepoPorts } from "../../repo/composeRepo";
 import { atomically, migrate } from "../../repo/storage";
-import { equalBytes, randomHex } from "../owner/encoding";
+import { equalBytes, hex, randomHex } from "../owner/encoding";
 
 /**
  * Most challenges one agent may redeem in any `CHALLENGE_TTL_MS`, counted from each redemption.
@@ -284,10 +284,6 @@ export function createSessions(
       return ok({ kind: "agent", agentId: sub, ownerId: owner, repoId });
     },
   };
-}
-
-function hex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function hexBytes(text: string): Uint8Array {

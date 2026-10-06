@@ -41,6 +41,7 @@ import {
 } from "../modules/demoSeed/entry";
 import type { SeedTarget } from "../modules/demoSeed/target";
 import type { GitTarget } from "../modules/git/entry";
+import { hex } from "../modules/owner/encoding";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
 import { EventLog, EventLogError } from "./eventLog";
@@ -408,7 +409,7 @@ export class Repo extends DurableObject<Env> {
 /** A new history: 128 random bits in lowercase hex. */
 function randomHistory(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex(bytes);
 }
 
 function replaced(): PortResult<never> {
