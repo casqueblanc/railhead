@@ -191,8 +191,6 @@ class SeedFake implements SeedArtifacts {
     return {
       ...handle,
       [Symbol.dispose]: () => handle[Symbol.dispose](),
-      // Artifacts resolves a branch by its short name and answers an empty log for a full ref name.
-      log: async (opts) => (opts?.ref?.startsWith("refs/") === true ? [] : handle.log(opts)),
       info: async () => ({
         id: name,
         name,

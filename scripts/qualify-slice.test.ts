@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { judgeReport } from "./qualify/evidence.ts";
-import { ORIGIN, liveBindingReport, liveSliceReport } from "./qualify/reportFixtures.ts";
+import { COMMITS, ORIGIN, liveBindingReport, liveSliceReport } from "./qualify/reportFixtures.ts";
 
 const script = join(import.meta.dirname, "qualify-slice.mjs");
 
@@ -302,6 +302,38 @@ describe("qualify-slice.mjs", () => {
     assert.equal(other.code, 1);
     assert.match(other.stdout, /FAIL slice .*\n  FAIL slice\.live-origin/);
     assert.equal(existsSync(network), false);
+  });
+
+  test("gate fails a binding whose log resolves a ref otherwise than the backend's fakes", async () => {
+    const slice = written("slice-refs.json", liveSliceReport());
+    const report = liveBindingReport();
+    const fullRefResolves = report.observations.refs.map((item) =>
+      item.ref === "refs/heads/main" ? { ref: item.ref, hashes: [COMMITS.c5] } : item,
+    );
+    const path = written("binding-refs.json", {
+      ...report,
+      observations: { ...report.observations, refs: fullRefResolves },
+    });
+    const ran = await gateRun([path, slice]);
+    assert.equal(ran.code, 1);
+    assert.match(
+      ran.stdout,
+      /FAIL binding .*binding-refs\.json\n  FAIL refs\.resolution\nFAIL slice/,
+    );
+    const recorded = JSON.parse(readFileSync(path, "utf8")).checks.at(-1);
+    assert.deepEqual(recorded, {
+      id: "refs.resolution",
+      outcome: "fail",
+      detail: `the fakes disagree with the binding: refs/heads/main: binding [${COMMITS.c5}], fakes []`,
+    });
+
+    const { refs: _refs, ...withoutRefs } = report.observations;
+    const missing = await gateRun([
+      written("binding-no-refs.json", { ...report, observations: withoutRefs }),
+      slice,
+    ]);
+    assert.equal(missing.code, 1);
+    assert.match(missing.stdout, /  FAIL refs\.resolution\n/);
   });
 
   test("gate fails reports that state passing checks without live observations", async () => {

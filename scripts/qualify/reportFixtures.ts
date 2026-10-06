@@ -2,7 +2,12 @@
 // `qualify-slice.test.ts`. They are test inputs only: built by hand, they stand for what a live run
 // records, so each test changes one part and asserts which checks that part decides.
 
-import type { MainRefCommits, MainRefObservations, SliceObservations } from "./evidence.ts";
+import {
+  refCases,
+  type MainRefCommits,
+  type MainRefObservations,
+  type SliceObservations,
+} from "./evidence.ts";
 
 export const LIVE_REMOTE =
   "https://0123456789abcdef0123456789abcdef.artifacts.cloudflare.net/git/qual/rh-m-1.git";
@@ -100,6 +105,11 @@ export function liveMainRef(): MainRefObservations {
   };
 }
 
+/** The ref observations of a binding that resolves refs as the fakes do. */
+export function liveRefs() {
+  return refCases(COMMITS).map(({ ref, fakes }) => ({ ref, hashes: fakes }));
+}
+
 const ACCOUNT_GIT = "https://0123456789abcdef0123456789abcdef.artifacts.cloudflare.net/git/qual";
 
 /** Two probe repositories, each named from its id as the probe's `mainRepoName` names it. */
@@ -126,7 +136,7 @@ export function liveBindingReport() {
     finishedAt: at(200),
     repositories: PROBE_REPOSITORIES,
     commits: COMMITS,
-    observations: { listing: liveListing(), restActive: 30, ...mainRef },
+    observations: { listing: liveListing(), restActive: 30, ...mainRef, refs: liveRefs() },
   };
 }
 

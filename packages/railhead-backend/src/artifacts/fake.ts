@@ -7,6 +7,7 @@
 // nothing about the deployed service's revocation timing or limits; that evidence is #71's.
 
 import { TOKEN_PAGE_SIZE, type ArtifactsNamespace, type ArtifactsRepoHandle } from "./adapter";
+import { resolveLogRef } from "./fakeRefs";
 
 /** The error the fake throws, shaped like the binding's `ArtifactsError`. */
 export class FakeArtifactsError extends Error {
@@ -315,8 +316,14 @@ export class FakeArtifacts implements ArtifactsNamespace {
       log: async (opts) => {
         live();
         const limit = opts?.limit ?? 50;
-        const ref = opts?.ref === undefined || opts.ref === "HEAD" ? repo.headRef : opts.ref;
-        const commits = ref === "refs/heads/main" || ref === "main" ? repo.commits : [];
+        const tip = repo.commits.at(-1);
+        const start = resolveLogRef(opts?.ref, {
+          head: repo.headRef === "refs/heads/main" ? tip : undefined,
+          names: new Map(tip === undefined ? [] : [["main", tip]]),
+          holds: (id) => repo.commits.includes(id),
+        });
+        const commits =
+          start === null ? [] : repo.commits.slice(0, repo.commits.indexOf(start) + 1);
         return commits
           .toReversed()
           .slice(0, limit)

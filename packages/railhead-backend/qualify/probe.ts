@@ -1,6 +1,6 @@
 // The Artifacts qualification probe: a throwaway Worker an operator deploys on its own Artifacts
-// namespace, so `scripts/qualify-slice.mjs` can run the binding-level cases #161 and #158 recorded
-// for A40 against the live service. It is never part of the `railhead` Worker and holds no Railhead
+// namespace, so `scripts/qualify-slice.mjs` can run binding-level cases against the live service:
+// #161 and #158, recorded for A40, and #350's ref resolution. It is never part of the `railhead` Worker and holds no Railhead
 // data: every repository it touches is one it created, named by a random repository id.
 //
 // Each route runs one case and returns what it observed, not a verdict; the harness judges the
@@ -264,6 +264,8 @@ function stringField(value: unknown, key: string, pattern: RegExp): string | nul
 }
 
 const REPO_ID = /^rep_[0-9a-f]{64}$/;
+/** A branch, tag, full ref name or commit id. */
+const LOG_REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/;
 
 /** A fresh random repository id, so the probe's main is named as Railhead names one. */
 function randomRepoId(): RepoId {
@@ -388,6 +390,15 @@ async function route(env: ProbeEnv, name: string, body: unknown): Promise<Respon
       if (repoId === null) return json({ error: "repoId" }, 400);
       using repo = await env.ARTIFACTS.get(await mainRepoName(repoId));
       return json({ main: await mainHead(repo), liveWriteTokens: await liveWriteTokens(repo) });
+    }
+    case "log": {
+      // The commits `log` answers for one ref (#350), as hashes only.
+      const repoId = stringField(body, "repoId", REPO_ID);
+      const ref = stringField(body, "ref", LOG_REF);
+      if (repoId === null || ref === null) return json({ error: "repoId, ref" }, 400);
+      using repo = await env.ARTIFACTS.get(await mainRepoName(repoId));
+      const commits = await repo.log({ ref, limit: 1 });
+      return json({ hashes: commits.map((commit) => commit.hash) });
     }
     case "update": {
       // The production adapter's update, as the main writer calls it.

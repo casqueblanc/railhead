@@ -10,6 +10,7 @@
 import { ReceivePackHeadParser } from "../git/pktLine";
 import type { MainRefHandle, MainRefNamespace } from "./mainRef";
 import { FakeArtifactsError } from "./fake";
+import { resolveLogRef } from "./fakeRefs";
 
 /** The size of the binding's token page, as measured. */
 const TOKEN_PAGE = 30;
@@ -309,16 +310,18 @@ export class FakeMainRepo implements MainRefNamespace {
       log: async (opts) => {
         live();
         this.#step("log");
-        const ref = opts?.ref ?? "HEAD";
-        let hash: string | undefined =
-          ref === "HEAD" || ref === "main" || ref === "refs/heads/main" ? this.main : ref;
+        let hash = resolveLogRef(opts?.ref, {
+          head: this.main,
+          names: new Map([["main", this.main]]),
+          holds: (id) => this.commits.has(id),
+        });
         const limit = opts?.limit ?? 50;
         const history: ArtifactsCommitMetadata[] = [];
-        while (hash !== undefined && history.length < limit) {
+        while (hash !== null && history.length < limit) {
           const parents = this.commits.get(hash);
           if (parents === undefined) break;
           history.push(commitMetadata(hash, parents));
-          hash = parents[0];
+          hash = parents[0] ?? null;
         }
         return history;
       },
