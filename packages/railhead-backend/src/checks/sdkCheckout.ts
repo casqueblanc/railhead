@@ -117,10 +117,10 @@ export function gatewayCheckout(
   if (namespaceOf(source.providerData) !== source.owner) {
     throw new Error("check source namespace does not match its owner");
   }
-  if (!ACCOUNT_ID.test(accountId)) throw new Error("invalid Cloudflare account ID");
+  const host = artifactsHost(accountId);
+  if (host === null) throw new Error("invalid Cloudflare account ID");
   const slot = slotOf(source.providerData);
   if (slot === null) throw new Error("check source names no admitted sandbox slot");
-  const host = `${accountId}.artifacts.cloudflare.net`;
   const policy = parseSandboxPolicy({
     host,
     namespace: source.owner,
@@ -134,6 +134,14 @@ export function gatewayCheckout(
     sha: source.sha,
     fence: { policy, expiresAt: slot.deadline, sandbox: slot.sandbox },
   };
+}
+
+/**
+ * The Artifacts Git host of a Cloudflare account, or `null` when `accountId` is not 32 lowercase
+ * hex digits.
+ */
+export function artifactsHost(accountId: string): string | null {
+  return ACCOUNT_ID.test(accountId) ? `${accountId}.artifacts.cloudflare.net` : null;
 }
 
 function assertRepository(repository: CheckRepository, source: Source): void {

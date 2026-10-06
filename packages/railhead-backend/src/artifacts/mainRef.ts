@@ -35,6 +35,7 @@ import { fail, ok, type PortResult } from "../contracts/result";
 import type { MainRefPort, MainUpdate } from "../contracts/train";
 import type { Upstream } from "../git/gateway";
 import { PushReportReader } from "../git/reportStatus";
+import { gitServiceUrl } from "../git/serviceUrl";
 import { MAIN_REF_TIMEOUT_MS } from "../modules/mainWriter/mainWriter";
 import { boundedCall, mainRepoName, MIN_TOKEN_TTL_MS } from "./adapter";
 
@@ -224,7 +225,7 @@ class ArtifactsMainRef implements MainRefPort {
       );
     }
     const info = await boundedCall(handle.info(), remaining());
-    const url = receivePackUrl(info.remote);
+    const url = gitServiceUrl(info.remote, "git-receive-pack");
     if (url === null) return fail("internal", "Main's repository has no usable Git remote.");
     const token = await boundedCall(
       handle.createToken("write", MIN_TOKEN_TTL_MS / 1000),
@@ -428,26 +429,6 @@ async function receivePackBody(expected: CommitSha, next: CommitSha): Promise<Ui
     offset += part.length;
   }
   return body;
-}
-
-/** The receive-pack URL of an HTTPS remote with no credentials, query or fragment. */
-function receivePackUrl(remote: string): URL | null {
-  let base: URL;
-  try {
-    base = new URL(remote);
-  } catch {
-    return null;
-  }
-  if (
-    base.protocol !== "https:" ||
-    base.username !== "" ||
-    base.password !== "" ||
-    base.search !== "" ||
-    base.hash !== ""
-  ) {
-    return null;
-  }
-  return new URL(`${base.href.replace(/\/+$/, "")}/git-receive-pack`);
 }
 
 /** Settles with `work`, or rejects once `signal` aborts. */
