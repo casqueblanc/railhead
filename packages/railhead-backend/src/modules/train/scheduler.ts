@@ -13,30 +13,30 @@
 // A pin is queued only inside the transaction that records `ready`, or that repeats it for a pin
 // with no entry, and the Repo's alarm drives the train once it commits; each `recordCheck` drives
 // it at once. A drive runs until the train waits for a check report or a port, or the queue is
-// empty. Whenever storage holds work the train
-// owes (an active batch or a queued pin), it also holds a wake row and the Repo's alarm is set for
-// it. `recordDebt` is the only writer of that row, and it writes inside the transaction that
-// creates or restarts the debt: accepting work records it due now with the alarm due now, and
-// starting a drive records it with the alarm `DRIVE_LEASE_MS` later, so the work is resumed even if
-// the object stops before or during the drive and nothing else wakes it. When a drive ends, the
-// train settles that debt from storage: it asks the alarm to drive again at once when work arrived
-// too late for the drive, waits for the active attempt's deadline while a runner's report is due,
-// backs off when a port refused or the drive threw, up to `MAX_WAKE_FAILURES` drives in a row, and
-// otherwise clears it. After the last of those drives the
+// empty. Whenever storage holds work the train owes (an active batch or a queued pin), it also
+// holds a wake row and the Repo's alarm is set for it. `recordDebt` is the only writer of that row,
+// and it writes inside the transaction that creates or restarts the debt: accepting work records it
+// due now with the alarm due now, and starting a drive records it with the alarm `DRIVE_LEASE_MS`
+// later, so the work is resumed even if the object stops before or during the drive and nothing
+// else wakes it. When a drive ends, the train settles that debt from storage: it asks the alarm to
+// drive again at once when work arrived too late for the drive, waits for the active attempt's
+// deadline while a runner's report is due, backs off when a port refused or the drive threw, up to
+// `MAX_WAKE_FAILURES` drives in a row, and otherwise clears it. After the last of those drives the
 // row stays but is marked exhausted, and no alarm is asked for it; the next drive any call starts
 // restores it with a fresh count. Neither a backoff nor exhaustion outlasts a requested attempt's
-// deadline: the wake stays due by then, so the attempt expires even when no port answers again.
-// Nor does exhaustion stop the train while the active batch's merge intent is authorized with a
-// write attempt counted, or settled without the batch recording it: that write may have moved main
-// unheard, and no call may come to read main back or record the outcome. The exhausted row then stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row
-// exhausted, so the intent settles once Git answers or the write's outcome window has passed.
-// Settling any batch restores a fresh count, so the work that settlement exposes has its own retries.
-// A thrown drive error does not undo the call's committed write: the call still returns its result.
-// A restarted train asks again for the wake it owes, exhausted or not; the alarm drives an
-// exhausted one only while such an intent is unsettled. Those attempts use timers inside the object,
-// so they report rather than outlive it: the Repo awaits them before serving anything, and when
-// every one failed it resets the object, so the next request or alarm builds the train again and
-// asks again from the stored wake row.
+// deadline: the wake stays due by then, so the attempt expires even when no port answers again. Nor
+// does exhaustion stop the train while the active batch's merge intent is authorized with a write
+// attempt counted, or settled without the batch recording it: that write may have moved main
+// unheard, and no call may come to read main back or record the outcome. The exhausted row then
+// stays due every `SETTLE_WAKE_MS`, and each such drive keeps the row exhausted, so the intent
+// settles once Git answers or the write's outcome window has passed. Settling any batch restores a
+// fresh count, so the work that settlement exposes has its own retries. A thrown drive error does
+// not undo the call's committed write: the call still returns its result. A restarted train asks
+// again for the wake it owes, exhausted or not; the alarm drives an exhausted one only while such
+// an intent is unsettled. Those attempts use timers inside the object, so they report rather than
+// outlive it: the Repo awaits them before serving anything, and when every one failed it resets the
+// object, so the next request or alarm builds the train again and asks again from the stored wake
+// row.
 //
 // The claims module queues a pin inside the transaction that records `ready`, so a pin and its
 // queue entry commit together and a repeated `ready` queues nothing. Each such call is a new ready
