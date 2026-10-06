@@ -91,7 +91,9 @@ export const EnrollmentPanel = ({
               access={actionAccess(owner, authenticator, view.board.stream)}
             />
           )}
-          <OwnerPasskeySetup enrollment={enrollment} authenticator={authenticator} />
+          <div className="border-t border-kumo-line">
+            <OwnerPasskeySetup enrollment={enrollment} authenticator={authenticator} />
+          </div>
         </LayerCard.Primary>
       </LayerCard>
     </section>

@@ -1,23 +1,36 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import type { BoardResult } from "@railhead/shared/board-api";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { decisionReversal } from "../../../../../fixtures/board/decisionReversal";
 import { SYNTH_REPO, syntheticLog } from "../../../../../fixtures/board/syntheticLog";
 import { uploadPrelude } from "../../../../../fixtures/board/uploadSteps";
-import type { BoardPorts, FeatureEntry, OwnerSlotProps } from "../../features/board/boardPorts";
+import type {
+  BoardPorts,
+  EnrollmentPort,
+  FeatureEntry,
+  OwnerSlotProps,
+} from "../../features/board/boardPorts";
 import { emptyBoardState, foldEvents, type BoardState } from "../../features/board/boardState";
 import type { BoardFeed } from "../../features/claims/boardFeed";
+import { EnrollmentPanel } from "../../features/enrollment/EnrollmentPanel";
+import { fakeAuthenticator } from "../../features/enrollment/fakeAuthenticator";
+import { OwnerSetupCard, type OwnerSetupSlotProps } from "../../features/enrollment/OwnerSetupCard";
 import { HomePage } from "./HomePage";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-// The enrollment slot's entry is swapped per test to exercise an installed feature.
+// The enrollment entries are swapped per test to exercise an installed feature.
 const slot = vi.hoisted(() => ({
   enrollment: { kind: "unavailable" } as FeatureEntry<OwnerSlotProps>,
+  ownerSetup: { kind: "unavailable" } as FeatureEntry<OwnerSetupSlotProps>,
 }));
 vi.mock("../../features/enrollment/entry", () => ({
   get enrollmentEntry() {
     return slot.enrollment;
+  },
+  get ownerSetupEntry() {
+    return slot.ownerSetup;
   },
 }));
 // The page is tested apart from which leaf features are installed.
@@ -70,6 +83,49 @@ const ports = (overrides: Partial<BoardPorts> = {}): BoardPorts => ({
   ...overrides,
 });
 
+/** Installs the owner setup slot with a fake authenticator in place of the browser's. */
+const installOwnerSetup = () => {
+  const { authenticator } = fakeAuthenticator();
+  slot.ownerSetup = {
+    kind: "available",
+    Component: ({ enrollment }) => (
+      <OwnerSetupCard enrollment={enrollment} authenticator={authenticator} />
+    ),
+  };
+};
+
+const enrolledResult: BoardResult<{ ownerId: string }> = {
+  ok: true,
+  value: { ownerId: "usr_synthowner" },
+};
+
+/** An enrollment port that records each token and completed challenge. */
+const enrollmentPort = (completed: () => Promise<BoardResult<{ ownerId: string }>>) => {
+  const tokens: string[] = [];
+  const completions: string[] = [];
+  const port: EnrollmentPort = {
+    kind: "available",
+    onPrepareEnrollment: (token) => {
+      tokens.push(token);
+      return Promise.resolve({
+        ok: true,
+        value: {
+          challengeId: "enr_1",
+          challenge: "AAECAw",
+          rpId: "railhead.dev",
+          userHandle: "BAUG",
+          expiresAt: Date.now() + 60_000,
+        },
+      });
+    },
+    onCompleteEnrollment: (challengeId) => {
+      completions.push(challengeId);
+      return completed();
+    },
+  };
+  return { port, tokens, completions };
+};
+
 describe("HomePage", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -89,10 +145,23 @@ describe("HomePage", () => {
     return found;
   };
 
+  const tokenInput = () => container.querySelector<HTMLInputElement>("input[name=bootstrap-token]");
+
+  const typeToken = async (value: string) => {
+    const input = tokenInput();
+    if (input === null) throw new Error("no bootstrap token field");
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    await act(async () => {
+      setValue?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+
   beforeEach(() => {
     recorded.length = 0;
     onReconnect.mockReset();
     slot.enrollment = { kind: "unavailable" };
+    slot.ownerSetup = { kind: "unavailable" };
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -243,11 +312,109 @@ describe("HomePage", () => {
     ["connected", "No board on this Railhead yet"],
     ["lost", "Connection to the backend lost"],
   ] as const)("says why there is no board while %s", async (connection, title) => {
+    installOwnerSetup();
     await render(ports({ connection, board: { kind: "unavailable" } }));
 
     expect(text()).toContain(title);
     expect(container.querySelector("nav")).toBeNull();
     expect(text()).not.toContain("Not available.");
+    expect(tokenInput()?.closest("[hidden]") !== null).toBe(connection !== "connected");
+  });
+
+  describe("owner passkey on an instance with no board", () => {
+    it("enrolls the owner with the bootstrap token and then shows no form", async () => {
+      const { port, tokens, completions } = enrollmentPort(async () => enrolledResult);
+      installOwnerSetup();
+      await render(ports({ board: { kind: "unavailable" }, enrollment: port }));
+
+      expect(text()).toContain("No board on this Railhead yet");
+      expect(text()).toContain("Set up this Railhead");
+      await typeToken(" deploy-token ");
+      await act(async () => button("Enroll owner passkey").click());
+
+      expect(tokens).toEqual(["deploy-token"]);
+      expect(completions).toEqual(["enr_1"]);
+      expect(text()).toContain("Owner passkey enrolled. Enrollment is now closed.");
+      expect(tokenInput()).toBeNull();
+    });
+
+    it("keeps the form and shows the refusal when the backend closes enrollment", async () => {
+      const { port, tokens, completions } = enrollmentPort(async () => ({
+        ok: false,
+        code: "bootstrap_closed",
+        message: "closed",
+      }));
+      installOwnerSetup();
+      await render(ports({ board: { kind: "unavailable" }, enrollment: port }));
+
+      await typeToken("wrong-token");
+      await act(async () => button("Enroll owner passkey").click());
+
+      expect(tokens).toEqual(["wrong-token"]);
+      expect(completions).toEqual(["enr_1"]);
+      expect(text()).toContain(
+        "This Railhead already has an owner, or the bootstrap token is wrong.",
+      );
+      expect(text()).not.toContain("Owner passkey enrolled");
+      expect(tokenInput()).not.toBeNull();
+    });
+
+    it("still says a sent passkey was not confirmed after the connection drops and returns", async () => {
+      const { port, completions } = enrollmentPort(() => new Promise(() => {}));
+      installOwnerSetup();
+      const empty = { board: { kind: "unavailable" } } as const;
+      await render(ports({ ...empty, enrollment: port }));
+
+      await typeToken("deploy-token");
+      await act(async () => button("Enroll owner passkey").click());
+      expect(completions).toEqual(["enr_1"]);
+
+      await render(ports({ ...empty, connection: "lost", enrollment: port }));
+      expect(tokenInput()?.closest("[hidden]")).not.toBeNull();
+      await render(
+        ports({ ...empty, enrollment: enrollmentPort(async () => enrolledResult).port }),
+      );
+
+      expect(tokenInput()?.closest("[hidden]")).toBeNull();
+      expect(text()).toContain(
+        "The board lost its connection. Enrollment was not confirmed after the passkey was sent.",
+      );
+      expect(text()).not.toContain("Owner passkey enrolled");
+    });
+
+    it("shows no form when the backend serves no enrollment", async () => {
+      installOwnerSetup();
+      await render(
+        ports({
+          board: { kind: "unavailable" },
+          enrollment: { kind: "unavailable", reason: "module_unavailable" },
+        }),
+      );
+
+      expect(tokenInput()).toBeNull();
+      expect(text()).toContain("Unavailable: this Railhead has no owner actions installed.");
+    });
+
+    it("says enrollment is unavailable when the browser has no owner setup installed", async () => {
+      await render(ports({ board: { kind: "unavailable" } }));
+
+      expect(tokenInput()).toBeNull();
+      expect(text()).toContain("Not available. This board cannot enroll the owner's passkey yet.");
+    });
+
+    it("keeps the owner passkey in the Agents panel once the board is served", async () => {
+      installOwnerSetup();
+      const { authenticator } = fakeAuthenticator();
+      slot.enrollment = {
+        kind: "available",
+        Component: (props) => <EnrollmentPanel {...props} authenticator={authenticator} />,
+      };
+      await render(ports());
+
+      expect(sectionHeadings()).toContain("Agents");
+      expect(container.querySelectorAll("input[name=bootstrap-token]")).toHaveLength(1);
+      expect(text()).not.toContain("Set up this Railhead");
+    });
   });
 
   it("reconnects from the lost state", async () => {

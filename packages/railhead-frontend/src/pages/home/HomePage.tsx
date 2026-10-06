@@ -3,7 +3,7 @@ import { Link } from "@cloudflare/kumo";
 import { appEntry } from "../../features/app/entry";
 import { gateOnConnection, type BoardPorts } from "../../features/board/boardPorts";
 import { ClaimLanes } from "../../features/claims/ClaimLanes";
-import { enrollmentEntry } from "../../features/enrollment/entry";
+import { enrollmentEntry, ownerSetupEntry } from "../../features/enrollment/entry";
 import { issuesEntry } from "../../features/issues/entry";
 import { metricsEntry } from "../../features/metrics/entry";
 import { phoneEntry } from "../../features/phone/entry";
@@ -49,8 +49,21 @@ export const HomePage = ({ ports }: HomePageProps) => {
 
   if (board.kind === "unavailable") {
     return (
-      <div className="flex flex-1 items-center justify-center p-4" aria-live="polite">
-        <BoardUnavailable connection={connection} onReconnect={onReconnect} />
+      <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-6 p-4">
+        <div aria-live="polite">
+          <BoardUnavailable connection={connection} onReconnect={onReconnect} />
+        </div>
+        {/* Seeding the first board needs the owner's passkey, so a new instance enrolls it here.
+            The form stays mounted while the connection is down, so a passkey sent before the loss
+            still says its enrollment was not confirmed once the board reconnects. */}
+        <div hidden={connection !== "connected"}>
+          <FeatureSlot
+            entry={ownerSetupEntry}
+            props={{ enrollment }}
+            title="Set up this Railhead"
+            unavailable="This board cannot enroll the owner's passkey yet."
+          />
+        </div>
       </div>
     );
   }
