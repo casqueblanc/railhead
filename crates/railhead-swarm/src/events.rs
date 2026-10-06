@@ -8,10 +8,10 @@
 //! The agent wire shows an agent its own claim, its inbox and where the train holds its own pin.
 //! A waiting agent reads its pin after each poll and reports each change as a `pinState` event;
 //! the stream knows a batch only through the pins in it. "Landed" needs positive evidence: the
-//! agent read its claim as `merged`. A ready claim that leaves the agent's status without that
-//! evidence may have merged or expired. The agent wire's `StatusResult.closed` names the closed
-//! reason, but the driver reads only the active claim and does not use it yet, so such a claim is
-//! "unverified": never a landing, and not a failure. "Auto-merged" needs Git's evidence: two edits
+//! agent read its claim as `merged`, as its active claim or as the closed claim
+//! `StatusResult.closed` names. A claim that closed for another reason is reported with that
+//! reason. A ready claim that leaves the agent's status while `closed` names another claim or none
+//! is "unverified": never a landing, and not a failure. "Auto-merged" needs Git's evidence: two edits
 //! of the same path landed, each written on a base that lacked the other's line, and main read
 //! back afterwards holds both.
 
@@ -23,6 +23,19 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::plan::EditClass;
+
+/// Why a pinned claim closed without landing, from the agent wire's closed reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
+#[serde(rename_all = "camelCase")]
+pub enum Unlanded {
+    /// The lease lapsed.
+    Expired,
+    /// The claim was given up.
+    Released,
+    /// Another agent took the claim over.
+    TakenOver,
+}
 
 /// Most events queued for the writer before an agent waits for it.
 pub const EVENT_QUEUE: usize = 1024;
@@ -183,6 +196,8 @@ impl TrainState {
 /// One event.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(test, derive(serde::Deserialize))]
+// The summary's label reads back as a `&'static str`.
+#[cfg_attr(test, serde(bound(deserialize = "'de: 'static")))]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -274,8 +289,19 @@ pub enum Event {
         /// whose `rh ready` this run did not see.
         ready_to_landed_ms: Option<u64>,
     },
-    /// A pinned claim left the agent's status without a closed reason, so whether it merged or
-    /// expired is unknown. Not a landing, and not a failure.
+    /// A pinned claim closed without landing; the agent stops.
+    Closed {
+        /// The agent.
+        agent: String,
+        /// The claim.
+        claim_id: String,
+        /// What it delivers.
+        class: TaskClass,
+        /// Why it closed.
+        reason: Unlanded,
+    },
+    /// A pinned claim left the agent's status, which named no closed reason for it, so whether it
+    /// merged is unknown. Not a landing, and not a failure.
     Unverified {
         /// The agent.
         agent: String,
@@ -283,9 +309,6 @@ pub enum Event {
         claim_id: String,
         /// What it delivers.
         class: TaskClass,
-        /// The issue that adds the closed reason to the agent wire.
-        #[cfg_attr(test, serde(deserialize_with = "known"))]
-        needs: &'static str,
     },
     /// Two claims changed the same path from bases that lacked each other's edit, and main holds
     /// both: Git merged them.
@@ -390,7 +413,13 @@ pub struct Summary {
     pub readies: u64,
     /// Commits landed.
     pub landings: u64,
-    /// Pinned claims that closed without a closed reason, which may have landed or expired; see
+    /// Pinned claims whose lease lapsed.
+    pub expired: u64,
+    /// Pinned claims given up.
+    pub released: u64,
+    /// Pinned claims another agent took over.
+    pub taken_over: u64,
+    /// Pinned claims that closed without a closed reason, which may have landed; see
     /// [`Event::Unverified`].
     pub unverified: u64,
     /// Same-path pairs Git merged.
@@ -411,8 +440,8 @@ pub struct Summary {
 
 impl Summary {
     /// Whether the run did all it was asked: it completed, all `agents` finished every planned
-    /// task, and nothing failed or stalled. An unverified task is not a failure: the agent wire
-    /// cannot tell it apart from a landing yet.
+    /// task, and nothing failed or stalled. An unverified task is not a failure: it may have
+    /// landed. A claim that closed without landing stops its agent, so the run fails.
     #[must_use]
     pub fn succeeded(&self, agents: u32) -> bool {
         self.stopped_by == StopReason::Completed
@@ -427,7 +456,7 @@ impl Summary {
 fn known<'de, D: serde::Deserializer<'de>>(from: D) -> Result<&'static str, D::Error> {
     use serde::Deserialize as _;
     let text = String::deserialize(from)?;
-    [SUMMARY_LABEL, crate::agent::UNVERIFIED_NEEDS]
+    [SUMMARY_LABEL]
         .into_iter()
         .find(|known| *known == text)
         .ok_or_else(|| serde::de::Error::custom("not a string the stream carries"))
@@ -448,6 +477,12 @@ pub struct Tally {
     pub readies: u64,
     /// Commits landed.
     pub landings: u64,
+    /// Pinned claims whose lease lapsed.
+    pub expired: u64,
+    /// Pinned claims given up.
+    pub released: u64,
+    /// Pinned claims another agent took over.
+    pub taken_over: u64,
     /// Pinned claims that closed without a closed reason.
     pub unverified: u64,
     /// Same-path pairs Git merged.
@@ -477,6 +512,11 @@ impl Tally {
                 self.latencies.extend(*ready_to_landed_ms);
                 &mut self.landings
             }
+            Event::Closed { reason, .. } => match reason {
+                Unlanded::Expired => &mut self.expired,
+                Unlanded::Released => &mut self.released,
+                Unlanded::TakenOver => &mut self.taken_over,
+            },
             Event::Unverified { .. } => &mut self.unverified,
             Event::ConflictAutoMerged { .. } => &mut self.auto_merged,
             Event::ConflictRouted { .. } => &mut self.routed,
@@ -496,6 +536,14 @@ impl Tally {
             | Event::Summary(_) => return,
         };
         *counter = counter.saturating_add(1);
+    }
+
+    /// Pinned claims that closed without landing, for every reason.
+    #[must_use]
+    pub const fn unlanded(&self) -> u64 {
+        self.expired
+            .saturating_add(self.released)
+            .saturating_add(self.taken_over)
     }
 
     /// Ready→landed latency over the landings counted so far.
@@ -520,6 +568,9 @@ impl Tally {
             pushes: self.pushes,
             readies: self.readies,
             landings: self.landings,
+            expired: self.expired,
+            released: self.released,
+            taken_over: self.taken_over,
             unverified: self.unverified,
             auto_merged_overlaps: self.auto_merged,
             routed_conflicts: self.routed,
@@ -770,7 +821,6 @@ mod tests {
             agent: "swarm-00".to_owned(),
             claim_id: "clm_abcdef".to_owned(),
             class: TaskClass::Disjoint,
-            needs: "casqueblanc/railhead#237",
         };
         let summary = summary_of(
             &[unverified, state(AgentState::Done)],
@@ -779,5 +829,36 @@ mod tests {
         assert!(summary.succeeded(1));
         assert_eq!((summary.unverified, summary.landings), (1, 0));
         assert!(!summary_of(&done, StopReason::Interrupted).succeeded(2));
+    }
+
+    #[test]
+    fn each_closed_reason_has_its_own_total() {
+        let mut tally = Tally::default();
+        for reason in [
+            Unlanded::Expired,
+            Unlanded::TakenOver,
+            Unlanded::Released,
+            Unlanded::TakenOver,
+        ] {
+            tally.count(&Event::Closed {
+                agent: "swarm-00".to_owned(),
+                claim_id: "clm_abcdef".to_owned(),
+                class: TaskClass::Disjoint,
+                reason,
+            });
+        }
+        let summary = tally.summary(StopReason::Completed, Duration::ZERO);
+        assert_eq!(
+            (
+                summary.expired,
+                summary.released,
+                summary.taken_over,
+                summary.landings,
+                summary.unverified,
+                summary.failures
+            ),
+            (1, 1, 2, 0, 0, 0)
+        );
+        assert_eq!(tally.unlanded(), 4);
     }
 }

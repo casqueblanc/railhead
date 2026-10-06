@@ -163,7 +163,7 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &View) {
         stat("auto-merged ", tally.auto_merged.to_string()),
         stat("routed ", tally.routed.to_string()),
         stat("redos ", tally.redos.to_string()),
-        stat("unverified ", tally.unverified.to_string()),
+        stat("unlanded ", tally.unlanded().to_string()),
         stat("stalls ", tally.stalls.to_string()),
         stat("failures ", tally.failures.to_string()),
         stat("done ", format!("{}/{agents}", tally.agents_done)),
@@ -207,7 +207,7 @@ const fn stage_style(stage: Stage) -> Style {
         Stage::Train => Style::new().fg(Color::LightBlue),
         Stage::Landed => Style::new().fg(Color::Green),
         Stage::Unverified | Stage::Redo => Style::new().fg(Color::Yellow),
-        Stage::Stopped => Style::new().fg(Color::Red),
+        Stage::Closed(_) | Stage::Stopped => Style::new().fg(Color::Red),
     }
 }
 

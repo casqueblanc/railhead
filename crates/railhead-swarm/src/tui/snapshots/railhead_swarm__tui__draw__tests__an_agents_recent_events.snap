@@ -1,11 +1,11 @@
 ---
 source: crates/railhead-swarm/src/tui/draw.rs
-assertion_line: 530
+assertion_line: 537
 expression: "render(&view, 120, 30)?.backend()"
 ---
 " SIMULATED RUN  00:11  ended: completed  casqueblanc/demo · 4 agents × 3 rounds · seed 211                              "
 "pushes 14 (72.6/min)  landings 12 (62.2/min)  ready→landed p50 0.7s p95 2.4s                                            "
-"auto-merged 2  routed 2  redos 2  unverified 0  stalls 0  failures 0  done 4/4                                          "
+"auto-merged 2  routed 2  redos 2  unlanded 0  stalls 0  failures 0  done 4/4                                            "
 "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "┌ swarm-01 ──────────────────────────────────────────────────────┐┌ Train ─────────────────────────────────────────────┐"
 "│   +1.3s pushed 516bcfe overlap swarm/contested.txt             ││waiting 0  landed 12  unverified 0                  │"

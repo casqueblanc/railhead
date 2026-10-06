@@ -5,7 +5,7 @@ expression: "render(&view, 80, 24)?.backend()"
 ---
 " SIMULATED RUN  00:11  ended: completed  casqueblanc/demo · 4 agents × 3 rounds "
 "pushes 14 (72.6/min)  landings 12 (62.2/min)  ready→landed p50 0.7s p95 2.4s    "
-"auto-merged 2  routed 2  redos 2  unverified 0  stalls 0  failures 0  done 4/4  "
+"auto-merged 2  routed 2  redos 2  unlanded 0  stalls 0  failures 0  done 4/4    "
 "────────────────────────────────────────────────────────────────────────────────"
 "┌ Agents ──────────────────────────────────────────────────────────────────────┐"
 "│ agent    step       gen land last event                                      │"

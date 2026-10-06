@@ -11,7 +11,7 @@ use std::time::Duration;
 use railhead_protocol::{PinBatchState, PinLeaveReason};
 
 use crate::events::{
-    AgentState, Event, Step as FailedStep, StopReason, Tally, TaskClass, TrainState,
+    AgentState, Event, Step as FailedStep, StopReason, Tally, TaskClass, TrainState, Unlanded,
 };
 
 /// Recent events kept per agent for its detail view.
@@ -49,6 +49,8 @@ pub enum Stage {
     Landed,
     /// The last task closed without evidence of a landing.
     Unverified,
+    /// The last task's claim closed without landing, which stopped the agent.
+    Closed(Unlanded),
     /// Redoing the edit on the new main.
     Redo,
     /// Every planned task finished.
@@ -70,6 +72,9 @@ impl Stage {
             Self::Train => "in train",
             Self::Landed => "landed",
             Self::Unverified => "unverified",
+            Self::Closed(Unlanded::Expired) => "expired",
+            Self::Closed(Unlanded::Released) => "released",
+            Self::Closed(Unlanded::TakenOver) => "taken over",
             Self::Redo => "redo",
             Self::Done => "done",
             Self::Stopped => "stopped",
@@ -478,6 +483,15 @@ fn describe(event: &Event) -> Option<(&str, String)> {
         Event::Unverified {
             agent, claim_id, ..
         } => (agent, format!("closed {claim_id}, outcome unknown")),
+        Event::Closed {
+            agent,
+            claim_id,
+            reason,
+            ..
+        } => (
+            agent,
+            format!("closed {claim_id}: {}", Stage::Closed(*reason).label()),
+        ),
         Event::ConflictRouted {
             agent,
             other_claim_id,
@@ -592,7 +606,10 @@ impl View {
             }
             Event::AgentState { agent, state } => {
                 if let Some(lane) = self.lane(agent) {
-                    lane.stage = Stage::of(*state);
+                    // A lane keeps the closed reason that stopped its agent.
+                    if !(*state == AgentState::Stopped && matches!(lane.stage, Stage::Closed(_))) {
+                        lane.stage = Stage::of(*state);
+                    }
                     if matches!(state, AgentState::Done | AgentState::Stopped) {
                         lane.pin = None;
                     }
@@ -623,6 +640,7 @@ impl View {
                 train,
             } => self.train(agent, claim_id, train),
             Event::Unverified { agent, .. } => self.unpin(agent, Some(Stage::Unverified)),
+            Event::Closed { agent, reason, .. } => self.unpin(agent, Some(Stage::Closed(*reason))),
             Event::ConflictAutoMerged { path, claims } => {
                 let claims = claims.clone().map(|claim| printable(&claim));
                 self.conflict(path, Overlap::AutoMerged { claims });
@@ -1048,6 +1066,58 @@ pub mod tests {
         assert_eq!(view.waiting().len(), 0);
         // One landing in the first 10 seconds.
         assert_eq!(view.landings_per_minute(), 60);
+    }
+
+    #[test]
+    fn a_lane_keeps_the_closed_reason_that_stopped_its_agent() {
+        let mut view = View::new();
+        for (index, reason, label) in [
+            (0_u32, Unlanded::Expired, "expired"),
+            (1, Unlanded::Released, "released"),
+            (2, Unlanded::TakenOver, "taken over"),
+        ] {
+            let agent = crate::agent_name(index);
+            let claim_id = format!("clm_swarm000{index}");
+            view.apply(
+                &Event::Ready {
+                    agent: agent.clone(),
+                    claim_id: claim_id.clone(),
+                    commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                },
+                at(10),
+            );
+            view.apply(&state(&agent, AgentState::Waiting), at(10));
+            view.apply(
+                &Event::Closed {
+                    agent: agent.clone(),
+                    claim_id: claim_id.clone(),
+                    class: TaskClass::Disjoint,
+                    reason,
+                },
+                at(20),
+            );
+            view.apply(&state(&agent, AgentState::Stopped), at(20));
+            let lane = view.lanes.iter().find(|lane| lane.name == agent);
+            assert_eq!(lane.map(|lane| lane.stage.label()), Some(label));
+            assert_eq!(
+                lane.and_then(Lane::last).map(|entry| entry.text.clone()),
+                Some(format!("closed {claim_id}: {label}"))
+            );
+        }
+        assert_eq!(view.waiting().len(), 0);
+        assert_eq!(
+            (
+                view.tally.unlanded(),
+                view.tally.landings,
+                view.tally.failures
+            ),
+            (3, 0, 0)
+        );
+        // A stop for any other reason still shows as stopped.
+        view.apply(&state("swarm-03", AgentState::Waiting), at(30));
+        view.apply(&state("swarm-03", AgentState::Stopped), at(30));
+        let lane = view.lanes.iter().find(|lane| lane.name == "swarm-03");
+        assert_eq!(lane.map(|lane| lane.stage), Some(Stage::Stopped));
     }
 
     #[test]

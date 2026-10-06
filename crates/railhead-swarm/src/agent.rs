@@ -12,12 +12,13 @@
 //! reports where the train holds it whenever that changes. The pin only describes the wait: a
 //! landing still needs the claim read as `merged`, and a failed `rh pin` stops nothing.
 //!
-//! A task lands only when the agent reads its claim as `merged`. A ready claim that leaves the
-//! agent's status without that evidence may have merged or expired. The agent wire names the
-//! closed reason in `StatusResult.closed`, but the wait reads only the status's active claim and
-//! does not use it yet. The agent reports such a task as unverified, never as a landing, and goes
-//! on with its plan, which is what an agent whose claim merged would do. A claim it reads as
-//! `expired` stops it.
+//! A task lands only when the agent reads its claim as `merged`: as the status's active claim, or
+//! as the closed claim `StatusResult.closed` names with the reason `merged`. A claim that closed
+//! as expired, released or taken over is reported with that reason and stops the agent: it no
+//! longer holds the task, so it cannot land it. A ready claim that leaves the status while
+//! `closed` names another claim or none may have merged; the agent reports it as unverified,
+//! never as a landing, and goes on with its plan, which is what an agent whose claim merged would
+//! do.
 //!
 //! Two edits of the same path count as merged by Git only on evidence Git gives: each was
 //! written on a base that lacked the other's line, and main, read back after the second landed,
@@ -41,14 +42,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use railhead_protocol::{
-    AgentErrorCode, ClaimState, ClaimView, IdKind, InboxDigest, InboxEntry, InboxItem, InboxResult,
-    PinResult, PinView, is_commit_sha, is_id,
+    AgentErrorCode, ClaimState, ClaimView, ClosedClaimView, ClosedReason, IdKind, InboxDigest,
+    InboxEntry, InboxItem, InboxResult, PinResult, PinView, is_commit_sha, is_id,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::confined;
-use crate::events::{AgentState, Emitter, Event, Step, TaskClass, TrainState, millis};
+use crate::events::{AgentState, Emitter, Event, Step, TaskClass, TrainState, Unlanded, millis};
 use crate::plan::{ApplyError, Edit, scaffold};
 use crate::process::{self, AgentEnv, Envelope, Runner};
 use crate::progress::{Progress, ProgressFile, RunKey};
@@ -88,10 +89,6 @@ async fn unpaused(paused: &watch::Receiver<bool>) {
         std::future::pending::<()>().await;
     }
 }
-
-/// Where a ready claim's outcome is unverified: the issue that adds the closed reason to the
-/// agent wire.
-pub const UNVERIFIED_NEEDS: &str = "casqueblanc/railhead#237";
 
 /// One simulated agent.
 #[derive(Debug)]
@@ -135,6 +132,7 @@ struct CloneInfo {
 #[derive(Debug, Deserialize)]
 struct Status {
     claim: Option<ClaimView>,
+    closed: Option<ClosedClaimView>,
 }
 
 /// A claim the agent holds, with its clone.
@@ -151,7 +149,7 @@ struct Held {
 /// What waiting on a ready claim ended with.
 enum Waited {
     Landed,
-    /// It left the status without a closed reason; see [`UNVERIFIED_NEEDS`].
+    /// It left the status without a closed reason.
     Unverified,
     Redo,
 }
@@ -159,31 +157,51 @@ enum Waited {
 /// What one `rh status` poll says about a ready claim.
 #[derive(Debug, PartialEq, Eq)]
 enum Polled {
-    /// It merged.
-    Landed,
     /// It reopened for a redo.
     Redo,
     /// It is still ready.
     Pending,
-    /// It left the status, which does not say whether it merged or expired.
-    Unverified,
-    /// It closed without landing.
-    Closed(&'static str),
+    /// It is no longer the agent's to wait on.
+    Ended(Ended),
 }
 
-/// Judges the held claim's state as `rh status` reported it, `None` when the status shows no
-/// claim of that id.
-fn judge(state: Option<ClaimState>) -> Polled {
-    match state {
-        Some(ClaimState::Merged) => Polled::Landed,
-        Some(ClaimState::Working) => Polled::Redo,
-        Some(ClaimState::Ready) => Polled::Pending,
-        Some(ClaimState::Expired) => Polled::Closed("claim_expired"),
-        // The status shows only an active claim, so one that left it may have merged or expired.
-        // The agent wire does not yet say which (casqueblanc/railhead#237 adds the closed reason);
-        // without positive evidence it is not a landing, and not a failure either.
-        None => Polled::Unverified,
+/// How a pinned claim ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// It merged.
+    Landed,
+    /// It left the status, which names no closed reason for it.
+    Unverified,
+    /// It closed without landing.
+    Closed(Unlanded),
+}
+
+/// Judges claim `claim_id` as `rh status` reported it: its active claim, or else its closed one.
+fn judge(status: &Status, claim_id: &str) -> Polled {
+    if let Some(claim) = status
+        .claim
+        .as_ref()
+        .filter(|claim| claim.claim_id == claim_id)
+    {
+        return match claim.state {
+            ClaimState::Merged => Polled::Ended(Ended::Landed),
+            ClaimState::Working => Polled::Redo,
+            ClaimState::Ready => Polled::Pending,
+            ClaimState::Expired => Polled::Ended(Ended::Closed(Unlanded::Expired)),
+        };
     }
+    let closed = status
+        .closed
+        .as_ref()
+        .filter(|closed| closed.claim_id == claim_id);
+    Polled::Ended(match closed.map(|closed| &closed.reason) {
+        Some(ClosedReason::Merged { .. }) => Ended::Landed,
+        Some(ClosedReason::Expired) => Ended::Closed(Unlanded::Expired),
+        Some(ClosedReason::Released) => Ended::Closed(Unlanded::Released),
+        Some(ClosedReason::TakenOver) => Ended::Closed(Unlanded::TakenOver),
+        // Without positive evidence it is not a landing, and not a failure either.
+        None => Ended::Unverified,
+    })
 }
 
 /// What a waiting agent last read of its pin.
@@ -408,18 +426,11 @@ impl Run<'_> {
         if let Some(saved) = &saved
             && let Some(claim_id) = &saved.claim_id
         {
-            let state = status
-                .data
-                .claim
-                .filter(|claim| &claim.claim_id == claim_id)
-                .map(|claim| claim.state);
-            match judge(state) {
+            match judge(&status.data, claim_id) {
                 // Still held: `rh work` hands it back.
                 Polled::Pending | Polled::Redo => {}
-                Polled::Landed => next = self.closed_meanwhile(saved, claim_id, true).await?,
-                Polled::Unverified => next = self.closed_meanwhile(saved, claim_id, false).await?,
-                Polled::Closed(code) => {
-                    return Err(self.fail(Step::Claim, code.to_owned()).await);
+                Polled::Ended(ended) => {
+                    next = self.closed_meanwhile(saved, claim_id, ended).await?;
                 }
             }
         }
@@ -473,13 +484,13 @@ impl Run<'_> {
         Ok(next)
     }
 
-    /// Records the outcome of an earlier run's claim that closed while no run watched it, a landing
-    /// when it was read as `merged`, and returns the planned task to go on with.
+    /// Records how an earlier run's claim that closed while no run watched it ended, and returns
+    /// the planned task to go on with.
     async fn closed_meanwhile(
         &self,
         saved: &Progress,
         claim_id: &str,
-        merged: bool,
+        ended: Ended,
     ) -> Outcome<u32> {
         let Some(edit) = self.agent.edits.get(task_index(saved.round)).copied() else {
             return Err(self.fail(Step::Claim, "unmapped_claim".to_owned()).await);
@@ -495,17 +506,7 @@ impl Run<'_> {
         } else {
             TaskClass::from(edit.class)
         };
-        self.emit(if merged {
-            Event::Landed {
-                agent: self.name(),
-                claim_id: claim_id.to_owned(),
-                class,
-                ready_to_landed_ms: None,
-            }
-        } else {
-            self.unverified(claim_id, class)
-        })
-        .await;
+        self.end(claim_id, class, ended, None).await?;
         if saved.scaffold {
             self.save(saved.round, false, None).await?;
             return Ok(saved.round);
@@ -927,30 +928,12 @@ impl Run<'_> {
             {
                 self.acknowledge(held, items).await?;
             }
-            let state = status
-                .data
-                .claim
-                .filter(|claim| claim.claim_id == held.claim_id)
-                .map(|claim| claim.state);
-            match judge(state) {
-                Polled::Landed => {
-                    self.emit(Event::Landed {
-                        agent: self.name(),
-                        claim_id: held.claim_id.clone(),
-                        class,
-                        ready_to_landed_ms: ready_at.map(|at| millis(at.elapsed())),
-                    })
-                    .await;
-                    return Ok(Waited::Landed);
-                }
-                Polled::Unverified => {
-                    self.emit(self.unverified(&held.claim_id, class)).await;
-                    return Ok(Waited::Unverified);
-                }
+            match judge(&status.data, &held.claim_id) {
                 Polled::Redo => return Ok(Waited::Redo),
                 Polled::Pending => self.read_pin(held, &mut pin).await,
-                Polled::Closed(code) => {
-                    return Err(self.fail(Step::Status, code.to_owned()).await);
+                Polled::Ended(ended) => {
+                    let latency = ready_at.map(|at| millis(at.elapsed()));
+                    return self.end(&held.claim_id, class, ended, latency).await;
                 }
             }
         }
@@ -978,12 +961,40 @@ impl Run<'_> {
         }
     }
 
-    fn unverified(&self, claim_id: &str, class: TaskClass) -> Event {
-        Event::Unverified {
-            agent: self.name(),
-            claim_id: claim_id.to_owned(),
-            class,
-            needs: UNVERIFIED_NEEDS,
+    /// Reports how pinned claim `claim_id` ended, and stops the agent when it closed without
+    /// landing. `ready_to_landed_ms` is `None` for an adopted claim.
+    async fn end(
+        &self,
+        claim_id: &str,
+        class: TaskClass,
+        ended: Ended,
+        ready_to_landed_ms: Option<u64>,
+    ) -> Outcome<Waited> {
+        let (agent, claim_id) = (self.name(), claim_id.to_owned());
+        let event = match ended {
+            Ended::Landed => Event::Landed {
+                agent,
+                claim_id,
+                class,
+                ready_to_landed_ms,
+            },
+            Ended::Unverified => Event::Unverified {
+                agent,
+                claim_id,
+                class,
+            },
+            Ended::Closed(reason) => Event::Closed {
+                agent,
+                claim_id,
+                class,
+                reason,
+            },
+        };
+        self.emit(event).await;
+        match ended {
+            Ended::Landed => Ok(Waited::Landed),
+            Ended::Unverified => Ok(Waited::Unverified),
+            Ended::Closed(_) => Err(Stopped),
         }
     }
 
@@ -1111,7 +1122,7 @@ fn reconciled(
     commit: &str,
 ) -> Result<Reconciled, &'static str> {
     let Some(claim) = claim else {
-        // It left the status: merged or expired, which waiting reports as unverified.
+        // It left the status: waiting reads how it closed.
         return Ok(Reconciled::Settled);
     };
     match claim.state {
@@ -1346,17 +1357,56 @@ mod tests {
         );
     }
 
+    /// A status whose active claim, `clm_abcdef`, is in `state`, and whose closed claim is
+    /// `closed`.
+    fn status(state: Option<&str>, closed: &serde_json::Value) -> anyhow::Result<Status> {
+        let claim = state.map(|state| claim(state, 1, None)).transpose()?;
+        Ok(Status {
+            claim,
+            closed: serde_json::from_value(closed.clone())?,
+        })
+    }
+
+    fn closed(claim_id: &str, kind: &str) -> serde_json::Value {
+        let reason = if kind == "merged" {
+            serde_json::json!({"kind": kind, "commit": "a".repeat(40)})
+        } else {
+            serde_json::json!({ "kind": kind })
+        };
+        serde_json::json!({"claimId": claim_id, "issueId": "iss_abcdef", "generation": 1,
+            "reason": reason, "closedAt": 1})
+    }
+
     #[test]
-    fn only_a_merged_claim_counts_as_landed() {
-        assert_eq!(judge(Some(ClaimState::Merged)), Polled::Landed);
-        assert_eq!(judge(Some(ClaimState::Ready)), Polled::Pending);
-        assert_eq!(judge(Some(ClaimState::Working)), Polled::Redo);
+    fn only_a_merged_claim_counts_as_landed() -> anyhow::Result<()> {
+        let judged = |state, closed| status(state, &closed).map(|s| judge(&s, "clm_abcdef"));
+        let null = serde_json::Value::Null;
+        let landed = Polled::Ended(Ended::Landed);
+        assert_eq!(judged(Some("merged"), null.clone())?, landed);
+        assert_eq!(judged(Some("ready"), null.clone())?, Polled::Pending);
+        assert_eq!(judged(Some("working"), null.clone())?, Polled::Redo);
         assert_eq!(
-            judge(Some(ClaimState::Expired)),
-            Polled::Closed("claim_expired")
+            judged(Some("expired"), null.clone())?,
+            Polled::Ended(Ended::Closed(Unlanded::Expired))
         );
-        // Gone from the status: merged or expired, the agent cannot tell (#237).
-        assert_eq!(judge(None), Polled::Unverified);
+        assert_eq!(judged(None, closed("clm_abcdef", "merged"))?, landed);
+        for (kind, reason) in [
+            ("expired", Unlanded::Expired),
+            ("released", Unlanded::Released),
+            ("taken_over", Unlanded::TakenOver),
+        ] {
+            assert_eq!(
+                judged(None, closed("clm_abcdef", kind))?,
+                Polled::Ended(Ended::Closed(reason)),
+                "{kind}"
+            );
+        }
+        // Gone from the status, which names no closed reason for it: the agent cannot tell.
+        let unverified = Polled::Ended(Ended::Unverified);
+        assert_eq!(judged(None, null)?, unverified);
+        // The closed claim the status names is another one.
+        assert_eq!(judged(None, closed("clm_bbbbbb", "merged"))?, unverified);
+        Ok(())
     }
 
     fn claim(state: &str, generation: u64, ready: Option<&str>) -> anyhow::Result<ClaimView> {
