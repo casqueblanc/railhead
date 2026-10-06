@@ -23,8 +23,14 @@ const HEADER =
   "// Generated from cloudflare.config.ts by scripts/generate-worker-configs.ts -- do not edit.\n" +
   "// Change cloudflare.config.ts and run `pnpm configs:generate`.\n";
 
+/**
+ * Named exports that define a Wrangler environment of the same Worker, emitted under `env.<name>`
+ * and deployed with `wrangler deploy --env <name>`. Each sets its own Worker name and bindings.
+ */
+const ENVIRONMENT_EXPORTS = ["qualification"];
+
 /** Named exports a cloudflare.config.ts may have; anything else is a typo the generator rejects. */
-const READ_EXPORTS = ["default", "wrangler"];
+const READ_EXPORTS = ["default", "wrangler", ...ENVIRONMENT_EXPORTS];
 
 /**
  * Every package directory holding a Worker config. A directory with only a wrangler.jsonc is kept
@@ -54,21 +60,35 @@ export async function renderWorkerConfig(dir: string): Promise<string> {
   const unknown = Object.keys(mod).find((key) => !READ_EXPORTS.includes(key));
   if (unknown) {
     throw new Error(
-      `${rel}/cloudflare.config.ts exports ${unknown}; only default and wrangler are read`,
+      `${rel}/cloudflare.config.ts exports ${unknown}; only ${READ_EXPORTS.join(", ")} are read`,
     );
   }
 
-  const parsed = await resolveAndParseConfig(mod.default, { isPreview: false, mode: undefined });
+  // Typed by the config's own `satisfies WranglerExtras`, which `pnpm types:scripts` checks.
+  const extras = (mod.wrangler ?? {}) as WranglerExtras;
+  const config = await convertWorker(rel, "default", mod.default, extras);
+  const environments = await Promise.all(
+    ENVIRONMENT_EXPORTS.filter((name) => mod[name] !== undefined).map(
+      async (name) => [name, await convertWorker(rel, name, mod[name], extras)] as const,
+    ),
+  );
+  const env = environments.length > 0 ? Object.fromEntries(environments) : undefined;
+
+  // An undefined `env` drops out of the JSON.
+  return HEADER + JSON.stringify({ ...config, env }, null, 2) + "\n";
+}
+
+/** One Worker definition exported as `name`, converted to Wrangler's shape with `extras` applied. */
+async function convertWorker(rel: string, name: string, input: unknown, extras: WranglerExtras) {
+  const parsed = await resolveAndParseConfig(input, { isPreview: false, mode: undefined });
   if (!parsed.success) {
     throw new Error(
-      `${rel}/cloudflare.config.ts is invalid:\n` +
+      `${rel}/cloudflare.config.ts ${name} export is invalid:\n` +
         parsed.error.issues.map((i) => `  ${i.path.join(".")}: ${i.message}`).join("\n"),
     );
   }
   const config = convertToWranglerConfig(parsed.data);
 
-  // Typed by the config's own `satisfies WranglerExtras`, which `pnpm types:scripts` checks.
-  const extras = (mod.wrangler ?? {}) as WranglerExtras;
   if (extras.assetsDirectory !== undefined) {
     if (!config.assets || config.assets.directory !== undefined) {
       throw new Error(
@@ -95,7 +115,7 @@ export async function renderWorkerConfig(dir: string): Promise<string> {
   }
 
   // An undefined `build` drops out of the JSON.
-  return HEADER + JSON.stringify({ ...config, build: extras.build }, null, 2) + "\n";
+  return { ...config, build: extras.build };
 }
 
 /**
