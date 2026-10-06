@@ -1,12 +1,12 @@
 // The live `SeedTarget` and `BoardIssues`: a deployed Railhead's `DemoSeedApi` (#149) and board, over
 // one Cap'n Web session.
 //
-// Each write needs its own owner passkey assertion, and the command line has no passkey signer yet
-// (#148). So a write runs in one of two ways, chosen by the `Approval` the target is built with:
-// `prepare` asks the backend for the challenge bound to the action and stops with `ApprovalNeeded`,
-// writing nothing; `signed` performs the action with an assertion the owner already made for such a
-// challenge, once. The backend binds a challenge to its action, head included, so an assertion for
-// another action or head is refused there, never here.
+// Each write needs its own owner passkey assertion, which the target never makes itself. So a write
+// runs in one of two ways, chosen by the `Approval` the target is built with: `prepare` asks the
+// backend for the challenge bound to the action and stops with `ApprovalNeeded`, writing nothing;
+// `signed` performs the action with an assertion the owner already made for such a challenge, once.
+// The backend binds a challenge to its action, head included, so an assertion for another action or
+// head is refused there, never here.
 //
 // Every backend call is bounded by a timeout. A write is not repeated here when its answer times
 // out, is lost, or is anything but a success or a refusal the backend makes before acting
@@ -106,7 +106,7 @@ export interface LiveSession extends Disposable {
 
 /** How the target approves its one write. */
 export type Approval =
-  /** Ask for the challenge and stop: nothing can sign it yet (#148). */
+  /** Ask for the challenge and stop, for the owner to sign it. */
   | { readonly kind: "prepare" }
   /** Perform the action with an assertion the owner made for challenge `challengeId`. */
   | {

@@ -146,7 +146,9 @@ test("without an assertion a seed stops after prepare and writes nothing", async
     lines[0] ?? "",
     /^stopped after prepare: demo\.seed of main a{40} .*nothing was written$/,
   );
-  assert.ok(lines.includes("note there is no command-line passkey signer yet (#148)"));
+  assert.ok(
+    lines.includes("note on a qualification instance, --owner-key FILE signs it in the same run"),
+  );
   assert.ok(lines.includes(`challenge ${JSON.stringify(needed.challenge)}`));
   assert.match(lines.at(-1) ?? "", /before 2026-10-03T12:00:00\.000Z.*--assertion FILE$/);
 });

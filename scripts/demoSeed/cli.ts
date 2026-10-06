@@ -5,7 +5,7 @@
 //                       scratch, so it refuses whatever bundle refuses, and writes nothing
 //   reset --dry-run     plan the reset, which deletes demo/upload-app and nothing else; with
 //                       --target it reads the instance first and fails if it does not answer
-//   seed|reset --target ORIGIN [--assertion FILE]
+//   seed|reset --target ORIGIN [--assertion FILE | --owner-key FILE]
 //                       run against the deployed Railhead at ORIGIN; with --dry-run, plan against it
 //   bundle --out FILE   write the imported main as the Git bundle the seed takes, main alone;
 //                       refuses --dry-run, since seed --dry-run is the preview
@@ -17,15 +17,17 @@
 // refused.
 //
 // Without `--target`, seed and reset only plan, against an empty instance. With it they read the
-// live `DemoSeedApi` and, without `--dry-run`, write. Each write needs an owner passkey assertion,
-// and there is no command-line signer yet (#148): without `--assertion` the write stops after
-// `prepare`, prints the challenge and exits 3, writing nothing; `--assertion FILE` performs it with
-// `{ challengeId, assertion }` the owner signed for that challenge. The owner's steps are in
-// `docs/demo-seed.md`. A refusal exits 2, including a repository that changed while a seed planned;
-// a backend failure or timeout prints the backend's sentence and exits 1. A write sent whose answer
-// timed out, was lost, or was a failure that may follow a partial write exits 4 and says what to do
-// next: run a seed again, since it reads first; inspect the instance before approving another reset. Nothing
-// here creates a Cloudflare resource or reads a secret.
+// live `DemoSeedApi` and, without `--dry-run`, write. Each write needs an owner passkey assertion.
+// Without `--assertion` or `--owner-key` the write stops after `prepare`, prints the challenge and
+// exits 3, writing nothing; `--assertion FILE` performs it with `{ challengeId, assertion }` the
+// owner signed for that challenge. On a qualification instance whose owner is a software key
+// (`scripts/ownerKey/`), `--owner-key FILE` signs the challenge with it and performs the write in
+// the same run; the key refuses `railhead.dev`. The owner's steps are in `docs/demo-seed.md`. A
+// refusal exits 2, including a repository that changed while a seed planned; a backend failure or
+// timeout prints the backend's sentence and exits 1. A write sent whose answer timed out, was lost,
+// or was a failure that may follow a partial write exits 4 and says what to do next: run a seed
+// again, since it reads first; inspect the instance before approving another reset. Nothing here
+// creates a Cloudflare resource or reads a secret other than the `--owner-key` file.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -62,6 +64,8 @@ import {
   type LiveSession,
 } from "./liveTarget.ts";
 import { MemoryTarget } from "./memoryTarget.ts";
+import type { ActionChallenge } from "../../packages/railhead-shared/src/board-api.ts";
+import { keyHost, OwnerKeyRefusal, sign, type SignedChallenge } from "../ownerKey/ownerKey.ts";
 import {
   DEMO_REF,
   describeIssues,
@@ -112,6 +116,7 @@ export async function run(
       out: { type: "string" },
       target: { type: "string" },
       assertion: { type: "string" },
+      "owner-key": { type: "string" },
     },
   });
   const [command, ...extra] = positionals;
@@ -121,6 +126,41 @@ export async function run(
     throw new SeedRefusal("bundle has no dry run; use seed --dry-run to plan the import.");
   }
   const live = liveOptions(values.target, values.assertion, values["dry-run"]);
+  const ownerKey = ownerKeyOption(values["owner-key"], live, values);
+  const options: RunOptions = { command, values, openSession, limits };
+  if (live === null || ownerKey === undefined) return execute(options, live);
+  // The first pass stops after `prepare`; the second performs the write with the key's signature
+  // over that challenge, after reading the target again.
+  try {
+    return await execute(options, live);
+  } catch (error) {
+    if (!(error instanceof ApprovalNeeded)) throw error;
+    const signed = signChallenge(ownerKey, error.challenge);
+    return execute(options, { origin: live.origin, approval: { kind: "signed", ...signed } });
+  }
+}
+
+/** The parsed command line `execute` runs. */
+interface RunOptions {
+  readonly command: string | undefined;
+  readonly values: {
+    readonly "dry-run": boolean;
+    readonly manifest?: string | undefined;
+    readonly "source-root": string;
+    readonly revision: string;
+    readonly org?: string | undefined;
+    readonly repo?: string | undefined;
+    readonly out?: string | undefined;
+  };
+  readonly openSession: OpenSession;
+  readonly limits: LiveLimits;
+}
+
+/** Runs the command once, writing at most once with `live`'s approval. */
+async function execute(
+  { command, values, openSession, limits }: RunOptions,
+  live: { origin: string; approval: Approval } | null,
+): Promise<string[]> {
   if (command === "reset") {
     const ref = { org: values.org ?? DEMO_REF.org, repo: values.repo ?? DEMO_REF.repo };
     const plan = describePlan(planReset(ref));
@@ -297,6 +337,43 @@ function liveOptions(
 }
 
 /**
+ * The key file `--owner-key` names, refused unless it signs a live write on the target's host:
+ * with `--target`, without `--assertion` or `--dry-run`, and holding a key for that host.
+ */
+function ownerKeyOption(
+  path: string | undefined,
+  live: { origin: string } | null,
+  values: { readonly assertion?: string | undefined; readonly "dry-run": boolean },
+): string | undefined {
+  if (path === undefined) return undefined;
+  if (live === null) throw new SeedRefusal("--owner-key needs --target ORIGIN.");
+  if (values.assertion !== undefined) {
+    throw new SeedRefusal("--owner-key signs the write itself; drop --assertion.");
+  }
+  if (values["dry-run"]) throw new SeedRefusal("--owner-key approves a write; a dry run has none.");
+  const host = new URL(live.origin).hostname;
+  const keyFor = ownerKeyCall(() => keyHost(path));
+  if (keyFor !== host) {
+    throw new SeedRefusal(`${path} signs for ${keyFor}, not for --target ${live.origin}.`);
+  }
+  return path;
+}
+
+/** `sign` with the key at `path`, its refusals as the seed's. */
+function signChallenge(path: string, challenge: ActionChallenge): SignedChallenge {
+  return ownerKeyCall(() => sign(path, challenge));
+}
+
+function ownerKeyCall<T>(call: () => T): T {
+  try {
+    return call();
+  } catch (error) {
+    if (error instanceof OwnerKeyRefusal) throw new SeedRefusal(error.message, { cause: error });
+    throw error;
+  }
+}
+
+/**
  * What a write that stopped after `prepare` prints: the action, the challenge to sign, and how to
  * finish. The challenge holds no secret; it is spent only with the owner's assertion.
  */
@@ -305,7 +382,7 @@ export function describeApproval(needed: ApprovalNeeded): string[] {
   const what = action.kind === "demo.seed" ? `${action.kind} of main ${action.head}` : action.kind;
   return [
     `stopped after prepare: ${what} needs an owner passkey assertion; nothing was written`,
-    "note there is no command-line passkey signer yet (#148)",
+    "note on a qualification instance, --owner-key FILE signs it in the same run",
     `challenge ${JSON.stringify(challenge)}`,
     `note sign it with the owner passkey before ${new Date(challenge.expiresAt).toISOString()}, write { "challengeId", "assertion" } to a file, and rerun this command with --assertion FILE`,
   ];
