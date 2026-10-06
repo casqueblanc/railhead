@@ -8,13 +8,14 @@
 //
 // `probe-config` writes a Wrangler config and a secrets file for the throwaway probe Worker
 // (packages/railhead-backend/qualify/probe.ts) and prints the commands that deploy and delete it.
-// It deploys nothing. `binding` runs the #161 token-listing and #158 main-ref cases through that
-// probe, on repositories the probe creates and deletes; it also reads the REST token listing, with
-// the operator's `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the environment. `slice` reads a deployed instance's public
-// event log and three agents' claim clones, and checks the run the agents made there. `gate` exits 0
-// only when one binding report and one slice report both pass when judged again from the
-// observations and collection record they hold (scripts/qualify/evidence.ts, `judgeReport`), and
-// the instance still holds the slice's recorded events and check runs (scripts/qualify/live.ts).
+// It deploys nothing. `binding` runs the #161 token-listing, #158 main-ref and #350 ref-resolution
+// cases through that probe, on repositories the probe creates and deletes; it also reads the REST
+// token listing, with the operator's `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the
+// environment. `slice` reads a deployed instance's public event log and three agents' claim clones,
+// and checks the run the agents made there. `gate` exits 0 only when one binding report and one
+// slice report both pass when judged again from the observations and collection record they hold
+// (scripts/qualify/evidence.ts, `judgeReport`), and the instance still holds the slice's recorded
+// events and check runs (scripts/qualify/live.ts).
 //
 // Nothing here talks to a simulator: `slice` refuses a loopback or reserved host and `binding`
 // requires the probe's repositories to sit on a live Artifacts Git host, so a fake cannot pass.
@@ -42,6 +43,7 @@ import {
   judgeSliceReport,
   originProblem,
   probeProblem,
+  refCases,
   remoteProblem,
   sliceEvents,
 } from "./qualify/evidence.ts";
@@ -330,6 +332,12 @@ const binding = async (argv) => {
     await probe("revoke", { repoId: main.repoId, token: main.token });
     const update = (expected, next) => probe("update", { repoId: main.repoId, expected, next });
     const obs = {};
+    // What `log` answers for each ref while main is at c5, to compare with the backend's fakes.
+    obs.refs = [];
+    for (const { ref } of refCases(commits)) {
+      const { hashes } = await probe("log", { repoId: main.repoId, ref });
+      obs.refs.push({ ref, hashes });
+    }
     obs.rewind = await update(commits.c5, commits.c4);
     obs.unrelatedUpdate = await update(commits.c5, commits.unrelated);
     obs.forward = await update(commits.c5, commits.n1);

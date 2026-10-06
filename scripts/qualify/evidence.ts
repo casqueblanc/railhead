@@ -256,6 +256,60 @@ export interface MainRefObservations {
   eviction: unknown;
 }
 
+/** A branch the probe repository never has, for the unknown-ref case. */
+const UNKNOWN_BRANCH = "qualify/missing";
+
+/**
+ * The refs the harness reads main's log by, right after it pushes main at c5, and the hashes
+ * `log({ ref, limit: 1 })` answers for each in the backend's Artifacts fakes
+ * (packages/railhead-backend/src/artifacts/fakeRefs.ts).
+ */
+export function refCases(commits: MainRefCommits): { ref: string; fakes: string[] }[] {
+  return [
+    { ref: "main", fakes: [commits.c5] },
+    { ref: "refs/heads/main", fakes: [] },
+    { ref: UNKNOWN_BRANCH, fakes: [] },
+    { ref: commits.c4, fakes: [commits.c4] },
+  ];
+}
+
+/**
+ * Judges the #350 ref observations: every case of `refCases`, each answered by the binding as the
+ * fakes answer it. A failure names each disagreeing ref and what the binding answered.
+ */
+export function judgeRefs(commits: MainRefCommits, value: unknown): Check {
+  const answered = new Map<string, string[]>();
+  for (const item of Array.isArray(value) ? value : []) {
+    const ref = text(record(item)?.ref);
+    const hashes = strings(record(item)?.hashes);
+    if (ref !== null && hashes !== null && hashes.every((hash) => SHA.test(hash))) {
+      answered.set(ref, hashes);
+    }
+  }
+  const cases = refCases(commits);
+  const missing = cases.filter(({ ref }) => !answered.has(ref));
+  if (missing.length > 0) {
+    return check("refs.resolution", false, "malformed or missing a ref case");
+  }
+  const disagreeing = cases.flatMap(({ ref, fakes }) => {
+    const binding = answered.get(ref) ?? [];
+    return binding.length === fakes.length && binding.every((hash, i) => hash === fakes[i])
+      ? []
+      : [`${ref}: binding ${hashList(binding)}, fakes ${hashList(fakes)}`];
+  });
+  return check(
+    "refs.resolution",
+    disagreeing.length === 0,
+    disagreeing.length === 0
+      ? "log resolves main and a commit id, and answers [] for refs/heads/main and an unknown branch, as the fakes do"
+      : `the fakes disagree with the binding: ${disagreeing.join("; ")}`,
+  );
+}
+
+function hashList(hashes: string[]): string {
+  return `[${hashes.join(", ")}]`;
+}
+
 /** Judges the #158 main-ref observations. */
 export function judgeMainRef(commits: MainRefCommits, obs: MainRefObservations): Check[] {
   const checks: Check[] = [];
@@ -767,6 +821,7 @@ export const BINDING_CHECK_IDS = [
   "main.detects-foreign-push",
   "main.revoke-fence",
   "main.eviction",
+  "refs.resolution",
 ] as const;
 
 /** Every check a slice report must pass, in the order it is judged. */
@@ -955,7 +1010,7 @@ function bindingProvenance(
 
 /**
  * Judges a binding report as `qualify-slice.mjs binding` writes it: where and when it was collected,
- * then every #161 and #158 case from the observations it recorded.
+ * then every #161, #158 and #350 case from the observations it recorded.
  */
 export function judgeBinding(report: unknown, now: number): Check[] {
   const body = record(report);
@@ -990,6 +1045,7 @@ export function judgeBinding(report: unknown, now: number): Check[] {
       fence: obs.fence,
       eviction: obs.eviction,
     }),
+    judgeRefs(commits, obs.refs),
   ];
 }
 

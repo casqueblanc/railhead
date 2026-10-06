@@ -8,6 +8,7 @@ import {
   judgeBinding,
   judgeListing,
   judgeMainRef,
+  judgeRefs,
   judgeReport,
   judgeRestActive,
   judgeSlice,
@@ -31,6 +32,7 @@ import {
   liveBindingReport,
   liveListing,
   liveMainRef,
+  liveRefs,
   liveSlice,
   liveSliceReport,
   sha,
@@ -233,6 +235,50 @@ describe("judgeMainRef (#158)", () => {
   });
 });
 
+/** `liveRefs` with the binding's answer for `ref` replaced by `hashes`. */
+function answering(ref: string, hashes: string[]) {
+  return liveRefs().map((item) => (item.ref === ref ? { ref, hashes } : item));
+}
+
+describe("judgeRefs (#350)", () => {
+  test("passes a binding that resolves refs as the fakes do", () => {
+    assert.deepEqual(judgeRefs(COMMITS, liveRefs()), {
+      id: "refs.resolution",
+      outcome: "pass",
+      detail:
+        "log resolves main and a commit id, and answers [] for refs/heads/main and an unknown branch, as the fakes do",
+    });
+  });
+
+  test("fails naming each ref the binding resolves otherwise and what it answered", () => {
+    assert.deepEqual(judgeRefs(COMMITS, answering("refs/heads/main", [COMMITS.c5])), {
+      id: "refs.resolution",
+      outcome: "fail",
+      detail: `the fakes disagree with the binding: refs/heads/main: binding [${COMMITS.c5}], fakes []`,
+    });
+    const twoWrong = answering(COMMITS.c4, []).map((item) =>
+      item.ref === "main" ? { ref: "main", hashes: [COMMITS.c4] } : item,
+    );
+    assert.equal(
+      judgeRefs(COMMITS, twoWrong).detail,
+      `the fakes disagree with the binding: main: binding [${COMMITS.c4}], fakes [${COMMITS.c5}]; ${COMMITS.c4}: binding [], fakes [${COMMITS.c4}]`,
+    );
+    assert.equal(judgeRefs(COMMITS, answering("qualify/missing", [COMMITS.c5])).outcome, "fail");
+  });
+
+  test("fails a missing case, a hash that is not a commit id and a non-list", () => {
+    const malformed = {
+      id: "refs.resolution",
+      outcome: "fail",
+      detail: "malformed or missing a ref case",
+    };
+    assert.deepEqual(judgeRefs(COMMITS, liveRefs().slice(1)), malformed);
+    assert.deepEqual(judgeRefs(COMMITS, answering("main", ["main"])), malformed);
+    assert.deepEqual(judgeRefs(COMMITS, { main: [COMMITS.c5] }), malformed);
+    assert.deepEqual(judgeRefs(COMMITS, undefined), malformed);
+  });
+});
+
 describe("judgeSlice", () => {
   test("passes three agents whose second batch landed two claims", () => {
     const checks = judgeSlice(liveSlice());
@@ -367,7 +413,7 @@ describe("judgeBinding and judgeSliceReport", () => {
 
   test("fail a binding report missing any one case's observation", () => {
     const keys = Object.keys(liveBindingReport().observations);
-    assert.equal(keys.length, 12);
+    assert.equal(keys.length, 13);
     for (const key of keys) {
       const report = liveBindingReport();
       const observations: Record<string, unknown> = { ...report.observations };

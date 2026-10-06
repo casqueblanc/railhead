@@ -136,6 +136,19 @@ describe("the qualification probe", () => {
     expect(fakeMain().main).toBe(C2);
   });
 
+  it("reports the hashes log answers for a ref, as the fake resolves it", async () => {
+    const { env, fakeMain } = world();
+    const repoId = await createRepo(env);
+    fakeMain().forcePush(N1);
+
+    const log = async (ref: string) => (await call(env, "log", { repoId, ref })).body;
+    expect(await log("main")).toEqual({ hashes: [N1] });
+    expect(await log(C1)).toEqual({ hashes: [C1] });
+    expect(await log("refs/heads/main")).toEqual({ hashes: [] });
+    expect(await log("qualify/missing")).toEqual({ hashes: [] });
+    expect(fakeMain().openHandles).toBe(0);
+  });
+
   it("refuses another secret, a GET and malformed cases before touching Artifacts", async () => {
     const { env, fakeMain } = world();
     const repoId = await createRepo(env);
@@ -155,6 +168,9 @@ describe("the qualification probe", () => {
     expect(
       (await call(env, "race", { repoId, expected: C2, nexts: Array(9).fill(N1) })).status,
     ).toBe(400);
+    expect((await call(env, "log", { repoId })).status).toBe(400);
+    expect((await call(env, "log", { repoId, ref: "-main" })).status).toBe(400);
+    expect((await call(env, "log", { repoId, ref: "x".repeat(256) })).status).toBe(400);
     expect((await call(env, "unknown", {})).status).toBe(404);
     expect(fakeMain().steps).toHaveLength(steps);
   });
