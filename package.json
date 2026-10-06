@@ -14,6 +14,7 @@
     "dev-client": "pnpm --filter @railhead/frontend run dev",
     "dev-server": "pnpm run configs:generate && vp run --cache @railhead/frontend#build && pnpm --filter @railhead/backend run dev",
     "rust:check": "node scripts/rust-check.mjs",
+    "live-run": "node scripts/liveRun/cli.ts",
     "lint:check": "vp check",
     "lint:fix": "vp check --fix",
     "types:check": "pnpm run build",

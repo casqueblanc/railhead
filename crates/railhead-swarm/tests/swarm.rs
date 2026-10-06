@@ -868,6 +868,11 @@ impl World {
     }
 
     fn driver(&self, scenario: &Path) -> anyhow::Result<Command> {
+        self.driver_with(scenario, "--workdir", &self.dir.path().join("work"))
+    }
+
+    /// The driver with `flag DIR` saying where the clones go.
+    fn driver_with(&self, scenario: &Path, flag: &str, dir: &Path) -> anyhow::Result<Command> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_railhead-swarm"));
         command
             .arg("--scenario")
@@ -876,8 +881,8 @@ impl World {
             .arg(self.dir.path().join("homes"))
             .arg("--rh")
             .arg(rh_binary()?)
-            .arg("--workdir")
-            .arg(self.dir.path().join("work"))
+            .arg(flag)
+            .arg(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", self.dir.path().join("gitconfig"))
             .env_remove("RAILHEAD_AGENT")
@@ -1038,6 +1043,66 @@ async fn disjoint_edits_land_without_conflict() -> anyhow::Result<()> {
     assert!(world.work_is_empty()?, "the run left clones behind");
     // A finished run leaves nothing to resume.
     assert!(!world.progress_file("swarm-00").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn clones_dir_keeps_each_agents_clone_after_the_run() -> anyhow::Result<()> {
+    let world = world(2, 2, false).await?;
+    let scenario = world.scenario(2, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let kept = world.dir.path().join("kept/clones");
+    let run = run(&mut world.driver_with(&scenario, "--clones-dir", &kept)?)?;
+    assert_eq!(run.code, Some(0));
+    for agent in ["swarm-00", "swarm-01"] {
+        let clones = fs::read_dir(kept.join(agent))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(clones.len(), 1, "{agent}");
+        let clone = clones
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no clone"))?
+            .path();
+        let pushed = git(
+            &clone,
+            &["show", &format!("HEAD:{}", disjoint_path(agent, 0))],
+        )?;
+        assert_eq!(pushed.split(' ').next(), Some(agent));
+    }
+    // Nothing went to the temporary directory, and the kept one is the owner's alone.
+    assert!(world.work_is_empty()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [kept.clone(), kept.join("swarm-00")] {
+            assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clones_dir_others_can_read_starts_nothing() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let open = world.dir.path().join("open");
+    fs::create_dir(&open)?;
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o755))?;
+    let run = run(&mut world.driver_with(&scenario, "--clones-dir", &open)?)?;
+    assert_eq!(run.code, Some(2));
+    assert_eq!(fs::read_dir(&open)?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn clones_dir_and_workdir_together_start_nothing() -> anyhow::Result<()> {
+    let world = world(1, 1, false).await?;
+    let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
+    let kept = world.dir.path().join("kept");
+    let mut command = world.driver_with(&scenario, "--workdir", &world.dir.path().join("work"))?;
+    let run = run(command.arg("--clones-dir").arg(&kept))?;
+    assert_eq!(run.code, Some(2));
+    assert_eq!(run.events, Vec::<Value>::new());
+    assert!(!kept.exists());
     Ok(())
 }
 
