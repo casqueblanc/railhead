@@ -61,7 +61,7 @@ import type { RepoStorage } from "../../repo/storage";
 import { migrate } from "../../repo/storage";
 
 /** The migration owner name of the train's tables. */
-export const TRAIN_OWNER = "train";
+const TRAIN_OWNER = "train";
 
 /** Released schema steps of the train. Append a step to change the schema; never edit one. */
 const MIGRATIONS: readonly string[] = [
