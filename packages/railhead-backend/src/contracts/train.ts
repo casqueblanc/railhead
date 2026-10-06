@@ -84,7 +84,9 @@ export interface CheckRunReport {
   candidate: CommitSha;
   /** SHA-256 of the trusted definition the run used. */
   digest: string;
-  /** The outcome: `fail` only when the check's own command failed, `error` when it could not run. */
+  /**
+   * The outcome: `fail` only when the check's own command failed, `error` when it could not run.
+   */
   result: CheckResult;
   /** The run's output. Untrusted text: stored cut to its end, never logged. */
   log: string;
@@ -105,7 +107,9 @@ export type MergeOutcome =
   /** The merge could not run, such as a missing commit or a timeout. Not the agents' failure. */
   | { kind: "error"; reason: "missing_commit" | "timeout" | "unsupported" | "infrastructure" };
 
-/** Where a merge intent stands. The settled states are the `MainOutcome` of its `train.main` event. */
+/**
+ * Where a merge intent stands. The settled states are the `MainOutcome` of its `train.main` event.
+ */
 export type MergeIntentStatus =
   /** Recorded and authorized; main has not been confirmed moved. A writer must reconcile first. */
   | "authorized"
@@ -138,7 +142,9 @@ export interface MergeIntentRecord {
   main: CommitSha | null;
   /** When it was authorized. */
   authorizedAt: number;
-  /** When it last changed; while `authorized` with attempts counted, when the last attempt began. */
+  /**
+   * When it last changed; while `authorized` with attempts counted, when the last attempt began.
+   */
   updatedAt: number;
 }
 
@@ -200,8 +206,8 @@ export interface CheckPort {
   approve(grant: GrantFor<"check.approve">): Promise<PortResult<{ checkRunId: CheckRunId }>>;
   /**
    * What was recorded for an attempt this module held or started: its candidate, the command its
-   * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its output.
-   * An attempt it never recorded, or no longer keeps, is `not_found`.
+   * definition gave it and where it stands, with at most `MAX_CHECK_DETAIL_LOG_BYTES` of its
+   * output. An attempt it never recorded, or no longer keeps, is `not_found`.
    */
   detail(attemptId: CheckRunId): Promise<PortResult<CheckDetail>>;
 }
@@ -217,24 +223,26 @@ export interface AttemptOutcome {
 /**
  * The train's queue and its check bookkeeping.
  *
- * `attemptOutcome` and `holdsLiveEntry` are fence readers: each is synchronous and reads only the Repo's storage, so a
- * caller calls it inside its own `log.transaction` or `atomically` body, and what it returns holds
- * until that transaction commits. Read outside a transaction, the result may already be stale.
+ * `attemptOutcome` and `holdsLiveEntry` are fence readers: each is synchronous and reads only the
+ * Repo's storage, so a caller calls it inside its own `log.transaction` or `atomically` body, and
+ * what it returns holds until that transaction commits. Read outside a transaction, the result may
+ * already be stale.
  */
 export interface TrainPort {
   /**
    * Queues a ready pin inside the caller's transaction, without driving: the entry and the train's
    * wake commit or roll back with that transaction, and the Repo's alarm drives once it commits.
    * Each call is a new ready episode of the claim, numbered by the claim's `episode`, which the
-   * entry records: a pin already waiting is a no-op apart from that number, a waiting entry of the
-   * same claim and generation takes the new commit, a dropped or parked one is queued again, a
+   * entry records. A pin already waiting is a no-op apart from that number. A waiting entry of the
+   * same claim and generation takes the new commit. A dropped or parked one is queued again. A
    * landed one is queued again with another commit, answered as done for a repeat of the episode it
-   * landed for, and refused with `decision_superseded` for a later episode of the same commit, and a batched one takes the new commit and episode once its batch settles. A drive
-   * settles or drops a waiting entry only at the episode it read, so a newer episode is never lost
-   * to an older read. Every accepted pin asks for a drive, restarting a wake whose retries ran out.
-   * A pin of an older generation than one queued is `stale_generation`. A refusal writes nothing; a
-   * missing module throws, so the caller's transaction rolls back. Only the claims module calls it,
-   * in the transaction that records `ready`, or that answers a repeated `ready` when `holdsLiveEntry`
+   * landed for, and refused with `decision_superseded` for a later episode of the same commit. A
+   * batched one takes the new commit and episode once its batch settles. A drive settles or drops a
+   * waiting entry only at the episode it read, so a newer episode is never lost to an older read.
+   * Every accepted pin asks for a drive, restarting a wake whose retries ran out. A pin of an older
+   * generation than one queued is `stale_generation`. A refusal writes nothing; a missing module
+   * throws, so the caller's transaction rolls back. Only the claims module calls it, in the
+   * transaction that records `ready`, or that answers a repeated `ready` when `holdsLiveEntry`
    * finds no live entry.
    */
   queue(tx: EventTransaction, pin: ClaimPin, episode: number): PortResult<{ queued: boolean }>;
@@ -242,8 +250,8 @@ export interface TrainPort {
   recordCheck(report: CheckReport): Promise<PortResult<CheckAttempt>>;
   /**
    * The persisted attempt and its recorded report, or `null` when the attempt is unknown or the
-   * module is missing; `null` is a refusal. Call it only inside the caller's transaction; an `await`
-   * between this read and the write that relies on it is not a fence.
+   * module is missing; `null` is a refusal. Call it only inside the caller's transaction; an
+   * `await` between this read and the write that relies on it is not a fence.
    */
   attemptOutcome(attemptId: CheckRunId): AttemptOutcome | null;
   /**
@@ -256,8 +264,8 @@ export interface TrainPort {
   holdsLiveEntry(claimId: ClaimId, generation: number): boolean | null;
   /**
    * Returns the pair parked behind the train's question that opened `decisionId` to the queue,
-   * inside the caller's transaction, and records the drive it is owed: the pair and the train's wake
-   * commit or roll back with that transaction. Answers whether an asked pair waited on that
+   * inside the caller's transaction, and records the drive it is owed: the pair and the train's
+   * wake commit or roll back with that transaction. Answers whether an asked pair waited on that
    * decision; for any other decision it writes nothing. Only the decisions module calls it, in the
    * transaction that records a version of a system question, and awaits `armWake` once that
    * commits. A missing module throws, so the caller's transaction rolls back.
@@ -266,8 +274,8 @@ export interface TrainPort {
   /**
    * Where the queue entry of `claimId` at exactly `generation` stands, with the state of the batch
    * holding it, or `null` when the queue holds none. An entry of another generation, which may be
-   * another agent's pin, is never returned. It only reads. The caller authorizes the read: the agent
-   * routes pass only the caller's own active claim at its current generation.
+   * another agent's pin, is never returned. It only reads. The caller authorizes the read: the
+   * agent routes pass only the caller's own active claim at its current generation.
    */
   pinView(claimId: ClaimId, generation: number): Promise<PortResult<PinView | null>>;
   /**
@@ -275,8 +283,8 @@ export interface TrainPort {
    * `true` when it does or no alarm is owed, `false` when the alarm write failed or the module is
    * missing. A wake whose retries ran out owes no alarm unless the active batch's merge intent is
    * unsettled. The claims module awaits it once `ready` commits, so a `ready` answered with success
-   * never leaves its pin without a scheduled drive, and a `ready` repeated after a failed write asks
-   * again. It writes nothing, so a repeat is harmless.
+   * never leaves its pin without a scheduled drive, and a `ready` repeated after a failed write
+   * asks again. It writes nothing, so a repeat is harmless.
    */
   armWake(): Promise<boolean>;
   /**
@@ -328,9 +336,9 @@ export interface MergeIntentWrite {
  * and records the `MergeIntentRecord`. A repeat for the same attempt returns the same record.
  *
  * `record`, `unsettled` and `recordWrite` are fence methods: they are synchronous and touch only
- * the Repo's storage. Called inside a caller's `log.transaction` body, what they read holds and what
- * they write commits or rolls back with that transaction. Read outside one, a result may already be
- * stale, so a caller re-reads inside the transaction whose write relies on it.
+ * the Repo's storage. Called inside a caller's `log.transaction` body, what they read holds and
+ * what they write commits or rolls back with that transaction. Read outside one, a result may
+ * already be stale, so a caller re-reads inside the transaction whose write relies on it.
  */
 export interface AuthorizationPort {
   /** Authorizes the merge of a passed attempt. */
@@ -390,7 +398,9 @@ export interface MainRefPort {
   update(expected: CommitSha, next: CommitSha): Promise<PortResult<MainUpdate>>;
 }
 
-/** Publishes authorized intents to main, and reads main for the modules that do not hold its ref. */
+/**
+ * Publishes authorized intents to main, and reads main for the modules that do not hold its ref.
+ */
 export interface MainWriterPort {
   /**
    * Main's current commit. It only reads: main may move as soon as it returns, so a caller records
