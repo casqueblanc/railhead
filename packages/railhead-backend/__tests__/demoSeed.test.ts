@@ -191,6 +191,8 @@ class SeedFake implements SeedArtifacts {
     return {
       ...handle,
       [Symbol.dispose]: () => handle[Symbol.dispose](),
+      // Artifacts resolves a branch by its short name and answers an empty log for a full ref name.
+      log: async (opts) => (opts?.ref?.startsWith("refs/") === true ? [] : handle.log(opts)),
       info: async () => ({
         id: name,
         name,
@@ -1055,6 +1057,24 @@ describe("seed target", () => {
       seed.fake.pageTokens(TOKEN_PAGE_SIZE);
       expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
       expect(seed.fake.liveTokens(main)).toEqual([]);
+      expect(host.initialized).toBe(true);
+    }));
+
+  it("reads main by its branch name, which Artifacts resolves where the full ref name is empty", () =>
+    withTarget(async ({ seed, target, host, main }) => {
+      expect(await target.seed(HEAD, fakePack())).toEqual(
+        ok({ kind: "demo.seed", repo: REPO_ID, head: HEAD }),
+      );
+      expect(seed.pushes).toHaveLength(1);
+      expect(seed.pushes[0]?.command).toContain(" refs/heads/main\0");
+      expect(await target.read()).toEqual(ok({ repo: REPO_ID, main: HEAD }));
+      using repo = await seed.get(main);
+      expect(await repo.log({ ref: "refs/heads/main", limit: 1 })).toEqual([]);
+
+      // A seed whose push landed before the Repo was initialized finds main in place.
+      host.initialized = false;
+      expect(await target.seed(HEAD, fakePack())).toMatchObject({ ok: true });
+      expect(seed.pushes).toHaveLength(1);
       expect(host.initialized).toBe(true);
     }));
 
