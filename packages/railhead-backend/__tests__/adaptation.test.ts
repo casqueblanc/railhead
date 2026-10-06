@@ -610,8 +610,7 @@ describe("failures", () => {
       await withAdaptation(async ({ adaptation, world, wakes, now, advance }) => {
         adaptation.owe(INTENT, [pinOf(ATLAS)]);
         world.intents.delete(INTENT);
-        // More tries than any former give-up limit, alternating a missing intent and a reader that
-        // throws.
+        // 24 tries, alternating a missing intent and a reader that throws.
         for (let attempt = 1; attempt <= 24; attempt += 1) {
           world.failure = attempt % 2 === 0 ? new TypeError("storage gone") : null;
           await adaptation.resume();
