@@ -39,7 +39,7 @@ export const SYNTH_GATEWAY: Actor = { kind: "system", id: "sys_gateway" };
 /** The time of a synthetic log's first event: 1 October 2026, 00:00 UTC. */
 export const SYNTH_START_MS = Date.UTC(2026, 9, 1);
 /** Milliseconds between consecutive synthetic events. */
-export const SYNTH_STEP_MS = 1000;
+const SYNTH_STEP_MS = 1000;
 
 /** The actor for a synthetic agent. */
 export const synthAgent = (id: AgentId): Actor => ({ kind: "agent", id });

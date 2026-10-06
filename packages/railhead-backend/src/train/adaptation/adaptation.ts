@@ -253,7 +253,7 @@ interface AdaptationRow extends Record<string, SqlStorageValue> {
 const PENDING = null;
 
 /** An `owe` call refused. It throws inside the caller's transaction, which rolls back. */
-export class AdaptationWriteError extends Error {
+class AdaptationWriteError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "AdaptationWriteError";
