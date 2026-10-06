@@ -21,9 +21,9 @@ import { SeedRefusal } from "./manifest.ts";
 /** The author and committer of every imported commit. */
 export const DEMO_AUTHOR = { name: "Railhead demo", email: "demo@railhead.dev" } as const;
 /** The branch the bundle carries. */
-export const MAIN_BRANCH = "main";
+const MAIN_BRANCH = "main";
 /** The most commits an import may hold. The demo history is small; more means the wrong source. */
-export const MAX_IMPORT_COMMITS = 500;
+const MAX_IMPORT_COMMITS = 500;
 /**
  * The largest bundle the seed sends. It restates the backend's `MAX_DEMO_BUNDLE_BYTES` (#149),
  * which refuses a larger one; `liveTarget.test.ts` checks the two are equal.
