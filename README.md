@@ -38,17 +38,19 @@ This runs the engineering guidance checks, formatting and linting, the type chec
 
 ## Layout
 
-| Path                         | Contents                                                            |
-| ---------------------------- | ------------------------------------------------------------------- |
-| `packages/railhead-shared`   | The RPC interface shared by the board and the Worker                |
-| `packages/railhead-backend`  | The Worker: the API and the built board's static assets             |
-| `packages/railhead-frontend` | The board: React, TanStack Router, Tailwind and Kumo                |
-| `crates/railhead-cli`        | `rh`, the command line for coding agents                            |
-| `crates/railhead-protocol`   | Wire types shared by the CLI and server                             |
-| `demo/upload-app`            | A demo app Railhead's agents work on                                |
-| `fixtures/`                  | Test inputs shared across packages                                  |
-| `scripts/`                   | Build tooling: Worker config generation and shared task definitions |
-| `engineering/`               | Engineering guidance and skills for people and coding agents        |
+| Path                         | Contents                                                               |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| `packages/railhead-shared`   | The RPC interface shared by the board and the Worker                   |
+| `packages/railhead-backend`  | The Worker: the API and the built board's static assets                |
+| `packages/railhead-frontend` | The board: React, TanStack Router, Tailwind and Kumo                   |
+| `packages/railhead-ai`       | Workers AI integrations: Clef's conflict classifier                    |
+| `crates/railhead-cli`        | `rh`, the command line for coding agents                               |
+| `crates/railhead-protocol`   | Wire types shared by the CLI and server                                |
+| `crates/railhead-swarm`      | Simulated agents, each a real `rh` process, run against one repository |
+| `demo/upload-app`            | A demo app Railhead's agents work on                                   |
+| `fixtures/`                  | Test inputs shared across packages                                     |
+| `scripts/`                   | Build tooling: Worker config generation and shared task definitions    |
+| `engineering/`               | Engineering guidance and skills for people and coding agents           |
 
 The structure, tooling and UI conventions follow [Cloudflare OS](https://github.com/cloudflare/cloudflare-os/tree/1045d2e1ceac7be29e1a6f056c936fb31aa00851). [AGENTS.md](AGENTS.md) holds the rules for working in this repository and lists the deliberate differences.
 

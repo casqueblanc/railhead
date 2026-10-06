@@ -45,8 +45,10 @@ Issue #1 sets [Cloudflare OS](https://github.com/cloudflare/cloudflare-os/tree/1
 - `packages/railhead-shared` (`@railhead/shared`): the RPC interfaces shared by client and server. Types and constants only.
 - `packages/railhead-backend` (`@railhead/backend`): the Worker. It serves the Cap'n Web session at `/api` and the built board as static assets.
 - `packages/railhead-frontend` (`@railhead/frontend`): the board, a client-side React app (Vite, TanStack Router, Tailwind, Kumo, Phosphor icons). `packages/railhead-frontend/AGENTS.md` adds its directory rules.
+- `packages/railhead-ai` (`@railhead/ai`): Workers AI integrations. `src/clef.ts` holds Clef's conflict classifier.
 - `crates/railhead-cli` (published as `railhead`): `rh`, the command line for coding agents.
 - `crates/railhead-protocol`: wire types shared by the CLI and server.
+- `crates/railhead-swarm`: simulated agents, each a real `rh` process, run against one Railhead repository.
 - `demo/upload-app`: a demo app Railhead's agents work on, seeded into its own Artifacts repository.
 - `fixtures/`: test inputs shared across packages: SSH signatures (`auth`), synthetic board scenarios (`board`) and wire messages (`protocol`).
 - `scripts/` (`@railhead/scripts`): build tooling that runs directly under `node`: the Worker config factory and generators, and the shared Vite+ task definitions.
