@@ -301,9 +301,10 @@ function writeNew(file: string, key: OwnerKey): void {
   } finally {
     unlinkSync(temporary);
   }
+  syncDirectory(file);
 }
 
-/** Replaces `file` with `key` in one rename. */
+/** Replaces `file` with `key` in one rename, synced so a crash cannot bring back the old counter. */
 function replace(file: string, key: OwnerKey): void {
   const temporary = writeTemporary(file, key);
   try {
@@ -311,6 +312,17 @@ function replace(file: string, key: OwnerKey): void {
   } catch (error) {
     unlinkSync(temporary);
     throw new OwnerKeyRefusal(`${file} cannot be updated.`, { cause: error });
+  }
+  syncDirectory(file);
+}
+
+/** Syncs the directory holding `file`, which makes a rename or link into it durable. */
+function syncDirectory(file: string): void {
+  const fd = openSync(dirname(file), "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
