@@ -17,7 +17,23 @@ import { basename, dirname, join } from "node:path";
 import { after, test } from "node:test";
 import { stripVTControlCharacters } from "node:util";
 import { failureReport, run } from "./cli.ts";
-import { FakeBackend, issueEvent, otherEvent, sessionWith, signedFor } from "./fakeBackend.ts";
+import type { BoardResult, DemoSeedResult } from "../../packages/railhead-shared/src/board-api.ts";
+import {
+  actionChallenge,
+  enroll,
+  isRecord,
+  relyingParty,
+  verifyActionAssertion,
+  type Enrolled,
+} from "../ownerKey/backendVerifier.ts";
+import {
+  FakeBackend,
+  issueEvent,
+  otherEvent,
+  REPO_ID,
+  sessionWith,
+  signedFor,
+} from "./fakeBackend.ts";
 import { MAX_BUNDLE_BYTES } from "./history.ts";
 import {
   ApprovalNeeded,
@@ -781,4 +797,177 @@ test("a dry run whose repository is reset and reseeded at the same head while it
   });
   assert.equal(backend.main, head);
   assert.deepEqual(backend.performed, ["demo.seed"]);
+});
+
+/** The qualification instance a software owner key may act on. */
+const QUALIFICATION = "railhead.mashin.workers.dev";
+
+/** A key enrolled on the qualification instance, outside any checkout. */
+async function ownerKey(name: string): Promise<{ path: string; credential: Enrolled }> {
+  const path = join(scratch, name);
+  const credential = await enroll(path, {
+    challengeId: "enr_1",
+    challenge: randomBytes(32).toString("base64url"),
+    rpId: QUALIFICATION,
+    userHandle: randomBytes(16).toString("base64url"),
+    expiresAt: Date.now() + 60_000,
+  });
+  return { path, credential };
+}
+
+/**
+ * Opens sessions with `backend` whose demo seed issues the challenge the backend would for each
+ * action on the qualification instance, and performs only an assertion the backend's verifier
+ * accepts for it under `enrolled`. The sessions share the issued challenges and the counter, as one
+ * backend's do.
+ */
+function verifyingSessions(backend: FakeBackend, enrolled: Enrolled): () => LiveSession {
+  const bindings = new Map<string, Record<string, unknown>>();
+  let credential = enrolled;
+  return () => {
+    const inner = sessionWith(backend);
+    return {
+      openBoard: (org, repo) => inner.openBoard(org, repo),
+      demoSeed: async () => {
+        const demo = await inner.demoSeed();
+        return {
+          read: () => demo.read(),
+          prepare: async (action) => {
+            const prepared = await demo.prepare(action);
+            if (!prepared.ok) return prepared;
+            const { challengeId } = prepared.value;
+            const binding = {
+              repoId: REPO_ID,
+              challengeId,
+              nonce: randomBytes(16).toString("base64url"),
+              expiresAt: Date.now() + 60_000,
+              action,
+            };
+            const computed = await actionChallenge(await relyingParty(QUALIFICATION), binding);
+            assert.ok(isRecord(computed) && typeof computed.challenge === "string");
+            bindings.set(challengeId, binding);
+            return {
+              ok: true,
+              value: {
+                challengeId,
+                challenge: computed.challenge,
+                rpId: QUALIFICATION,
+                allowCredentials: [credential.credentialId],
+                expiresAt: binding.expiresAt,
+              },
+            };
+          },
+          perform: async (challengeId, assertion, bundle): Promise<BoardResult<DemoSeedResult>> => {
+            const binding = bindings.get(challengeId);
+            const verified = await verifyActionAssertion({
+              relyingParty: await relyingParty(QUALIFICATION),
+              binding,
+              credential,
+              assertion,
+              now: Date.now(),
+            });
+            if (
+              binding === undefined ||
+              !isRecord(verified) ||
+              verified.ok !== true ||
+              typeof verified.signCount !== "number"
+            ) {
+              return { ok: false, code: "proof_invalid", message: JSON.stringify(verified) };
+            }
+            credential = { ...credential, signCount: verified.signCount };
+            // The fake accepts its own stand-in once the real verifier has accepted the assertion.
+            return demo.perform(challengeId, signedFor(challengeId), bundle);
+          },
+          [Symbol.dispose]: () => demo[Symbol.dispose](),
+        };
+      },
+      [Symbol.dispose]: () => inner[Symbol.dispose](),
+    };
+  };
+}
+
+test("--owner-key signs the challenge and performs the seed and the reset in one run each", async () => {
+  const backend = new FakeBackend();
+  const { path, credential } = await ownerKey("owner-cli.json");
+  const sessions = verifyingSessions(backend, credential);
+  const open = (origin: string): LiveSession => {
+    assert.equal(origin, `https://${QUALIFICATION}`);
+    return sessions();
+  };
+  const target = ["--target", `https://${QUALIFICATION}`, "--owner-key", path];
+
+  const lines = await run(["seed", "--source-root", source, ...target], open);
+  assert.match(lines[1] ?? "", /^ok {3}seed repository demo\/upload-app@main = [0-9a-f]{40}$/);
+  assert.deepEqual(backend.performed, ["demo.seed"]);
+  assert.deepEqual(
+    backend.prepared.map((action) => action.kind),
+    ["demo.seed"],
+  );
+  assert.ok(backend.main !== null);
+  // The key file holds the private key: none of it reaches the output.
+  const stored: unknown = JSON.parse(readFileSync(path, "utf8"));
+  assert.ok(
+    isRecord(stored) && isRecord(stored.privateKey) && typeof stored.privateKey.d === "string",
+  );
+  const { d } = stored.privateKey;
+  assert.ok(lines.every((line) => !line.includes(d)));
+  assert.equal(stored.signCount, 1);
+
+  // A seed with main in place reads it and asks for nothing to sign.
+  await run(["seed", "--source-root", source, ...target], open);
+  assert.equal(backend.prepared.length, 1);
+
+  assert.deepEqual(await run(["reset", ...target], open), [
+    "todo delete repository demo/upload-app",
+    "deleted demo/upload-app",
+  ]);
+  assert.deepEqual(backend.performed, ["demo.seed", "demo.reset"]);
+  assert.equal(backend.main, null);
+});
+
+test("--owner-key is refused without a live write on its own host", async () => {
+  const backend = new FakeBackend();
+  const { path, credential } = await ownerKey("owner-cli-refusals.json");
+  const sessions = verifyingSessions(backend, credential);
+  const opened: string[] = [];
+  const open = (origin: string): LiveSession => {
+    opened.push(origin);
+    return sessions();
+  };
+  const live = ["reset", "--target", `https://${QUALIFICATION}`, "--owner-key", path];
+  await assert.rejects(run(["reset", "--owner-key", path], open), /needs --target/);
+  await assert.rejects(run([...live, "--dry-run"], open), /a dry run has none/);
+  const file = join(scratch, "owner-cli-assertion.json");
+  writeFileSync(file, JSON.stringify({ challengeId: "dsc_1", assertion: signedFor("dsc_1") }));
+  await assert.rejects(run([...live, "--assertion", file], open), /drop --assertion/);
+  await assert.rejects(
+    run(["reset", "--target", "https://railhead.dev", "--owner-key", path], open),
+    /signs for railhead\.mashin\.workers\.dev, not for --target https:\/\/railhead\.dev/,
+  );
+  await assert.rejects(
+    run([...live.slice(0, -1), join(scratch, "no-such-key.json")], open),
+    /not a readable key file/,
+  );
+  assert.deepEqual(opened, []);
+  assert.deepEqual(backend.prepared, []);
+});
+
+test("--owner-key refuses a challenge for another host, and nothing is written", async () => {
+  // This fake backend issues challenges for railhead.dev whatever the target's host is.
+  const backend = new FakeBackend();
+  const { path } = await ownerKey("owner-cli-wrong-host.json");
+  const before = readFileSync(path, "utf8");
+  const refused = await run(
+    ["reset", "--target", `https://${QUALIFICATION}`, "--owner-key", path],
+    () => sessionWith(backend),
+  ).then(
+    () => assert.fail("the reset should be refused"),
+    (thrown: unknown) => thrown,
+  );
+  const report = failureReport(refused);
+  assert.equal(report.exitCode, 2);
+  assert.match(report.stderr[0] ?? "", /The challenge is for "railhead\.dev"/);
+  assert.deepEqual(backend.prepared, [{ kind: "demo.reset" }]);
+  assert.deepEqual(backend.performed, []);
+  assert.equal(readFileSync(path, "utf8"), before);
 });

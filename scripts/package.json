@@ -8,6 +8,10 @@
       "types": "./assert-workerd.ts",
       "import": "./assert-workerd.ts"
     },
+    "./owner-key": {
+      "types": "./ownerKey/ownerKey.ts",
+      "import": "./ownerKey/ownerKey.ts"
+    },
     "./typecheck-task": {
       "types": "./typecheck-task-vite-config.ts",
       "import": "./typecheck-task-vite-config.ts"
