@@ -50,7 +50,8 @@ export const MAX_LANE_PUSHES = 20;
 /** How many minutes of recent activity the board keeps, ending at the newest event's minute. */
 export const ACTIVITY_WINDOW_MINUTES = 10;
 
-const MINUTE_MS = 60_000;
+/** The bucket size of `recent`, in milliseconds. */
+export const MINUTE_MS = 60_000;
 
 /** Where an agent's inbox item stands. Each state is recorded by a separate event. */
 export type InboxDelivery = "queued" | "delivered" | "acknowledged";
