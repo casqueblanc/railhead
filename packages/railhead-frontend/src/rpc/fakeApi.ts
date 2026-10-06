@@ -43,7 +43,7 @@ const fault = <T>(
  * Calls a test holds pending, as a backend that never answers over an open session would. Each held
  * call answers normally, late, once the test resumes it.
  */
-export class Stalls<Name extends string> {
+class Stalls<Name extends string> {
   readonly names = new Set<Name>();
   readonly #held: (() => void)[] = [];
 
@@ -72,7 +72,7 @@ export const releaseTarget = (listener: BoardListener): void => {
  * A subscription handle. Like the backend, it releases the client's listener when the handle is
  * disposed or cancelled, so a client sees that disposal arrive for a subscription it dropped.
  */
-export class FakeSubscription implements SubscriptionSession {
+class FakeSubscription implements SubscriptionSession {
   disposed = false;
   #listener: BoardListener | null;
 
@@ -99,7 +99,7 @@ export class FakeSubscription implements SubscriptionSession {
   }
 }
 
-export class FakeOwner implements OwnerSession {
+class FakeOwner implements OwnerSession {
   disposed = false;
   readonly prepared: OwnerAction[] = [];
   readonly performed: { challengeId: string; assertion: PasskeyAssertion }[] = [];
@@ -138,7 +138,7 @@ export class FakeOwner implements OwnerSession {
   }
 }
 
-export class FakeEnrollment implements EnrollmentSession {
+class FakeEnrollment implements EnrollmentSession {
   disposed = false;
   readonly tokens: string[] = [];
 
