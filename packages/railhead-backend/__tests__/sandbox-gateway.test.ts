@@ -9,6 +9,7 @@ import {
   type SandboxPolicy,
 } from "../src/sandbox/policy";
 import { RailheadSandbox } from "../src/sandbox/sandboxObject";
+import { pkt } from "./sliceWorld";
 
 const encoder = new TextEncoder();
 const HOST = "acct.artifacts.cloudflare.net";
@@ -35,11 +36,6 @@ const DISCARD: SandboxPolicy = {
 };
 
 function noop(): void {}
-
-/** One pkt-line, written by hand so the tests do not reuse the subject's parser. */
-function pkt(payload: string): string {
-  return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
-}
 
 function push(...commands: string[]): string {
   const [first = "", ...rest] = commands;

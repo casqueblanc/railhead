@@ -9,6 +9,7 @@ import { createMainRef, MAIN_REF_LIMITS } from "../src/artifacts/mainRef";
 import { FakeMainRepo } from "../src/artifacts/mainRefFake";
 import { CANDIDATE_REF_PREFIX, type SandboxPolicy } from "../src/sandbox/policy";
 import { RailheadSandbox } from "../src/sandbox/sandboxObject";
+import { pkt } from "./sliceWorld";
 
 const REPO = "rep_aaaaaaaaaaaa";
 const HOST = "acct.artifacts.cloudflare.net";
@@ -32,11 +33,6 @@ afterEach(() => {
 
 async function alwaysCurrent(): Promise<boolean> {
   return true;
-}
-
-/** One pkt-line, written by hand so the test does not reuse the gateway's parser. */
-function pkt(payload: string): string {
-  return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
 }
 
 /** An upstream answer whose body the test writes, ends or fails. */

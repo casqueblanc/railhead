@@ -23,6 +23,7 @@ import { composeRepo } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName, type Repo } from "../src/repo/RepoObject";
 import { AgentKey } from "./agentKey";
+import { pkt } from "./sliceWorld";
 
 const ORIGIN = "https://railhead.mashin.workers.dev";
 const ORG = "acme";
@@ -32,7 +33,6 @@ const HEAD = "2".repeat(40);
 const ZERO = "0".repeat(40);
 const PUSHED = "3".repeat(40);
 const FEATURE = "refs/heads/feature";
-const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 afterEach(() => {
@@ -59,11 +59,6 @@ interface Setup {
   readonly seen: Seen[];
   /** How the endpoint answers a receive-pack POST that carries a live token. */
   pushAnswer: () => Response;
-}
-
-/** A pkt-line, written by hand so the tests do not reuse the subject's encoder. */
-function pkt(payload: string): string {
-  return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
 }
 
 function advertisement(service: string, refs: string): Response {

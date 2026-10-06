@@ -41,6 +41,17 @@ export function pkt(payload: string): string {
   return (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
 }
 
+function noop(): void {}
+
+/** A promise the test settles by hand. */
+export function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = noop;
+  const promise = new Promise<void>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 /** The commit SHA made of one repeated hex digit or a short hex prefix padded with zeros. */
 export function sha(prefix: string): CommitSha {
   return prefix.padEnd(40, prefix.length === 1 ? prefix : "0");

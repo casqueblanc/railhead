@@ -34,6 +34,7 @@ import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm } from "../src/repo/storage";
+import { deferred } from "./sliceWorld";
 
 const REPO = "rep_takeover001";
 const ROOT = "1".repeat(40);
@@ -300,15 +301,6 @@ async function fireDue(setup: Setup): Promise<void> {
 }
 
 function noop(): void {}
-
-/** A promise the test settles by hand. */
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve: () => void = noop;
-  const promise = new Promise<void>((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-}
 
 /** How many claims, of any state, the issue has. */
 function claimsOn(setup: Setup, issueId: string): number {
