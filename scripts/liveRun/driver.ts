@@ -265,9 +265,16 @@ export async function drive(options: DriverOptions, deps: DriverDeps): Promise<V
     invite(origin, options.ownerKey, names, homes, deps),
   );
   await runStep("join", () => joinAll(origin, options, invites, homes, deps));
-  const clones = await runStep("swarm", () => runSwarm(origin, options, homes, names, deps));
-  const slice = await runStep("slice", () => runSlice(origin, options, homes, names, clones, deps));
-  return runStep("gate", () => runGate(origin, options, slice, deps));
+  // This attempt's clones and reports, apart from every earlier attempt's: a rerun may claim
+  // again, the slice takes one clone per agent, and the gate must judge this attempt's report.
+  const attempt = nextAttempt(options.runDir);
+  const clones = await runStep("swarm", () =>
+    runSwarm(origin, options, attempt, homes, names, deps),
+  );
+  const slice = await runStep("slice", () =>
+    runSlice(origin, options, attempt, homes, names, clones, deps),
+  );
+  return runStep("gate", () => runGate(origin, options, attempt, slice, deps));
 }
 
 /** Runs `body` as `name`, turning any failure into a `StepFailure` naming it. */
@@ -624,6 +631,7 @@ function rhFailed(name: string, exited: { code: number | null; stdout: string })
 async function runSwarm(
   origin: string,
   options: DriverOptions,
+  attempt: Attempt,
   homes: string,
   names: readonly string[],
   deps: DriverDeps,
@@ -643,10 +651,8 @@ async function runSwarm(
       mix: { disjoint: 1, sameFileHunks: 0, overlapping: 0 },
     })}\n`,
   );
-  // A directory of its own per run: a rerun may claim again, and the slice takes one clone each.
-  const clonesDir = freshDir(join(options.runDir, "clones"));
-  const events = join(options.runDir, "reports", "swarm.jsonl");
-  mkdirSync(join(options.runDir, "reports"), { recursive: true });
+  const clonesDir = attempt.clones;
+  const events = join(attempt.reports, "swarm.jsonl");
   const child = deps.start({
     command: options.swarm,
     args: ["--scenario", scenario, "--homes", homes, "--rh", options.rh, "--clones-dir", clonesDir],
@@ -681,13 +687,14 @@ async function runSwarm(
 async function runSlice(
   origin: string,
   options: DriverOptions,
+  attempt: Attempt,
   homes: string,
   names: readonly string[],
   clones: readonly string[],
   deps: DriverDeps,
 ): Promise<string> {
   const home = sliceHome(options.runDir, homes, names);
-  const report = join(options.runDir, "reports", "slice.json");
+  const report = join(attempt.reports, "slice.json");
   const repo = `${DEMO_REF.org}/${DEMO_REF.repo}`;
   const args = [options.qualify, "slice", "--origin", origin, "--repo", repo];
   for (const clone of clones) args.push("--clone", clone);
@@ -701,13 +708,26 @@ async function runSlice(
   return report;
 }
 
-/** `parent/run-N` for the first N not taken yet; the swarm creates it. */
-function freshDir(parent: string): string {
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const taken = new Set(readdirSync(parent));
+/** Where one attempt keeps its clones and its reports. */
+interface Attempt {
+  /** `clones/run-N`, which the swarm creates. */
+  readonly clones: string;
+  /** `reports/run-N`, created here. */
+  readonly reports: string;
+}
+
+/** `run-N` for the first N that neither `clones/` nor `reports/` holds yet. */
+function nextAttempt(runDir: string): Attempt {
+  const clones = join(runDir, "clones");
+  const reports = join(runDir, "reports");
+  mkdirSync(clones, { recursive: true, mode: 0o700 });
+  mkdirSync(reports, { recursive: true, mode: 0o700 });
+  const taken = new Set([...readdirSync(clones), ...readdirSync(reports)]);
   let index = 1;
   while (taken.has(`run-${index}`)) index += 1;
-  return join(parent, `run-${index}`);
+  const name = `run-${index}`;
+  mkdirSync(join(reports, name), { mode: 0o700 });
+  return { clones: join(clones, name), reports: join(reports, name) };
 }
 
 /**
@@ -734,10 +754,11 @@ function sliceHome(runDir: string, homes: string, names: readonly string[]): str
 async function runGate(
   origin: string,
   options: DriverOptions,
+  attempt: Attempt,
   slice: string,
   deps: DriverDeps,
 ): Promise<Verdict> {
-  const output = join(options.runDir, "reports", "gate.txt");
+  const output = join(attempt.reports, "gate.txt");
   const exited = await runNode(
     [options.qualify, "gate", "--origin", origin, options.binding, slice],
     {},

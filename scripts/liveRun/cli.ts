@@ -3,7 +3,7 @@
 //
 //   --origin ORIGIN         the qualification instance; railhead.dev is refused
 //   --owner-key FILE        the software owner key; created by enrollment when it does not exist
-//   --agents N              agents to invite and join, 1 to 64 (the slice gate takes 3)
+//   --agents N              agents to invite and join, 3 to 64
 //   --binding FILE          the binding report from `qualify-slice.mjs binding`, for the gate
 //   --revision REV          the commit the demo app is seeded from (default HEAD)
 //   --bootstrap-token FILE  the owner bootstrap token, when the key must be enrolled; otherwise
@@ -42,6 +42,9 @@ const ROOT = resolve(import.meta.dirname, "..", "..");
 /** The environment variable the bootstrap token may come from. */
 export const TOKEN_ENV = "RAILHEAD_OWNER_BOOTSTRAP_TOKEN";
 
+/** Fewest agents: the slice harness takes at least three clones. */
+const MIN_AGENTS = 3;
+
 /** Most agents `railhead-swarm` runs. */
 const MAX_AGENTS = 64;
 
@@ -60,8 +63,13 @@ export function parseOptions(argv: readonly string[]): DriverOptions & { tokenFi
   }
   const checked = assertQualificationOrigin(origin);
   const count = Number(agents);
-  if (!/^\d+$/.test(agents) || !Number.isSafeInteger(count) || count < 1 || count > MAX_AGENTS) {
-    throw new DriverRefusal(`--agents must be a whole number from 1 to ${MAX_AGENTS}.`);
+  if (
+    !/^\d+$/.test(agents) ||
+    !Number.isSafeInteger(count) ||
+    count < MIN_AGENTS ||
+    count > MAX_AGENTS
+  ) {
+    throw new DriverRefusal(`--agents must be a whole number from ${MIN_AGENTS} to ${MAX_AGENTS}.`);
   }
   if (!existsSync(binding)) throw new DriverRefusal(`--binding ${binding} does not exist.`);
   const runDir = resolve(

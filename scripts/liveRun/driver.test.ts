@@ -285,7 +285,7 @@ test("a run enrolls, seeds, files, invites, joins, runs the swarm and prints the
   assert.deepEqual(verdict, {
     passed: true,
     binding: w.options.binding,
-    slice: join(w.options.runDir, "reports", "slice.json"),
+    slice: join(w.options.runDir, "reports", "run-1", "slice.json"),
   });
   assert.ok(w.instance.owner !== null);
   assert.ok(w.instance.backend.main !== null);
@@ -340,7 +340,7 @@ test("a run enrolls, seeds, files, invites, joins, runs the swarm and prints the
     "demo/upload-app",
     ...clones.flatMap((clone) => ["--clone", clone]),
     "--out",
-    join(w.options.runDir, "reports", "slice.json"),
+    join(w.options.runDir, "reports", "run-1", "slice.json"),
   ]);
   // The harness's credential helper reads every agent from one home of copied store entries.
   const sliceHome = slice.env.RAILHEAD_HOME;
@@ -357,7 +357,7 @@ test("a run enrolls, seeds, files, invites, joins, runs the swarm and prints the
     "--origin",
     ORIGIN,
     w.options.binding,
-    join(w.options.runDir, "reports", "slice.json"),
+    join(w.options.runDir, "reports", "run-1", "slice.json"),
   ]);
 
   const printed = w.lines.join("\n");
@@ -373,6 +373,13 @@ test("a rerun files, invites and confirms nothing twice", async () => {
   const verdict = await drive(w.options, w.deps());
 
   assert.equal(verdict.passed, true);
+  // The gate judges the slice report this run wrote, never the first run's.
+  const report = join(w.options.runDir, "reports", "run-2", "slice.json");
+  assert.equal(verdict.slice, report);
+  const [slice, gate] = w.calls.qualify.slice(-2);
+  assert.ok(slice !== undefined && gate !== undefined);
+  assert.equal(arg(slice, "--out"), report);
+  assert.equal(gate.args.at(-1), report);
   assert.equal(w.instance.enrollmentsPrepared, enrollments);
   assert.deepEqual(w.instance.backend.performed, ["demo.seed"]);
   assert.deepEqual(w.instance.performed, performed);
@@ -535,10 +542,10 @@ test("a gate failure is a verdict, printed with both reports", async () => {
   assert.deepEqual(verdict, {
     passed: false,
     binding: w.options.binding,
-    slice: join(w.options.runDir, "reports", "slice.json"),
+    slice: join(w.options.runDir, "reports", "run-1", "slice.json"),
   });
   assert.equal(
-    readFileSync(join(w.options.runDir, "reports", "gate.txt"), "utf8"),
+    readFileSync(join(w.options.runDir, "reports", "run-1", "gate.txt"), "utf8"),
     "gate output\n",
   );
 });
@@ -589,8 +596,9 @@ test("parseOptions refuses a bad origin, agent count or run directory", () => {
     [...base, ...run, "--origin", "http://example.com", "--agents", "3"],
     /https origin/,
   );
-  assertRefused([...base, ...run, "--origin", ORIGIN, "--agents", "0"], /from 1 to 64/);
-  assertRefused([...base, ...run, "--origin", ORIGIN, "--agents", "3.5"], /from 1 to 64/);
+  assertRefused([...base, ...run, "--origin", ORIGIN, "--agents", "0"], /from 3 to 64/);
+  assertRefused([...base, ...run, "--origin", ORIGIN, "--agents", "2"], /from 3 to 64/);
+  assertRefused([...base, ...run, "--origin", ORIGIN, "--agents", "3.5"], /from 3 to 64/);
   assertRefused(
     [...base, "--origin", ORIGIN, "--agents", "3", "--run-dir", join(root, "run")],
     /inside the Git checkout/,
