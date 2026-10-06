@@ -15,7 +15,8 @@
 //
 // Nothing here prints a token, a key, an invite URL or a join code. `rh join` gets the invite in
 // `RAILHEAD_INVITE`, never on its command line, and its output, which holds the code, is read for
-// its error code alone; its diagnostics are discarded. Every wait is bounded by `DriverLimits`.
+// its error code alone; its diagnostics are discarded. Every wait is bounded: the seed's by its own
+// limits, the rest by `DriverLimits`.
 
 import { createHash } from "node:crypto";
 import {

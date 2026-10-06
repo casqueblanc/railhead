@@ -271,7 +271,9 @@ export class FakeInstance {
 
 /** The OpenSSH SHA256 fingerprint of an `ssh-ed25519 <base64>` key, computed apart from the driver. */
 export function fingerprint(publicKey: string): string {
-  const blob = Buffer.from(publicKey.split(" ")[1] ?? "", "base64");
+  const [type, encoded] = publicKey.split(" ");
+  if (type !== "ssh-ed25519" || encoded === undefined) throw new Error("not an ssh-ed25519 key");
+  const blob = Buffer.from(encoded, "base64");
   return `SHA256:${createHash("sha256").update(blob).digest("base64").replace(/=+$/, "")}`;
 }
 

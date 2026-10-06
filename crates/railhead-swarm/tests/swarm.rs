@@ -1076,7 +1076,7 @@ async fn clones_dir_and_workdir_together_start_nothing() -> anyhow::Result<()> {
     let world = world(1, 1, false).await?;
     let scenario = world.scenario(1, "casqueblanc/demo", &mix(1, 0, 0), &fast_bounds())?;
     let kept = world.dir.path().join("kept");
-    let mut command = world.driver(&scenario)?;
+    let mut command = world.driver_with(&scenario, "--workdir", &world.dir.path().join("work"))?;
     let run = run(command.arg("--clones-dir").arg(&kept))?;
     assert_eq!(run.code, Some(2));
     assert_eq!(run.events, Vec::<Value>::new());

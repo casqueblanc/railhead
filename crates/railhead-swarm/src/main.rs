@@ -86,7 +86,8 @@ struct Cli {
     workdir: Option<PathBuf>,
 
     /// Keeps the clones in this directory, one subdirectory per agent, instead of a temporary
-    /// directory removed when the run ends. It is created when missing and never removed.
+    /// directory removed when the run ends. It is created when missing and never removed. The
+    /// home locks do not cover it, so give each set of homes its own.
     #[arg(long, value_name = "DIR")]
     clones_dir: Option<PathBuf>,
 
