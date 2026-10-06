@@ -8,11 +8,10 @@ import type { CommitSha } from "@railhead/shared/events";
 import { mainRepoName } from "../../artifacts/adapter";
 import { AttemptTable } from "../../checks/attempts";
 import { createChecks, type MainReader, type MainSource } from "../../checks/port";
+import { artifactsHost } from "../../checks/sdkCheckout";
 import type { CheckRunParams } from "../../checks/workflow";
 import type { CheckPort } from "../../contracts/train";
 import type { ModuleFactory } from "../../repo/composeRepo";
-
-const ACCOUNT_ID = /^[0-9a-f]{32}$/;
 
 /** Builds the checks module of one repository. */
 export const checks: ModuleFactory<CheckPort> = (context, ports) =>
@@ -22,12 +21,14 @@ export const checks: ModuleFactory<CheckPort> = (context, ports) =>
     log: context.log,
     main: async (): Promise<MainSource | null> => {
       const account: unknown = context.env.CLOUDFLARE_ACCOUNT_ID;
-      if (typeof account !== "string" || !ACCOUNT_ID.test(account)) return null;
+      if (typeof account !== "string") return null;
+      const host = artifactsHost(account);
+      if (host === null) return null;
       const name = await mainRepoName(context.repoId);
       return {
         name,
         namespace: context.env.ARTIFACTS_NAMESPACE,
-        host: `${account}.artifacts.cloudflare.net`,
+        host,
         reader: artifactsReader(context.env.ARTIFACTS, name),
       };
     },

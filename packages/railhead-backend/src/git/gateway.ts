@@ -78,6 +78,7 @@ import {
 } from "./pktLine";
 import { AdvertisedRefsReader } from "./refAdvertisement";
 import { PushReportReader, reportFraming } from "./reportStatus";
+import { gitServiceUrl } from "./serviceUrl";
 
 /** Bounds on one Git request. A test may tighten them. */
 export interface GitGatewayLimits {
@@ -1327,23 +1328,8 @@ function refusal(route: Route, failure: PortFailure): Response {
 }
 
 function upstreamUrl(remote: string, route: Route): URL | null {
-  let base: URL;
-  try {
-    base = new URL(remote);
-  } catch {
-    return null;
-  }
-  if (
-    base.protocol !== "https:" ||
-    base.username !== "" ||
-    base.password !== "" ||
-    base.search !== "" ||
-    base.hash !== ""
-  ) {
-    return null;
-  }
   const suffix = route.phase === "advertise" ? `info/refs?service=${route.service}` : route.service;
-  return new URL(`${base.href.replace(/\/+$/, "")}/${suffix}`);
+  return gitServiceUrl(remote, suffix);
 }
 
 function declaredTooLarge(request: Request, max: number): Response | null {
