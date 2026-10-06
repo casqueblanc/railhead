@@ -56,7 +56,6 @@ import {
 } from "../../artifacts/adapter";
 import { fail, ok, type PortResult } from "../../contracts/result";
 import { migrate, type RepoStorage } from "../../repo/storage";
-import { BUNDLE_REF } from "./bundle";
 import { PUSH_TIMEOUT_MS, pushMain, type PushOutcome } from "./receivePack";
 
 /** The repository methods the seed calls. `ArtifactsRepo` satisfies it. */
@@ -387,9 +386,10 @@ export function createSeedTarget(
   }
 
   /**
-   * The head of main's `refs/heads/main`, which the push creates, whatever `HEAD` names: `null`
-   * when the repository has no such branch or no commit on it, or `missing` when there is no
-   * repository.
+   * The head of main's `main` branch, which the push creates, whatever `HEAD` names: `null` when
+   * the repository has no such branch or no commit on it, or `missing` when there is no repository.
+   * The log reads the branch by its short name, as the main-ref adapter does: `log` answers a ref
+   * it cannot resolve with an empty list.
    */
   async function readMain(
     artifacts: SeedArtifacts,
@@ -403,7 +403,7 @@ export function createSeedTarget(
     }
     using handle = repo;
     try {
-      const [latest] = await bounded(handle.log({ ref: BUNDLE_REF, limit: 1 }));
+      const [latest] = await bounded(handle.log({ ref: "main", limit: 1 }));
       if (latest === undefined) return ok(null);
       return isCommitSha(latest.hash) ? ok(latest.hash) : artifactsFailed();
     } catch (error) {
