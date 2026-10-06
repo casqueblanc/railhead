@@ -44,6 +44,7 @@ import { demoSeedPort, type DemoSeedPort } from "../modules/demoSeed/entry";
 import { ownerEnrollment, type OwnerEnrollmentPort } from "../modules/owner/entry";
 import {
   DELIVERY_TIMEOUT_MS,
+  release,
   type StreamListener,
   type StreamSubscription,
 } from "../modules/stream/entry";
@@ -340,13 +341,8 @@ class SubscriptionImpl extends RpcTarget implements BoardSubscription {
     if (this.#cancelling !== null) return;
     const subscription = this.#subscription;
     this.#subscription = null;
-    if (subscription !== null) dispose(subscription);
+    if (subscription !== null) release(subscription);
   }
-}
-
-function dispose(value: object): void {
-  const fn: unknown = Reflect.get(value, Symbol.dispose);
-  if (typeof fn === "function") fn.call(value);
 }
 
 const BOARD_ERROR_CODES = {

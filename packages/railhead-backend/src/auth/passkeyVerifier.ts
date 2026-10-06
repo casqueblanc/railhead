@@ -14,7 +14,7 @@ import type {
   PasskeyAssertion,
 } from "@railhead/shared/board-api";
 import type { RepoId } from "@railhead/shared/events";
-import { equalBytes } from "../modules/owner/encoding";
+import { decodeBase64Url, encodeBase64Url, equalBytes, sha256 } from "../modules/owner/encoding";
 
 /** The hosts a Railhead instance may use as its relying party: submission, then development. */
 export const RELYING_PARTY_HOSTS = ["railhead.dev", "railhead.mashin.workers.dev"] as const;
@@ -467,24 +467,4 @@ function derToRawSignature(der: Uint8Array): Uint8Array<ArrayBuffer> | undefined
     offset = end;
   }
   return offset === der.length ? out : undefined;
-}
-
-/** Decodes canonical base64url without padding, refusing more than `maxBytes` decoded bytes. */
-function decodeBase64Url(text: string, maxBytes: number): Uint8Array<ArrayBuffer> | undefined {
-  if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) return undefined;
-  if (Math.floor((text.length * 3) / 4) > maxBytes) return undefined;
-  const binary = atob(text.replaceAll("-", "+").replaceAll("_", "/"));
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  // Refuse non-zero trailing bits, so each byte string has exactly one accepted spelling.
-  return encodeBase64Url(bytes) === text ? bytes : undefined;
-}
-
-function encodeBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-async function sha256(bytes: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes)));
 }

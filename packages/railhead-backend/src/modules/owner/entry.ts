@@ -96,7 +96,7 @@ export const owner: ModuleFactory<OwnerPort> = (context, ports) =>
  * The instance's `Owner` object as a port. Each call takes a fresh stub: a stub that saw an
  * exception may stay broken, and this port outlives any one request.
  */
-function instanceOwner(env: Env): InstanceOwnerPort {
+export function instanceOwner(env: Env): InstanceOwnerPort {
   const stub = () => env.OWNER.getByName(OWNER_OBJECT_NAME);
   return {
     credential: () => stub().credential(),
