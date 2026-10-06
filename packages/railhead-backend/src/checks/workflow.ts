@@ -33,7 +33,12 @@ import type { CheckRunReport } from "../contracts/train";
 import { CANDIDATE_REF_PREFIX } from "../sandbox/policy";
 import { boundedLog } from "./attempts";
 import { MAX_CHECK_TIMEOUT_MS, MAX_COMMAND_LENGTH, MIN_CHECK_TIMEOUT_MS } from "./definition";
-import { classifyRunnerFailure, railheadCheckout, type CheckSlot } from "./sdkCheckout";
+import {
+  classifyRunnerFailure,
+  railheadCheckout,
+  type CheckProviderData,
+  type CheckSlot,
+} from "./sdkCheckout";
 
 /** The runner's name: the Workflow step it runs in, and the first word of its failure. */
 export const CHECK_RUNNER = "check";
@@ -147,7 +152,7 @@ export function parseCheckRunParams(value: unknown): CheckRunParams | null {
 /** The SDK's run parameters for `params`: its candidate, in its namespace, in its admitted slot. */
 export function ciParams(params: CheckRunParams): CiParams<CloudflareArtifacts> {
   // The checkout reads the slot from here; the SDK passes it through untouched.
-  const providerData = { namespace: params.namespace, slot: params.slot };
+  const providerData: CheckProviderData = { namespace: params.namespace, slot: params.slot };
   return {
     provider: "cloudflare-artifacts",
     providerData,

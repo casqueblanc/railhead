@@ -30,7 +30,8 @@ const worker = defineRailheadWorker({
     // One `Repo` Durable Object per repository, named `org/repo`. Private: only this Worker's code
     // reaches it, through the fixed HTTP and RPC adapters in `src/gateway/`.
     REPO: { type: "durable-object", worker: "railhead", exportName: "Repo" },
-    // One sandbox per admitted attempt, named by the attempt. Only the sandbox module reaches it.
+    // One sandbox per admitted slot, under a random `sbx-` name chosen at admission. Only the
+    // sandbox module reaches it.
     SANDBOX: { type: "durable-object", worker: "railhead", exportName: "RailheadSandbox" },
     // Git storage. Tokens minted from it stay in the Worker; a sandbox never receives one.
     ARTIFACTS: bindings.artifacts({ namespace: "railhead" }),
