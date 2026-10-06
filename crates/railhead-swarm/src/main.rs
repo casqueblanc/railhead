@@ -11,10 +11,11 @@
 //! already hold that agent, joined to the scenario's origin and repository. The driver checks each
 //! identity before any agent runs and refuses to start on a mismatch. Clones go in a temporary
 //! directory that is removed when the run ends, on Ctrl-C included; every child process is killed
-//! first, on an error included. Each agent's progress is kept in `<homes>/progress/swarm-NN.json`,
-//! so running a stopped scenario again resumes it; a record that is damaged or belongs to another
-//! scenario file stops the run until `--discard-progress` removes it. A run holds an
-//! operating-system lock on `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a
+//! first, on an error included. With `--clones-dir` they go in that directory instead, under
+//! `swarm-NN`, and are kept, so a qualification run can read them afterwards. Each agent's progress
+//! is kept in `<homes>/progress/swarm-NN.json`, so running a stopped scenario again resumes it; a
+//! record that is damaged or belongs to another scenario file stops the run until
+//! `--discard-progress` removes it. A run holds an operating-system lock on `<homes>/progress/swarm-NN.lock` for each agent while it runs, so a
 //! second run on the same homes refuses to start; the lock ends with the process, so a run that
 //! was killed leaves nothing to clean up before the next. Ctrl-C is listened for before anything
 //! else, so one pressed during startup still stops the run cleanly.
@@ -81,8 +82,13 @@ struct Cli {
     rh: PathBuf,
 
     /// Where the run's temporary directory of clones is made. Defaults to the system's.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", conflicts_with = "clones_dir")]
     workdir: Option<PathBuf>,
+
+    /// Keeps the clones in this directory, one subdirectory per agent, instead of a temporary
+    /// directory removed when the run ends. It is created when missing and never removed.
+    #[arg(long, value_name = "DIR")]
+    clones_dir: Option<PathBuf>,
 
     /// Removes every agent's progress record first, so the scenario starts over instead of
     /// resuming.
@@ -209,6 +215,54 @@ impl Interrupt {
     }
 }
 
+/// Where a run's clones go: a temporary directory removed when the run ends, or a kept one.
+enum Clones {
+    Temporary(tempfile::TempDir),
+    Kept(PathBuf),
+}
+
+impl Clones {
+    fn new(cli: &Cli) -> anyhow::Result<Self> {
+        if let Some(dir) = &cli.clones_dir {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            return Ok(Self::Kept(dir.clone()));
+        }
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("railhead-swarm-");
+        match &cli.workdir {
+            Some(dir) => builder.tempdir_in(dir),
+            None => builder.tempdir(),
+        }
+        .map(Self::Temporary)
+        .context("creating the run's temporary directory")
+    }
+
+    /// Agent `name`'s working directory. A kept one may already exist from an earlier run.
+    fn agent_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let created = match self {
+            Self::Temporary(dir) => {
+                let path = dir.path().join(name);
+                std::fs::create_dir(&path).map(|()| path)
+            }
+            Self::Kept(dir) => {
+                let path = dir.join(name);
+                std::fs::create_dir_all(&path).map(|()| path)
+            }
+        };
+        created.with_context(|| format!("creating the clone directory of {name}"))
+    }
+
+    /// Removes a temporary directory; a kept one stays.
+    fn close(self) -> anyhow::Result<()> {
+        match self {
+            Self::Temporary(dir) => dir
+                .close()
+                .context("removing the run's temporary directory"),
+            Self::Kept(_) => Ok(()),
+        }
+    }
+}
+
 /// How a run ended.
 struct Ended {
     stopped_by: StopReason,
@@ -240,13 +294,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     let saved = (0..scenario.agents)
         .map(|index| load_progress(&progress, index, &key, &plan, cli.discard_progress))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("railhead-swarm-");
-    let clones = match &cli.workdir {
-        Some(dir) => builder.tempdir_in(dir),
-        None => builder.tempdir(),
-    }
-    .context("creating the run's temporary directory")?;
+    let clones = Clones::new(cli)?;
 
     let started = Instant::now();
     let (tui, stop_asked, paused) = start_view(cli.tui, started)?;
@@ -284,8 +332,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     let mut prepared = Vec::with_capacity(homes.len());
     for ((slot, home), (progress, saved)) in (0..scenario.agents).zip(homes).zip(saved) {
         let name = agent_name(slot);
-        let workdir = clones.path().join(&name);
-        std::fs::create_dir(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
+        let workdir = clones.agent_dir(&name)?;
         prepared.push(Agent {
             slot,
             progress,
@@ -310,9 +357,7 @@ async fn run(cli: &Cli) -> anyhow::Result<Ended> {
     }
     let Sink { writer, tui } = sink;
     let summary = writer.finish(stopped_by)?;
-    clones
-        .close()
-        .context("removing the run's temporary directory")?;
+    clones.close()?;
     if let Some(tui) = tui {
         finish_view(tui, &summary).await?;
     }
