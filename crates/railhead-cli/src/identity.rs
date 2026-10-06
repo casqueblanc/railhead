@@ -3,8 +3,8 @@
 //! Each identity lives under `<home>/agents/<name>/`: `identity.json` names the agent and the
 //! repository it joined, `key` holds its OpenSSH private key and `session` its current session
 //! record. While `rh join` has an enrollment it has not finished, `enrollment.json` holds its
-//! scope. The two secrets go through [`SecretStore`], so a system keychain can replace the file
-//! store without touching the commands. Secrets never reach `Debug`, `Display` or an error.
+//! scope. Secrets are read and written through [`SecretStore`]. Secrets never reach `Debug`,
+//! `Display` or an error.
 //!
 //! The session is stored with the identity it was issued to and its expiry, so a session is never
 //! used for another identity or after it lapses. Processes that act on one agent at once take a
@@ -492,7 +492,7 @@ impl SecretKind {
     }
 }
 
-/// Where an agent's secrets are kept. The file store is the default; a keychain can stand in.
+/// Where an agent's secrets are kept. The file store is the default.
 pub trait SecretStore {
     /// Reads a secret, or `None` when it was never stored.
     ///

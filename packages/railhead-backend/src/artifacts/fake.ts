@@ -4,7 +4,7 @@
 // rarely: a lost fork response, a hung or late call, slow revocations, and a fork still in
 // progress. `listTokens` answers as the binding was measured to (#161): only live tokens, newest
 // first, at most one page of `TOKEN_PAGE_SIZE`, with `total` counting live tokens. It proves
-// nothing about the deployed service's revocation timing or limits; that evidence is H04's.
+// nothing about the deployed service's revocation timing or limits; that evidence is #71's.
 
 import { TOKEN_PAGE_SIZE, type ArtifactsNamespace, type ArtifactsRepoHandle } from "./adapter";
 
