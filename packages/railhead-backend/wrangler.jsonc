@@ -103,5 +103,112 @@
   "build": {
     "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
     "watch_dir": "src"
+  },
+  "env": {
+    "qualification": {
+      "name": "railhead-qual",
+      "main": ".wrangler/validate/src/server.ts",
+      "compatibility_date": "2026-09-30",
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "ai": {
+        "binding": "AI"
+      },
+      "r2_buckets": [
+        {
+          "binding": "BACKUP_BUCKET",
+          "bucket_name": "railhead-qual-check-backups"
+        }
+      ],
+      "artifacts": [
+        {
+          "binding": "ARTIFACTS",
+          "namespace": "railhead-qual-instance"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "REPO",
+            "class_name": "Repo"
+          },
+          {
+            "name": "SANDBOX",
+            "class_name": "RailheadSandbox"
+          },
+          {
+            "name": "OWNER",
+            "class_name": "Owner"
+          }
+        ]
+      },
+      "workflows": [
+        {
+          "binding": "CHECKS",
+          "name": "railhead-qual-checks",
+          "class_name": "CheckWorkflow",
+          "script_name": "railhead-qual"
+        }
+      ],
+      "vars": {
+        "ARTIFACTS_NAMESPACE": "railhead-qual-instance",
+        "BACKUP_BUCKET_NAME": "railhead-qual-check-backups",
+        "RELYING_PARTY_HOST": "railhead-qual.mashin.workers.dev"
+      },
+      "secrets": {
+        "required": [
+          "CLOUDFLARE_ACCOUNT_ID",
+          "OWNER_BOOTSTRAP_TOKEN",
+          "SESSION_SIGNING_SECRET"
+        ]
+      },
+      "assets": {
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application",
+        "run_worker_first": [
+          "/api",
+          "/api/*",
+          "/agent/*",
+          "/git/*"
+        ],
+        "directory": "../railhead-frontend/dist"
+      },
+      "exports": {
+        "Repo": {
+          "type": "durable-object",
+          "storage": "sqlite"
+        },
+        "RailheadSandbox": {
+          "type": "durable-object",
+          "storage": "sqlite",
+          "container": "railhead-qual-sandbox"
+        },
+        "Owner": {
+          "type": "durable-object",
+          "storage": "sqlite"
+        },
+        "CheckWorkflow": {
+          "type": "workflow",
+          "name": "railhead-qual-checks"
+        }
+      },
+      "containers": [
+        {
+          "name": "railhead-qual-sandbox",
+          "image": "../../containers/railhead/Dockerfile",
+          "max_instances": 10,
+          "instance_type": "basic"
+        }
+      ],
+      "build": {
+        "command": "pnpm exec capnweb-validate build --out .wrangler/validate",
+        "watch_dir": "src"
+      }
+    }
   }
 }

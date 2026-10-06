@@ -67,6 +67,32 @@ What the live instance confirms and what stays the operator's word:
 
 So a hand-built slice report fails unless the instance really holds its events and check runs. A binding report reproduced consistently offline still passes; the binding report remains evidence from the operator who ran the harness.
 
+### The qualification instance
+
+The nightly live run (#349) uses its own instance, so its owner can be the software passkey from #347 while `railhead.mashin.workers.dev` keeps the owner's own passkey for manual runs. It is the `qualification` environment of `packages/railhead-backend/wrangler.jsonc`: Worker `railhead-qual` at `https://railhead-qual.mashin.workers.dev`, Artifacts namespace `railhead-qual-instance`, Workflow `railhead-qual-checks`, R2 bucket `railhead-qual-check-backups` and container application `railhead-qual-sandbox`. It shares none of them with the development instance, so its `demo/upload-app` is a separate repository. The probe in step 1 uses `railhead-qual`, a different namespace.
+
+Deploy it fresh for each run, from `packages/railhead-backend` with the board built (`vp run -F @railhead/frontend build`), using the API token permissions in docs/deploy.md:
+
+```sh
+node ../../scripts/write-worker-secrets.mjs --config wrangler.jsonc --out <secrets file>
+pnpm exec wrangler deploy --env qualification --secrets-file <secrets file>
+```
+
+`write-worker-secrets.mjs` reads `CLOUDFLARE_ACCOUNT_ID`, `SESSION_SIGNING_SECRET` and `OWNER_BOOTSTRAP_TOKEN` from the environment; give each run a new session secret and bootstrap token. Delete the secrets file after the deploy. The bootstrap token enrols the run's software passkey as the instance's one owner.
+
+Delete it after the run, with every resource it created:
+
+```sh
+pnpm exec wrangler delete --env qualification
+pnpm exec wrangler workflows delete railhead-qual-checks
+pnpm exec wrangler r2 bucket delete railhead-qual-check-backups
+pnpm exec wrangler artifacts repos delete <repository> --namespace railhead-qual-instance
+```
+
+Run the repository delete for each name `wrangler artifacts repos list --namespace railhead-qual-instance` shows; the namespace itself stays, as in step 1. The R2 bucket must be emptied first. Remove the container application and its image tags as in docs/sandbox-teardown.md, with `railhead-qual-sandbox` for `railhead-sandbox`.
+
+The owner's enrolled passkey and the bootstrap's state live in the Worker's `Owner` Durable Object, and the repositories' state in its `Repo` objects. Wrangler documents `wrangler delete` as deleting the Worker and its associated resources; that it also removes these Durable Object namespaces and their data has not been measured. Before the next deploy, confirm that the account lists no Durable Object namespace for `railhead-qual` (`GET /accounts/<account id>/workers/durable_objects/namespaces`). Once they are gone, the owner enrollment has ended: the next deploy starts with no passkey, and its bootstrap token opens enrollment again.
+
 ## Checks
 
 | Check                                           | Source     | Passes when                                                                                                                                                                                                                                                                                                                                                                                           |

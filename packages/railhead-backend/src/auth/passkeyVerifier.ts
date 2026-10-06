@@ -16,8 +16,17 @@ import type {
 import type { RepoId } from "@railhead/shared/events";
 import { decodeBase64Url, encodeBase64Url, equalBytes, sha256 } from "../modules/owner/encoding";
 
-/** The hosts a Railhead instance may use as its relying party: submission, then development. */
-export const RELYING_PARTY_HOSTS = ["railhead.dev", "railhead.mashin.workers.dev"] as const;
+/**
+ * The hosts a Railhead instance may use as its relying party: `railhead.dev` is the submission
+ * instance, `railhead.mashin.workers.dev` the development instance for manual runs, and
+ * `railhead-qual.mashin.workers.dev` the qualification instance the nightly live run deploys for
+ * each run and deletes afterwards.
+ */
+export const RELYING_PARTY_HOSTS = [
+  "railhead.dev",
+  "railhead.mashin.workers.dev",
+  "railhead-qual.mashin.workers.dev",
+] as const;
 
 /** One of {@link RELYING_PARTY_HOSTS}. */
 export type RelyingPartyHost = (typeof RELYING_PARTY_HOSTS)[number];

@@ -205,6 +205,10 @@ describe("relyingParty", () => {
       rpId: "railhead.mashin.workers.dev",
       origin: "https://railhead.mashin.workers.dev",
     });
+    expect(relyingParty("railhead-qual.mashin.workers.dev")).toEqual({
+      rpId: "railhead-qual.mashin.workers.dev",
+      origin: "https://railhead-qual.mashin.workers.dev",
+    });
   });
 
   it("refuses any other host, suffix or parent domain", () => {
@@ -213,6 +217,8 @@ describe("relyingParty", () => {
       "evil.railhead.dev",
       "workers.dev",
       "mashin.workers.dev",
+      "railhead-qual.workers.dev",
+      "evil.railhead-qual.mashin.workers.dev",
       "RAILHEAD.DEV",
       "railhead.dev.",
       "https://railhead.dev",
@@ -315,6 +321,22 @@ describe("verifyActionAssertion", () => {
     expect(await verify(assertion, { relyingParty: dev })).toEqual({ ok: true, signCount: 1 });
   });
 
+  it("accepts on the qualification instance", async () => {
+    const qual = rp("railhead-qual.mashin.workers.dev");
+    const qualChallenge = await challengeFor(binding, qual);
+    const assertion = await assert(auth, qual, qualChallenge);
+    expect(await verify(assertion, { relyingParty: qual })).toEqual({ ok: true, signCount: 1 });
+  });
+
+  it("refuses an assertion from the qualification origin signed for another RP ID", async () => {
+    const qual = rp("railhead-qual.mashin.workers.dev");
+    const qualChallenge = await challengeFor(binding, qual);
+    for (const rpId of ["railhead.mashin.workers.dev", "railhead.dev"]) {
+      const assertion = await assert(auth, qual, qualChallenge, { rpId });
+      expect(await verify(assertion, { relyingParty: qual })).toEqual(refused("rp-mismatch"));
+    }
+  });
+
   it("accepts DER signatures of every integer length the signer produces", async () => {
     // About half of ECDSA r and s values have the high bit set and need a leading zero in DER.
     for (let i = 0; i < 24; i += 1) {
@@ -339,6 +361,7 @@ describe("verifyActionAssertion", () => {
   it("refuses the wrong origin, a cross-origin call and an embedded call", async () => {
     const cases: AssertOptions[] = [
       { origin: "https://railhead.mashin.workers.dev" },
+      { origin: "https://railhead-qual.mashin.workers.dev" },
       { origin: "https://evil.railhead.dev" },
       { origin: "http://railhead.dev" },
       { origin: "https://railhead.dev:8443" },
