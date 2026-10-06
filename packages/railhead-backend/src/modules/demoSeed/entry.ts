@@ -20,8 +20,7 @@ import type { RepoId } from "@railhead/shared/events";
 import { relyingParty } from "../../auth/passkeyVerifier";
 import type { PortResult } from "../../contracts/result";
 import type { RepoStorage } from "../../repo/storage";
-import type { InstanceOwnerPort } from "../owner/entry";
-import { OWNER_OBJECT_NAME } from "../owner/OwnerObject";
+import { instanceOwner } from "../owner/entry";
 import { checkPerformInput, createSeedControl, type SeedControl } from "./control";
 import { artifactsBinding, createSeedTarget, type SeedTarget } from "./target";
 
@@ -114,13 +113,4 @@ export function demoSeedTarget(host: DemoSeedHost, env: Env): SeedTarget {
     initialize: () => host.initialize(),
     wipe: () => host.wipe(),
   });
-}
-
-/** The instance's `Owner` object as a port, a fresh stub per call. */
-function instanceOwner(env: Env): InstanceOwnerPort {
-  const stub = () => env.OWNER.getByName(OWNER_OBJECT_NAME);
-  return {
-    credential: () => stub().credential(),
-    recordSignCount: (credentialId, signCount) => stub().recordSignCount(credentialId, signCount),
-  };
 }

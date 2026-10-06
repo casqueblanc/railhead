@@ -57,7 +57,7 @@ import {
 import { fail, ok, type PortResult } from "../../contracts/result";
 import { migrate, type RepoStorage } from "../../repo/storage";
 import { BUNDLE_REF } from "./bundle";
-import { pushMain, type PushOutcome } from "./receivePack";
+import { PUSH_TIMEOUT_MS, pushMain, type PushOutcome } from "./receivePack";
 
 /** The repository methods the seed calls. `ArtifactsRepo` satisfies it. */
 export type SeedArtifactsRepo = Disposable &
@@ -112,7 +112,7 @@ export const SEED_TARGET_LIMITS: SeedTargetLimits = {
   callTimeoutMs: ARTIFACTS_LIMITS.callTimeoutMs,
   sweepDeadlineMs: ARTIFACTS_LIMITS.sweepDeadlineMs,
   maxRevokesPerSweep: ARTIFACTS_LIMITS.maxRevokesPerSweep,
-  pushTimeoutMs: 60_000,
+  pushTimeoutMs: PUSH_TIMEOUT_MS,
   readCacheMs: 5_000,
 };
 

@@ -302,8 +302,8 @@ async function withTimeout(call: Promise<void>, ms: number): Promise<"done" | "t
   }
 }
 
-// Disposes `value` when the transport made it disposable: a stub or an RPC call's result.
-function release(value: object): void {
+/** Disposes `value` when the transport made it disposable: a stub or an RPC call's result. */
+export function release(value: object): void {
   const dispose: unknown = Reflect.get(value, Symbol.dispose);
   if (typeof dispose === "function") dispose.call(value);
 }
