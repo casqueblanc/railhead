@@ -33,10 +33,13 @@ export interface RefGrant {
   refPrefix: string;
 }
 
-const HOST =
+/** A Git host a policy may name: a lowercase DNS name of two or more labels. */
+export const HOST =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
-const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
-const REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+/** An Artifacts namespace or repository name a policy may name. */
+export const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+/** The one segment under `CANDIDATE_REF_PREFIX` that a grant's prefix holds. */
+export const REF_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /**
  * Validates `value` as a policy and returns it, or `null`. A write or discard prefix must be one

@@ -1,14 +1,18 @@
 // The shell commands a merge runs in its sandbox, and the parsers for what they print.
 //
 // Every value placed in a command is checked here first: commit and object IDs are 40 lowercase hex
-// digits, and remote URLs come from a host, namespace and repository name that match the sandbox
-// policy's own patterns. Nothing from a repository or a client reaches a command line. Each command
-// runs under one deadline computed inside the sandbox, so its steps together never outlast its
-// budget, and a step cut by that deadline exits with `TIMEOUT_EXIT`.
+// digits, and remote URLs come from a host, namespace and repository name that match the patterns
+// imported from the sandbox policy. Nothing from a repository or a client reaches a command line.
+// Each command runs under one deadline computed inside the sandbox, so its steps together never
+// outlast its budget, and a step cut by that deadline exits with one of `TIMEOUT_EXITS`.
 //
 // Output is untrusted: conflicted paths are repository content. Each command prints its own status
 // lines before any repository text, and paths arrive NUL-terminated from `git ls-files -z`, so a
 // path cannot pose as a status line.
+
+// `.ts` because `scripts/merge-git.test.ts` loads this file under `node --test`, which resolves
+// no extensionless import.
+import { CANDIDATE_REF_PREFIX, HOST, NAME, REF_SEGMENT } from "../../sandbox/policy.ts";
 
 /** The exit status of a command whose deadline passed: `timeout`'s own, or its kill after grace. */
 export const TIMEOUT_EXITS: readonly number[] = [124, 137];
@@ -36,11 +40,10 @@ export const CONFLICT_EXIT = 40;
 const WORKDIR = '"${RAILHEAD_MERGE_DIR:-/tmp/railhead-merge}"';
 
 const SHA = /^[0-9a-f]{40}$/;
-const HOST =
-  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
-const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
-const REF = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/[a-z]+$/;
-const PREFIX = /^refs\/heads\/candidate\/[A-Za-z0-9][A-Za-z0-9_-]{0,63}\/$/;
+// The prefix holds only letters and `/`, so it needs no escaping in a pattern.
+const SEGMENT = REF_SEGMENT.source.slice(1, -1);
+const REF = new RegExp(`^${CANDIDATE_REF_PREFIX}${SEGMENT}/[a-z]+$`);
+const PREFIX = new RegExp(`^${CANDIDATE_REF_PREFIX}${SEGMENT}/$`);
 const NONCE = /^[a-z0-9]{16,64}$/;
 
 /** Where a repository's Git remote lives: the Artifacts host and namespace. */
@@ -119,7 +122,7 @@ export function fetchCommand(
   );
   return script(seconds, [
     // Status 1 is Git's answer that there is no common ancestor; anything else is an error.
-    `no_base() { r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ "$r" -eq 1 ] && exit ${NO_MERGE_BASE_EXIT}; exit 2; }`,
+    `no_base() { r=$?; timed_out "$r" && exit "$r"; [ "$r" -eq 1 ] && exit ${NO_MERGE_BASE_EXIT}; exit 2; }`,
     ...lines,
     ...bases,
   ]);
@@ -137,7 +140,7 @@ export function mergeCommand(main: string, pins: readonly string[], seconds: num
   );
   return script(seconds, [
     // A merge that stopped with no unmerged entry failed for another reason, not a conflict.
-    'conflict() { r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ -n "$(git ls-files -u)" ] || exit 2; exit "$1"; }',
+    'conflict() { r=$?; timed_out "$r" && exit "$r"; [ -n "$(git ls-files -u)" ] || exit 2; exit "$1"; }',
     `step git checkout -q --detach ${sha(main)} || fail 2`,
     ...merges,
     "git rev-parse HEAD",
@@ -160,7 +163,7 @@ export function partnerCommand(pin: string, partners: readonly string[], seconds
     '  step git checkout -q -f --detach "$2" || exit 2',
     '  step git merge -q --no-ff --no-commit "$3" >/dev/null 2>&1',
     "  r=$?",
-    '  if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi',
+    '  timed_out "$r" && exit "$r"',
     // A merge that stopped with no unmerged entry failed for another reason, not a conflict.
     '  if [ "$r" -ne 0 ]; then',
     '    [ -n "$(git ls-files -u)" ] || exit 2',
@@ -218,7 +221,7 @@ export function regionsCommand(
     `  if grep -q '^=======' .git/rh-base .git/rh-ours .git/rh-theirs; then echo "${mark} opaque"; return; fi`,
     `  step git merge-file -p --diff3 -L ${mark} -L ${mark} -L ${mark} .git/rh-ours .git/rh-base .git/rh-theirs > .git/rh-merged`,
     // Git's exit status is the number of conflicts, or 255 when it failed.
-    '  r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; [ "$r" -lt 128 ] || exit 2',
+    '  r=$?; timed_out "$r" && exit "$r"; [ "$r" -lt 128 ] || exit 2',
     `  sed -n '/^<<<<<<< ${mark}/,/^>>>>>>> ${mark}/p' .git/rh-merged || exit 2`,
     "}",
     ...files.map(
@@ -259,8 +262,9 @@ export function discardCommand(url: string, prefix: string, seconds: number): st
 }
 
 /**
- * A command body under one deadline. `step` runs a command cut to the time left; `fail` exits with
- * the timeout's status when the step was cut, else with its own code.
+ * A command body under one deadline. `step` runs a command cut to the time left; `timed_out` tests
+ * whether a status is one of `TIMEOUT_EXITS`; `fail` exits with the timeout's status when the step
+ * was cut, else with its own code.
  */
 function script(seconds: number, lines: readonly string[]): string {
   if (!Number.isSafeInteger(seconds) || seconds < 1) throw new Error("invalid command budget");
@@ -269,7 +273,8 @@ function script(seconds: number, lines: readonly string[]): string {
     "export GIT_TERMINAL_PROMPT=0",
     `end=$(( $(date +%s) + ${seconds} ))`,
     'step() { left=$(( end - $(date +%s) )); [ "$left" -gt 0 ] || return 124; timeout -k 1 "$left" "$@"; }',
-    'fail() { r=$?; if [ "$r" -eq 124 ] || [ "$r" -eq 137 ]; then exit "$r"; fi; exit "$1"; }',
+    `timed_out() { ${TIMEOUT_EXITS.map((code) => `[ "$1" -eq ${code} ]`).join(" || ")}; }`,
+    'fail() { r=$?; timed_out "$r" && exit "$r"; exit "$1"; }',
     ...lines,
   ].join("\n");
 }
