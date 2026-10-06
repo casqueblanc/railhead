@@ -26,7 +26,7 @@ export interface RemoteLimits {
 }
 
 /** The production bounds. */
-export const REMOTE_LIMITS: RemoteLimits = { timeoutMs: 10_000, maxPending: 32, maxCached: 256 };
+const REMOTE_LIMITS: RemoteLimits = { timeoutMs: 10_000, maxPending: 32, maxCached: 256 };
 
 /** Resolves remotes through `namespace`. */
 export function artifactsRemotes(

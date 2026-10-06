@@ -70,13 +70,13 @@ export const MAX_CAPTURE_EVENTS = 2_000;
 export const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
 
 /** Longest origin, organisation, repository name or synthetic description a capture records. */
-export const MAX_SOURCE_TEXT_LENGTH = 256;
+const MAX_SOURCE_TEXT_LENGTH = 256;
 
 /** Largest time in milliseconds a `Date` can hold; a later one would break the page's clock. */
 const MAX_DATE_MS = 8_640_000_000_000_000;
 
 /** Events requested per page while capturing; the board API serves at most 256. */
-export const CAPTURE_PAGE_SIZE = 256;
+const CAPTURE_PAGE_SIZE = 256;
 
 /** How the log in a capture was made. */
 export type CaptureSource =

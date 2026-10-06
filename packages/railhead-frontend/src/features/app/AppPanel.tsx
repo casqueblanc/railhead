@@ -24,7 +24,7 @@ import { deploymentStatus, type AppLocation, type DeploymentStatus } from "./app
 import { useAppRevision } from "./useAppRevision";
 
 /** The only powers the embedded app gets: running its script and submitting its form. */
-export const APP_SANDBOX = "allow-scripts allow-forms";
+const APP_SANDBOX = "allow-scripts allow-forms";
 
 interface AppPanelProps {
   feed: BoardFeed;
