@@ -70,7 +70,8 @@ export interface StreamSink {
   onPhase(phase: StreamPhase): void;
 }
 
-const stopFor = (code: BoardErrorCode): StreamStop => {
+/** How a refused read, subscribe or board open ends: the repository has no log, or the call failed. */
+export const stopFor = (code: BoardErrorCode): Extract<StreamStop, "unavailable" | "failed"> => {
   switch (code) {
     case "not_found":
     case "unavailable":

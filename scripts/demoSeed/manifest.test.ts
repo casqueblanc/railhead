@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 // `events.ts` has no imports and only erasable syntax, so it loads under plain `node`.
 import * as sharedEvents from "../../packages/railhead-shared/src/events.ts";
+// `board-api.ts` imports only types, which plain `node` erases.
+import * as boardApi from "../../packages/railhead-shared/src/board-api.ts";
 import { parseCheckDefinitions } from "../../demo/upload-app/acceptance/select.ts";
 import {
   assertAskable,
@@ -331,16 +333,9 @@ test("the restated wire rules match @railhead/shared", () => {
   assert.ok(agentApi.includes("export const MAX_SCOPE_BYTES = MAX_AGENT_REQUEST_BYTES / 2;"));
 });
 
-test("the demo repository is the board's default repository", () => {
-  const apiSession = readFileSync(
-    join(root, "packages", "railhead-frontend", "src", "rpc", "apiSession.ts"),
-    "utf8",
-  );
-  assert.ok(
-    apiSession.includes(
-      `export const DEFAULT_BOARD_REPO: BoardRepo = { org: "${DEMO_ORG}", repo: "${DEMO_REPO}" };`,
-    ),
-  );
+test("the demo repository matches @railhead/shared", () => {
+  assert.equal(DEMO_ORG, boardApi.DEMO_ORG);
+  assert.equal(DEMO_REPO, boardApi.DEMO_REPO);
 });
 
 test("a manifest naming another repository is refused", () => {

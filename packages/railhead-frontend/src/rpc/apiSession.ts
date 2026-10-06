@@ -13,6 +13,7 @@ import type {
   PasskeyAssertion,
   PasskeyRegistration,
 } from "@railhead/shared/board-api";
+import { DEMO_ORG, DEMO_REPO } from "@railhead/shared/board-api";
 import type { CheckRunId, UserId } from "@railhead/shared/events";
 
 // The parts of the backend's capabilities the board calls, as the Cap'n Web stub of `RailheadApi`
@@ -72,10 +73,10 @@ export interface BoardRepo {
 }
 
 /**
- * The repository the board at `/` opens. The demo seed tooling (#59) must create exactly this
- * repository; until it exists, the backend answers `not_found` and the board says it has none.
+ * The repository the board at `/` opens. The demo seed creates this repository; before it is
+ * seeded, the backend answers `not_found` and the board says it has none.
  */
-export const DEFAULT_BOARD_REPO: BoardRepo = { org: "demo", repo: "upload-app" };
+export const DEFAULT_BOARD_REPO: BoardRepo = { org: DEMO_ORG, repo: DEMO_REPO };
 
 /** WebSocket URL of the backend's RPC session on the origin that served `location`. */
 export const apiUrl = (location: Pick<Location, "protocol" | "host">): string =>
