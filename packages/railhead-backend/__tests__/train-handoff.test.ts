@@ -42,6 +42,7 @@ import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm, type AlarmStorage } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
 import type { ConflictRegion } from "../src/train/classification/classify";
+import { deferred } from "./sliceWorld";
 
 const REPO = "rep_handoff0001";
 const ROOT = "1".repeat(40);
@@ -416,14 +417,14 @@ function withHandoff<T>(
       holdChecks: false,
       fake,
       holdNextPin() {
-        const reached = signal();
-        const released = signal();
+        const reached = deferred();
+        const released = deferred();
         held = { reach: reached.resolve, released: released.promise };
         return { reached: reached.promise, release: released.resolve };
       },
       holdMain() {
-        const reached = signal();
-        const released = signal();
+        const reached = deferred();
+        const released = deferred();
         mainGate = { reached: reached.resolve, released: released.promise };
         return {
           reached: reached.promise,
@@ -434,8 +435,8 @@ function withHandoff<T>(
         };
       },
       holdUpdate() {
-        const reached = signal();
-        const released = signal();
+        const reached = deferred();
+        const released = deferred();
         updateGate = { reach: reached.resolve, released: released.promise };
         return { reached: reached.promise, release: released.resolve };
       },
@@ -461,15 +462,6 @@ function samePin(left: ClaimPin, right: ClaimPin): boolean {
     left.generation === right.generation &&
     left.commit === right.commit
   );
-}
-
-/** A promise and the function that settles it. */
-function signal(): { promise: Promise<void>; resolve: () => void } {
-  let settle: (() => void) | null = null;
-  const promise = new Promise<void>((resolve) => {
-    settle = resolve;
-  });
-  return { promise, resolve: () => settle?.() };
 }
 
 function leaseOf(sql: SqlStorage, claimId: string): number | null {

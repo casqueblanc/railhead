@@ -1,6 +1,6 @@
 // Queues a pin the way `ready` does, for train tests that start from a pin rather than a claim.
 
-import type { CheckRunId } from "@railhead/shared/events";
+import type { CheckRunId, CommitSha } from "@railhead/shared/events";
 import type { ClaimPin } from "../src/contracts/claims";
 import type { PortResult } from "../src/contracts/result";
 import type { Train } from "../src/modules/train/scheduler";
@@ -42,4 +42,12 @@ export function queueing(train: Train, log: EventLog): QueueingTrain {
       return log.transaction((tx) => train.release(tx, attemptId)).value;
     },
   };
+}
+
+/** A distinct candidate for each main and pin list, as a real merge would produce. */
+export function candidateOf(main: CommitSha, pins: ClaimPin[]): CommitSha {
+  const key = `${main}:${pins.map((p) => `${p.claimId}@${p.generation}:${p.commit}`).join(",")}`;
+  let hash = 0;
+  for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return hash.toString(16).padStart(8, "0").repeat(5);
 }

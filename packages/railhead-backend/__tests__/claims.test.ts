@@ -19,6 +19,7 @@ import { CLAIMS_LIMITS, createClaims, type ClaimsLimits } from "../src/modules/c
 import { composeRepo } from "../src/repo/composeRepo";
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
+import { freshStub } from "./sliceWorld";
 
 const REPO = "rep_claimsrepo1";
 const ROOT = "1".repeat(40);
@@ -102,10 +103,6 @@ function inRepo<T>(
     expect(fake.openHandles).toBe(0);
     return result;
   });
-}
-
-function freshStub(): DurableObjectStub<Repo> {
-  return env.REPO.getByName(crypto.randomUUID());
 }
 
 function withClaims<T>(body: (setup: Setup, world: World) => Promise<T>, limits?: ClaimsLimits) {

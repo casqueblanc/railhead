@@ -1,5 +1,4 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   type ClaimId,
@@ -36,6 +35,7 @@ import {
   TRAIN_ACTOR,
   type AuthorizationReaders,
 } from "../src/train/authorize";
+import { freshStub } from "./sliceWorld";
 
 const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
@@ -263,10 +263,6 @@ function harness(
   const deps: MainWriterDeps = { authorization, ...readers };
   const writer = createMainWriter({ log, clock }, () => deps, ref, options.timeoutMs);
   return { storage, log, authorization, writer };
-}
-
-function freshStub(): DurableObjectStub {
-  return env.REPO.getByName(crypto.randomUUID());
 }
 
 /** Runs `body` against a Repo whose intent is already authorized. */

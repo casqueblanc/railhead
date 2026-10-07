@@ -1,5 +1,4 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { MAX_LIST_LENGTH, type ClaimId, type DecisionRef } from "@railhead/shared/events";
 import type { EpisodePin, ReadyPin } from "../src/contracts/claims";
@@ -19,6 +18,7 @@ import {
   TRAIN_ACTOR,
   type AuthorizationReaders,
 } from "../src/train/authorize";
+import { freshStub } from "./sliceWorld";
 
 const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
@@ -127,10 +127,6 @@ const UNKNOWN: AuthorizationReaders = {
   readyPin: () => null,
   readyGateNow: () => null,
 };
-
-function freshStub(): DurableObjectStub {
-  return env.REPO.getByName(crypto.randomUUID());
-}
 
 interface Harness {
   storage: RepoStorage;
