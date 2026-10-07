@@ -85,6 +85,26 @@ export type BoardErrorCode =
   /** The backend failed; the call may be repeated. */
   | "internal";
 
+/** Every `BoardErrorCode`, as keys. The `satisfies` fails to compile until a new code is added. */
+export const BOARD_ERROR_CODES = {
+  invalid_request: true,
+  not_found: true,
+  cursor_ahead: true,
+  proof_invalid: true,
+  proof_expired: true,
+  action_stale: true,
+  bootstrap_closed: true,
+  quota_exceeded: true,
+  busy: true,
+  unavailable: true,
+  internal: true,
+} as const satisfies Record<BoardErrorCode, true>;
+
+/** Whether `code` is a `BoardErrorCode`. Inherited keys such as `toString` are not. */
+export function isBoardErrorCode(code: string): code is BoardErrorCode {
+  return Object.hasOwn(BOARD_ERROR_CODES, code);
+}
+
 /** A failed board call. */
 export interface BoardFailure {
   /** Always `false`. */

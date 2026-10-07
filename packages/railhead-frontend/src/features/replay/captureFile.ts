@@ -32,10 +32,10 @@
 // presented as a run. Nothing signs the file, so an opened `captured` source is only the file's
 // claim: parsing checks that the events are consistent, not where they came from.
 //
-// This module imports nothing at run time but `@railhead/shared/events`, so the capture script can
-// load it under `node` directly.
+// This module imports nothing at run time but `@railhead/shared/events` and
+// `@railhead/shared/board-api`, so the capture script can load it under `node` directly.
 
-import type { BoardErrorCode } from "@railhead/shared/board-api";
+import { isBoardErrorCode, type BoardErrorCode } from "@railhead/shared/board-api";
 import {
   REOPEN_REASON_BEFORE_REASONS,
   isReadableVersion,
@@ -154,31 +154,12 @@ export interface CaptureReader {
   ): PromiseLike<{ ok: true; value: CapturePage } | { ok: false; code: unknown }>;
 }
 
-/** Every `BoardErrorCode`. A record, so a code added to the union must be added here. */
-const BOARD_ERROR_CODES: Record<BoardErrorCode, true> = {
-  invalid_request: true,
-  not_found: true,
-  cursor_ahead: true,
-  proof_invalid: true,
-  proof_expired: true,
-  action_stale: true,
-  bootstrap_closed: true,
-  quota_exceeded: true,
-  busy: true,
-  unavailable: true,
-  internal: true,
-};
-
 /**
  * Reads a failure code a backend sent. The backend chosen with `--origin` is not trusted, so
  * anything outside the closed `BoardErrorCode` set is `null` and its text is never shown.
  */
 export const readBoardErrorCode = (code: unknown): BoardErrorCode | null =>
   typeof code === "string" && isBoardErrorCode(code) ? code : null;
-
-function isBoardErrorCode(code: string): code is BoardErrorCode {
-  return Object.hasOwn(BOARD_ERROR_CODES, code);
-}
 
 /**
  * Reads the whole log through `reader` and builds a captured capture. The log is read up to the
