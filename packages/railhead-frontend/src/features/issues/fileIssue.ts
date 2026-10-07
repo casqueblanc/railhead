@@ -14,7 +14,11 @@
 import type { BoardErrorCode, BoardFailure } from "@railhead/shared/board-api";
 import { MAX_ISSUE_BODY_LENGTH, MAX_TITLE_LENGTH, type IssueId } from "@railhead/shared/events";
 import type { BoardState, IssueState } from "../board/boardState";
-import type { AttemptControl, AvailableOwnerPort } from "../enrollment/ownerActions";
+import {
+  refusedAfterSending,
+  type AttemptControl,
+  type AvailableOwnerPort,
+} from "../enrollment/ownerActions";
 import { signAction, type Authenticator } from "../enrollment/webauthn";
 
 /** The issue as it is sent: the title already trimmed. */
@@ -119,31 +123,6 @@ const failed = (failure: BoardFailure): FileOutcome => ({
   kind: "failed",
   message: failureMessage(failure.code),
 });
-
-/**
- * Whether a failed `perform` proves the issue was not filed. The board performs each challenge
- * once, so `proof_expired` means it expired before use. `internal` and `cursor_ahead` say nothing
- * about whether the filing was committed.
- */
-const refusedAfterSending = (failure: BoardFailure): boolean => {
-  switch (failure.code) {
-    case "proof_invalid":
-    case "proof_expired":
-    case "action_stale":
-    case "quota_exceeded":
-    case "unavailable":
-    case "invalid_request":
-    case "not_found":
-    case "bootstrap_closed":
-    case "busy":
-      return true;
-    case "cursor_ahead":
-    case "internal":
-      return false;
-    default:
-      return unreachable(failure.code);
-  }
-};
 
 /**
  * The sentence for a filing refused before or after it was sent. The backend's own message is untrusted text and may change

@@ -9,7 +9,11 @@
 
 import type { BoardErrorCode, BoardFailure } from "@railhead/shared/board-api";
 import type { HeldCheckState } from "../board/boardState";
-import type { AttemptControl, AvailableOwnerPort } from "../enrollment/ownerActions";
+import {
+  refusedAfterSending,
+  type AttemptControl,
+  type AvailableOwnerPort,
+} from "../enrollment/ownerActions";
 import { signAction, type Authenticator } from "../enrollment/webauthn";
 
 /** What became of one approval. Messages are shown as plain text. */
@@ -82,32 +86,11 @@ const failed = (failure: BoardFailure): ApproveOutcome => ({
   message: failureMessage(failure.code),
 });
 
-/** Whether a failed `perform` proves nothing was approved. See `fileIssue` for the same rule. */
-const refusedAfterSending = (failure: BoardFailure): boolean => {
-  switch (failure.code) {
-    case "proof_invalid":
-    case "proof_expired":
-    case "action_stale":
-    case "quota_exceeded":
-    case "unavailable":
-    case "invalid_request":
-    case "not_found":
-    case "bootstrap_closed":
-    case "busy":
-      return true;
-    case "cursor_ahead":
-    case "internal":
-      return false;
-    default:
-      return unreachable(failure.code);
-  }
-};
-
 /**
  * The sentence for an approval refused before or after it was sent. The backend's own message is
  * untrusted text, so the board names the outcome from the closed code.
  */
-export const failureMessage = (code: BoardErrorCode): string => {
+const failureMessage = (code: BoardErrorCode): string => {
   switch (code) {
     case "proof_invalid":
       return "The passkey did not verify for this approval. Nothing was approved.";

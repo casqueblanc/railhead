@@ -163,6 +163,31 @@ export const failureMessage = (code: BoardErrorCode): string => {
   }
 };
 
+/**
+ * Whether a failed `perform` proves the owner action did not happen. The board performs each
+ * challenge once, so `proof_expired` means it expired before use. `internal` and `cursor_ahead` say
+ * nothing about whether the action was committed.
+ */
+export const refusedAfterSending = (failure: BoardFailure): boolean => {
+  switch (failure.code) {
+    case "proof_invalid":
+    case "proof_expired":
+    case "action_stale":
+    case "quota_exceeded":
+    case "unavailable":
+    case "invalid_request":
+    case "not_found":
+    case "bootstrap_closed":
+    case "busy":
+      return true;
+    case "cursor_ahead":
+    case "internal":
+      return false;
+    default:
+      return unreachable(failure.code);
+  }
+};
+
 /** The sentence shown beside a blocked action. */
 export const blockMessage = (block: EnrollmentBlock): string => {
   switch (block.kind) {
