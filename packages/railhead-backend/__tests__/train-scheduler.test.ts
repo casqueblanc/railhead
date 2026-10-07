@@ -65,7 +65,8 @@ import type { ConflictInput, ConflictVerdict } from "../src/train/classification
 import { EventLog } from "../src/repo/eventLog";
 import { repoObjectName } from "../src/repo/RepoObject";
 import { EarliestAlarm } from "../src/repo/storage";
-import { queueing, type QueueingTrain } from "./trainQueue";
+import { deferred } from "./sliceWorld";
+import { candidateOf, queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_train0001";
 
@@ -202,7 +203,7 @@ class Fakes {
 
   /** Makes every `call` wait until the returned function releases them. */
   hold(call: PortCall): () => void {
-    const { promise, resolve } = released();
+    const { promise, resolve } = deferred();
     this.holds.set(call, promise);
     return () => {
       this.holds.delete(call);
@@ -333,23 +334,6 @@ class Fakes {
       },
     };
   }
-}
-
-/** A promise and the function that settles it. */
-function released(): { promise: Promise<void>; resolve: () => void } {
-  let settle: (() => void) | null = null;
-  const promise = new Promise<void>((resolve) => {
-    settle = resolve;
-  });
-  return { promise, resolve: () => settle?.() };
-}
-
-/** A distinct candidate for each main and pin list, as a real merge would produce. */
-function candidateOf(main: CommitSha, pins: ClaimPin[]): CommitSha {
-  const key = `${main}:${pins.map((p) => `${p.claimId}@${p.generation}:${p.commit}`).join(",")}`;
-  let hash = 0;
-  for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return hash.toString(16).padStart(8, "0").repeat(5);
 }
 
 function intentFor(attempt: CheckAttempt, n: number): MergeIntentRecord {

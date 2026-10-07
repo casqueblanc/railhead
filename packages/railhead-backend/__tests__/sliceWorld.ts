@@ -12,12 +12,14 @@
 // - Checks: a `CHECKS` Workflow binding that records each run it is asked to create. The test
 //   reports the run back through `Repo.reportCheck`, as the Workflow would.
 
+import { env } from "cloudflare:workers";
 import { vi } from "vitest";
 import type { CommitSha } from "@railhead/shared/events";
 import { FakeArtifacts } from "../src/artifacts/fake";
 import { FakeMainRepo } from "../src/artifacts/mainRefFake";
 import { CHECK_DEFINITION_PATH } from "../src/checks/definition";
 import type { CheckRunParams } from "../src/checks/workflow";
+import type { Repo } from "../src/repo/RepoObject";
 import type { SandboxCommand } from "../src/sandbox/entry";
 import type { BoundedOutput } from "../src/sandbox/output";
 
@@ -50,6 +52,11 @@ export function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = settle;
   });
   return { promise, resolve };
+}
+
+/** A Repo Durable Object no other test touches. */
+export function freshStub(): DurableObjectStub<Repo> {
+  return env.REPO.getByName(crypto.randomUUID());
 }
 
 /** The commit SHA made of one repeated hex digit or a short hex prefix padded with zeros. */

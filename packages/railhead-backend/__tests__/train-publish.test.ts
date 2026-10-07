@@ -40,7 +40,7 @@ import {
 import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm, type AlarmStorage } from "../src/repo/storage";
 import { createAuthorization } from "../src/train/authorize";
-import { queueing, type QueueingTrain } from "./trainQueue";
+import { candidateOf, queueing, type QueueingTrain } from "./trainQueue";
 
 const REPO_ID = "rep_publish01";
 const MAIN = "1".repeat(40);
@@ -59,14 +59,6 @@ function pin(n: number): ClaimPin {
 
 function sha(n: number): CommitSha {
   return n.toString(16).padStart(2, "0").repeat(20);
-}
-
-/** A distinct candidate for each main and pin list, as a real merge would produce. */
-function candidateOf(main: CommitSha, pins: ClaimPin[]): CommitSha {
-  const key = `${main}:${pins.map((p) => `${p.claimId}@${p.generation}:${p.commit}`).join(",")}`;
-  let hash = 0;
-  for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return hash.toString(16).padStart(8, "0").repeat(5);
 }
 
 /** How the fake ref answers one conditional update. */

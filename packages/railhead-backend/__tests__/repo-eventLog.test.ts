@@ -1,5 +1,4 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   EVENT_SCHEMA_VERSION,
@@ -16,6 +15,7 @@ import {
   type EventLogErrorCode,
 } from "../src/repo/eventLog";
 import { migrate, type RepoStorage } from "../src/repo/storage";
+import { freshStub } from "./sliceWorld";
 
 const REPO = "rep_demo01";
 const NOW = 1_790_000_000_000;
@@ -36,10 +36,6 @@ function reopened(claimId: string): EventPayload {
     type: "claim.reopened",
     data: { claimId, generation: 1, reason: "lost_conflict", decisions: [] },
   };
-}
-
-function freshStub(): DurableObjectStub {
-  return env.REPO.getByName(crypto.randomUUID());
 }
 
 /** Runs `body` against the storage of `stub`, or of a Durable Object no other test touches. */
