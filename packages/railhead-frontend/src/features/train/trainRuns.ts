@@ -57,7 +57,7 @@ export const trainRuns = (state: BoardState): TrainRun[] =>
     .toReversed();
 
 /** The intent's outcome. Exhaustive over the fold's landing and main outcomes. */
-export const outcomeOf = (intent: IntentState): TrainOutcome => {
+const outcomeOf = (intent: IntentState): TrainOutcome => {
   const { landing } = intent;
   switch (landing.kind) {
     case "pending":
