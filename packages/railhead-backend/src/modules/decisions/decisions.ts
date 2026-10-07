@@ -160,20 +160,6 @@ const OPTION_KEY = /^[a-z][a-z0-9_]{0,31}$/;
  */
 const SYSTEM_ID = /^sys_[a-z0-9_]{1,32}$/;
 
-/**
- * The decisions port, with the fence reader the train's authorization calls inside its own
- * transaction.
- */
-export interface Decisions extends DecisionsPort {
-  /**
-   * The current version of every recorded decision the claim depends on, oldest question first, or
-   * `null` when the claims module's fence reader does not know the claim, including when that
-   * module is missing. Synchronous: call it inside the caller's transaction, where its answer holds
-   * until that transaction commits.
-   */
-  currentVersions(claimId: ClaimId): DecisionRef[] | null;
-}
-
 interface QuestionRow extends Record<string, SqlStorageValue> {
   question_id: string;
   decision_id: string;
@@ -222,7 +208,7 @@ export class DecisionsWriteError extends Error {
 }
 
 /** Builds the decisions of one repository, creating or migrating its tables first. */
-export function createDecisions(context: RepoContext, ports: () => RepoPorts): Decisions {
+export function createDecisions(context: RepoContext, ports: () => RepoPorts): DecisionsPort {
   const { storage, log, clock, repoId } = context;
   migrate(storage, DECISIONS_OWNER, MIGRATIONS);
   const sql = storage.sql;

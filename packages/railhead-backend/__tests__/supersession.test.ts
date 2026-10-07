@@ -8,17 +8,13 @@ import {
   type InboxEntry,
   type RailheadEvent,
 } from "@railhead/shared/events";
-import type { DecisionObligation } from "../src/contracts/decisions";
+import type { DecisionObligation, DecisionsPort } from "../src/contracts/decisions";
 import type { InboxPort, InboxTarget } from "../src/contracts/inbox";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { ok, unavailable, type PortResult } from "../src/contracts/result";
 import type { AuthorizationPort, CheckAttempt } from "../src/contracts/train";
 import { unavailableClaims, unavailableInbox } from "../src/contracts/unavailable";
-import {
-  createDecisions,
-  DecisionsWriteError,
-  type Decisions,
-} from "../src/modules/decisions/decisions";
+import { createDecisions, DecisionsWriteError } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
 import { EventLog } from "../src/repo/eventLog";
@@ -61,7 +57,7 @@ const WORKING: ClaimView = {
 };
 
 interface Harness {
-  decisions: Decisions;
+  decisions: DecisionsPort;
   inbox: InboxPort;
   log: EventLog;
   ports: () => RepoPorts;
