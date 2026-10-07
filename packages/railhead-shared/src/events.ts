@@ -186,7 +186,7 @@ export type RefusalReason =
   /** A decision affecting the claim has not been acknowledged. */
   | "unacked_decision";
 
-/** Why a ready claim went back to working: the system decided its pinned work must be redone. */
+/** Why a ready or merged claim went back to working: the system decided its pinned work must be redone. */
 export type ReopenReason =
   /** The pin lost a conflict on the train and must be redone on the new base. */
   | "lost_conflict"
