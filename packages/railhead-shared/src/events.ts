@@ -61,7 +61,7 @@ export type IntentId = string;
 export type CommitSha = string;
 
 /** The prefix each identifier kind must carry. */
-export const ID_PREFIXES = {
+const ID_PREFIXES = {
   repo: "rep_",
   agent: "agt_",
   user: "usr_",
@@ -459,7 +459,7 @@ export type RailheadEvent = {
 } & EventPayload;
 
 /** The event types a person must record, never an agent or the system. */
-export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
+const HUMAN_ONLY_EVENTS: readonly EventType[] = [
   "agent.invited",
   "agent.confirmed",
   "agent.revoked",
@@ -471,10 +471,10 @@ export const HUMAN_ONLY_EVENTS: readonly EventType[] = [
  * The event types only an agent may record. An acknowledgement is what the `ready` gate relies on,
  * so nobody can acknowledge on an agent's behalf (#17), and only a claim's holder gives it up.
  */
-export const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked", "claim.released"];
+const AGENT_ONLY_EVENTS: readonly EventType[] = ["inbox.acked", "claim.released"];
 
 /** The event types only the system records: facts no caller can assert about itself. */
-export const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
+const SYSTEM_ONLY_EVENTS: readonly EventType[] = [
   "agent.joined",
   "claim.refused",
   "claim.reopened",

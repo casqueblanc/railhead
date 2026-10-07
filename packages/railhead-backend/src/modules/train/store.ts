@@ -1374,10 +1374,10 @@ export function hasMovableWork(sql: SqlStorage, now: number): boolean {
 function toEntry(row: QueueRow): QueueEntry {
   return {
     pin: { claimId: row.claim_id, generation: row.generation, commit: row.commit_sha },
-    state: parseEntryState(row.state),
+    state: member(ENTRY_STATES, row.state, "entry state"),
     isolate: row.isolate === 1,
     retries: row.retries,
-    reason: row.reason === null ? null : parseDropReason(row.reason),
+    reason: row.reason === null ? null : member(DROP_REASONS, row.reason, "drop reason"),
     episode: row.episode,
     nextCommit: row.next_commit,
     batchedEpisode: row.batched_episode,
@@ -1395,7 +1395,7 @@ function toBatch(row: BatchRow): BatchRecord {
   const definition: CheckDefinition = JSON.parse(row.definition);
   return {
     batchId: row.batch_id,
-    state: parseBatchState(row.state),
+    state: member(BATCH_STATES, row.state, "batch state"),
     expectedMain: row.expected_main,
     pins,
     decisions,
@@ -1408,11 +1408,12 @@ function toBatch(row: BatchRow): BatchRecord {
     checkHeld: row.check_held === 1,
     // A started attempt always has a deadline; one recorded without it has already expired.
     checkDeadline: row.check_deadline ?? (row.check_started === 1 ? row.updated_at : null),
-    checkResult: row.check_result === null ? null : parseCheckResult(row.check_result),
+    checkResult:
+      row.check_result === null ? null : member(CHECK_RESULTS, row.check_result, "check result"),
     logDigest: row.log_digest,
     finishedAt: row.finished_at,
     intentId: row.intent_id,
-    failure: row.failure === null ? null : parseBatchFailure(row.failure),
+    failure: row.failure === null ? null : member(BATCH_FAILURES, row.failure, "batch failure"),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1463,26 +1464,6 @@ const BATCH_FAILURES = [
   "publish_refused",
 ] as const;
 const CHECK_RESULTS = ["pass", "fail", "error"] as const;
-
-function parseEntryState(value: string): EntryState {
-  return member(ENTRY_STATES, value, "entry state");
-}
-
-function parseDropReason(value: string): DropReason {
-  return member(DROP_REASONS, value, "drop reason");
-}
-
-function parseBatchState(value: string): BatchState {
-  return member(BATCH_STATES, value, "batch state");
-}
-
-function parseBatchFailure(value: string): BatchFailure {
-  return member(BATCH_FAILURES, value, "batch failure");
-}
-
-function parseCheckResult(value: string): CheckResult {
-  return member(CHECK_RESULTS, value, "check result");
-}
 
 function member<T extends string>(values: readonly T[], value: string, what: string): T {
   const found = values.find((candidate) => candidate === value);
