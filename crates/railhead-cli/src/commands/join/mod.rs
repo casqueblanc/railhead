@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use railhead_protocol::{
     AgentErrorCode, AgentRoute, ChallengeRequest, ChallengeResult, EnrollmentState, InboxDigest,
-    JoinRequest, JoinResult, NextCommand, SessionRequest, SessionResult,
+    JoinRequest, JoinResult, NextCommand, SessionRequest, SessionResult, is_challenge_id,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -428,13 +428,6 @@ async fn by<T>(
         .unwrap_or(Err(http::Error::Timeout(route)))
 }
 
-/// `chl_` and 16 to 64 letters or digits.
-fn is_challenge_id(value: &str) -> bool {
-    value.strip_prefix("chl_").is_some_and(|body| {
-        (16..=64).contains(&body.len()) && body.bytes().all(|b| b.is_ascii_alphanumeric())
-    })
-}
-
 /// True when the backend refused the join itself, so it recorded nothing for the key.
 fn is_refusal(error: &http::Error) -> bool {
     matches!(error, http::Error::Rejected { error, .. } if error.code == AgentErrorCode::JoinRefused)
@@ -695,18 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn names_and_challenges_are_checked() {
+    fn names_are_checked() {
         assert!(parse_name("atlas").is_ok());
         for bad in ["", "Atlas", "1atlas", "a b"] {
             assert!(parse_name(bad).is_err(), "{bad:?}");
-        }
-        assert!(is_challenge_id("chl_3q27HkVb0nZ8pXa1"));
-        for bad in [
-            "chl_short",
-            "chl_3q27HkVb0nZ8pXa1\nagent=x",
-            "3q27HkVb0nZ8pXa1abcd",
-        ] {
-            assert!(!is_challenge_id(bad), "{bad:?}");
         }
     }
 }

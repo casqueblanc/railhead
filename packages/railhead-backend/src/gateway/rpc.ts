@@ -14,28 +14,28 @@ import { RpcTarget as WorkersRpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import { isRepoSegment, type RepoSegment } from "@railhead/shared/agent-api";
 import type { RailheadApi } from "@railhead/shared/api";
-import type {
-  ActionChallenge,
-  BoardApi,
-  BoardErrorCode,
-  BoardListener,
-  BoardResult,
-  BoardSubscription,
-  CheckDetail,
-  DemoSeedAction,
-  DemoSeedApi,
-  DemoSeedResult,
-  DemoSeedState,
-  EnrollmentChallenge,
-  EventPage,
-  OwnerAction,
-  OwnerActionResult,
-  OwnerApi,
-  OwnerEnrollmentApi,
-  PasskeyAssertion,
-  PasskeyRegistration,
-  PendingJoin,
-  SubscriptionEnd,
+import {
+  isBoardErrorCode,
+  type ActionChallenge,
+  type BoardApi,
+  type BoardListener,
+  type BoardResult,
+  type BoardSubscription,
+  type CheckDetail,
+  type DemoSeedAction,
+  type DemoSeedApi,
+  type DemoSeedResult,
+  type DemoSeedState,
+  type EnrollmentChallenge,
+  type EventPage,
+  type OwnerAction,
+  type OwnerActionResult,
+  type OwnerApi,
+  type OwnerEnrollmentApi,
+  type PasskeyAssertion,
+  type PasskeyRegistration,
+  type PendingJoin,
+  type SubscriptionEnd,
 } from "@railhead/shared/board-api";
 import type { CheckRunId, RailheadEvent, UserId } from "@railhead/shared/events";
 import type { PortResult } from "../contracts/result";
@@ -343,24 +343,6 @@ class SubscriptionImpl extends RpcTarget implements BoardSubscription {
     this.#subscription = null;
     if (subscription !== null) release(subscription);
   }
-}
-
-const BOARD_ERROR_CODES = {
-  invalid_request: true,
-  not_found: true,
-  cursor_ahead: true,
-  proof_invalid: true,
-  proof_expired: true,
-  action_stale: true,
-  bootstrap_closed: true,
-  quota_exceeded: true,
-  busy: true,
-  unavailable: true,
-  internal: true,
-} as const satisfies Record<BoardErrorCode, true>;
-
-function isBoardErrorCode(code: string): code is BoardErrorCode {
-  return Object.hasOwn(BOARD_ERROR_CODES, code);
 }
 
 /** A port's result as a board result. */

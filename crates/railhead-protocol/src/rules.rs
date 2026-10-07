@@ -143,7 +143,8 @@ fn starts_lowercase_then(value: &str, min: usize, max: usize, rest: fn(u8) -> bo
 }
 
 /// `chl_[A-Za-z0-9]{16,64}`, a login challenge.
-pub(crate) fn is_challenge_id(value: &str) -> bool {
+#[must_use]
+pub fn is_challenge_id(value: &str) -> bool {
     value
         .strip_prefix("chl_")
         .is_some_and(|body| is_alphanumeric_between(body, 16, 64))
@@ -359,8 +360,9 @@ pub(crate) fn require_unique<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        IdKind, MAX_PATH_LENGTH, is_armored_signature, is_commit_sha, is_ed25519_public_key, is_id,
-        require_agent_name, require_option_key, require_path, require_text,
+        IdKind, MAX_PATH_LENGTH, is_armored_signature, is_challenge_id, is_commit_sha,
+        is_ed25519_public_key, is_id, require_agent_name, require_option_key, require_path,
+        require_text,
     };
 
     #[test]
@@ -375,6 +377,21 @@ mod tests {
         assert!(!is_id(IdKind::System, "sys_t"));
         assert!(!is_id(IdKind::System, "sys_Train"));
         assert!(!is_id(IdKind::System, "sys_1train"));
+    }
+
+    #[test]
+    fn challenges_are_chl_and_16_to_64_alphanumerics() {
+        assert!(is_challenge_id("chl_3q27HkVb0nZ8pXa1"));
+        assert!(is_challenge_id(&format!("chl_{}", "A1".repeat(32))));
+        for bad in [
+            "chl_short".to_owned(),
+            format!("chl_{}", "a".repeat(15)),
+            format!("chl_{}", "a".repeat(65)),
+            "chl_3q27HkVb0nZ8pXa1\nagent=x".to_owned(),
+            "3q27HkVb0nZ8pXa1abcd".to_owned(),
+        ] {
+            assert!(!is_challenge_id(&bad), "{bad:?}");
+        }
     }
 
     #[test]
