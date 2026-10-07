@@ -164,13 +164,13 @@ const enrolled: BoardResult<{ ownerId: string }> = {
   value: { ownerId: "usr_synthowner" },
 };
 
-/** An enrollment port that records each token and completed challenge. */
 const CLOSED =
   "This Railhead already has an owner, or the bootstrap token is wrong. Use an owner passkey you already hold; if none is accepted, ask the operator.";
 
 const UNCONFIRMED =
   "Enrollment was not confirmed after the passkey was sent. Try again; if enrollment is closed, that does not show this passkey was enrolled, so check it with an owner action.";
 
+/** An enrollment port that records each token and completed challenge. */
 const enrollmentPort = (
   completed: () => Promise<BoardResult<{ ownerId: string }>> = async () => enrolled,
   prepared: () => Promise<BoardResult<EnrollmentChallenge>> = async () => ({

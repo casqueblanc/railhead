@@ -326,7 +326,7 @@ impl ClaimAdapted {
     }
 }
 
-/// `question.asked`: an agent asked the owner a question.
+/// `question.asked`: a question was put to the owner, by an agent or by a system module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuestionAsked {

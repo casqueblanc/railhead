@@ -183,8 +183,9 @@ export interface CheckDetail {
   /** SHA-256 of the trusted definition's bytes, 64 lowercase hexadecimal characters. */
   definitionDigest: string;
   /**
-   * The shell command the definition on `expectedMain` gave the run, or `null` for a run recorded
-   * before the backend kept commands. Repository content: render it as text.
+   * The shell command the definition on `expectedMain` gave the run, or for an approved held
+   * attempt the approved candidate definition's, or `null` for a run recorded before the backend
+   * kept commands. Repository content: render it as text.
    */
   command: string | null;
   /** Where it stands. */
