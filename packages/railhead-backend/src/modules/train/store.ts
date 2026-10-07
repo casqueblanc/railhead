@@ -168,8 +168,7 @@ export type EntryState =
    * Out of the queue until something returns it: held with the claim it conflicts with until the
    * owner answers the train's question about the pair, a new ready of either claim arrives, or
    * either claim is no longer held (#118); or waiting for a person to approve the protected check
-   * paths it edits, which an approval of its held attempt returns. A new push enqueues the claim's
-   * next generation.
+   * paths it edits, which an approval of its held attempt returns.
    */
   | "parked";
 

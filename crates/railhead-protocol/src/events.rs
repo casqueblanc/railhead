@@ -223,7 +223,7 @@ pub enum EventPayload {
     /// A claim's action was refused.
     #[serde(rename = "claim.refused")]
     ClaimRefused(ClaimRefused),
-    /// A superseded pin returned a ready claim to working.
+    /// The system decided a ready claim's pinned work must be redone, so it is working again.
     #[serde(rename = "claim.reopened")]
     ClaimReopened(ClaimReopened),
     /// The train landed a claim's pin and the claim closed.
@@ -241,7 +241,7 @@ pub enum EventPayload {
     /// A claim's landed work passed the acceptance check of a decision version it depended on.
     #[serde(rename = "claim.adapted")]
     ClaimAdapted(ClaimAdapted),
-    /// An agent asked the owner a question.
+    /// A question was put to the owner, by an agent or by a system module.
     #[serde(rename = "question.asked")]
     QuestionAsked(QuestionAsked),
     /// A person recorded a decision version.

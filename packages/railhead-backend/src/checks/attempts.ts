@@ -4,20 +4,20 @@
 // definition) is written once and never changed: a later call naming the same attempt with anything
 // else is a mismatch, never an update. A row only moves forward, from `held` (a protected path was
 // edited, so nothing runs) or `started` (a sandbox slot was admitted and the run was asked for) to
-// `reported` (the run's result, with its output cut to `MAX_CHECK_LOG_BYTES` and the SHA-256 of what
-// was kept). A held attempt moves to `started` only after a person approved it: the approval names
-// the digest of the candidate's own definition, recorded when the attempt was held, and stays on the
-// row through the run and its report. The output is untrusted text: it is stored for a reader, never logged. The table keeps
-// at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones going first. A held attempt the train
-// may still run is not settled: its approval must find it. Those can keep the table over its bound
-// by at most the attempts the train holds: the active batch's and `MAX_PARKED_HELD` parked pins',
-// each for at most `HELD_PARK_TTL_MS`. A
-// started attempt counts as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its
-// run cannot still be running, and the train no longer accepts its report. A report for an attempt
-// removed this way finds no row and is refused, so an abandoned run can neither grow the table nor
-// pass late. The command the run was given is kept with the attempt so the board can show what
-// ran: the trusted definition's, or for an approved held attempt the approved candidate definition's.
-// A row written before commands were kept has none.
+// `reported` (the run's result, with its output cut to `MAX_CHECK_LOG_BYTES` and the SHA-256 of
+// what was kept). A held attempt moves to `started` only after a person approved it: the approval
+// names the digest of the candidate's own definition, recorded when the attempt was held, and stays
+// on the row through the run and its report. The output is untrusted text: it is stored for a
+// reader, never logged. The table keeps at most `MAX_STORED_ATTEMPTS` rows, the oldest settled ones
+// going first. A held attempt the train may still run is not settled: its approval must find it.
+// Those can keep the table over its bound by at most the attempts the train holds: the active
+// batch's and `MAX_PARKED_HELD` parked pins', each for at most `HELD_PARK_TTL_MS`. A started
+// attempt counts as settled once its sandbox's deadline is `REPORT_GRACE_MS` behind: its run cannot
+// still be running, and the train no longer accepts its report. A report for an attempt removed
+// this way finds no row and is refused, so an abandoned run can neither grow the table nor pass
+// late. The command the run was given is kept with the attempt so the board can show what ran: the
+// trusted definition's, or for an approved held attempt the approved candidate definition's. A row
+// written before commands were kept has none.
 
 import type { CheckResult, CheckRunId, CommitSha, UserId } from "@railhead/shared/events";
 import { CHECK_DEADLINE_MS } from "../modules/train/scheduler";
@@ -109,8 +109,9 @@ export interface AttemptApproval {
 /** One stored attempt. */
 export interface AttemptRecord extends AttemptIdentity {
   /**
-   * The command the trusted definition gave the run, or `null` for a row written before commands
-   * were kept. Repository content.
+   * The command the trusted definition gave the run, or for an approved held attempt the approved
+   * candidate definition's, or `null` for a row written before commands were kept. Repository
+   * content.
    */
   command: string | null;
   /** Where it stands. */

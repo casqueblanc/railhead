@@ -243,7 +243,8 @@ pub fn exit_on(signal: i32) -> ! {
     signals::exit_on(signal)
 }
 
-/// Ends `rh` as `signal` would have. No signal is ever received here, so nothing calls it.
+/// Ends `rh` as `signal` would have. No signal is received here, so [`interrupted`] never returns
+/// one and this is never reached.
 #[cfg(not(unix))]
 pub fn exit_on(signal: i32) -> ! {
     std::process::exit(128_i32.saturating_add(signal))
