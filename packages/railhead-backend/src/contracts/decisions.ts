@@ -126,9 +126,10 @@ export interface DecisionsPort {
   requirements(claimId: ClaimId): Promise<PortResult<DecisionRef[]>>;
   /**
    * The current version of every decision the claim's work must satisfy, as `requirements` returns
-   * them, or `null` when they are unknown, such as for an unknown claim or a missing module. `[]`
-   * means the claim genuinely requires no decision. Call it only inside the caller's transaction; a
-   * recorded decision version is current only if it appears here, and `null` is a refusal.
+   * them, oldest question first, or `null` when they are unknown, such as for an unknown claim or a
+   * missing module. `[]` means the claim genuinely requires no decision. Call it only inside the
+   * caller's transaction; a recorded decision version is current only if it appears here, and `null`
+   * is a refusal.
    */
   currentVersions(claimId: ClaimId): DecisionRef[] | null;
   /**

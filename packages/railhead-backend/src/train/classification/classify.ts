@@ -30,7 +30,7 @@ export const MAX_REGIONS = 8;
 export const MAX_REGION_LENGTH = 8 * 1024;
 
 /** Longest intent, in UTF-16 code units. */
-export const MAX_INTENT_LENGTH = 1024;
+const MAX_INTENT_LENGTH = 1024;
 
 /** Longest path, in UTF-16 code units. */
 export const MAX_PATH_LENGTH = 1024;

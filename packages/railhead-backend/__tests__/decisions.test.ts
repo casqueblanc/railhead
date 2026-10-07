@@ -20,7 +20,7 @@ import type { InboxPort } from "../src/contracts/inbox";
 import type { TrainPort } from "../src/contracts/train";
 import type { AgentPrincipal, GrantFor } from "../src/contracts/principals";
 import { fail, ok, unavailable, type PortResult } from "../src/contracts/result";
-import type { SystemQuestion } from "../src/contracts/decisions";
+import type { DecisionsPort, SystemQuestion } from "../src/contracts/decisions";
 import {
   UnavailableError,
   unavailableClaims,
@@ -32,7 +32,6 @@ import {
   createDecisions,
   MAX_QUESTIONS_PER_CLAIM,
   MAX_WAITERS,
-  type Decisions,
 } from "../src/modules/decisions/decisions";
 import { createInbox } from "../src/modules/inbox/inbox";
 import { composeRepo, type RepoPorts } from "../src/repo/composeRepo";
@@ -76,7 +75,7 @@ function claimView(fields: Partial<ClaimView> = {}): ClaimView {
 }
 
 interface Harness {
-  decisions: Decisions;
+  decisions: DecisionsPort;
   inbox: InboxPort;
   log: EventLog;
   repoId: string;
