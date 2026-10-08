@@ -46,6 +46,7 @@ import type {
   TokenRevocation,
 } from "../contracts/artifacts";
 import { fail, ok, type PortFailure, type PortResult } from "../contracts/result";
+import { hex, sha256 } from "../modules/owner/encoding";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
 
 /** The binding methods this adapter calls on one Artifacts repository. `ArtifactsRepo` satisfies it. */
@@ -1097,8 +1098,5 @@ function forkState(value: string): ForkState {
 }
 
 async function digest(text: string): Promise<string> {
-  const bytes = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
-  );
-  return Array.from(bytes.subarray(0, 16), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return hex((await sha256(new TextEncoder().encode(text))).subarray(0, 16));
 }
