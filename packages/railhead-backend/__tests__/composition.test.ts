@@ -315,8 +315,8 @@ describe("installed authorization", () => {
 });
 
 /**
- * Runs `body` with the composed, unavailable ports of a fresh repository, overriding the three
- * the `work` route reaches. `calls` records which of them ran.
+ * Runs `body` with a fresh repository's composed ports, overriding the six methods the session
+ * routes reach. `calls` records which of them ran.
  */
 async function withFakePorts<R>(
   overrides: {

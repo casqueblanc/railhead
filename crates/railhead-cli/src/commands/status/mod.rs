@@ -1,4 +1,4 @@
-//! `rh status`: Show the agent, its claim with the durable task, and its inbox.
+//! `rh status`: Show the agent, its claim with the durable task, its last closed claim, its clone and its inbox.
 
 use std::io::{self, Write};
 

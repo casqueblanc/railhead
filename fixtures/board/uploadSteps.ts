@@ -123,7 +123,7 @@ export const decide = (version: number, option: "reject" | "chunk"): SyntheticSt
   },
 });
 
-/** The three inbox events for one item, in the order given by `upTo`. */
+/** The inbox events for one item, queued then delivered then acknowledged, stopping at `upTo`. */
 export const inbox = (
   agentId: AgentId,
   claimId: ClaimId,
