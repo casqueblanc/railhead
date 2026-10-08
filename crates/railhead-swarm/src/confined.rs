@@ -103,7 +103,7 @@ fn check_inside(root: &Path, path: &Path) -> Result<(), ConfineError> {
 }
 
 /// Options that refuse to open a symbolic link as the file itself.
-fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
+pub(crate) fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;

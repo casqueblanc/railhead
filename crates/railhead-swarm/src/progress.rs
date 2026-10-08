@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use railhead_protocol::{IdKind, is_id};
 
+use crate::confined::no_follow;
 use crate::plan::Edit;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -239,14 +240,15 @@ impl HomeLock {
             source,
         };
         std::fs::create_dir_all(dir).map_err(failed)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
-        }
-        let mut file = options.open(&path).map_err(failed)?;
+        let mut file = no_follow(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+        .open(&path)
+        .map_err(failed)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {

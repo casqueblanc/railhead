@@ -65,8 +65,6 @@ pub struct Rejection {
     pub retryable: bool,
     /// How long to wait first, in milliseconds.
     pub retry_after_ms: Option<u64>,
-    /// The command `rh` suggests next, such as `rh sync`.
-    pub next: Option<String>,
 }
 
 /// A successful `rh` result.
