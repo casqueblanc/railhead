@@ -823,13 +823,13 @@ impl Run<'_> {
     }
 
     /// Reads the inbox with `rh sync` and acknowledges every item on it.
-    async fn sync(&self, held: &Held) -> Outcome<bool> {
+    async fn sync(&self, held: &Held) -> Outcome<()> {
         let page: Envelope<InboxResult> = self
             .retrying(Step::Inbox, || {
                 self.shared.runner.rh(&self.agent.env, &held.dir, &["sync"])
             })
             .await?;
-        self.acknowledge(held, &page.data.items).await
+        self.acknowledge(held, &page.data.items).await.map(|_| ())
     }
 
     /// Acknowledges `items`, reporting each routed conflict. Returns whether one asks this claim
@@ -1476,7 +1476,6 @@ mod tests {
             code: process::Code::Agent(code),
             retryable,
             retry_after_ms: after,
-            next: None,
         })
     }
 
