@@ -650,7 +650,7 @@ class GitGateway implements GitPort {
     }
     const deadline = new Deadline(headersTimeoutMs);
     try {
-      const response = await untilAborted(
+      const response = await untilAnswered(
         this.#context.upstream(
           new Request(url, {
             headers: { authorization: `Bearer ${token.value.value}` },
@@ -855,7 +855,7 @@ class GitGateway implements GitPort {
 
     let response: Response;
     try {
-      response = await untilAborted(this.#context.upstream(upstreamRequest), deadline.signal);
+      response = await untilAnswered(this.#context.upstream(upstreamRequest), deadline.signal);
     } catch {
       // The upstream may have failed without reading the upload: end the exchange, which cancels it.
       deadline.abort();
@@ -1418,7 +1418,13 @@ function logFailure(route: Route, outcome: string): void {
  * Settles with `work`, or rejects once `signal` aborts. A response that arrives after the abort is
  * released unread.
  */
-function untilAborted(work: Promise<Response>, signal: AbortSignal): Promise<Response> {
+function untilAnswered(work: Promise<Response>, signal: AbortSignal): Promise<Response> {
+  releaseLate(work, signal);
+  return untilAborted(work, signal);
+}
+
+/** Settles with `work`, or rejects once `signal` aborts. */
+export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   let rejectAborted: ((reason: unknown) => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
     rejectAborted = reject;
@@ -1428,15 +1434,19 @@ function untilAborted(work: Promise<Response>, signal: AbortSignal): Promise<Res
   };
   if (signal.aborted) onAbort();
   else signal.addEventListener("abort", onAbort, { once: true });
+  return Promise.race([work, aborted]).finally(() => {
+    signal.removeEventListener("abort", onAbort);
+  });
+}
+
+/** Releases unread a response from `work` that arrives after `signal` aborts. */
+export function releaseLate(work: Promise<Response>, signal: AbortSignal): void {
   void work.then(
     async (late) => {
       if (signal.aborted) await late.body?.cancel().catch(() => undefined);
     },
     () => undefined,
   );
-  return Promise.race([work, aborted]).finally(() => {
-    signal.removeEventListener("abort", onAbort);
-  });
 }
 
 /**

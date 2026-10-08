@@ -9,6 +9,7 @@
 // remote nor the response body is logged or returned.
 
 import type { CommitSha } from "@railhead/shared/events";
+import { concat, pktLine } from "../../git/pktLine";
 import { BUNDLE_REF } from "./bundle";
 
 /** How long one push may take before it counts as lost. */
@@ -51,7 +52,7 @@ export async function pushMain(
   if (url.protocol !== "https:" || url.username !== "" || url.password !== "") return "refused";
 
   const command = `${ZERO_ID} ${request.head} ${BUNDLE_REF}\0report-status\n`;
-  const body = concat([pktLine(command), encoder.encode("0000"), request.pack]);
+  const body = concat([pktLine(encoder.encode(command)), encoder.encode("0000"), request.pack]);
   let response: Response;
   try {
     response = await fetcher(url, {
@@ -128,19 +129,4 @@ async function readAtMost(response: Response, limit: number): Promise<Uint8Array
     }
     chunks.push(value);
   }
-}
-
-function pktLine(payload: string): Uint8Array {
-  const bytes = encoder.encode(payload);
-  return concat([encoder.encode((bytes.length + 4).toString(16).padStart(4, "0")), bytes]);
-}
-
-function concat(parts: readonly Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
-  let at = 0;
-  for (const part of parts) {
-    out.set(part, at);
-    at += part.length;
-  }
-  return out;
 }

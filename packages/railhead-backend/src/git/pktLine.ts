@@ -345,7 +345,8 @@ function oneLine(text: string, maxCodePoints: number): string {
   return out;
 }
 
-function concat(parts: readonly Uint8Array[]): Uint8Array {
+/** Joins `parts` into one buffer. */
+export function concat(parts: readonly Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
   let offset = 0;
   for (const part of parts) {
@@ -357,7 +358,8 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
 
 const FLUSH = textEncoder.encode("0000");
 
-function pktLine(payload: Uint8Array): Uint8Array {
+/** Frames `payload` as one pkt-line: its length in four hex digits, then the payload. */
+export function pktLine(payload: Uint8Array): Uint8Array {
   const header = textEncoder.encode((payload.length + 4).toString(16).padStart(4, "0"));
   return concat([header, payload]);
 }
