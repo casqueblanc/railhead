@@ -33,7 +33,8 @@
 import { isCommitSha, type CommitSha, type RepoId } from "@railhead/shared/events";
 import { fail, ok, type PortResult } from "../contracts/result";
 import type { MainRefPort, MainUpdate } from "../contracts/train";
-import type { Upstream } from "../git/gateway";
+import { releaseLate, untilAborted, type Upstream } from "../git/gateway";
+import { concat, pktLine } from "../git/pktLine";
 import { PushReportReader } from "../git/reportStatus";
 import { gitServiceUrl } from "../git/serviceUrl";
 import { MAIN_REF_TIMEOUT_MS } from "../modules/mainWriter/mainWriter";
@@ -263,13 +264,8 @@ class ArtifactsMainRef implements MainRefPort {
     let response: Response;
     try {
       const pending = this.#context.upstream(request);
-      // A response that arrives after the abort is released unread.
-      void pending.then(
-        async (late) => {
-          if (deadline.aborted) await late.body?.cancel().catch(() => undefined);
-        },
-        () => undefined,
-      );
+      releaseLate(pending, deadline);
+      deadline.throwIfAborted();
       response = await untilAborted(pending, deadline);
     } catch {
       return "uncertain";
@@ -291,7 +287,9 @@ class ArtifactsMainRef implements MainRefPort {
     let read = 0;
     try {
       for (;;) {
-        const { done, value } = await untilAborted(body.read(), deadline);
+        const chunk = body.read();
+        deadline.throwIfAborted();
+        const { done, value } = await untilAborted(chunk, deadline);
         if (done) break;
         read += value.length;
         if (read > MAX_REPORT_BYTES) {
@@ -417,32 +415,10 @@ class ArtifactsMainRef implements MainRefPort {
 async function receivePackBody(expected: CommitSha, next: CommitSha): Promise<Uint8Array> {
   const encoder = new TextEncoder();
   const command = encoder.encode(`${expected} ${next} ${MAIN}\0report-status\n`);
-  const length = encoder.encode((command.length + 4).toString(16).padStart(4, "0"));
   // An empty version 2 pack: the commits are already in the repository.
   const pack = Uint8Array.of(0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, 0);
   const checksum = new Uint8Array(await crypto.subtle.digest("SHA-1", pack));
-  const parts = [length, command, encoder.encode("0000"), pack, checksum];
-  const body = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    body.set(part, offset);
-    offset += part.length;
-  }
-  return body;
-}
-
-/** Settles with `work`, or rejects once `signal` aborts. */
-function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise<T>((resolve, reject) => {
-    const abort = (): void => {
-      reject(signal.reason);
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    work.then(resolve, reject).finally(() => {
-      signal.removeEventListener("abort", abort);
-    });
-  });
+  return concat([pktLine(command), encoder.encode("0000"), pack, checksum]);
 }
 
 /** Reports what the ref saw, by event name and counts only. */
