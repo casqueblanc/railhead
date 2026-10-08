@@ -6,7 +6,7 @@ import { boardMetrics, type BoardMetrics } from "./metrics";
 
 /**
  * Raw totals counted from the log: questions, human actions, reported checks including failures,
- * checks that timed out or were held, changes landed, active claims and the recent window. Every number is a count of recorded events.
+ * checks that timed out or were held, changes landed, active claims and the recent window.
  */
 export const TotalsPanel = ({ feed }: { feed: BoardFeed }) => {
   const headingId = useId();
