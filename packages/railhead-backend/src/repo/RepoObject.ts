@@ -41,7 +41,7 @@ import {
 } from "../modules/demoSeed/entry";
 import type { SeedTarget } from "../modules/demoSeed/target";
 import type { GitTarget } from "../modules/git/entry";
-import { hex } from "../modules/owner/encoding";
+import { randomHex } from "../modules/owner/encoding";
 import type { StreamListener, StreamSubscription } from "../modules/stream/entry";
 import { composeRepo, resumables, resumeAll, type RepoPorts } from "./composeRepo";
 import { EventLog, EventLogError } from "./eventLog";
@@ -151,8 +151,9 @@ export class Repo extends DurableObject<Env> {
     migrate(this.ctx.storage, REPO_OWNER, MIGRATIONS);
     const summary: RepoSummary = { repoId: `rep_${this.ctx.id.toString()}`, org, name };
     // A repository recorded again after a reset reuses its id and restarts its `seq` numbers, so
-    // only a new history tells a cursor from the deleted log apart from one in the new log.
-    const history = randomHistory();
+    // only a new history tells a cursor from the deleted log apart from one in the new log. A
+    // history is 128 random bits.
+    const history = randomHex(16);
     this.ctx.storage.sql.exec(
       "INSERT INTO repo (id, repo_id, org, name, created_at, history) VALUES (1, ?, ?, ?, ?, ?)",
       summary.repoId,
@@ -404,12 +405,6 @@ export class Repo extends DurableObject<Env> {
     });
     return { summary, history, log, ports };
   }
-}
-
-/** A new history: 128 random bits in lowercase hex. */
-function randomHistory(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return hex(bytes);
 }
 
 function replaced(): PortResult<never> {

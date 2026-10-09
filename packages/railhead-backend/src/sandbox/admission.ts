@@ -13,7 +13,7 @@
 // no slot to change.
 
 import { fail, ok, type PortResult } from "../contracts/result";
-import { hex } from "../modules/owner/encoding";
+import { randomHex } from "../modules/owner/encoding";
 import { atomically, migrate, type RepoStorage } from "../repo/storage";
 import { parseSandboxPolicy, type SandboxPolicy } from "./policy";
 
@@ -327,8 +327,7 @@ export class SlotTable {
  * only in case never share a sandbox.
  */
 export function sandboxName(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return `sbx-${hex(bytes)}`;
+  return `sbx-${randomHex(16)}`;
 }
 
 function toRecord(row: SlotRow): SlotRecord {
