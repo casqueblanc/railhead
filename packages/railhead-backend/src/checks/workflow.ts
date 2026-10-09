@@ -53,7 +53,7 @@ export const REPORT_STEP = "report";
 export const RUN_OVERHEAD_MS = 7 * 60_000;
 
 /** How the report step retries a repository that did not answer. */
-export const REPORT_STEP_CONFIG = {
+const REPORT_STEP_CONFIG = {
   retries: { limit: 5, delay: 10_000, backoff: "exponential" },
   timeout: 60_000,
 } as const;
@@ -150,7 +150,7 @@ export function parseCheckRunParams(value: unknown): CheckRunParams | null {
 }
 
 /** The SDK's run parameters for `params`: its candidate, in its namespace, in its admitted slot. */
-export function ciParams(params: CheckRunParams): CiParams<CloudflareArtifacts> {
+function ciParams(params: CheckRunParams): CiParams<CloudflareArtifacts> {
   // The checkout reads the slot from here; the SDK passes it through untouched.
   const providerData: CheckProviderData = { namespace: params.namespace, slot: params.slot };
   return {
