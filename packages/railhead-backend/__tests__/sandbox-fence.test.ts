@@ -15,7 +15,7 @@ import { serveGitGateway, type GatewayDeps } from "../src/sandbox/gateway";
 import { readBoundedExec } from "../src/sandbox/output";
 import { CANDIDATE_REF_PREFIX, type SandboxGrant, type SandboxPolicy } from "../src/sandbox/policy";
 import { wakeTime } from "../src/sandbox/sandboxObject";
-import { deferred } from "./sliceWorld";
+import { deferred, pkt } from "./sliceWorld";
 
 const POLICY: SandboxPolicy = {
   host: "acct.artifacts.cloudflare.net",
@@ -394,10 +394,9 @@ const encoder = new TextEncoder();
 /** A candidate push, its pkt-lines written by hand. */
 function candidatePush(): Request {
   const line = `${"0".repeat(40)} ${"2".repeat(40)} ${CANDIDATE_REF_PREFIX}chk_attempt1/head\u0000report-status\n`;
-  const pkt = (encoder.encode(line).length + 4).toString(16).padStart(4, "0") + line;
   return new Request(`https://${POLICY.host}/git/railhead/main-repo.git/git-receive-pack`, {
     method: "POST",
-    body: `${pkt}0000PACKbytes`,
+    body: `${pkt(line)}0000PACKbytes`,
   });
 }
 
