@@ -23,7 +23,7 @@ import {
 /** How long one board call may take. */
 export const BOARD_TIMEOUT_MS = 30_000;
 /** The longest event log read. */
-export const MAX_EVENTS = 20_000;
+const MAX_EVENTS = 20_000;
 
 /** The board calls the harness makes, as a Cap'n Web stub of `BoardApi` offers them. */
 export interface LiveBoard {
