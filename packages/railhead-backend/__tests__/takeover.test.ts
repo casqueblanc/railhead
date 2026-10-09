@@ -34,7 +34,7 @@ import { composeRepo, resumables, resumeAll, type RepoPorts } from "../src/repo/
 import type { Repo } from "../src/repo/RepoObject";
 import { EventLog } from "../src/repo/eventLog";
 import { EarliestAlarm } from "../src/repo/storage";
-import { deferred } from "./sliceWorld";
+import { deferred, pkt } from "./sliceWorld";
 
 const REPO = "rep_takeover001";
 const ROOT = "1".repeat(40);
@@ -2124,9 +2124,6 @@ describe("revocation at ready", () => {
 describe("the Git gateway at the lease deadline", () => {
   const SESSION = "session-token-of-agent-one";
   const encoder = new TextEncoder();
-  /** A pkt-line, written by hand so the test does not reuse the subject's encoder. */
-  const pkt = (payload: string): string =>
-    (encoder.encode(payload).length + 4).toString(16).padStart(4, "0") + payload;
 
   /**
    * Pushes a new branch to agent 1's fork through a gateway over the real claims module, with the
