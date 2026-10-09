@@ -16,7 +16,7 @@ catalog:
   # pool, Wrangler, Miniflare and workerd are one matched set without overrides.
   "@cloudflare/vitest-plugin": 1.3.4
   # Types follow the Node runtime pinned in .node-version, not the newest Node.
-  "@types/node": 24.19.0
+  "@types/node": 24.19.1
   # Not 1.x: @cloudflare/ci 0.2.0, which runs the trusted checks, pins exactly 0.12.1, so merges and
   # checks share one Sandbox class and one container image. The image tag in
   # containers/railhead/Dockerfile moves with this pin.
