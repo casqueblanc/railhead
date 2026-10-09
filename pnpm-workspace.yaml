@@ -14,13 +14,13 @@ catalog:
   # The Workers test pool, under its current package name (formerly `@cloudflare/vitest-pool-workers`).
   # Released in step with Wrangler: 1.3.4 depends on exactly the `wrangler` pinned below, so the
   # pool, Wrangler, Miniflare and workerd are one matched set without overrides.
-  "@cloudflare/vitest-plugin": 1.3.4
+  "@cloudflare/vitest-plugin": 1.3.5
   # Types follow the Node runtime pinned in .node-version, not the newest Node.
   "@types/node": 24.19.0
   # Not 1.x: @cloudflare/ci 0.2.0, which runs the trusted checks, pins exactly 0.12.1, so merges and
   # checks share one Sandbox class and one container image. The image tag in
   # containers/railhead/Dockerfile moves with this pin.
-  "@cloudflare/sandbox": 0.12.1
+  "@cloudflare/sandbox": 0.12.10
   capnweb: 0.12.0
   # Pinned in lockstep with capnweb (declared as a >=0.7.0 peer).
   capnweb-validate: 0.3.0
@@ -35,7 +35,7 @@ catalog:
   vite-plus: 1.0.0
   # The 4.x line the Workers test pool supports (peer `^4.1.0`); the major moves with the pool.
   vitest: 4.1.11
-  wrangler: 4.145.0
+  wrangler: 4.146.0
 
 overrides:
   # Vitest peers can resolve vite@latest, so the version is pinned through the catalog. Selected by
