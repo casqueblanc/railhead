@@ -20,7 +20,7 @@
     "capnweb-validate": "catalog:"
   },
   "devDependencies": {
-    "@cloudflare/config": "0.22.0",
+    "@cloudflare/config": "0.24.1",
     "@cloudflare/vitest-plugin": "catalog:",
     "@railhead/scripts": "workspace:*",
     "typescript": "catalog:",

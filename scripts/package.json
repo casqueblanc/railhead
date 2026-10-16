@@ -22,7 +22,7 @@
     }
   },
   "dependencies": {
-    "@cloudflare/config": "0.22.0",
+    "@cloudflare/config": "0.24.1",
     "capnweb": "catalog:"
   },
   "devDependencies": {
